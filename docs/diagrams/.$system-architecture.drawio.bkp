@@ -1,0 +1,120 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="System Architecture" id="sysarch1">
+    <mxGraphModel dx="1900" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1980" pageHeight="650" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- External sources (left) -->
+        <mxCell id="src_airplay" value="Phone / PC&#10;(AirPlay sender)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="src_phone_bt" value="Phone&#10;(Bluetooth A2DP source)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="220" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="bt_bridge" value="Bluetooth Bridge Box&#10;ESP32-D0WDQ6 · ESPHome +&#10;custom classic-BT A2DP sink&#10;(firmware/bt-bridge)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="300" y="210" width="220" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Container group -->
+        <mxCell id="container" value="Add-on container (pipewire_audio_router) — Ubuntu 26.04 LTS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;dashed=1;verticalAlign=top;fontStyle=1;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="600" y="40" width="640" height="520" as="geometry" />
+        </mxCell>
+
+        <mxCell id="pw_group" value="PipeWire + WirePlumber graph" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#82b366;dashed=1;verticalAlign=top;fontStyle=1;align=left;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="620" y="80" width="300" height="440" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_shairport" value="shairport-sync&#10;(AirPlay source node)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="640" y="110" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="node_rtpsource" value="rtp-source&#10;(libpipewire-module-rtp-source)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="640" y="190" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="node_raopout" value="raop-out-*&#10;(libpipewire-module-raop-sink,&#10;static pipewire.conf.d)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="640" y="320" width="260" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="node_sendspinout" value="sendspin-out-*&#10;(support.null-audio-sink,&#10;created by sendspin-adapter)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="640" y="420" width="260" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="bridge_daemon" value="Bridge Daemon (Rust)&#10;pipewire-rs registry-observer thread&#10;+ pw-link / wpctl / pw-cat&#10;axum REST + WebSocket API :8080" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="960" y="90" width="240" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="sendspin_adapter" value="sendspin-adapter.py&#10;(aiosendspin + pw-record,&#10;one process per output)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="960" y="400" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- External outputs (right) -->
+        <mxCell id="out_avr" value="AVR Receiver&#10;(Yamaha / Pioneer, RAOP)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1300" y="320" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="out_espspeaker" value="ESPHome Speaker&#10;(Sendspin client)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1300" y="410" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Home Assistant + Browser: external clients of the API, own column -->
+        <mxCell id="ha_group" value="Home Assistant" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;dashed=1;verticalAlign=top;fontStyle=1;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="1660" y="60" width="280" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="ha_automations" value="Voice assistant / automations&#10;(tts.speak, play_media)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="100" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ha_integration" value="custom_components/pipewire_audio_router&#10;(media_player entities)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="190" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="browser" value="Browser&#10;(manual routing UI, GET /)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="410" width="240" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Edges: sources into container -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="src_airplay" target="node_shairport">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="classic BT A2DP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="src_phone_bt" target="bt_bridge">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="RTP / UDP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="bt_bridge" target="node_rtpsource">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- many-to-many linking, managed by bridge daemon -->
+        <mxCell id="e4" value="pw-link (many-to-many, via Bridge Daemon)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;strokeColor=#6c8ebf;exitX=0.3;exitY=1;entryX=0.3;entryY=0;" edge="1" parent="1" source="node_shairport" target="node_raopout">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;strokeColor=#6c8ebf;exitX=0.7;exitY=1;entryX=0.7;entryY=0;" edge="1" parent="1" source="node_rtpsource" target="node_sendspinout">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- outputs to external hardware -->
+        <mxCell id="e6" value="RTSP / RAOP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="node_raopout" target="out_avr">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="pw-record capture" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="node_sendspinout" target="sendspin_adapter">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="Sendspin (WebSocket)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="sendspin_adapter" target="out_espspeaker">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- bridge daemon controls pipewire -->
+        <mxCell id="e9" value="observes + controls" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;exitX=0;exitY=0.75;entryX=1;entryY=0.75;" edge="1" parent="1" source="bridge_daemon" target="pw_group">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- HA side -->
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="ha_automations" target="ha_integration">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" value="REST: /api/media_players, /announce, /volume" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="1" source="ha_integration" target="bridge_daemon">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="HTTP + WebSocket (routing UI)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.3;entryX=1;entryY=0.3;" edge="1" parent="1" source="browser" target="bridge_daemon">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

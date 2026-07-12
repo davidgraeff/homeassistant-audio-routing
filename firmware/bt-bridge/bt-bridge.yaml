@@ -1,0 +1,87 @@
+esphome:
+  name: bt-bridge
+  friendly_name: Bluetooth Audio Bridge
+  min_version: 2025.1.0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# Deliberately NOT included: esp32_ble, esp32_ble_tracker, bluetooth_proxy,
+# esp32_improv_ble. Omitting all four is what keeps the classic-BT radio
+# free for a2dp_bridge with no stack conflict — see PLAN.md Section 5.3.
+# If any of them is ever added to this device, re-read that section first,
+# it documents a real CONFIG_BT_CLASSIC_ENABLED=False landmine.
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+logger:
+
+api:
+  encryption:
+      key: "tqKenRnTdf1bvc/gsb0v7zVKIUKcfaO6fdeiy4mp0tI="
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "BT Bridge Fallback Hotspot"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+a2dp_bridge:
+  id: bt_bridge
+  device_name: "HA Audio Bridge"
+  rtp_host: !secret pipewire_rtp_host
+  rtp_port: 46000
+  connected:
+    name: "Bluetooth Connected"
+  peer_name:
+    name: "Bluetooth Device Name"
+  peer_address:
+    name: "Bluetooth Device Address"
+  track_title:
+    name: "Track Title"
+  track_artist:
+    name: "Track Artist"
+
+# RTP target is HA-configurable at runtime (not just a compile-time
+# secret) — e.g. to repoint this box at a different PipeWire host without
+# reflashing. `restore_value: true` persists whatever HA last set across
+# reboots; `initial_value` only matters for the very first boot before
+# any value has been persisted.
+text:
+  - platform: template
+    name: "PipeWire RTP Host"
+    id: rtp_host_text
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: !secret pipewire_rtp_host
+    set_action:
+      - lambda: |-
+          id(bt_bridge).set_rtp_host(x);
+
+number:
+  - platform: template
+    name: "PipeWire RTP Port"
+    id: rtp_port_number
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 46000
+    min_value: 1
+    max_value: 65535
+    step: 1
+    set_action:
+      - lambda: |-
+          id(bt_bridge).set_rtp_port((uint16_t) x);

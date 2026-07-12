@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Connect to a running pipewire_audio_router add-on instance.",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the bridge daemon at that host/port."
+    },
+    "abort": {
+      "already_configured": "This bridge daemon is already configured."
+    }
+  }
+}

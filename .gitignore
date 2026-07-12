@@ -1,0 +1,15 @@
+# Rust
+pipewire_audio_router/bridge-daemon/target/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ESPHome
+firmware/bt-bridge/.esphome/
+firmware/bt-bridge/secrets.yaml
+
+# Editor/OS cruft
+.DS_Store
+*.swp

@@ -1,0 +1,33 @@
+name: PipeWire Audio Router
+version: "0.1.0"
+slug: pipewire_audio_router
+description: >-
+  PipeWire-based whole-home audio router (RAOP/sendspin outputs), replacing
+  Music Assistant's Python audio engine.
+url: "https://github.com/davidgraeff/homeassistant-audio-routing"
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+# Required: PC-sourced RTP audio and RAOP need to receive/send unsolicited
+# traffic on the LAN. Default bridge networking isolates the container from
+# the host's other interfaces by design — confirmed necessary empirically,
+# see spikes/02-raop-static-sink.md and spikes/03b-rtp-pc-transfer.md.
+host_network: true
+options:
+  outputs: []
+  sendspin_outputs: []
+  airplay_source_name: "PipeWire Router"
+schema:
+  outputs:
+    - name: str
+      ip: str
+      port: int(1,65535)?
+      encryption: "list(none|RSA|auth_setup)?"
+  # sendspin devices connect *to* this add-on (Section 5.4b) — no per-device
+  # IP needed, unlike RAOP outputs which we connect *out* to.
+  sendspin_outputs:
+    - name: str
+  # Empty string disables the AirPlay-receive source entirely (Section 5.2).
+  airplay_source_name: str?

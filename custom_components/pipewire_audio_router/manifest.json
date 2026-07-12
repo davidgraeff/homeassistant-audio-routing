@@ -1,0 +1,11 @@
+{
+  "domain": "pipewire_audio_router",
+  "name": "PipeWire Audio Router",
+  "codeowners": ["@davidgraeff"],
+  "config_flow": true,
+  "documentation": "https://github.com/davidgraeff/homeassistant-audio-routing",
+  "issue_tracker": "https://github.com/davidgraeff/homeassistant-audio-routing/issues",
+  "iot_class": "local_polling",
+  "requirements": [],
+  "version": "0.1.0"
+}

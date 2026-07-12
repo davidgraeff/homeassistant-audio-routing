@@ -1,0 +1,149 @@
+#!/bin/bash
+# Phase 4 check: the manual routing UI (PLAN.md Section 8) — through the
+# real add-on binary, not a bare-PipeWire stand-in.
+#
+# Verifies, against a live container:
+# 1. GET / serves the routing UI HTML.
+# 2. GET /api/routing reports configured outputs and no sources when
+#    nothing is playing yet.
+# 3. A real source node appearing in the PipeWire registry shows up in the
+#    matrix.
+# 4. POST /api/routing/link actually creates the right per-channel
+#    pw-link connections (confirmed via `pw-link -l`, not just the JSON
+#    response) and the matrix reflects it.
+# 5. POST /api/routing/unlink actually removes them.
+# 6. The /api/routing/ws WebSocket pushes a live snapshot (initial, then
+#    another one) the moment a real link change happens in PipeWire —
+#    driven by pw_thread.rs's own registry listener, not polled.
+#
+# Needs a WebSocket client; the host's system python3 is broken in this
+# dev environment (missing libpython shared lib, unrelated to this
+# project), so step 6 runs a throwaway `python3-slim` container with
+# `--network host` instead of assuming a working local python3.
+set -euo pipefail
+
+ADDON_DIR="$(dirname "$0")/../pipewire_audio_router"
+IMAGE="${IMAGE:-pipewire_audio_router:dev}"
+CONTAINER_NAME="pw-addon-routing-ui-test"
+NETWORK_NAME="pw-addon-routing-ui-net"
+DATA_DIR="$(mktemp -d)"
+HOST_PORT="${HOST_PORT:-18400}"
+
+cleanup() {
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  # See tests/test_addon_announce_ducking_e2e.sh for why this is bounded
+  # with `timeout` — `docker network rm` right after `docker rm -f` on the
+  # same network has been observed to hang for minutes.
+  timeout 5 docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
+  rm -rf "$DATA_DIR"
+}
+trap cleanup EXIT
+
+echo "--- building add-on image ---"
+docker build -t "$IMAGE" "$ADDON_DIR"
+
+cat > "$DATA_DIR/options.json" << 'EOF'
+{
+  "outputs": [],
+  "sendspin_outputs": [ { "name": "Kitchen" }, { "name": "Bedroom" } ],
+  "airplay_source_name": ""
+}
+EOF
+
+docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+docker run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
+  -v "$DATA_DIR:/data" -p "$HOST_PORT:8080" "$IMAGE" >/dev/null
+
+echo "--- waiting for both sendspin outputs ---"
+READY=""
+for _ in $(seq 1 30); do
+  MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing" 2>/dev/null || true)
+  if echo "$MATRIX" | grep -q '"kitchen"' && echo "$MATRIX" | grep -q '"bedroom"'; then
+    READY=1
+    break
+  fi
+  sleep 1
+done
+if [ -z "$READY" ]; then
+  echo "FAIL: outputs never appeared in /api/routing: $MATRIX"
+  docker logs "$CONTAINER_NAME"
+  exit 1
+fi
+echo "OK: both outputs present, no sources yet: $MATRIX"
+echo "$MATRIX" | grep -q '"sources":\[\]' || { echo "FAIL: expected no sources before any were created"; exit 1; }
+
+echo "--- GET / serves the routing UI HTML ---"
+HTML=$(curl -sf "http://localhost:$HOST_PORT/")
+echo "$HTML" | grep -q "PipeWire Audio Router" || { echo "FAIL: routing UI HTML missing expected title"; exit 1; }
+echo "OK: routing UI HTML served"
+
+echo "--- creating a real source node ---"
+docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c '
+pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=test-music-src media.class=Audio/Source/Virtual object.linger=true audio.position=[FL,FR] }" >/dev/null
+'
+SOURCE_NODE_ID=""
+for _ in $(seq 1 30); do
+  MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing" 2>/dev/null || true)
+  SOURCE_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"display_name":"test-music-src"' | grep -oE '[0-9]+' | head -1) || true
+  [ -n "$SOURCE_NODE_ID" ] && break
+  sleep 1
+done
+if [ -z "$SOURCE_NODE_ID" ]; then
+  echo "FAIL: test-music-src never appeared as a source in /api/routing"
+  exit 1
+fi
+OUTPUT_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"display_name":"kitchen"' | grep -oE '[0-9]+' | head -1)
+echo "OK: source node id = $SOURCE_NODE_ID, kitchen output node id = $OUTPUT_NODE_ID"
+
+echo "--- POST /api/routing/link ---"
+LINK_RESPONSE=$(curl -s -X POST "http://localhost:$HOST_PORT/api/routing/link" -H 'Content-Type: application/json' \
+  -d "{\"source_node_id\":$SOURCE_NODE_ID,\"output_node_id\":$OUTPUT_NODE_ID}")
+echo "$LINK_RESPONSE" | grep -q '"ok":true' || { echo "FAIL: link request did not report ok:true: $LINK_RESPONSE"; exit 1; }
+sleep 0.5
+REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
+echo "$REAL_LINKS" | grep -q "test-music-src:capture_FL" || { echo "FAIL: real pw-link state missing the FL link after /api/routing/link"; echo "$REAL_LINKS"; exit 1; }
+MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing")
+echo "$MATRIX" | grep -q "\[$SOURCE_NODE_ID,$OUTPUT_NODE_ID\]" || { echo "FAIL: matrix does not show the new link: $MATRIX"; exit 1; }
+echo "OK: link created and reflected both in real PipeWire state and the matrix"
+
+echo "--- POST /api/routing/unlink ---"
+UNLINK_RESPONSE=$(curl -s -X POST "http://localhost:$HOST_PORT/api/routing/unlink" -H 'Content-Type: application/json' \
+  -d "{\"source_node_id\":$SOURCE_NODE_ID,\"output_node_id\":$OUTPUT_NODE_ID}")
+echo "$UNLINK_RESPONSE" | grep -q '"ok":true' || { echo "FAIL: unlink request did not report ok:true: $UNLINK_RESPONSE"; exit 1; }
+sleep 0.5
+REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
+echo "$REAL_LINKS" | grep -q "test-music-src:capture_FL" && { echo "FAIL: real pw-link state still shows the FL link after /api/routing/unlink"; echo "$REAL_LINKS"; exit 1; }
+MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing")
+echo "$MATRIX" | grep -q "\[$SOURCE_NODE_ID,$OUTPUT_NODE_ID\]" && { echo "FAIL: matrix still shows the link after unlink: $MATRIX"; exit 1; }
+echo "OK: unlink removed the real PipeWire link and the matrix no longer shows it"
+
+echo "--- WebSocket: initial snapshot + live push on a real link change ---"
+WS_LOG=$(docker run --rm --network host python:3.13-slim bash -c "
+pip install --quiet --no-cache-dir websockets 2>&1 >/dev/null
+python3 - << PYEOF
+import asyncio, json, urllib.request
+import websockets
+
+async def main():
+    async with websockets.connect('ws://localhost:$HOST_PORT/api/routing/ws') as ws:
+        initial = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        assert initial['links'] == [], f'expected no links in initial snapshot, got {initial[\"links\"]}'
+        req = urllib.request.Request(
+            'http://localhost:$HOST_PORT/api/routing/link',
+            data=json.dumps({'source_node_id': $SOURCE_NODE_ID, 'output_node_id': $OUTPUT_NODE_ID}).encode(),
+            headers={'Content-Type': 'application/json'},
+        )
+        urllib.request.urlopen(req).read()
+        pushed = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        assert [$SOURCE_NODE_ID, $OUTPUT_NODE_ID] in pushed['links'], f'expected the new link in the pushed snapshot, got {pushed[\"links\"]}'
+        print('WS_OK')
+
+asyncio.run(main())
+PYEOF
+" 2>&1)
+echo "$WS_LOG" | tail -5
+echo "$WS_LOG" | grep -q "WS_OK" || { echo "FAIL: WebSocket did not push a live snapshot reflecting the real link change"; exit 1; }
+echo "OK: WebSocket pushed a live snapshot driven by the real PipeWire registry change"
+
+echo "PASS: manual routing UI (matrix API, link/unlink, live WebSocket updates) verified end-to-end against the real add-on binary"

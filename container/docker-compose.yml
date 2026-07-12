@@ -1,0 +1,11 @@
+services:
+  pw-router:
+    build: .
+    image: pw-audio-router:dev
+    container_name: pw-router-dev
+    # Fast local iteration on the host's native arch (x86_64). Cross-arch
+    # correctness is checked separately via scripts/build-arm64.sh — see
+    # PLAN.md Section 7 (spikes are done locally first, arm64 is a
+    # periodic sanity check, not the primary dev loop).
+    tty: true
+    stdin_open: true
