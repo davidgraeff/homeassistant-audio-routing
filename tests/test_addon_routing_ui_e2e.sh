@@ -42,18 +42,20 @@ trap cleanup EXIT
 echo "--- building add-on image ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-cat > "$DATA_DIR/options.json" << 'EOF'
-{
-  "outputs": [],
-  "sendspin_outputs": [ { "name": "Kitchen" }, { "name": "Bedroom" } ],
-  "airplay_source_name": ""
-}
-EOF
-
+# No options.json seeding — the two sendspin outputs are created via the API
+# once the daemon is up.
 docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
-  -v "$DATA_DIR:/data" -p "$HOST_PORT:8080" "$IMAGE" >/dev/null
+  -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
+
+echo "--- waiting for the bridge-daemon HTTP API, then creating two sendspin outputs ---"
+for _ in $(seq 1 30); do curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+for NAME in Kitchen Bedroom; do
+  curl -s -X POST "http://localhost:$HOST_PORT/api/sendspin_outputs" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$NAME\"}" | grep -q '"ok":true' \
+    || { echo "FAIL: POST /api/sendspin_outputs ($NAME) failed"; docker logs "$CONTAINER_NAME"; exit 1; }
+done
 
 echo "--- waiting for both sendspin outputs ---"
 READY=""
@@ -85,7 +87,7 @@ pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=tes
 SOURCE_NODE_ID=""
 for _ in $(seq 1 30); do
   MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing" 2>/dev/null || true)
-  SOURCE_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"display_name":"test-music-src"' | grep -oE '[0-9]+' | head -1) || true
+  SOURCE_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"node_name":"[^"]*","display_name":"test-music-src"' | grep -oE '[0-9]+' | head -1) || true
   [ -n "$SOURCE_NODE_ID" ] && break
   sleep 1
 done
@@ -93,7 +95,7 @@ if [ -z "$SOURCE_NODE_ID" ]; then
   echo "FAIL: test-music-src never appeared as a source in /api/routing"
   exit 1
 fi
-OUTPUT_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"display_name":"kitchen"' | grep -oE '[0-9]+' | head -1)
+OUTPUT_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"node_name":"[^"]*","display_name":"kitchen"' | grep -oE '[0-9]+' | head -1)
 echo "OK: source node id = $SOURCE_NODE_ID, kitchen output node id = $OUTPUT_NODE_ID"
 
 echo "--- POST /api/routing/link ---"

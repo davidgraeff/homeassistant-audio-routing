@@ -47,18 +47,17 @@ trap cleanup EXIT
 echo "--- building add-on image (includes the Wyoming client) ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-cat > "$DATA_DIR/options.json" << 'EOF'
-{
-  "outputs": [],
-  "sendspin_outputs": [ { "name": "Kitchen" } ],
-  "airplay_source_name": ""
-}
-EOF
-
+# No options.json seeding — the sendspin output is created via the API below.
 docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
-  -v "$DATA_DIR:/data" -p "$HOST_PORT:8080" "$IMAGE" >/dev/null
+  -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
+
+echo "--- waiting for the bridge-daemon HTTP API, then creating the sendspin output ---"
+for _ in $(seq 1 30); do curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+curl -s -X POST "http://localhost:$HOST_PORT/api/sendspin_outputs" -H 'Content-Type: application/json' \
+  -d '{"name":"Kitchen"}' | grep -q '"ok":true' \
+  || { echo "FAIL: POST /api/sendspin_outputs failed"; docker logs "$CONTAINER_NAME"; exit 1; }
 
 echo "--- waiting for the sendspin sink node ---"
 SINK_NODE_ID=""

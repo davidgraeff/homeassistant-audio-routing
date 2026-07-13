@@ -22,8 +22,9 @@ WAV_HOST_PATH="${WAV_HOST_PATH:-/usr/share/sounds/speech-dispatcher/pipe.wav}"
 CLIRAOP_PATH="${CLIRAOP_PATH:-$(dirname "$0")/../../music-assistant-server/music_assistant/providers/airplay/bin/cliraop-linux-x86_64}"
 
 if [ ! -x "$CLIRAOP_PATH" ]; then
-  echo "FAIL: cliraop binary not found/executable at $CLIRAOP_PATH — set CLIRAOP_PATH"
-  exit 1
+  echo "SKIP: cliraop not found at $CLIRAOP_PATH — set CLIRAOP_PATH to run this test."
+  echo "      (It needs Music Assistant's proprietary AirPlay sender, which isn't in this repo / CI.)"
+  exit 0
 fi
 
 TEMP_WAV=""
@@ -38,20 +39,25 @@ trap cleanup EXIT
 echo "--- building add-on image ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-cat > "$DATA_DIR/options.json" << 'EOF'
-{
-  "outputs": [
-    { "name": "Test RAOP", "ip": "192.0.2.1", "port": 7000, "encryption": "auth_setup" }
-  ],
-  "sendspin_outputs": [ { "name": "Kitchen" } ],
-  "airplay_source_name": "PipeWire Router"
-}
-EOF
-
+# No options.json seeding — the RAOP output, sendspin output, and AirPlay
+# source are created at runtime via the API once the daemon is up (below).
 docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
-  -v "$DATA_DIR:/data" -p "$HOST_PORT:8080" "$IMAGE" >/dev/null
+  -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
+
+echo "--- waiting for the bridge-daemon HTTP API ---"
+for _ in $(seq 1 30); do curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+echo "--- creating the RAOP output, sendspin output, and AirPlay source via the API ---"
+curl -s -X POST "http://localhost:$HOST_PORT/api/outputs" -H 'Content-Type: application/json' \
+  -d '{"name":"Test RAOP","ip":"192.0.2.1","port":7000,"encryption":"auth_setup"}' | grep -q '"ok":true' \
+  || { echo "FAIL: POST /api/outputs failed"; docker logs "$CONTAINER_NAME"; exit 1; }
+curl -s -X POST "http://localhost:$HOST_PORT/api/sendspin_outputs" -H 'Content-Type: application/json' \
+  -d '{"name":"Kitchen"}' | grep -q '"ok":true' \
+  || { echo "FAIL: POST /api/sendspin_outputs failed"; docker logs "$CONTAINER_NAME"; exit 1; }
+curl -s -X PUT "http://localhost:$HOST_PORT/api/source/airplay" -H 'Content-Type: application/json' \
+  -d '{"name":"PipeWire Router"}' | grep -q '"ok":true' \
+  || { echo "FAIL: PUT /api/source/airplay failed"; docker logs "$CONTAINER_NAME"; exit 1; }
 
 echo "--- waiting for bridge-daemon + both output nodes ---"
 READY=""
