@@ -54,10 +54,29 @@ WiFi (OTA) — no cable needed for subsequent updates.
 
 ### Setting up the PipeWire side
 
-The receiving end needs `libpipewire-module-rtp-source` configured to
-match what this firmware actually sends: **native-endian `S16LE`**, not
-RFC 3551's big-endian `L16` convention, and `sess.ignore-ssrc = true`
-(this firmware picks a new random SSRC every boot — see
+**Using the Home Assistant add-on?** You don't need to hand-write any of
+this. The [PipeWire audio router add-on](../../pipewire_audio_router/README.md)
+now loads the RTP source for you. Three equivalent ways to turn it on:
+
+- **From Home Assistant** — the
+  [custom integration](../../custom_components/pipewire_audio_router/README.md)
+  exposes a *"Bluetooth bridge RTP source"* **switch** and a *"...RTP port"*
+  **number**. Set the port to match this firmware's target port and flip the
+  switch.
+- **The add-on's web UI** → **Sources** tab → **Bluetooth bridge (RTP)
+  source**.
+- **The REST API** directly: `PUT /api/source/rtp {"port":46000}` (see
+  [api-reference.md](../../docs/api-reference.md#rtp-source-bluetooth-bridge--a-module-not-a-process)).
+
+The add-on already hardcodes the exact format this firmware sends, so the
+node (`bt-bridge-rtp`) appears as a routable source automatically.
+
+The rest of this section is only needed if you're feeding a **standalone
+PipeWire session** (e.g. testing on a dev machine, not the add-on). The
+receiving end needs `libpipewire-module-rtp-source` configured to match
+what this firmware actually sends: **native-endian `S16LE`**, not RFC
+3551's big-endian `L16` convention, and `sess.ignore-ssrc = true` (this
+firmware picks a new random SSRC every boot — see
 [decisions.md](../../docs/decisions.md#bluetooth-bridge-box-hardware-and-firmware-constraints)
 for why that setting matters, not just what it does). Example
 `pipewire.conf.d` snippet:
@@ -82,8 +101,11 @@ context.modules = [
 ]
 ```
 
-A checked-in version of this for the actual add-on container is tracked
-as a follow-up — see [../../docs/roadmap.md](../../docs/roadmap.md#phase-5--bluetooth-bridge-box--functionally-done-one-item-owed).
+This snippet is the manual equivalent of what the add-on now does for you
+at runtime (see above) — the add-on builds the same args in
+`bridge-daemon/src/rtp_source.rs` and loads the module live, so there's no
+checked-in `.conf` to maintain. See
+[../../docs/roadmap.md](../../docs/roadmap.md#phase-5--bluetooth-bridge-box--done).
 
 ## Configuring the RTP target from Home Assistant
 

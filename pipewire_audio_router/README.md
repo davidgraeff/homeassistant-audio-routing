@@ -20,7 +20,8 @@ add-on repository:
 1. Home Assistant → Settings → Add-ons → Add-on Store → ⋮ (top right) →
    **Repositories** → add this repo's URL.
 2. Find **PipeWire Audio Router** in the store and install it.
-3. Configure your outputs (see schema below), then start it.
+3. Start it — there's nothing to configure up front; outputs and sources
+   are added at runtime (see [Configuration](#configuration)).
 4. `host_network: true` is required and already set in `config.yaml` —
    RAOP and RTP-sourced audio both need to send/receive unsolicited LAN
    traffic that default Docker bridge networking blocks (see
@@ -28,15 +29,58 @@ add-on repository:
 
 ## Configuration
 
-| Option | Type | Default | Notes |
-|---|---|---|---|
-| `outputs` | list of `{name, ip, port?, encryption?}` | `[]` | RAOP (AirPlay) receivers this add-on connects **out** to — AV receivers like a Yamaha/Pioneer. `port` defaults to `7000` (RAOP's actual advertised RTSP port is often *not* 5000 — check via mDNS if unsure). `encryption` defaults to `auth_setup`, the only mode that worked against real hardware tested here; `none`/`RSA` are fallbacks, not the default, for a real reason — see [decisions.md](../docs/decisions.md#raop-quirks-found-only-by-testing-against-real-hardware). |
-| `sendspin_outputs` | list of `{name}` | `[]` | Sendspin (ESPHome speaker) outputs. No IP needed — these devices connect **in** to this add-on, not the other way around. |
-| `airplay_source_name` | string | `"PipeWire Router"` | Display/service name for the single AirPlay-receive source (phones/PCs casting in). Set to an empty string to disable this source entirely. |
+There are **no add-on options** to fill in. Everything user-facing is
+configured at runtime via the daemon's REST API / web UI and persisted
+under `/data`, so it survives restarts. (Earlier versions had static
+`options.json` fields that only *seeded* these on first run and were then
+ignored — user testing found that confusing, so they were removed.)
 
-Changing `outputs` requires a restart (PipeWire has no way to hot-load a
-module — see [decisions.md](../docs/decisions.md#pipewire-has-no-runtime-load-module-rpc)),
-same as most HA add-ons already require on config changes.
+- **RAOP (AirPlay) outputs** — AV receivers this add-on streams *out* to
+  (e.g. Yamaha/Pioneer). Managed via `/api/outputs`, and auto-discovered
+  over mDNS. `port` defaults to `7000` (RAOP's advertised RTSP port is
+  often *not* 5000); `encryption` defaults to `auth_setup` — the only mode
+  that worked against real hardware tested here (`none`/`RSA` are
+  fallbacks, for a real reason — see
+  [decisions.md](../docs/decisions.md#raop-quirks-found-only-by-testing-against-real-hardware)).
+- **AirPlay-receive source** — the name phones/PCs cast *in* to. A single
+  source, managed via `/api/source/airplay` (empty name = disabled).
+- **Bluetooth bridge (RTP) source** — receives the RTP stream from the
+  [ESP32 Bluetooth bridge firmware](../firmware/bt-bridge/README.md) and
+  exposes it as a routable source (`bt-bridge-rtp`). A single source,
+  managed via `/api/source/rtp` (set the listen port to match the
+  firmware; disabled by default). Loaded as a native PipeWire module like
+  RAOP outputs — not a subprocess.
+- **Sendspin outputs** — ESPHome speakers that connect *in* to this add-on
+  (no IP needed). Managed via `/api/sendspin_outputs`.
+
+See [Managing outputs at runtime](#managing-outputs-at-runtime) below and
+the [full API reference](../docs/api-reference.md).
+
+## Managing outputs at runtime
+
+RAOP outputs are hot-reloadable: the daemon loads one
+`libpipewire-module-raop-sink` module per output into its own PipeWire
+context at runtime, so adding or removing one doesn't restart PipeWire or
+interrupt audio on the other outputs (see
+[decisions.md](../docs/decisions.md#loading-pipewire-modules-at-runtime)
+for how this works, and why the old "requires a restart" limitation was a
+misreading). The set is persisted to `/data/raop-outputs.json`.
+
+```bash
+# list outputs (and whether each is loaded right now)
+curl http://<add-on-host>:8099/api/outputs
+
+# add one — appears in the graph live, no restart
+curl -X POST http://<add-on-host>:8099/api/outputs \
+  -H 'content-type: application/json' \
+  -d '{"name":"Pioneer VSX-934","ip":"192.168.178.35","port":7000,"encryption":"auth_setup"}'
+
+# remove one by node name — its sink node disappears live
+curl -X DELETE http://<add-on-host>:8099/api/outputs/raop-out-pioneer_vsx_934
+```
+
+Full endpoint reference (status codes, failure modes):
+[api-reference.md](../docs/api-reference.md#outputs-raop-hot-reloadable).
 
 ## What's inside
 
@@ -44,7 +88,7 @@ same as most HA add-ons already require on config changes.
   LTS base validated in `spikes/01`–`04` (see repo-root `spikes/`).
 - **Bridge daemon** (`bridge-daemon/`, Rust): generates the static RAOP
   `pipewire.conf.d` config, observes the live PipeWire registry on a
-  dedicated thread, and serves the REST/WebSocket API on `:8080`. Full
+  dedicated thread, and serves the REST/WebSocket API on `:8099`. Full
   endpoint reference: [../docs/api-reference.md](../docs/api-reference.md).
 - **`sendspin-adapter.py`**: one process per configured sendspin output,
   embedding `aiosendspin` and capturing PipeWire audio via `pw-record` to
@@ -55,29 +99,53 @@ same as most HA add-ons already require on config changes.
   [decisions.md](../docs/decisions.md#shairport-sync-needs-a-real-d-bus-system-bus--avahi).
 
 Startup order (`rootfs/run.sh`): D-Bus system + session buses →
-`bridge-daemon generate-config` (must complete before PipeWire starts) →
-`pipewire` → `wireplumber` → `avahi-daemon` → every configured source/
-adapter process (via `bridge-daemon runtime-plan`) → `bridge-daemon
-serve`. If any component dies, the whole container exits so HA's
-supervisor restarts everything rather than limping along with a dead
-piece.
+`pipewire` → `wireplumber` → `avahi-daemon` → `bridge-daemon serve`. The
+daemon then loads a `raop-sink` module per stored RAOP output and
+spawns/supervises the source/adapter processes (`shairport-sync`,
+`sendspin-adapter.py`) from its own persisted `/data` stores — all
+reconfigurable live via the API (`/api/outputs`, `/api/source/airplay`,
+`/api/sendspin_outputs`), no restart. If a top-level component dies, the
+whole container exits so HA's supervisor restarts everything rather than
+limping along with a dead piece.
 
-## Manual routing UI
+## Web UI
 
-Open `http://<add-on-host>:8080/` directly (not through Home Assistant)
-for a source × output matrix — click cells to link/unlink, drag volume
-sliders per output. Live-updated over WebSocket as the real PipeWire
-graph changes. This is independent of the HA integration; useful for
-routing changes you don't want to wire into an automation.
+The daemon serves a small admin web app (Vite + Svelte, in
+[`frontend/`](frontend/), built into the image and served as static files).
+It's a dark/light-themed console — styled to match Home Assistant — covering
+the whole API: a live source × output **routing matrix** with per-output
+volume, RAOP **output** management, the AirPlay **source** and **sendspin**
+outputs, and an **announce** test. Live-updated over WebSocket as the PipeWire
+graph changes; independent of the HA integration (which exposes the
+`media_player` entities).
+
+Reach it two ways:
+
+- **In Home Assistant's sidebar** via ingress (authenticated, no separate
+  login) — `ingress: true` in `config.yaml`.
+- **Directly** at `http://<add-on-host>:8099/`.
+
+The UI uses relative asset/API paths, so the same build works under both. Dev:
+`cd frontend && npm install && npm run dev` (point it at a running daemon), or
+`npm run build` → `dist/` (what the daemon serves via `--static-dir`).
 
 ## Development
 
 ```
-cd bridge-daemon && cargo test        # unit tests: config parsing, config-file rendering
+cd bridge-daemon && cargo test        # unit tests: config parsing, module-args + outputs store
+cd bridge-daemon && cargo build       # fast host-side build for local runs/tests (native, user-owned)
+../scripts/build-daemon.sh            # build the daemon binary in a container, rootless-safe (no root-owned files)
 docker compose -f ../container/docker-compose.yml up   # bare PipeWire sandbox (see container/README.md) — NOT this add-on
 docker build -t pipewire-audio-router .                # build the real add-on image locally
 ../scripts/build-arm64.sh                              # cross-build for the Pi 4 (linux/arm64)
 ```
+
+Use `../scripts/build-daemon.sh` for any **container** build of the daemon
+— it prefers rootless podman and extracts the binary via `create`+`cp`, so
+it never leaves `root:root` files on the host the way an ad-hoc
+`docker run -v "$PWD:/build" … cargo build` does. For the fast inner loop,
+plain `cargo build`/`cargo test` on the host is fine (native → already
+user-owned).
 
 `container/` is a separate, throwaway bare-PipeWire dev sandbox used for
 early spikes — it does not contain the bridge daemon and isn't what gets

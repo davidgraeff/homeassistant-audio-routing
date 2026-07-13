@@ -47,18 +47,24 @@ PipeWire `rtp-source` would do).
 3. **Outputs** are two kinds of PipeWire sink:
    - **RAOP** (AirPlay-receiver AV receivers, e.g. Yamaha/Pioneer):
      handled entirely by PipeWire's own `libpipewire-module-raop-sink`,
-     statically configured per device before the daemon starts (PipeWire
-     has no runtime "load module" RPC — see decisions.md).
-   - **Sendspin** (ESPHome speaker devices): a `support.null-audio-sink`
-     node captured by a small per-output Python process
-     (`sendspin-adapter.py`) that embeds `aiosendspin` and pushes the
-     captured audio to the real device over the Sendspin WebSocket
-     protocol.
+     one module per device — hot-loaded into the bridge daemon's own
+     PipeWire context at runtime so outputs can be added/removed without
+     restarting PipeWire (see [decisions.md](decisions.md#loading-pipewire-modules-at-runtime)).
+   - **Sendspin** (ESPHome speaker devices): a null-sink node created and
+     captured natively by the daemon, which runs an embedded Sendspin
+     server per output (`sendspin_server.rs`, on the `sendspin` crate)
+     that pushes the captured audio to the real device over the Sendspin
+     WebSocket protocol — all in-process, no subprocess.
 4. **The bridge daemon** (Rust) is the only thing that knows about HA,
    config files, or "what a room is." It observes the live PipeWire
    registry on a dedicated thread (PipeWire's core types aren't `Send`)
-   and exposes that state — plus mutation endpoints backed by `pw-link`/
-   `wpctl`/`pw-cat` — over a REST + WebSocket API. Full endpoint
+   and exposes that state — plus native mutation endpoints (links via
+   `Core::create_object`/`Registry::destroy_global`, volume via the node's
+   `Props` param, announce playback via a `pw::stream`; no subprocesses) —
+   over a REST + WebSocket API. It also supervises the one remaining external
+   process — the AirPlay-receive source (`shairport-sync`) — from its
+   persisted store, spawning/stopping it live; the Sendspin servers run
+   inside the daemon itself rather than as subprocesses. Full endpoint
    reference: [api-reference.md](api-reference.md).
 5. **Home Assistant** talks to that API through the `custom_components`
    integration, which creates one `media_player` entity per configured

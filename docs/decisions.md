@@ -47,9 +47,10 @@ not critical, it's control-plane only"). Spike 4
 
 Rust's web ecosystem (`axum`, `serde`) meant the *entire* daemon —
 graph control, REST/WS API, static UI — could ship as one compiled
-binary, not just the PipeWire layer. The sendspin sink adapter stays a
-separate Python process per output regardless (see below) — rewriting
-that in Rust wasn't justified.
+binary, not just the PipeWire layer. (The sendspin sink adapter was
+originally kept as a separate Python process per output — "rewriting that
+in Rust wasn't justified" — but that conclusion was later reversed; see
+"Sendspin sink adapter rewritten in Rust, embedded in bridge-daemon" below.)
 
 ## No MQTT `media_player` platform — a custom integration is required
 
@@ -100,9 +101,9 @@ set on a **Link** (source→sink connection) to duck just that one path.
 Spike 5 (`spikes/05-tts-ducking-mechanism.md`) found this doesn't exist:
 PipeWire Links carry no Props/gain stage at all (Format param only) — a
 `volume` property set via `pw-link -p` is stored but has zero audible
-effect. The real mechanism is **per-source-**node** volume via `wpctl`**
-— already used by the daemon's `/api/media_players/:id/volume`
-endpoint. A real A/B/restore signal test confirmed this ducks only the
+effect. The real mechanism is **per-source-**node** volume** — the node's
+SPA `Props` `channelVolumes`, set natively (`volume.rs`), already used by
+the daemon's `/api/media_players/:id/volume` endpoint. A real A/B/restore signal test confirmed this ducks only the
 intended source while a second source mixed into the same sink is
 unaffected, with a clean restore to the original level. A related real
 bug caught during end-to-end testing: a stereo source contributes two
@@ -110,35 +111,120 @@ bug caught during end-to-end testing: a stereo source contributes two
 *link* instead of per distinct *node* double-applied the duck/restore
 and had to be fixed to dedupe by node id.
 
-## PipeWire has no runtime "load module" RPC
+## Loading PipeWire modules at runtime
 
-Confirmed directly against `pipewire/core.h` — there is no `load_module`
-entry in `pw_core_methods`. Modules (like `raop-sink`) can only be
-loaded from the daemon's own startup config, never injected by a
-connected client regardless of connection lifetime. This is *why*
-output config is static-file-generated-before-start
-(`bridge-daemon generate-config` → `pipewire.conf.d/10-outputs.conf`,
-written before `pipewire` itself starts) rather than applied live over
-the daemon's persistent connection — not a shortcut, a real protocol
-limitation. Changing RAOP outputs requires regenerating the config and
-restarting the add-on, matching standard HA add-on UX (most add-ons
-already require a restart on config changes). Sendspin outputs don't
-have this constraint — their sink node is created at runtime by
-`sendspin-adapter.py` via `pw-cli create-node`, not via a config-time
-module load.
+The native PipeWire *wire protocol* has no "load module" RPC:
+`pw_core_methods` in `pipewire/core.h` is exactly eight methods —
+`add_listener`, `hello`, `sync`, `pong`, `error`, `get_registry`,
+`create_object`, `destroy` — with no `load_module`. So a connected
+client genuinely cannot tell the *daemon process* to `dlopen` a module.
+That part was confirmed by reading the header directly.
 
-## `pw-link` subprocess, not native `pipewire-rs` link mutation
+An earlier version of this project drew the wrong conclusion from that
+fact — "so modules can only be loaded from the daemon's startup config,
+outputs can't change without a restart." That is **false**, and worth
+correcting because it drove a design choice. Runtime module loading
+plainly exists, verified against the live PipeWire (1.6.7) on the dev
+machine two ways:
+
+- **`pw_context_load_module()`** (`pipewire/impl-module.h`) loads a
+  module into *the calling process's own* `pw_context`. That's what
+  `pw-cli load-module` uses. Verified: a non-interactive
+  `pw-cli load-module` returns and the node vanishes immediately —
+  because the module is hosted *in pw-cli's process* and dies with it —
+  but a **long-lived** client that keeps its context alive keeps the
+  module (and the node it creates) alive too.
+- **`pactl load-module`** works as well, against `pipewire-pulse` — a
+  separate, long-lived PulseAudio-compatibility server whose protocol
+  *does* have a load-module command. Verified: `pactl load-module
+  module-null-sink …` returns a module index and the sink persists,
+  hosted by the `pipewire-pulse` process.
+
+So the real constraint is **ownership/lifetime, not possibility**: a
+hot-loaded module is owned by whichever process loaded it, never adopted
+into the PipeWire daemon's own lifetime.
+
+That is exactly the lever the bridge daemon uses for **hot-reloadable
+RAOP outputs**. The daemon is itself a long-lived PipeWire client, so it
+loads `libpipewire-module-raop-sink` into its *own* context at runtime —
+one module per output — and adding/removing/changing an output
+loads/unloads just that one module, with no PipeWire restart and no
+disturbance to audio already flowing through the other outputs. Because
+`pipewire-rs` 0.10 doesn't wrap `pw_context_load_module` (it lives in
+`impl-module.h`, outside the crate's bindgen surface), the daemon
+declares the two C functions (`pw_context_load_module` /
+`pw_impl_module_destroy`) itself and calls them on its PipeWire thread
+via a `pipewire::channel` command channel — see
+`bridge-daemon/src/pw_module.rs` and `pw_thread.rs`. Status and control
+surface: [roadmap.md](roadmap.md#raop-output-hot-reload--done).
+
+Sendspin outputs never had this constraint anyway — their sink node is a
+plain `create_object` node (the native protocol method that *is* in
+`pw_core_methods`), not a loaded module. The daemon now creates it natively
+on its PipeWire thread (`pw_thread.rs`'s `CreateSinkNode`); see "Sendspin
+sink adapter rewritten in Rust, embedded in bridge-daemon" below.
+
+## Link mutation is native `pipewire-rs`, not a `pw-link` subprocess
 
 Spike 4 measured native link creation at 0.07ms vs. ~16ms for shelling
-out to `pw-link` — a 230x difference — but the daemon's actual link
-endpoints (`POST /api/links`, `POST /api/routing/link`/`unlink`) still
-shell out to `pw-link`. Deliberate: wiring a correctly thread-safe
-command channel into the PipeWire event-loop thread (real `Send`/
-lifetime work) wasn't justified for human-paced UI interactions. The
-registry-*observation* half stays native (that's where the speed
-mattered — polling `pw-dump` doesn't scale to live UI updates); only the
-mutation path is "boring but proven" subprocess calls. Revisit only if
-link-mutation frequency ever stops being human-paced.
+out to `pw-link` — a 230x difference. An earlier iteration nonetheless
+kept the mutation endpoints (`POST /api/links`, `POST /api/routing/link`/
+`unlink`) on `pw-link`, judging the thread-safety work not worth it for
+human-paced UI clicks. That's since been done: the daemon already owns a
+`pipewire::channel` command channel into its PipeWire event-loop thread
+(for runtime module loading, above), so routing link create/destroy now
+go through it natively — `Core::create_object` with the `link-factory`,
+and `Registry::destroy_global` by link id. Idempotency (creating a link
+that already exists) and targeted unlink are decided against the observed
+registry state, not by matching subprocess stderr for `"File exists"`.
+Combined with native volume (`Props`/`channelVolumes`) and native announce
+playback (`pw::stream`), the daemon now speaks one native PipeWire API
+with no `pw-link`/`pw-cat`/`wpctl`/`ffmpeg` subprocesses left. See
+`bridge-daemon/src/pw_thread.rs`, `routing.rs`, `volume.rs`, `player.rs`.
+
+## Source & sendspin processes are daemon-supervised, not spawned by `run.sh`
+
+> **Update:** the sendspin half of this section is superseded — sendspin
+> outputs are now an embedded native server, not a supervised subprocess
+> (see "Sendspin sink adapter rewritten in Rust, embedded in bridge-daemon"
+> below). `Supervisor` now handles only `shairport-sync`; the rest of this
+> section describes the mechanism, which still applies to that one process.
+
+`shairport-sync` (the AirPlay-receive source) and `sendspin-adapter.py`
+(one per sendspin output) are external processes — unlike RAOP outputs,
+which are native PipeWire modules the daemon loads in-process (above),
+these have no in-daemon equivalent. An earlier iteration had `run.sh`
+spawn them once at boot from a `bridge-daemon runtime-plan` dump of
+`options.json`, so changing the source name or a sendspin output required
+an add-on restart. The daemon now **supervises** them itself
+(`supervisor.rs`): it spawns them from a persisted `/data/sources.json`
+store at startup, reconciles them live on API changes
+(`/api/source/airplay`, `/api/sendspin_outputs`), and kills them on
+removal and on its own graceful shutdown (SIGTERM). This makes *every*
+user-facing config runtime-managed and persisted, matching RAOP outputs;
+`run.sh` is left with just infrastructure (D-Bus, PipeWire, WirePlumber,
+avahi) + the daemon, and the `runtime-plan` subcommand is gone. A crashed
+child is reported as not-running rather than fatal (the same `nofail`
+stance as a bad RAOP device); the daemon exiting still restarts the
+container.
+
+## No `options.json` seeding — runtime config only
+
+For a while the daemon's stores were *seeded* once from the add-on's
+`options.json` (`outputs`, `airplay_source_name`, `sendspin_outputs`) on
+first run, then ignored. User testing found this genuinely confusing: the
+fields stayed visible and editable in the add-on's Configuration tab but
+had no effect after the first start — people edited them expecting a
+change and got none. So the options (and their `schema`) were removed from
+`config.yaml` entirely, along with the `AddonOptions` parsing and the
+`--options` flag. The stores (`/data/raop-outputs.json`,
+`/data/sources.json`) now start empty on a fresh install and are populated
+only at runtime — via the REST API / web UI, and (for RAOP) mDNS
+auto-discovery. Existing installs keep whatever their stores already hold;
+nothing re-reads `options.json`. The trade-off — no declarative up-front
+config in the add-on UI — is acceptable because the whole point of this
+project is live, no-restart reconfiguration, and one clear source of truth
+beats two competing ones.
 
 ## `host_network: true` is required, not a convenience
 
@@ -167,9 +253,10 @@ the node appearing.
 ## TTS/announce ducking: URL-based (v1) and Wyoming-based (v2), additive
 
 `POST /api/media_players/:node_id/announce` accepts either `url` (fetch
-+ ffmpeg-decode to WAV, works with HA's standard `tts.speak` contract
-unchanged) or `wyoming` (direct synthesis via the Wyoming protocol, no
-ffmpeg needed) — mutually exclusive, chosen per call via HA's standard
++ decode to WAV via `symphonia` — pure Rust, no system dependency —
+works with HA's standard `tts.speak` contract unchanged) or `wyoming`
+(direct synthesis via the Wyoming protocol, no decode step at all) —
+mutually exclusive, chosen per call via HA's standard
 `play_media` `extra` dict (the same mechanism other integrations use for
 implementation-specific options), not a daemon-wide mode switch or
 transparent interception. Either way, the daemon ducks every distinct
@@ -187,6 +274,155 @@ on engine+text+language+options) only exists in the `url`/file-based
 code path — repeating the same `wyoming` text re-synthesizes it every
 time, with no caching layer of our own. Low-priority as long as usage
 stays occasional announcements rather than frequently-repeated phrases.
+
+## Decoding announce audio: `symphonia`, not an `ffmpeg` subprocess
+
+The `url` announce path (above) originally shelled out to `ffmpeg -i
+<fetched> <wav>` to decode whatever format HA's TTS integration
+happened to render (usually mp3). Investigated why the runtime image was
+864MB — roughly double what its actual contents (a Rust binary, a
+Python sendspin adapter, PipeWire/WirePlumber) should need.
+
+**`ffmpeg` alone accounted for ~250-300MB**, confirmed two ways: (1)
+`docker history` on the built image showed the apt-get layer at 524MB
+total; (2) installing *only* `ffmpeg` via `--no-install-recommends` on a
+clean `ubuntu:26.04` container pulled `libllvm21` (130MB!),
+`mesa-libgallium` (48MB), `libplacebo360` (9MB, GPU color management),
+`libx265` (8.5MB, HEVC), `libcodec2` (16.5MB), plus X11/OpenCL/Kerberos
+libraries — Ubuntu's `ffmpeg` package is built with full GPU-accelerated
+video transcoding and broad protocol support, none of which this project
+uses. Our only use of it was decoding a short spoken-word clip to WAV.
+
+(The other major layer, ~212MB of `pip install aiosendspin[server]`
+pulling `av`/`numpy`/`pillow`, is **not** the same kind of waste —
+verified directly by uninstalling them and trying to import
+`SendspinServer`: `pillow` is a hard import-time dependency of the
+artwork/album-art role, `numpy` of the visualizer role. Both are baked
+into the same shared library Music Assistant depends on; not something
+to patch around for a packaging win.)
+
+**Fix**: replaced the `ffmpeg` subprocess with `symphonia`
+(`decode.rs`), a pure-Rust decoder with zero system dependencies —
+probes the format from content (mp3/wav/aac/ogg/flac all work
+unmodified) and decodes to a `SampleBuffer<i16>`, which `wav.rs` (shared
+with the Wyoming path) turns into a WAV. Removing `ffmpeg` from the
+Dockerfile and adding the `symphonia` crate (`features = ["all"]` — the
+cost of enabling every codec is a bit more compiled Rust in our own
+~8MB binary, not a system dependency tree, so there's no reason to
+hand-pick a narrower set) brought the image from **864MB to 456MB**.
+Verified functionally identical, not just smaller: the same real-signal
+e2e test (`tests/test_addon_announce_ducking_e2e.sh`) produced the exact
+same baseline/ducked/restored RMS measurements before and after the
+swap.
+
+**Considered and rejected**: rewriting `aiosendspin`'s server essentials
+(the other ~212MB) in Rust/Go/C++, prompted by finding
+[sendspin-rs](https://github.com/Sendspin/sendspin-rs). That project
+implements the **client/receiver** role (a sendspin *player*), not the
+**server** role this project needs (accepting ESP32 connections, clock
+sync across speakers, pushing audio) — wrong half of the protocol, and
+still WIP even for what it does cover. A from-scratch server
+reimplementation's real risk isn't library availability (Rust/Go/C++ all
+have adequate WebSocket/audio libraries) but multi-room clock
+synchronization correctness — the genuinely hard part of this protocol,
+currently handled by a shared library Music Assistant also depends on.
+Not worth that risk for a packaging win of this size; revisit only if
+sendspin-rs's server side matures or the image size becomes a real
+problem for the deployment target. (Superseded: this was reversed once a
+server role was actually built and tested — see the next section.)
+
+## Sendspin sink adapter rewritten in Rust, embedded in bridge-daemon — supersedes the two entries above
+
+Both "Bridge daemon language: Rust, not Python" and the "Considered and
+rejected" paragraph just above concluded a sendspin server rewrite wasn't
+worth it, on the same premise: [sendspin-rs](https://github.com/Sendspin/sendspin-rs)
+only implemented the client role, so a from-scratch server meant redoing
+multi-room clock synchronization from zero — the genuinely hard, risky part.
+That premise changed, not the risk calculus around it: a server role was
+built and validated on a fork (`server-role-prototype` branch,
+`github.com/davidgraeff/sendspin-rs`) — handshake, clock-sync echo,
+multi-client synchronized groups, mDNS advertise *and* discover/dial-in for
+clients that only run their own embedded server, reconnect-with-backoff —
+and tested against real Home Assistant Voice PE hardware. The hard part got
+derisked by actually building and testing it, not by re-estimating it.
+
+`sendspin-adapter.py` (a Python subprocess per output, wrapping
+`aiosendspin[server]`) is replaced by an embedded native server
+(`sendspin_server.rs`), pinning the fork by commit hash (`sendspin = { git =
+"...", rev = "..." }` — unreviewed/unmerged, so pinned to an exact commit,
+not a branch). This also picks up the two shellouts the Python adapter still
+had: sink-node creation now goes through `pw_thread.rs`'s
+`CreateSinkNode`/`DestroySinkNode` (the native equivalent of `pw-cli
+create-node`, alongside the existing `Load`/`CreateLinks` commands there),
+and continuous capture is native PipeWire (`sendspin_capture.rs`, mirroring
+`player.rs`'s stream setup but `Direction::Input` with
+`STREAM_CAPTURE_SINK`) instead of a `pw-record` subprocess. No longer
+daemon-supervised as an external process — the sendspin half of "Source &
+sendspin processes are daemon-supervised" (above) no longer applies;
+`Supervisor` is now exclusively for `shairport-sync`/AirPlay.
+
+**Payoff, measured**: image size **456MB → 193MB**; `python3`/`pip`/
+`aiosendspin` fully gone. `sendspin-rs` still compiles in `cpal`/`alsa` (its
+client-role audio module, which this project's server-only usage never
+calls), but the linker drops the dependency entirely — confirmed via `ldd`
+on the built binary showing zero ALSA runtime link.
+
+**Scope decision made alongside this**: no historical-replay/late-join
+catch-up buffer. A `Group` member added after streaming has already started
+gets `stream_start` plus only subsequent audio (covered by a
+`sendspin-rs` test), so a late joiner is in sync within about the next
+buffer's worth of audio (~100ms) — an accepted trade-off, not a gap.
+Discovery is deliberately unfiltered (`ClientManager::start`, not
+`start_filtered`) to preserve current behavior exactly: aiosendspin's
+`SendspinServer.start_server()` already defaults `discover_clients=True`,
+so today's production adapter already has every output/process discover and
+dial every such device on the network — this port doesn't introduce a new
+device-to-output assignment problem, whatever already arbitrates which
+server's connection a device keeps continues to do so unchanged.
+
+## Runtime image trimming: `systemd-standalone-sysusers`, not full `systemd`
+
+Investigated whether the 193MB runtime image (above) could shrink further,
+given the container only actually needs PipeWire, D-Bus, a shell, and their
+real dependencies. `dpkg-query -Wf` sorted by installed size turned up two
+full-size `systemd`/`libsystemd-shared` packages (~18MB combined) that don't
+appear in the bare `ubuntu:26.04` base image at all — i.e. something in our
+own `apt-get install` line was pulling them in.
+
+**Cause**: `pipewire`'s own Depends is an alternative, `systemd |
+systemd-standalone-sysusers` — either can satisfy its install-time need to
+create system users/groups. Neither was already installed, so apt defaulted
+to the first (full `systemd`), even though this container never runs systemd
+as PID 1 (`run.sh` is) and uses nothing else from it. Listing
+`systemd-standalone-sysusers` explicitly (340KB, a standalone `sysusers`
+binary built for exactly this non-systemd-init case) satisfies the same
+dependency; confirmed via `apt-get install --no-install-recommends -s` with
+the full package list that nothing else about the resolved set changes.
+Paired with stripping `/usr/share/{doc,man,locale}` in the same `RUN` layer
+(dead weight for a container that only speaks REST and logs in English) —
+**measured 192,750,570 → 175,922,196 bytes** (~16.8MB) on the otherwise
+identical image from the sendspin-native-rewrite entry above.
+
+**Investigated and deliberately kept**: `dbus-x11`. It looks like it's only
+there for `run.sh`'s own `dbus-launch` call (spec: cheap way to give
+PipeWire's portal/rtkit probing a session bus per the entry above), so
+dropping the apt package and having `run.sh` call plain `dbus-daemon
+--session --fork --print-address` instead looked like a free ~2.8MB win
+(dbus-x11 itself plus its `libx11-6`/`libx11-data` chain). Building that and
+checking `dpkg -l` in the result showed dbus-x11 still present — `apt-get
+install -s` on the package set traced it to `wireplumber` itself, which
+hard-Depends on some session-bus provider (`<default-dbus-session-bus>` →
+`dbus-user-session` or `dbus-x11`), independent of anything `run.sh` does.
+The only other option, `dbus-user-session`, hard-Depends on `systemd` and
+`libpam-systemd` — reinstalling the exact ~18MB the fix above just removed.
+So `dbus-x11` (118KB installed) plus its X11 chain is genuinely the smaller
+of the only two real choices here, not an oversight; `run.sh` keeps
+`dbus-launch` rather than churning to `dbus-daemon --session` for no
+measurable benefit. Also checked and ruled out: dropping
+`pipewire-audio-client-libraries` (its only unique contribution beyond what
+`shairport-sync`'s own hard Depends already pull in is the ~746KB
+`pipewire-alsa`/`pipewire-jack` shims — not worth the risk of retesting
+AirPlay-receive for that little).
 
 ## Bluetooth bridge box: hardware and firmware constraints
 

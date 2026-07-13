@@ -1,5 +1,7 @@
 # PipeWire Whole-Home Audio Router
 
+[![CI](https://github.com/davidgraeff/homeassistant-audio-routing/actions/workflows/ci.yml/badge.svg)](https://github.com/davidgraeff/homeassistant-audio-routing/actions/workflows/ci.yml)
+
 A PipeWire-based replacement for Music Assistant's audio engine: phones/PCs
 and a dedicated Bluetooth bridge box stream in, a Rust daemon routes/mixes
 them through a native PipeWire graph, and Home Assistant gets ordinary
@@ -61,7 +63,11 @@ setup flow, are in each component's own README linked above.
 - [**spikes/**](spikes/) — the empirical write-up behind every claim in
   `decisions.md`: what was tried, what broke, what fixed it.
 - [**tests/**](tests/) — the runnable scripts backing those write-ups;
-  nothing here is "verified" without one.
+  nothing here is "verified" without one. All of it — the Rust daemon
+  (rustfmt/clippy/tests), the web UI (svelte-check/build), the HA
+  integration (pytest), and the add-on end-to-end scripts — runs in CI on
+  every push to `main` and every PR
+  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ## Repo layout
 

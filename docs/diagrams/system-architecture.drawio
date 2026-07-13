@@ -25,16 +25,16 @@
         <mxCell id="node_rtpsource" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="rtp-source&#xa;(libpipewire-module-rtp-source)" vertex="1">
           <mxGeometry height="50" width="180" x="640" y="195" as="geometry" />
         </mxCell>
-        <mxCell id="node_raopout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="raop-out-*&#xa;(libpipewire-module-raop-sink,&#xa;static pipewire.conf.d)" vertex="1">
+        <mxCell id="node_raopout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="raop-out-*&#xa;(libpipewire-module-raop-sink,&#xa;hot-loaded at runtime)" vertex="1">
           <mxGeometry height="60" width="180" x="720" y="320" as="geometry" />
         </mxCell>
-        <mxCell id="node_sendspinout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="sendspin-out-*&#xa;(support.null-audio-sink,&#xa;created by sendspin-adapter)" vertex="1">
+        <mxCell id="node_sendspinout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="sendspin-out-*&#xa;(null-audio-sink, created&#xa;natively by the daemon)" vertex="1">
           <mxGeometry height="60" width="190" x="640" y="420" as="geometry" />
         </mxCell>
-        <mxCell id="bridge_daemon" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Bridge Daemon (Rust)&#xa;pipewire-rs registry-observer thread&#xa;+ pw-link / wpctl / pw-cat&#xa;axum REST + WebSocket API :8080" vertex="1">
+        <mxCell id="bridge_daemon" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Bridge Daemon (Rust)&#xa;pipewire-rs registry observer +&#xa;native links / volume / playback&#xa;axum REST + WebSocket API :8099" vertex="1">
           <mxGeometry height="110" width="240" x="960" y="90" as="geometry" />
         </mxCell>
-        <mxCell id="sendspin_adapter" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="sendspin-adapter.py&#xa;(aiosendspin + pw-record,&#xa;one process per output)" vertex="1">
+        <mxCell id="sendspin_adapter" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Sendspin server&#xa;(embedded in Bridge Daemon,&#xa;one per output)" vertex="1">
           <mxGeometry height="70" width="240" x="960" y="415" as="geometry" />
         </mxCell>
         <mxCell id="out_avr" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" value="AVR Receiver&#xa;(Yamaha / Pioneer, RAOP)" vertex="1">
@@ -68,7 +68,7 @@
             <mxPoint as="offset" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="e4" edge="1" parent="1" source="node_shairport" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;strokeColor=#6c8ebf;exitX=0.827;exitY=1.049;entryX=0.75;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;exitPerimeter=0;" target="node_raopout" value="pw-link (many-to-many, &lt;br&gt;via Bridge Daemon)">
+        <mxCell id="e4" edge="1" parent="1" source="node_shairport" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;strokeColor=#6c8ebf;exitX=0.827;exitY=1.049;entryX=0.75;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;exitPerimeter=0;" target="node_raopout" value="links (many-to-many, &lt;br&gt;via Bridge Daemon)">
           <mxGeometry relative="1" x="0.3333" as="geometry">
             <mxPoint as="offset" />
           </mxGeometry>
@@ -79,7 +79,7 @@
         <mxCell id="e6" edge="1" parent="1" source="node_raopout" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="out_avr" value="RTSP / RAOP">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e7" edge="1" parent="1" source="node_sendspinout" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="sendspin_adapter" value="pw-record capture">
+        <mxCell id="e7" edge="1" parent="1" source="node_sendspinout" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="sendspin_adapter" value="native capture">
           <mxGeometry relative="1" x="-0.0769" y="-10" as="geometry">
             <mxPoint as="offset" />
           </mxGeometry>
