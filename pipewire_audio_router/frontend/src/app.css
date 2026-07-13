@@ -1,0 +1,250 @@
+/*
+ * Theme tokens mirroring Home Assistant's default light/dark themes so this
+ * standalone page reads as part of HA. We can't inherit HA's CSS variables
+ * (this isn't rendered inside HA's document), so we replicate the ones that
+ * matter. Light values are the defaults; dark is applied either by the OS
+ * preference (when the user hasn't chosen) or an explicit `data-theme`.
+ */
+:root {
+  --primary-color: #03a9f4;
+  --primary-color-emphasis: #0288d1;
+  --accent-color: #ff9800;
+  --error-color: #db4437;
+  --success-color: #43a047;
+  --warning-color: #ffa600;
+
+  --primary-background-color: #fafafa;
+  --secondary-background-color: #e5e5e5;
+  --card-background-color: #ffffff;
+  --app-header-background-color: var(--primary-color);
+  --app-header-text-color: #ffffff;
+
+  --primary-text-color: #212121;
+  --secondary-text-color: #727272;
+  --disabled-text-color: #bdbdbd;
+  --text-on-primary: #ffffff;
+
+  --divider-color: rgba(0, 0, 0, 0.12);
+  --input-fill-color: #f5f5f5;
+
+  --ha-card-border-radius: 12px;
+  --ha-card-border-color: rgba(0, 0, 0, 0.06);
+  --ha-card-box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+  --ha-font-family: Roboto, "Helvetica Neue", system-ui, -apple-system, sans-serif;
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+  }
+  :root:not([data-theme]) {
+    --primary-background-color: #111111;
+    --secondary-background-color: #1c1c1c;
+    --card-background-color: #1c1c1c;
+    --app-header-background-color: #1f1f1f;
+
+    --primary-text-color: #e1e1e1;
+    --secondary-text-color: #9b9b9b;
+    --disabled-text-color: #6f6f6f;
+
+    --divider-color: rgba(225, 225, 225, 0.12);
+    --input-fill-color: #2a2a2a;
+
+    --ha-card-border-color: rgba(255, 255, 255, 0.06);
+    --ha-card-box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --primary-background-color: #111111;
+  --secondary-background-color: #1c1c1c;
+  --card-background-color: #1c1c1c;
+  --app-header-background-color: #1f1f1f;
+  --primary-text-color: #e1e1e1;
+  --secondary-text-color: #9b9b9b;
+  --disabled-text-color: #6f6f6f;
+  --divider-color: rgba(225, 225, 225, 0.12);
+  --input-fill-color: #2a2a2a;
+  --ha-card-border-color: rgba(255, 255, 255, 0.06);
+  --ha-card-box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--ha-font-family);
+  background: var(--primary-background-color);
+  color: var(--primary-text-color);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--primary-color);
+}
+
+/* ---- Cards ------------------------------------------------------------- */
+.card {
+  background: var(--card-background-color);
+  border: 1px solid var(--ha-card-border-color);
+  border-radius: var(--ha-card-border-radius);
+  box-shadow: var(--ha-card-box-shadow);
+  padding: 16px;
+}
+.card + .card {
+  margin-top: 16px;
+}
+.card h2 {
+  margin: 0 0 4px;
+  font-size: 1.05rem;
+  font-weight: 500;
+}
+.card .card-sub {
+  margin: 0 0 16px;
+  color: var(--secondary-text-color);
+  font-size: 0.85rem;
+}
+
+/* ---- Buttons ----------------------------------------------------------- */
+button {
+  font-family: inherit;
+  font-size: 0.9rem;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 8px 14px;
+  cursor: pointer;
+  background: var(--input-fill-color);
+  color: var(--primary-text-color);
+  transition: background 0.15s, box-shadow 0.15s, opacity 0.15s;
+}
+button:hover:not(:disabled) {
+  box-shadow: var(--ha-card-box-shadow);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.primary {
+  background: var(--primary-color);
+  color: var(--text-on-primary);
+}
+button.primary:hover:not(:disabled) {
+  background: var(--primary-color-emphasis);
+}
+button.danger {
+  background: transparent;
+  color: var(--error-color);
+  border-color: currentColor;
+}
+button.ghost {
+  background: transparent;
+  border-color: var(--divider-color);
+}
+
+/* ---- Inputs ------------------------------------------------------------ */
+input[type="text"],
+input[type="number"],
+input[type="url"],
+select,
+textarea {
+  font-family: inherit;
+  font-size: 0.9rem;
+  color: var(--primary-text-color);
+  background: var(--input-fill-color);
+  border: 1px solid var(--divider-color);
+  border-radius: 8px;
+  padding: 8px 10px;
+  width: 100%;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--primary-color);
+  outline-offset: -1px;
+}
+label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--secondary-text-color);
+  margin-bottom: 4px;
+}
+.field {
+  margin-bottom: 12px;
+}
+.group-label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--secondary-text-color);
+  margin-bottom: 4px;
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--primary-color);
+}
+
+/* ---- Tables ------------------------------------------------------------ */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9rem;
+}
+th,
+td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--divider-color);
+  text-align: left;
+}
+th {
+  font-weight: 500;
+  color: var(--secondary-text-color);
+}
+
+/* ---- Misc -------------------------------------------------------------- */
+.empty {
+  color: var(--secondary-text-color);
+  font-style: italic;
+  padding: 12px 0;
+}
+.badge {
+  display: inline-block;
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--divider-color);
+  color: var(--secondary-text-color);
+}
+.badge.on {
+  color: var(--success-color);
+  border-color: currentColor;
+}
+.badge.off {
+  color: var(--disabled-text-color);
+}
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.grow {
+  flex: 1 1 140px;
+}
+.muted {
+  color: var(--secondary-text-color);
+}
+code {
+  font-family: "Roboto Mono", ui-monospace, monospace;
+  font-size: 0.85em;
+}
