@@ -57,6 +57,15 @@ fn output_name_from_fullname(fullname: &str) -> String {
     }
 }
 
+/// The MAC portion of a RAOP mDNS instance fullname
+/// (`"<MAC>@<friendly>._raop._tcp.local."`), or `""` if there's no `@`. Used to
+/// recognize our own AirPlay receiver regardless of any ` (N)` suffix mDNS
+/// appends to the friendly part on a name conflict.
+fn instance_mac(fullname: &str) -> &str {
+    let instance = fullname.split("._raop._tcp").next().unwrap_or(fullname);
+    instance.split_once('@').map(|(mac, _)| mac).unwrap_or("")
+}
+
 /// Picks the RAOP encryption mode from the mDNS `et` (encryption types) TXT
 /// value — a comma-separated list of the modes the receiver supports:
 /// `0`=none, `1`=RSA, `2`=FairPlay, `3`=MFiSAP, `4`=FairPlay SAPv2.5.
@@ -119,21 +128,27 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                         let node_name = raop_node_name(&output.name);
                         let fullname = info.get_fullname().to_string();
 
-                        // Skip our OWN AirPlay-receive source. shairport-sync
-                        // (the AirPlay source we spawn) advertises itself on
+                        // Skip our OWN AirPlay-receive source. The embedded
+                        // receiver (airplay_source.rs) advertises itself on
                         // _raop._tcp, so without this the daemon discovers the
                         // receiver it just started and loads a raop-sink
-                        // pointing back at itself — which then shows up as a
-                        // bogus output in the routing matrix. Identify it by a
-                        // friendly-name match against the configured AirPlay
-                        // source name.
+                        // pointing back at itself — a bogus output / feedback
+                        // loop. Match on the mDNS instance MAC (our derived
+                        // hwaddr), which is stable even when mDNS appends
+                        // " (2)" to our name on a transient conflict; fall back
+                        // to a friendly-name slug match too.
                         let airplay_name = sources.lock_recover().airplay_source_name().map(str::to_string);
-                        if airplay_name.as_deref().is_some_and(|ap| slugify(ap) == slugify(&output.name)) {
-                            tracing::debug!(
-                                "discovered '{}' is our own AirPlay-receive source; not loading it as an output",
-                                output.name
-                            );
-                            continue;
+                        if let Some(ap) = &airplay_name {
+                            let own_mac = crate::airplay_source::mdns_mac(ap);
+                            if instance_mac(&fullname).eq_ignore_ascii_case(&own_mac)
+                                || slugify(ap) == slugify(&output.name)
+                            {
+                                tracing::debug!(
+                                    "discovered '{}' is our own AirPlay receiver; not loading it as an output",
+                                    output.name
+                                );
+                                continue;
+                            }
                         }
 
                         if store.lock_recover().contains(&node_name) {

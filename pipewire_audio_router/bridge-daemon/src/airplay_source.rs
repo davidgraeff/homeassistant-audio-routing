@@ -113,6 +113,15 @@ pub async fn start(name: String) -> anyhow::Result<AirplayHandle> {
     Ok(AirplayHandle { server: Some(server), producer_stop: Some(producer_stop), peak })
 }
 
+/// The uppercase-hex MAC (no separators) shairplay puts before `@` in its mDNS
+/// `_raop._tcp` instance name (e.g. `485D607CEE22@Music Via Airplay`). RAOP
+/// discovery uses this to recognize and skip our OWN receiver — stable even
+/// when mDNS appends ` (2)` to our name on a transient conflict, so it's more
+/// robust than matching the friendly name.
+pub fn mdns_mac(name: &str) -> String {
+    derive_hwaddr(name).iter().map(|b| format!("{b:02X}")).collect()
+}
+
 /// A locally-administered, deterministic MAC derived from the source name, so
 /// the AirPlay device identity is stable across restarts and unlikely to
 /// collide on a LAN with other installs.

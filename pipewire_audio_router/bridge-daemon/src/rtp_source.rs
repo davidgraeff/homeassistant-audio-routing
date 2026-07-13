@@ -33,6 +33,15 @@ pub const RTP_SOURCE_MODULE_NAME: &str = "libpipewire-module-rtp-source";
 /// per install (sources_store.rs) and settable via the API.
 pub const DEFAULT_RTP_PORT: u16 = 46000;
 
+/// Receiver-side jitter buffer target, in milliseconds. The module's own
+/// default is 100 ms, which is too tight for this sender: the ESP32 bridges
+/// classic-BT A2DP and WiFi on one 2.4 GHz radio, so RTP egress arrives in
+/// bursts (DTIM/coex-aligned) rather than paced. A 200 ms buffer absorbs that
+/// jitter and stops the underruns heard as stutter, at the cost of ~100 ms
+/// extra latency — imperceptible for this one-way "phone → whole-home audio"
+/// path. See firmware/bt-bridge/README.md and docs/decisions.md.
+pub const RTP_SOURCE_LATENCY_MSEC: u32 = 200;
+
 /// The SPA-JSON `args` object for the rtp-source module, ready to pass as the
 /// `args` string to `pw_context_load_module` (the braces-wrapped form the
 /// module's own `pw_properties_new_string(args)` parses). `stream.props` is a
@@ -46,6 +55,7 @@ pub fn rtp_source_module_args(port: u16) -> String {
     write!(a, "source.port = {port} ").unwrap();
     a.push_str("sess.media = \"audio\" ");
     a.push_str("sess.ignore-ssrc = true ");
+    write!(a, "sess.latency.msec = {RTP_SOURCE_LATENCY_MSEC} ").unwrap();
     a.push_str("audio.format = \"S16LE\" ");
     a.push_str("audio.rate = 44100 ");
     a.push_str("audio.channels = 2 ");
@@ -67,6 +77,9 @@ mod tests {
         assert!(args.contains("source.port = 46000"));
         // The three settings that must match the firmware exactly.
         assert!(args.contains("sess.ignore-ssrc = true"));
+        // Jitter buffer widened past the module default to absorb the
+        // ESP32's bursty BT+WiFi coexistence egress (stutter fix).
+        assert!(args.contains("sess.latency.msec = 200"));
         assert!(args.contains("audio.format = \"S16LE\""));
         assert!(args.contains("audio.rate = 44100"));
         assert!(args.contains("audio.channels = 2"));

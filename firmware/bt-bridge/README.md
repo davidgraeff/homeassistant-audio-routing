@@ -89,6 +89,11 @@ context.modules = [
             source.port = 46000
             sess.media = "audio"
             sess.ignore-ssrc = true
+            # The module default (100ms) is too tight for this sender: the
+            # ESP32 shares one 2.4GHz radio between classic-BT A2DP and WiFi,
+            # so RTP egress arrives in bursts, not paced. 200ms absorbs that
+            # jitter and stops the underruns you'd otherwise hear as stutter.
+            sess.latency.msec = 200
             audio.format = "S16LE"
             audio.rate = 44100
             audio.channels = 2

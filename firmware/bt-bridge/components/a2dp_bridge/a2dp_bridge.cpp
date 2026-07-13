@@ -3,6 +3,7 @@
 #ifdef USE_ESP_IDF
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 
 #include <arpa/inet.h>
@@ -118,6 +119,28 @@ void A2DPBridge::loop() {
   if (now - this->last_metadata_poll_ >= 5000) {
     this->last_metadata_poll_ = now;
     this->request_track_metadata_();
+  }
+
+  // RTP TX health, logged from the main task (never from the audio
+  // callback). Reports deltas per interval so a nonzero "failed" count
+  // points squarely at sender-side drops (WiFi TX buffer full) as opposed
+  // to WiFi-layer loss or receiver jitter, which are invisible here.
+  if (now - this->last_stats_log_ >= 5000) {
+    this->last_stats_log_ = now;
+    uint32_t sent = this->rtp_packets_sent_.load(std::memory_order_relaxed);
+    uint32_t failed = this->rtp_send_failures_.load(std::memory_order_relaxed);
+    uint32_t d_sent = sent - this->last_packets_sent_;
+    uint32_t d_failed = failed - this->last_send_failures_;
+    this->last_packets_sent_ = sent;
+    this->last_send_failures_ = failed;
+    if (d_sent != 0 || d_failed != 0) {
+      if (d_failed != 0) {
+        ESP_LOGW(TAG, "RTP TX: %u sent, %u DROPPED (errno=%d) in last 5s", d_sent, d_failed,
+                 this->last_send_errno_.load(std::memory_order_relaxed));
+      } else {
+        ESP_LOGD(TAG, "RTP TX: %u sent, 0 dropped in last 5s", d_sent);
+      }
+    }
   }
 }
 
@@ -266,7 +289,19 @@ void A2DPBridge::send_rtp_packet_(const uint8_t *payload, size_t len) {
     packet[11] = static_cast<uint8_t>(this->rtp_ssrc_);
     memcpy(packet + 12, payload + offset, chunk);
 
-    sendto(this->rtp_socket_, packet, 12 + chunk, 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
+    // Fire-and-forget UDP, but do NOT ignore the result: on lwIP a full
+    // WiFi TX buffer (typical during power-save bursts / BT+WiFi coex
+    // stalls) fails here with ENOMEM/EWOULDBLOCK and silently drops this
+    // packet — the exact mechanism behind audible RTP stutter. We can't
+    // log from this Bluedroid-task callback, so just bump atomic counters
+    // and let loop() report them from the main task.
+    if (sendto(this->rtp_socket_, packet, 12 + chunk, 0, reinterpret_cast<struct sockaddr *>(&dest),
+               sizeof(dest)) < 0) {
+      this->rtp_send_failures_.fetch_add(1, std::memory_order_relaxed);
+      this->last_send_errno_.store(errno, std::memory_order_relaxed);
+    } else {
+      this->rtp_packets_sent_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     this->rtp_sequence_++;
     this->rtp_timestamp_ += chunk / 4;  // stereo 16-bit frames, RTP clock rate == sample_rate_

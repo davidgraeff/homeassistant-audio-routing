@@ -6,6 +6,7 @@
 
 #ifdef USE_ESP_IDF
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -91,6 +92,17 @@ class A2DPBridge : public Component {
   bool avrc_connected_{false};
   uint8_t avrc_transaction_label_{0};
   uint32_t last_metadata_poll_{0};
+
+  // RTP TX health counters. Written from the Bluedroid audio task in
+  // send_rtp_packet_(), read/logged from the main-loop task — hence
+  // atomic. The last_* mirrors and last_stats_log_ are touched only by
+  // loop() (main task), so they need no synchronization.
+  std::atomic<uint32_t> rtp_packets_sent_{0};
+  std::atomic<uint32_t> rtp_send_failures_{0};
+  std::atomic<int> last_send_errno_{0};
+  uint32_t last_packets_sent_{0};
+  uint32_t last_send_failures_{0};
+  uint32_t last_stats_log_{0};
 };
 
 }  // namespace a2dp_bridge
