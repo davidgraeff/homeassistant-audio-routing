@@ -32,6 +32,13 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
 
+  # Real-time RTP audio egress + BT/WiFi radio coexistence cannot tolerate
+  # the radio duty-cycling that ESPHome's ESP32 default (LIGHT) imposes:
+  # it parks WiFi between DTIM beacons (~100ms) so UDP goes out in bursts,
+  # underrunning the receiver's jitter buffer -> audible stutter. Keep the
+  # radio always-on for this streaming box.
+  power_save_mode: none
+
   ap:
     ssid: "BT Bridge Fallback Hotspot"
     password: !secret fallback_ap_password

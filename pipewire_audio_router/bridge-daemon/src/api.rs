@@ -10,8 +10,8 @@ use crate::routing;
 use crate::routing_store::SharedRouting;
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::rtp_source::{rtp_source_module_args, DEFAULT_RTP_PORT, RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME};
-use crate::sources_store::{self, RtpSourceConfig, SourcesStore};
-use crate::supervisor::Supervisor;
+use crate::sources_store::{RtpSourceConfig, SourcesStore};
+use crate::airplay_source::AirplayHandle;
 use axum::{
     extract::{FromRef, Path, State},
     http::StatusCode,
@@ -30,11 +30,10 @@ pub type SharedStore = Arc<Mutex<OutputsStore>>;
 /// Runtime config for the daemon-supervised source/adapter processes.
 pub type SharedSources = Arc<Mutex<SourcesStore>>;
 
-/// The child-process supervisor (async: spawning/killing awaits). `tokio`'s
-/// mutex, since it's held across `.await`. Sendspin outputs no longer go
-/// through this — they're native, embedded servers (sendspin_server.rs), not
-/// subprocesses. Still used for the AirPlay-receive source (`shairport-sync`).
-pub type SharedSupervisor = Arc<tokio::sync::Mutex<Supervisor>>;
+/// The running AirPlay-receive source (airplay_source.rs), if configured —
+/// a native embedded RAOP server feeding a PipeWire source node. `tokio` mutex
+/// since start/stop `.await`. `None` = disabled.
+pub type SharedAirplay = Arc<tokio::sync::Mutex<Option<AirplayHandle>>>;
 
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
 /// change-notification channel (Section 8, routing.rs), the command sender for
@@ -48,7 +47,7 @@ pub struct AppState {
     pub pw_cmd: PwCommandSender,
     pub store: SharedStore,
     pub sources: SharedSources,
-    pub supervisor: SharedSupervisor,
+    pub airplay: SharedAirplay,
     /// Live mDNS-discovered sendspin devices (sendspin_discovery.rs), surfaced
     /// as virtual routing outputs.
     pub sendspin_devices: SharedSendspinDevices,
@@ -80,12 +79,12 @@ pub fn router(
     pw_cmd: PwCommandSender,
     store: SharedStore,
     sources: SharedSources,
-    supervisor: SharedSupervisor,
+    airplay: SharedAirplay,
     sendspin_devices: SharedSendspinDevices,
     routing: SharedRouting,
     static_dir: PathBuf,
 ) -> Router {
-    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_devices, routing };
+    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, airplay, sendspin_devices, routing };
     Router::new()
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))
@@ -430,7 +429,7 @@ async fn remove_output(
 struct AirplaySourceInfo {
     /// `None` when the source is disabled.
     name: Option<String>,
-    /// Whether the `shairport-sync` process is running right now.
+    /// Whether the embedded AirPlay receiver is running right now.
     running: bool,
 }
 
@@ -442,15 +441,22 @@ struct SetAirplaySourceRequest {
 
 async fn get_airplay_source(State(state): State<AppState>) -> Json<AirplaySourceInfo> {
     let name = state.sources.lock_recover().airplay_source_name().map(str::to_string);
-    let running = state.supervisor.lock().await.is_running(sources_store::AIRPLAY_KEY);
+    let running = state.airplay.lock().await.is_some();
     Json(AirplaySourceInfo { name, running })
+}
+
+/// Stop the current AirPlay receiver (if any). Caller holds no locks.
+async fn stop_airplay(state: &AppState) {
+    if let Some(handle) = state.airplay.lock().await.take() {
+        handle.stop().await;
+    }
 }
 
 async fn set_airplay_source(
     State(state): State<AppState>,
     Json(req): Json<SetAirplaySourceRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    // Persist first, then reconcile the process to the (normalized) stored value.
+    // Persist first (normalizes empty -> None), then reconcile the receiver.
     let stored = {
         let mut sources = state.sources.lock_recover();
         if let Err(e) = sources.set_airplay_source_name(Some(req.name.clone())) {
@@ -462,22 +468,20 @@ async fn set_airplay_source(
         sources.airplay_source_name().map(str::to_string)
     };
 
-    let mut supervisor = state.supervisor.lock().await;
+    // Tear down any existing receiver, then (re)start for the new name.
+    stop_airplay(&state).await;
     match stored {
-        Some(name) => match supervisor.respawn(sources_store::AIRPLAY_KEY, &sources_store::airplay_spec(&name)).await {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(OutputOpResponse { ok: true, message: format!("AirPlay source set to '{name}'") }),
-            ),
+        Some(name) => match crate::airplay_source::start(name.clone()).await {
+            Ok(handle) => {
+                *state.airplay.lock().await = Some(handle);
+                (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("AirPlay source set to '{name}'") }))
+            }
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
                 Json(OutputOpResponse { ok: false, message: format!("saved '{name}' but failed to start it: {e}") }),
             ),
         },
-        None => {
-            supervisor.stop(sources_store::AIRPLAY_KEY).await;
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() }))
-        }
+        None => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() })),
     }
 }
 
@@ -488,7 +492,7 @@ async fn delete_airplay_source(State(state): State<AppState>) -> (StatusCode, Js
             Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
         );
     }
-    state.supervisor.lock().await.stop(sources_store::AIRPLAY_KEY).await;
+    stop_airplay(&state).await;
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() }))
 }
 

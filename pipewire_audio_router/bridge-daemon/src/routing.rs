@@ -24,6 +24,7 @@
 //! by hand in every test script in `tests/`, generalized here instead of
 //! being hardcoded per source/output type.
 
+use crate::airplay_source::AIRPLAY_NODE_NAME;
 use crate::api::AppState;
 use crate::config::{SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
@@ -99,6 +100,7 @@ fn build_matrix(
     reg: &RegistryState,
     store: &OutputsStore,
     devices: &BTreeMap<String, SendspinDevice>,
+    airplay_display: Option<&str>,
     intent: &[RoutingLink],
 ) -> RoutingMatrix {
     use std::collections::BTreeSet;
@@ -166,7 +168,13 @@ fn build_matrix(
         .into_iter()
         .map(|name| {
             let node_id = present_sources.get(&name).copied();
-            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name: name.clone(), node_name: name }
+            // The AirPlay source's node is named `airplay-in`; show the
+            // user-facing service name instead when we know it.
+            let display_name = match airplay_display {
+                Some(ap) if name == AIRPLAY_NODE_NAME => ap.to_string(),
+                _ => name.clone(),
+            };
+            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name }
         })
         .collect();
 
@@ -185,9 +193,10 @@ fn build_matrix(
 fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let intent = routing_store::snapshot(&state.routing);
     let devices = state.sendspin_devices.lock_recover().clone();
+    let airplay = state.sources.lock_recover().airplay_source_name().map(str::to_string);
     let reg = state.pw.lock_recover();
     let store = state.store.lock_recover();
-    build_matrix(&reg, &store, &devices, &intent)
+    build_matrix(&reg, &store, &devices, airplay.as_deref(), &intent)
 }
 
 /// Every non-monitor output-direction port on `source_node_id` paired with the

@@ -40,3 +40,10 @@ mdns-sd = "0.13"
 # two separate versions rather than risking discovery.rs's working RAOP
 # lookup code to unify them.
 sendspin = { git = "https://github.com/davidgraeff/sendspin-rs.git", rev = "1594c06cf6ace1bee95dde6f2beb088669ca56d6" }
+
+# Native AirPlay (RAOP) receiver — a pure-Rust, clean-room AP1+AP2 server that
+# hands us decoded f32 PCM via a callback (spike-validated end-to-end). Replaces
+# the shairport-sync subprocess, which had no PipeWire backend in the Ubuntu
+# build so its audio never reached the graph. LGPL-3.0-or-later. Decodes ALAC/
+# AAC via symphonia (already a dep) and advertises via mdns-sd (already a dep).
+shairplay = "0.7"

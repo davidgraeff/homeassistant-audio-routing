@@ -107,7 +107,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         bash \
         avahi-daemon \
-        shairport-sync \
     && rm -rf /var/lib/apt/lists/* \
     # Man pages, translated message catalogs, and long-form package docs are
     # dead weight in a container that only ever talks over its own REST API

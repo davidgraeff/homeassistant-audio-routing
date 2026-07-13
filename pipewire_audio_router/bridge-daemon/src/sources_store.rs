@@ -1,5 +1,5 @@
-//! Persistent, runtime-managed config for the daemon-supervised AirPlay-receive
-//! source (`shairport-sync`, via `supervisor.rs`) and the Bluetooth-bridge RTP
+//! Persistent, runtime-managed config for the AirPlay-receive source name (the
+//! embedded native receiver, airplay_source.rs) and the Bluetooth-bridge RTP
 //! source. Mirrors outputs_store.rs: no `options.json` seeding — starts empty
 //! on a fresh install, then the `/data` file is authoritative and everything is
 //! managed live via the API (api.rs).
@@ -9,23 +9,8 @@
 //! (sendspin_group.rs), so there's nothing per-output to persist.)
 
 use crate::rtp_source::DEFAULT_RTP_PORT;
-use crate::supervisor::ProcessSpec;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
-/// Supervisor key for the single AirPlay-receive source.
-pub const AIRPLAY_KEY: &str = "airplay";
-
-const SHAIRPORT_SYNC_BIN: &str = "shairport-sync";
-
-/// How to spawn `shairport-sync` for an AirPlay-receive source of the given
-/// advertised name.
-pub fn airplay_spec(name: &str) -> ProcessSpec {
-    ProcessSpec {
-        program: SHAIRPORT_SYNC_BIN.to_string(),
-        args: vec!["-a".to_string(), name.to_string()],
-    }
-}
 
 /// The single RTP source (Bluetooth bridge firmware target). Its presence in
 /// the store means "enabled"; the only knob is the UDP port it listens on (the

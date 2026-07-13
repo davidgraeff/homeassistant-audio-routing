@@ -1,3 +1,4 @@
+mod airplay_source;
 mod api;
 mod config;
 mod decode;
@@ -16,7 +17,6 @@ mod sendspin_discovery;
 mod sendspin_group;
 mod sendspin_server;
 mod sources_store;
-mod supervisor;
 mod volume;
 mod wav;
 mod wyoming;
@@ -132,7 +132,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     tracing::info!("{} persisted routing link(s) in {}", routing.links().count(), routing_path.display());
     let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
 
-    let supervisor = std::sync::Arc::new(tokio::sync::Mutex::new(supervisor::Supervisor::new()));
+    let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(None));
     let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
@@ -212,7 +212,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         // Start every stored source/adapter process (AirPlay source via
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
         // — the rest still start and it can be re-enabled live.
-        spawn_stored_sources(&sources, &supervisor, pw_cmd.clone()).await;
+        spawn_stored_sources(&sources, &airplay, pw_cmd.clone()).await;
 
         // Reconcile persisted routing intent onto the live graph, now and on
         // every registry/device change: a node that (re)appears — a reloaded
@@ -247,7 +247,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             pw_cmd,
             store,
             sources,
-            supervisor.clone(),
+            airplay.clone(),
             sendspin_devices,
             routing,
             static_dir.to_path_buf(),
@@ -256,27 +256,28 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         tracing::info!("listening on {listen}");
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 
-        // On SIGTERM/SIGINT (run.sh's trap / container stop), kill the
-        // supervised child processes before exiting so nothing is orphaned.
-        // (Sendspin group servers tear themselves down when the reconcile task
-        // is dropped at process exit — their handles' Drop destroys the sinks.)
-        tracing::info!("shutting down; stopping supervised processes");
-        supervisor.lock().await.stop_all().await;
+        // On SIGTERM/SIGINT (run.sh's trap / container stop), stop the AirPlay
+        // receiver cleanly (unregister its mDNS, close listeners). Sendspin
+        // group servers and the RTP module tear down with the process.
+        tracing::info!("shutting down; stopping AirPlay source");
+        if let Some(handle) = airplay.lock().await.take() {
+            handle.stop().await;
+        }
         Ok::<(), anyhow::Error>(())
     })
 }
 
-/// Spawns the AirPlay source (via `Supervisor`) and every sendspin output
-/// from the persisted sources store. (Sendspin devices aren't spawned here —
-/// they're auto-discovered and grouped from the routing intent; see
+/// Starts the persisted sources: the native AirPlay receiver (airplay_source.rs)
+/// and the RTP source (a PipeWire module). (Sendspin devices aren't started
+/// here — they're auto-discovered and grouped from the routing intent; see
 /// sendspin_group.rs.)
 async fn spawn_stored_sources(
     sources: &api::SharedSources,
-    supervisor: &api::SharedSupervisor,
+    airplay: &api::SharedAirplay,
     pw_cmd: pw_thread::PwCommandSender,
 ) {
     // Snapshot the config and drop the (std) lock before awaiting anything.
-    let (airplay, rtp) = {
+    let (airplay_name, rtp) = {
         let s = sources.lock_recover();
         (s.airplay_source_name().map(str::to_string), s.rtp_source())
     };
@@ -304,9 +305,12 @@ async fn spawn_stored_sources(
         }
     }
 
-    if let Some(name) = airplay {
-        match supervisor.lock().await.respawn(sources_store::AIRPLAY_KEY, &sources_store::airplay_spec(&name)).await {
-            Ok(()) => tracing::info!("started AirPlay source '{name}'"),
+    if let Some(name) = airplay_name {
+        match airplay_source::start(name.clone()).await {
+            Ok(handle) => {
+                *airplay.lock().await = Some(handle);
+                tracing::info!("started AirPlay source '{name}'");
+            }
             Err(e) => tracing::warn!("failed to start AirPlay source '{name}': {e}"),
         }
     }
