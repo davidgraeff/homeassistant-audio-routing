@@ -121,10 +121,9 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
 
     let sources = sources_store::SourcesStore::load(sources_path)?;
     tracing::info!(
-        "sources: airplay={:?}, rtp={:?}, {} sendspin output(s) in {}",
+        "sources: airplay={:?}, rtp={:?} in {}",
         sources.airplay_source_name(),
         sources.rtp_source().map(|c| c.port),
-        sources.sendspin_outputs().len(),
         sources_path.display()
     );
     let sources = std::sync::Arc::new(std::sync::Mutex::new(sources));
@@ -134,8 +133,6 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
 
     let supervisor = std::sync::Arc::new(tokio::sync::Mutex::new(supervisor::Supervisor::new()));
-    let sendspin_servers: api::SharedSendspinServers =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
@@ -213,10 +210,9 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         }
 
         // Start every stored source/adapter process (AirPlay source via
-        // Supervisor; sendspin outputs as native embedded servers). A failed
-        // spawn is logged, not fatal — the rest still start and it can be
-        // re-added live.
-        spawn_stored_sources(&sources, &supervisor, &sendspin_servers, pw_state.clone(), pw_cmd.clone()).await;
+        // Supervisor) and the RTP source. A failed spawn is logged, not fatal
+        // — the rest still start and it can be re-enabled live.
+        spawn_stored_sources(&sources, &supervisor, pw_cmd.clone()).await;
 
         // Reconcile persisted routing intent onto the live graph, now and on
         // every registry/device change: a node that (re)appears — a reloaded
@@ -252,7 +248,6 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             store,
             sources,
             supervisor.clone(),
-            sendspin_servers.clone(),
             sendspin_devices,
             routing,
             static_dir.to_path_buf(),
@@ -261,30 +256,29 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         tracing::info!("listening on {listen}");
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 
-        // On SIGTERM/SIGINT (run.sh's trap / container stop), kill the child
-        // processes and tear down the native sendspin servers we own before
-        // exiting so nothing is orphaned.
+        // On SIGTERM/SIGINT (run.sh's trap / container stop), kill the
+        // supervised child processes before exiting so nothing is orphaned.
+        // (Sendspin group servers tear themselves down when the reconcile task
+        // is dropped at process exit — their handles' Drop destroys the sinks.)
         tracing::info!("shutting down; stopping supervised processes");
         supervisor.lock().await.stop_all().await;
-        sendspin_servers.lock().await.clear();
         Ok::<(), anyhow::Error>(())
     })
 }
 
 /// Spawns the AirPlay source (via `Supervisor`) and every sendspin output
-/// (as a native embedded server — see sendspin_server.rs) from the persisted
-/// sources store.
+/// from the persisted sources store. (Sendspin devices aren't spawned here —
+/// they're auto-discovered and grouped from the routing intent; see
+/// sendspin_group.rs.)
 async fn spawn_stored_sources(
     sources: &api::SharedSources,
     supervisor: &api::SharedSupervisor,
-    sendspin_servers: &api::SharedSendspinServers,
-    pw_state: pw_thread::SharedState,
     pw_cmd: pw_thread::PwCommandSender,
 ) {
     // Snapshot the config and drop the (std) lock before awaiting anything.
-    let (airplay, sendspins, rtp) = {
+    let (airplay, rtp) = {
         let s = sources.lock_recover();
-        (s.airplay_source_name().map(str::to_string), s.sendspin_outputs().to_vec(), s.rtp_source())
+        (s.airplay_source_name().map(str::to_string), s.rtp_source())
     };
 
     // The RTP source (bt-bridge) is a native PipeWire module, not a subprocess
@@ -314,16 +308,6 @@ async fn spawn_stored_sources(
         match supervisor.lock().await.respawn(sources_store::AIRPLAY_KEY, &sources_store::airplay_spec(&name)).await {
             Ok(()) => tracing::info!("started AirPlay source '{name}'"),
             Err(e) => tracing::warn!("failed to start AirPlay source '{name}': {e}"),
-        }
-    }
-    for output in sendspins {
-        let node_name = output.node_name();
-        match sendspin_server::start(&output, pw_state.clone(), pw_cmd.clone()).await {
-            Ok(handle) => {
-                sendspin_servers.lock().await.insert(node_name, handle);
-                tracing::info!("started sendspin output '{}' (port {})", output.name, output.port);
-            }
-            Err(e) => tracing::warn!("failed to start sendspin output '{}': {e}", output.name),
         }
     }
 }

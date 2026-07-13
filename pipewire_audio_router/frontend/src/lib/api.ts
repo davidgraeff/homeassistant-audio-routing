@@ -13,7 +13,6 @@ import type {
   OutputInfo,
   RoutingMatrix,
   RtpSourceInfo,
-  SendspinInfo,
   VolumeResponse,
   WyomingAnnounce,
 } from './types';
@@ -93,9 +92,4 @@ export const api = {
   rtpSource: () => request<RtpSourceInfo>('GET', 'api/source/rtp'),
   setRtpSource: (port: number) => request<OpResponse>('PUT', 'api/source/rtp', { port }),
   disableRtpSource: () => request<OpResponse>('DELETE', 'api/source/rtp'),
-
-  // Sendspin outputs (CRUD)
-  sendspin: () => request<SendspinInfo[]>('GET', 'api/sendspin_outputs'),
-  addSendspin: (name: string) => request<OpResponse>('POST', 'api/sendspin_outputs', { name }),
-  removeSendspin: (nodeName: string) => request<OpResponse>('DELETE', `api/sendspin_outputs/${nodeName}`),
 };

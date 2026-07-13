@@ -1,11 +1,13 @@
 //! Persistent, runtime-managed config for the daemon-supervised AirPlay-receive
-//! source (`shairport-sync`, via `supervisor.rs`) and the sendspin outputs (an
-//! embedded native server per output, via `sendspin_server.rs` — no subprocess
-//! at all, see docs/decisions.md). Mirrors outputs_store.rs: no `options.json`
-//! seeding — starts empty on a fresh install, then the `/data` file is
-//! authoritative and everything is managed live via the API (api.rs).
+//! source (`shairport-sync`, via `supervisor.rs`) and the Bluetooth-bridge RTP
+//! source. Mirrors outputs_store.rs: no `options.json` seeding — starts empty
+//! on a fresh install, then the `/data` file is authoritative and everything is
+//! managed live via the API (api.rs).
+//!
+//! (Sendspin is no longer configured here: devices are auto-discovered
+//! (sendspin_discovery.rs) and grouped from the routing intent
+//! (sendspin_group.rs), so there's nothing per-output to persist.)
 
-use crate::config::{slugify, SENDSPIN_NODE_PREFIX};
 use crate::rtp_source::DEFAULT_RTP_PORT;
 use crate::supervisor::ProcessSpec;
 use serde::{Deserialize, Serialize};
@@ -15,13 +17,6 @@ use std::path::{Path, PathBuf};
 pub const AIRPLAY_KEY: &str = "airplay";
 
 const SHAIRPORT_SYNC_BIN: &str = "shairport-sync";
-const DEFAULT_SENDSPIN_BASE_PORT: u16 = 8927;
-
-/// The PipeWire node name for a sendspin output (also its native server
-/// handle's map key — see sendspin_server.rs).
-pub fn sendspin_node_name(name: &str) -> String {
-    format!("{SENDSPIN_NODE_PREFIX}{}", slugify(name))
-}
 
 /// How to spawn `shairport-sync` for an AirPlay-receive source of the given
 /// advertised name.
@@ -30,12 +25,6 @@ pub fn airplay_spec(name: &str) -> ProcessSpec {
         program: SHAIRPORT_SYNC_BIN.to_string(),
         args: vec!["-a".to_string(), name.to_string()],
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SendspinOutput {
-    pub name: String,
-    pub port: u16,
 }
 
 /// The single RTP source (Bluetooth bridge firmware target). Its presence in
@@ -51,26 +40,11 @@ fn default_rtp_port() -> u16 {
     DEFAULT_RTP_PORT
 }
 
-impl SendspinOutput {
-    pub fn node_name(&self) -> String {
-        sendspin_node_name(&self.name)
-    }
-}
-
-fn default_base_port() -> u16 {
-    DEFAULT_SENDSPIN_BASE_PORT
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourcesConfig {
     /// AirPlay-receive service name; `None` (or empty) = disabled.
     #[serde(default)]
     airplay_source_name: Option<String>,
-    #[serde(default)]
-    sendspin_outputs: Vec<SendspinOutput>,
-    /// Base port new sendspin outputs are allocated from.
-    #[serde(default = "default_base_port")]
-    sendspin_base_port: u16,
     /// RTP source (Bluetooth bridge firmware target); `None` = disabled.
     #[serde(default)]
     rtp_source: Option<RtpSourceConfig>,
@@ -98,12 +72,7 @@ impl SourcesStore {
                 .map_err(|e| anyhow::anyhow!("parsing sources store {}: {e}", path.display()))?;
             Ok(Self { path: path.to_path_buf(), config })
         } else {
-            let config = SourcesConfig {
-                airplay_source_name: None,
-                sendspin_outputs: Vec::new(),
-                sendspin_base_port: default_base_port(),
-                rtp_source: None,
-            };
+            let config = SourcesConfig { airplay_source_name: None, rtp_source: None };
             Ok(Self { path: path.to_path_buf(), config })
         }
     }
@@ -118,10 +87,6 @@ impl SourcesStore {
         self.persist()
     }
 
-    pub fn sendspin_outputs(&self) -> &[SendspinOutput] {
-        &self.config.sendspin_outputs
-    }
-
     /// The stored RTP source config, or `None` when the source is disabled.
     pub fn rtp_source(&self) -> Option<RtpSourceConfig> {
         self.config.rtp_source
@@ -131,42 +96,6 @@ impl SourcesStore {
     pub fn set_rtp_source(&mut self, cfg: Option<RtpSourceConfig>) -> anyhow::Result<()> {
         self.config.rtp_source = cfg;
         self.persist()
-    }
-
-    pub fn contains_sendspin(&self, node_name: &str) -> bool {
-        self.config.sendspin_outputs.iter().any(|o| o.node_name() == node_name)
-    }
-
-    /// Add a sendspin output (deduped by node name), allocating the lowest free
-    /// port at/above the base. Persists and returns the created output.
-    pub fn add_sendspin(&mut self, name: &str) -> anyhow::Result<SendspinOutput> {
-        let node_name = sendspin_node_name(name);
-        if self.contains_sendspin(&node_name) {
-            anyhow::bail!("a sendspin output named '{name}' (node {node_name}) already exists");
-        }
-        let used: std::collections::HashSet<u16> = self.config.sendspin_outputs.iter().map(|o| o.port).collect();
-        let base = if self.config.sendspin_base_port == 0 { default_base_port() } else { self.config.sendspin_base_port };
-        let mut port = base;
-        while used.contains(&port) {
-            port += 1;
-        }
-        let output = SendspinOutput { name: name.to_string(), port };
-        self.config.sendspin_outputs.push(output.clone());
-        self.persist()?;
-        Ok(output)
-    }
-
-    /// Remove a sendspin output by node name. Returns the removed config, or
-    /// `None` if there was no such output.
-    pub fn remove_sendspin(&mut self, node_name: &str) -> anyhow::Result<Option<SendspinOutput>> {
-        match self.config.sendspin_outputs.iter().position(|o| o.node_name() == node_name) {
-            Some(i) => {
-                let removed = self.config.sendspin_outputs.remove(i);
-                self.persist()?;
-                Ok(Some(removed))
-            }
-            None => Ok(None),
-        }
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -194,7 +123,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SourcesStore::load(&path).unwrap();
         assert_eq!(store.airplay_source_name(), None);
-        assert!(store.sendspin_outputs().is_empty());
+        assert_eq!(store.rtp_source(), None);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -226,21 +155,6 @@ mod tests {
         // Cleared = disabled.
         store.set_rtp_source(None).unwrap();
         assert_eq!(store.rtp_source(), None);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn sendspin_add_dedupes_and_allocates_ports() {
-        let path = temp_path("sendspin");
-        let _ = std::fs::remove_file(&path);
-        let mut store = SourcesStore::load(&path).unwrap();
-        let a = store.add_sendspin("Bedroom").unwrap();
-        let b = store.add_sendspin("Bath").unwrap();
-        assert_eq!(a.port, 8927);
-        assert_eq!(b.port, 8928);
-        assert!(store.add_sendspin("bedroom").is_err()); // same slug
-        assert!(store.remove_sendspin("sendspin-out-bedroom").unwrap().is_some());
-        assert!(store.remove_sendspin("sendspin-out-bedroom").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

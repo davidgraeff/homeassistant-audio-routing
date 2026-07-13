@@ -32,11 +32,13 @@ export type Encryption = 'none' | 'RSA' | 'auth_setup';
 export interface OutputInfo {
   node_name: string;
   name: string;
+  /** 'airplay' (RAOP) or 'sendspin' — for the Type column. */
+  kind: 'airplay' | 'sendspin';
   /** In the live graph now. */
   present: boolean;
   /** Manual store entry (`true`) vs mDNS auto-discovered (`false`). */
   configured: boolean;
-  /** Connection details — known only for configured entries (else null). */
+  /** Connection details — known only for configured AirPlay entries (else null). */
   ip: string | null;
   port: number | null;
   encryption: string | null;
@@ -61,13 +63,6 @@ export interface RtpSourceInfo {
   port: number;
   /** Whether the `bt-bridge-rtp` node is present in the live PipeWire graph. */
   loaded: boolean;
-}
-
-export interface SendspinInfo {
-  name: string;
-  port: number;
-  node_name: string;
-  running: boolean;
 }
 
 export interface MediaPlayerInfo {

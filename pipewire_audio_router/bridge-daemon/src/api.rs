@@ -1,7 +1,7 @@
 //! REST API: health check, live PipeWire registry state, and manual link
 //! creation
 
-use crate::config::{RaopOutputConfig, SENDSPIN_NODE_PREFIX};
+use crate::config::{RaopOutputConfig, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
 use crate::outputs_store::OutputsStore;
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
@@ -36,13 +36,6 @@ pub type SharedSources = Arc<Mutex<SourcesStore>>;
 /// subprocesses. Still used for the AirPlay-receive source (`shairport-sync`).
 pub type SharedSupervisor = Arc<tokio::sync::Mutex<Supervisor>>;
 
-/// Running native sendspin servers, keyed by node name — the in-process
-/// equivalent of what `Supervisor` is for subprocesses. Dropping a handle
-/// tears down everything that output's server started (see
-/// `sendspin_server::SendspinServerHandle`).
-pub type SharedSendspinServers =
-    Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::sendspin_server::SendspinServerHandle>>>;
-
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
 /// change-notification channel (Section 8, routing.rs), the command sender for
 /// runtime module load/unload (pw_thread.rs), and the persistent outputs store.
@@ -56,7 +49,6 @@ pub struct AppState {
     pub store: SharedStore,
     pub sources: SharedSources,
     pub supervisor: SharedSupervisor,
-    pub sendspin_servers: SharedSendspinServers,
     /// Live mDNS-discovered sendspin devices (sendspin_discovery.rs), surfaced
     /// as virtual routing outputs.
     pub sendspin_devices: SharedSendspinDevices,
@@ -89,13 +81,11 @@ pub fn router(
     store: SharedStore,
     sources: SharedSources,
     supervisor: SharedSupervisor,
-    sendspin_servers: SharedSendspinServers,
     sendspin_devices: SharedSendspinDevices,
     routing: SharedRouting,
     static_dir: PathBuf,
 ) -> Router {
-    let state =
-        AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_servers, sendspin_devices, routing };
+    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_devices, routing };
     Router::new()
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))
@@ -104,8 +94,6 @@ pub fn router(
         .route("/api/outputs/:node_name", delete(remove_output))
         .route("/api/source/airplay", get(get_airplay_source).put(set_airplay_source).delete(delete_airplay_source))
         .route("/api/source/rtp", get(get_rtp_source).put(set_rtp_source).delete(delete_rtp_source))
-        .route("/api/sendspin_outputs", get(list_sendspin_outputs).post(add_sendspin_output))
-        .route("/api/sendspin_outputs/:node_name", delete(remove_sendspin_output))
         .route("/api/media_players", get(list_media_players))
         .route("/api/media_players/:node_id/volume", get(get_volume).post(set_volume))
         .route("/api/media_players/:node_id/announce", post(announce))
@@ -217,25 +205,27 @@ async fn create_link(State(app): State<AppState>, Json(req): Json<CreateLinkRequ
 // PipeWire modules at runtime". The outputs store (outputs_store.rs) is the
 // persistent source of truth; the live registry is what actually has a node.
 
-/// A RAOP output for the Outputs tab. Covers all three origins so the UI can
-/// show everything the routing matrix does (previously only manually-configured
-/// ones were listed, which confused users who saw auto-discovered devices in
-/// the matrix but not here):
-/// - **configured**: a manual store entry — `configured: true`, `ip`/`port`/
-///   `encryption` known.
-/// - **discovered**: present via mDNS, not in the store — `configured: false`,
-///   `present: true`, connection details unknown here (`None`).
+/// An output for the Outputs tab. Covers RAOP (AirPlay) receivers and
+/// discovered sendspin devices, across all three origins so the UI shows
+/// everything the routing matrix does:
+/// - **configured**: a manual RAOP store entry — `configured: true`,
+///   `ip`/`port`/`encryption` known.
+/// - **discovered**: present via mDNS, not in the store (a RAOP receiver or a
+///   sendspin device) — `configured: false`, `present: true`, connection
+///   details unknown here (`None`).
 /// - **offline**: referenced by saved routing intent but not currently in the
 ///   graph — `present: false` (shown grayed; re-linked when it returns).
 #[derive(Serialize)]
 struct OutputInfo {
     node_name: String,
     name: String,
-    /// Node is in the live graph right now.
+    /// `"airplay"` (RAOP) or `"sendspin"` — for the Type column / badge.
+    kind: &'static str,
+    /// Node/device is live right now.
     present: bool,
     /// Manual store entry (`true`) vs mDNS auto-discovered (`false`).
     configured: bool,
-    /// Connection details — known only for configured entries.
+    /// Connection details — known only for configured RAOP entries.
     ip: Option<String>,
     port: Option<u16>,
     encryption: Option<String>,
@@ -277,11 +267,12 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
     names.extend(configured.keys().cloned());
     names.extend(intent_outputs);
 
-    let outputs = names
+    let mut outputs: Vec<OutputInfo> = names
         .into_iter()
         .map(|node_name| {
             let cfg = configured.get(&node_name);
             OutputInfo {
+                kind: "airplay",
                 present: present.contains(&node_name),
                 configured: cfg.is_some(),
                 name: cfg.map(|c| c.name.clone()).unwrap_or_else(|| raop_display_name(&node_name)),
@@ -292,6 +283,32 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             }
         })
         .collect();
+
+    // Discovered sendspin devices (present) + any offline ones still referenced
+    // by saved routing intent — surfaced here too so users see every routable
+    // output, not just RAOP.
+    let devices = state.sendspin_devices.lock_recover().clone();
+    let mut sendspin_names: BTreeSet<String> = devices.keys().cloned().collect();
+    sendspin_names.extend(
+        state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(SENDSPIN_DEV_PREFIX)),
+    );
+    for node_name in sendspin_names {
+        let present = devices.contains_key(&node_name);
+        let name = devices.get(&node_name).map(|d| d.display_name.clone()).unwrap_or_else(|| {
+            node_name.strip_prefix(SENDSPIN_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " ")
+        });
+        outputs.push(OutputInfo {
+            kind: "sendspin",
+            present,
+            configured: false, // sendspin devices are always auto-discovered
+            name,
+            ip: None,
+            port: None,
+            encryption: None,
+            node_name,
+        });
+    }
+
     Json(outputs)
 }
 
@@ -594,84 +611,6 @@ async fn delete_rtp_source(State(state): State<AppState>) -> (StatusCode, Json<O
     }
     let _ = rx.await;
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "RTP source disabled".to_string() }))
-}
-
-#[derive(Serialize)]
-struct SendspinInfo {
-    name: String,
-    port: u16,
-    node_name: String,
-    /// Whether this output's native embedded sendspin server is running now.
-    running: bool,
-}
-
-#[derive(Deserialize)]
-struct AddSendspinRequest {
-    name: String,
-}
-
-async fn list_sendspin_outputs(State(state): State<AppState>) -> Json<Vec<SendspinInfo>> {
-    let outputs = state.sources.lock_recover().sendspin_outputs().to_vec();
-    let servers = state.sendspin_servers.lock().await;
-    let infos = outputs
-        .into_iter()
-        .map(|o| {
-            let node_name = o.node_name();
-            let running = servers.get(&node_name).is_some_and(|h| h.is_running());
-            SendspinInfo { name: o.name, port: o.port, node_name, running }
-        })
-        .collect();
-    Json(infos)
-}
-
-async fn add_sendspin_output(
-    State(state): State<AppState>,
-    Json(req): Json<AddSendspinRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let output = {
-        let mut sources = state.sources.lock_recover();
-        match sources.add_sendspin(&req.name) {
-            Ok(o) => o,
-            Err(e) => return (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: e.to_string() })),
-        }
-    };
-    let node_name = output.node_name();
-    match crate::sendspin_server::start(&output, state.pw.clone(), state.pw_cmd.clone()).await {
-        Ok(handle) => {
-            state.sendspin_servers.lock().await.insert(node_name, handle);
-            (
-                StatusCode::CREATED,
-                Json(OutputOpResponse { ok: true, message: format!("added sendspin output '{}' on port {}", output.name, output.port) }),
-            )
-        }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(OutputOpResponse { ok: false, message: format!("added '{}' but failed to start it: {e}", output.name) }),
-        ),
-    }
-}
-
-async fn remove_sendspin_output(
-    State(state): State<AppState>,
-    Path(node_name): Path<String>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let removed = state.sources.lock_recover().remove_sendspin(&node_name);
-    match removed {
-        Ok(Some(_)) => {
-            // Dropping the handle tears down every task/thread that output's
-            // server started (see SendspinServerHandle's Drop impl).
-            state.sendspin_servers.lock().await.remove(&node_name);
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed sendspin output '{node_name}'") }))
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(OutputOpResponse { ok: false, message: format!("no such sendspin output: {node_name}") }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to persist removal: {e}") }),
-        ),
-    }
 }
 
 /// One output the custom HA integration (Section 6/9) turns into a

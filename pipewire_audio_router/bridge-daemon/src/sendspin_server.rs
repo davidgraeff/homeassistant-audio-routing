@@ -22,7 +22,6 @@
 
 use crate::locks::LockRecover;
 use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
-use crate::sources_store::SendspinOutput;
 use sendspin::protocol::messages::StreamPlayerConfig;
 use sendspin::server::{Advertisement, ClientEvent, ClientManager, Group};
 use sendspin::{DefaultClock, ServerConnection, ServerListener};
@@ -50,14 +49,6 @@ pub struct SendspinServerHandle {
     pw_cmd: PwCommandSender,
 }
 
-impl SendspinServerHandle {
-    /// Whether this output's tasks are still alive — the native equivalent of
-    /// `Supervisor::is_running`'s reaping check.
-    pub fn is_running(&self) -> bool {
-        !self.accept_task.is_finished() && !self.event_task.is_finished()
-    }
-}
-
 impl Drop for SendspinServerHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
@@ -75,17 +66,6 @@ impl Drop for SendspinServerHandle {
             reply: reply_tx,
         });
     }
-}
-
-/// Start a native sendspin server for a manually-added `output`. Dials every
-/// discovered sendspin device (unfiltered), as before — the grouping
-/// reconciler uses [`start_server`] with a filter instead.
-pub async fn start(
-    output: &SendspinOutput,
-    pw_state: SharedState,
-    pw_cmd: PwCommandSender,
-) -> anyhow::Result<SendspinServerHandle> {
-    start_server(&output.node_name(), &output.name, output.port, None, pw_state, pw_cmd).await
 }
 
 /// Start a native sendspin server on `node_name`/`port`: create its sink node,
