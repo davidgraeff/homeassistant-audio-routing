@@ -62,10 +62,13 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 export const api = {
   // Routing matrix
   routing: () => request<RoutingMatrix>('GET', 'api/routing'),
-  link: (source_node_id: number, output_node_id: number) =>
-    request<OpResponse>('POST', 'api/routing/link', { source_node_id, output_node_id }),
-  unlink: (source_node_id: number, output_node_id: number) =>
-    request<OpResponse>('POST', 'api/routing/unlink', { source_node_id, output_node_id }),
+  link: (source: string, output: string) =>
+    request<OpResponse>('POST', 'api/routing/link', { source, output }),
+  unlink: (source: string, output: string) =>
+    request<OpResponse>('POST', 'api/routing/unlink', { source, output }),
+  /** Forget all routing for an offline entity (matrix remove-✕). */
+  forgetEntity: (nodeName: string) =>
+    request<OpResponse>('DELETE', `api/routing/entity/${encodeURIComponent(nodeName)}`),
 
   // Media players (volume + announce)
   mediaPlayers: () => request<MediaPlayerInfo[]>('GET', 'api/media_players'),

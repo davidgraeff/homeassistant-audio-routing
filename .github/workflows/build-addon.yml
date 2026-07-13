@@ -60,6 +60,9 @@ jobs:
           context: pipewire_audio_router
           platforms: ${{ matrix.platform }}
           push: true
+          # Baked into the image so the daemon can log the add-on version.
+          build-args: |
+            ADDON_VERSION=${{ steps.version.outputs.version }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-addon-pipewire_audio_router:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-addon-pipewire_audio_router:latest

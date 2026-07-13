@@ -177,7 +177,7 @@ async def test_unknown_node_is_unavailable_not_crashing(hass):
 
 async def test_source_list_and_current_source_from_routing(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -200,7 +200,7 @@ async def test_current_source_is_none_when_nothing_linked(hass):
 
 async def test_select_source_unlinks_previous_then_links_new(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -215,13 +215,13 @@ async def test_select_source_unlinks_previous_then_links_new(hass):
                 blocking=True,
             )
             # Exclusive swap: old source (10) dropped, new source (11) linked.
-            mock_unlink.assert_awaited_once_with(10, 50)
-            mock_link.assert_awaited_once_with(11, 50)
+            mock_unlink.assert_awaited_once_with("shairport-sync", "sendspin-out-kitchen")
+            mock_link.assert_awaited_once_with("bt-bridge", "sendspin-out-kitchen")
 
 
 async def test_select_source_none_unlinks_without_linking(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -235,13 +235,13 @@ async def test_select_source_none_unlinks_without_linking(hass):
                 {"entity_id": "media_player.kitchen", "source": "None"},
                 blocking=True,
             )
-            mock_unlink.assert_awaited_once_with(10, 50)
+            mock_unlink.assert_awaited_once_with("shairport-sync", "sendspin-out-kitchen")
             mock_link.assert_not_awaited()
 
 
 async def test_select_source_already_selected_is_noop(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -261,7 +261,7 @@ async def test_select_source_already_selected_is_noop(hass):
 
 async def test_select_unknown_source_raises(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -276,7 +276,7 @@ async def test_select_unknown_source_raises(hass):
 
 async def test_link_service_is_additive(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -291,13 +291,13 @@ async def test_link_service_is_additive(hass):
                 blocking=True,
             )
             # Additive: bt-bridge added, shairport-sync left connected.
-            mock_link.assert_awaited_once_with(11, 50)
+            mock_link.assert_awaited_once_with("bt-bridge", "sendspin-out-kitchen")
             mock_unlink.assert_not_awaited()
 
 
 async def test_unlink_service_named_source(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -308,12 +308,12 @@ async def test_unlink_service_named_source(hass):
                 {"entity_id": "media_player.kitchen", "source": "shairport-sync"},
                 blocking=True,
             )
-            mock_unlink.assert_awaited_once_with(10, 50)
+            mock_unlink.assert_awaited_once_with("shairport-sync", "sendspin-out-kitchen")
 
 
 async def test_unlink_service_without_source_drops_all(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([(10, 50), (11, 50)])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen"), ("bt-bridge", "sendspin-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -326,7 +326,7 @@ async def test_unlink_service_without_source_drops_all(hass):
             )
             assert mock_unlink.await_count == 2
             unlinked = {call.args for call in mock_unlink.await_args_list}
-            assert unlinked == {(10, 50), (11, 50)}
+            assert unlinked == {("shairport-sync", "sendspin-out-kitchen"), ("bt-bridge", "sendspin-out-kitchen")}
 
 
 # ---- Routing over the WebSocket (push, not poll) -------------------------
@@ -345,7 +345,7 @@ async def test_routing_push_updates_source_live(hass):
     assert hass.states.get("media_player.kitchen").attributes["source"] == "None"
 
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    coordinator._apply_routing(_routing_matrix([(10, 50)]))
+    coordinator._apply_routing(_routing_matrix([("shairport-sync", "sendspin-out-kitchen")]))
     await hass.async_block_till_done()
 
     assert hass.states.get("media_player.kitchen").attributes["source"] == "shairport-sync"
@@ -396,9 +396,9 @@ async def test_async_routing_ws_messages_parses_pushes():
     cleanly when the socket closes."""
     matrix_json = json.dumps(
         {
-            "sources": [{"node_id": 10, "node_name": "shairport-sync", "display_name": "shairport-sync"}],
-            "outputs": [{"node_id": 50, "node_name": "sendspin-out-kitchen", "display_name": "kitchen"}],
-            "links": [[10, 50]],
+            "sources": [{"node_id": 10, "node_name": "shairport-sync", "display_name": "shairport-sync", "present": True, "configured": True}],
+            "outputs": [{"node_id": 50, "node_name": "sendspin-out-kitchen", "display_name": "kitchen", "present": True, "configured": True}],
+            "links": [{"source": "shairport-sync", "output": "sendspin-out-kitchen"}],
         }
     )
     ws = _FakeWS(
@@ -412,6 +412,6 @@ async def test_async_routing_ws_messages_parses_pushes():
     received = [m async for m in client.async_routing_ws_messages()]
 
     assert len(received) == 1
-    assert received[0].links == [(10, 50)]
+    assert received[0].links == [("shairport-sync", "sendspin-out-kitchen")]
     assert [s.display_name for s in received[0].sources] == ["shairport-sync"]
     assert [o.node_name for o in received[0].outputs] == ["sendspin-out-kitchen"]

@@ -7,6 +7,7 @@ use crate::outputs_store::OutputsStore;
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME, RAOP_NODE_PREFIX};
 use crate::routing;
+use crate::routing_store::SharedRouting;
 use crate::rtp_source::{rtp_source_module_args, DEFAULT_RTP_PORT, RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME};
 use crate::sources_store::{self, RtpSourceConfig, SourcesStore};
 use crate::supervisor::Supervisor;
@@ -55,6 +56,10 @@ pub struct AppState {
     pub sources: SharedSources,
     pub supervisor: SharedSupervisor,
     pub sendspin_servers: SharedSendspinServers,
+    /// Persistent routing intent (routing_store.rs): links by stable node
+    /// name, reconciled onto the live graph so routing survives node reloads
+    /// and device disappearance/reappearance.
+    pub routing: SharedRouting,
 }
 
 impl FromRef<AppState> for SharedState {
@@ -81,9 +86,10 @@ pub fn router(
     sources: SharedSources,
     supervisor: SharedSupervisor,
     sendspin_servers: SharedSendspinServers,
+    routing: SharedRouting,
     static_dir: PathBuf,
 ) -> Router {
-    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_servers };
+    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_servers, routing };
     Router::new()
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))
@@ -100,6 +106,7 @@ pub fn router(
         .route("/api/routing", get(routing::get_routing))
         .route("/api/routing/link", post(routing::link))
         .route("/api/routing/unlink", post(routing::unlink))
+        .route("/api/routing/entity/:node_name", delete(routing::forget_entity))
         .route("/api/routing/ws", get(routing::routing_ws))
         // Everything else (`/`, `/assets/*`, favicon, …) is the built Svelte
         // SPA (frontend/, served from `static_dir`). `ServeDir` returns
@@ -204,18 +211,33 @@ async fn create_link(State(app): State<AppState>, Json(req): Json<CreateLinkRequ
 // PipeWire modules at runtime". The outputs store (outputs_store.rs) is the
 // persistent source of truth; the live registry is what actually has a node.
 
-/// One configured RAOP output, plus whether its module is loaded right now
-/// (its node is present in the live registry). `loaded` can be `false` briefly
-/// after add if the node hasn't been observed yet, or if libpipewire dropped
-/// the module.
+/// A RAOP output for the Outputs tab. Covers all three origins so the UI can
+/// show everything the routing matrix does (previously only manually-configured
+/// ones were listed, which confused users who saw auto-discovered devices in
+/// the matrix but not here):
+/// - **configured**: a manual store entry — `configured: true`, `ip`/`port`/
+///   `encryption` known.
+/// - **discovered**: present via mDNS, not in the store — `configured: false`,
+///   `present: true`, connection details unknown here (`None`).
+/// - **offline**: referenced by saved routing intent but not currently in the
+///   graph — `present: false` (shown grayed; re-linked when it returns).
 #[derive(Serialize)]
 struct OutputInfo {
-    name: String,
-    ip: String,
-    port: u16,
-    encryption: String,
     node_name: String,
-    loaded: bool,
+    name: String,
+    /// Node is in the live graph right now.
+    present: bool,
+    /// Manual store entry (`true`) vs mDNS auto-discovered (`false`).
+    configured: bool,
+    /// Connection details — known only for configured entries.
+    ip: Option<String>,
+    port: Option<u16>,
+    encryption: Option<String>,
+}
+
+/// Human name from a RAOP node name (`raop-out-living_room` -> `living room`).
+fn raop_display_name(node_name: &str) -> String {
+    node_name.strip_prefix(RAOP_NODE_PREFIX).unwrap_or(node_name).replace(['_', '-'], " ")
 }
 
 #[derive(Serialize)]
@@ -225,25 +247,42 @@ struct OutputOpResponse {
 }
 
 async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
-    // Snapshot which RAOP node names PipeWire actually has right now, then
-    // release that lock before touching the store.
-    let present: std::collections::HashSet<String> = {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // RAOP node names present in the live graph right now.
+    let present: BTreeSet<String> = {
         let pw = state.pw.lock_recover();
-        pw.nodes.values().map(|n| n.node_name.clone()).collect()
+        pw.nodes.values().map(|n| n.node_name.clone()).filter(|n| n.starts_with(RAOP_NODE_PREFIX)).collect()
     };
-    let store = state.store.lock_recover();
-    let outputs = store
-        .list()
-        .iter()
-        .map(|o| {
-            let node_name = raop_node_name(&o.name);
+    // Configured (manual) outputs: node_name -> config.
+    let configured: BTreeMap<String, RaopOutputConfig> =
+        state.store.lock_recover().list().iter().map(|o| (raop_node_name(&o.name), o.clone())).collect();
+    // RAOP outputs referenced by saved routing intent (offline ones surface here).
+    let intent_outputs: BTreeSet<String> = state
+        .routing
+        .lock_recover()
+        .referenced_outputs()
+        .into_iter()
+        .filter(|n| n.starts_with(RAOP_NODE_PREFIX))
+        .collect();
+
+    // Union: present ∪ configured ∪ intent-referenced.
+    let mut names: BTreeSet<String> = present.iter().cloned().collect();
+    names.extend(configured.keys().cloned());
+    names.extend(intent_outputs);
+
+    let outputs = names
+        .into_iter()
+        .map(|node_name| {
+            let cfg = configured.get(&node_name);
             OutputInfo {
-                loaded: present.contains(&node_name),
+                present: present.contains(&node_name),
+                configured: cfg.is_some(),
+                name: cfg.map(|c| c.name.clone()).unwrap_or_else(|| raop_display_name(&node_name)),
+                ip: cfg.map(|c| c.ip.clone()),
+                port: cfg.map(|c| c.port),
+                encryption: cfg.map(|c| c.encryption.as_pipewire_arg().to_string()),
                 node_name,
-                name: o.name.clone(),
-                ip: o.ip.clone(),
-                port: o.port,
-                encryption: o.encryption.as_pipewire_arg().to_string(),
             }
         })
         .collect();
@@ -304,52 +343,56 @@ async fn add_output(
     }
 }
 
-/// Remove a RAOP output by node name and unload its module live. Unload is
-/// idempotent, so the store entry is dropped regardless — the caller's intent
-/// ("gone") always holds afterward.
+/// Remove a RAOP output by node name — works for all three origins:
+/// - **configured**: unload its module (if loaded) + drop the store entry.
+/// - **discovered**: unload it; it'll be re-discovered when the device next
+///   announces (mDNS), per the intended UX.
+/// - **offline**: nothing to unload; just forget its saved routing.
+/// In every case the output's routing intent is dropped so it doesn't linger
+/// as an offline phantom. Unload is idempotent — the caller's intent ("gone")
+/// always holds afterward.
 async fn remove_output(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    if !state.store.lock_recover().contains(&node_name) {
+    let configured = state.store.lock_recover().contains(&node_name);
+    let present = { state.pw.lock_recover().nodes.values().any(|n| n.node_name == node_name) };
+    let has_intent = state.routing.lock_recover().referenced_outputs().contains(&node_name);
+    if !configured && !present && !has_intent {
         return (
             StatusCode::NOT_FOUND,
             Json(OutputOpResponse { ok: false, message: format!("no such output: {node_name}") }),
         );
     }
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .pw_cmd
-        .send(PwCommand::Unload { node_name: node_name.clone(), reply: tx })
-        .is_err()
-    {
+    // Unload the live module if it has a node right now (discovered or
+    // configured-and-loaded). Offline entries skip this.
+    if present {
+        let (tx, rx) = oneshot::channel();
+        if state.pw_cmd.send(PwCommand::Unload { node_name: node_name.clone(), reply: tx }).is_err() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+            );
+        }
+        if let Ok(Err(e)) = rx.await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OutputOpResponse { ok: false, message: format!("failed to unload module: {e}") }),
+            );
+        }
+    }
+
+    if let Err(e) = state.store.lock_recover().remove(&node_name) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist removal: {e}") }),
         );
     }
-    let unloaded = rx.await;
-    let removed = state.store.lock_recover().remove(&node_name);
-
-    match (unloaded, removed) {
-        (Ok(Ok(())), Ok(_)) => (
-            StatusCode::OK,
-            Json(OutputOpResponse { ok: true, message: format!("removed output '{node_name}'") }),
-        ),
-        (_, Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("unloaded '{node_name}' but failed to persist removal: {e}") }),
-        ),
-        (Ok(Err(e)), _) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to unload module: {e}") }),
-        ),
-        (Err(_), _) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: "no reply from PipeWire thread".to_string() }),
-        ),
+    if let Err(e) = state.routing.lock_recover().remove_entity(&node_name) {
+        tracing::warn!("removed output '{node_name}' but failed to drop its routing intent: {e}");
     }
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed output '{node_name}'") }))
 }
 
 // ---- Daemon-supervised source/adapter processes ---------------------------

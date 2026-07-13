@@ -24,8 +24,8 @@
 //! channel; `PwCommandSender::send` is thread-safe, so it drives the PipeWire
 //! thread directly without any tokio runtime of its own.
 
-use crate::api::SharedStore;
-use crate::config::{RaopEncryption, RaopOutputConfig};
+use crate::api::{SharedSources, SharedStore};
+use crate::config::{slugify, RaopEncryption, RaopOutputConfig};
 use crate::locks::LockRecover;
 use crate::pw_thread::{PwCommand, PwCommandSender};
 use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME};
@@ -97,7 +97,7 @@ fn output_from_service(info: &ServiceInfo) -> Option<RaopOutputConfig> {
 /// Starts mDNS discovery and returns the daemon handle. The handle must be
 /// kept alive for discovery to keep running — dropping it stops the browse and
 /// ends the worker thread.
-pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, mode: Mode) -> anyhow::Result<ServiceDaemon> {
+pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources, mode: Mode) -> anyhow::Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
     let receiver = daemon.browse(RAOP_SERVICE_TYPE)?;
     std::thread::Builder::new()
@@ -118,6 +118,23 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, mode: Mode) -> anyhow:
                         };
                         let node_name = raop_node_name(&output.name);
                         let fullname = info.get_fullname().to_string();
+
+                        // Skip our OWN AirPlay-receive source. shairport-sync
+                        // (the AirPlay source we spawn) advertises itself on
+                        // _raop._tcp, so without this the daemon discovers the
+                        // receiver it just started and loads a raop-sink
+                        // pointing back at itself — which then shows up as a
+                        // bogus output in the routing matrix. Identify it by a
+                        // friendly-name match against the configured AirPlay
+                        // source name.
+                        let airplay_name = sources.lock_recover().airplay_source_name().map(str::to_string);
+                        if airplay_name.as_deref().is_some_and(|ap| slugify(ap) == slugify(&output.name)) {
+                            tracing::debug!(
+                                "discovered '{}' is our own AirPlay-receive source; not loading it as an output",
+                                output.name
+                            );
+                            continue;
+                        }
 
                         if store.lock_recover().contains(&node_name) {
                             tracing::debug!(

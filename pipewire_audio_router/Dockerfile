@@ -191,4 +191,11 @@ RUN chmod +x /run.sh /usr/local/bin/bridge-daemon
 
 ENV XDG_RUNTIME_DIR=/run/pipewire
 
+# The HA add-on version, passed at build time (scripts/deploy-dev.sh and the CI
+# workflow set --build-arg ADDON_VERSION=<config.yaml version / dev tag>). The
+# daemon logs it at startup. Placed last so a version-only change invalidates
+# just this trivial layer, never the expensive build/apt layers above.
+ARG ADDON_VERSION=dev
+ENV ADDON_VERSION=${ADDON_VERSION}
+
 ENTRYPOINT ["/run.sh"]

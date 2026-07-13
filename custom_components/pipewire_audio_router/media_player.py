@@ -150,23 +150,20 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
 
     @property
     def source(self) -> str | None:
-        """The source currently linked into this output, or SOURCE_NONE if
-        nothing feeds it. In the exclusive model there's at most one; if the
-        graph somehow has several (e.g. wired via the additive `link`
-        service), report the first by name so the attribute stays defined."""
-        node_id = self._live_node_id
-        if node_id is None:
-            return None
+        """The source routed into this output, or SOURCE_NONE if none. Read
+        from the persisted intent (by stable name), so it stays correct even
+        when this output is momentarily offline. Exclusive model → at most one;
+        report the first by name if several were wired additively."""
         matrix = self._matrix()
-        linked_source_ids = {src for src, out in matrix.links if out == node_id}
-        names = [s.display_name for s in matrix.sources if s.node_id in linked_source_ids]
+        linked_sources = {src for src, out in matrix.links if out == self.node_name}
+        names = [s.display_name for s in matrix.sources if s.node_name in linked_sources]
         return names[0] if names else SOURCE_NONE
 
-    def _resolve_source_id(self, source: str) -> int:
+    def _resolve_source_name(self, source: str) -> str:
         target = next((s for s in self._matrix().sources if s.display_name == source), None)
         if target is None:
             raise HomeAssistantError(f"unknown source '{source}' for {self.entity_id}")
-        return target.node_id
+        return target.node_name
 
     def _require_node_id(self) -> int:
         node_id = self._live_node_id
@@ -180,37 +177,37 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
 
     async def async_select_source(self, source: str) -> None:
         """Exclusive swap: unlink every source that isn't the requested one,
-        then link the requested one (SOURCE_NONE just disconnects)."""
-        node_id = self._require_node_id()
+        then link the requested one (SOURCE_NONE just disconnects). Routes by
+        stable name, so it works — and persists — even if the output is offline
+        (it's applied when the device returns)."""
         matrix = self._matrix()
-        current_source_ids = {src for src, out in matrix.links if out == node_id}
+        current_sources = {src for src, out in matrix.links if out == self.node_name}
 
-        target_id = None if source == SOURCE_NONE else self._resolve_source_id(source)
+        target = None if source == SOURCE_NONE else self._resolve_source_name(source)
 
-        for src_id in current_source_ids:
-            if src_id != target_id:
-                await self.coordinator.client.async_unlink(src_id, node_id)
-        if target_id is not None and target_id not in current_source_ids:
-            await self.coordinator.client.async_link(target_id, node_id)
+        for src in current_sources:
+            if src != target:
+                await self.coordinator.client.async_unlink(src, self.node_name)
+        if target is not None and target not in current_sources:
+            await self.coordinator.client.async_link(target, self.node_name)
 
         await self.coordinator.async_request_refresh()
 
     async def async_service_link(self, source: str) -> None:
         """`pipewire_audio_router.link` — additively connect `source` to
         this output without disturbing any source already linked."""
-        await self.coordinator.client.async_link(self._resolve_source_id(source), self._require_node_id())
+        await self.coordinator.client.async_link(self._resolve_source_name(source), self.node_name)
         await self.coordinator.async_request_refresh()
 
     async def async_service_unlink(self, source: str | None = None) -> None:
         """`pipewire_audio_router.unlink` — disconnect `source` from this
-        output, or every source currently feeding it when `source` is
+        output, or every source currently routed to it when `source` is
         omitted."""
-        node_id = self._require_node_id()
         if source is not None:
-            await self.coordinator.client.async_unlink(self._resolve_source_id(source), node_id)
+            await self.coordinator.client.async_unlink(self._resolve_source_name(source), self.node_name)
         else:
-            for src_id in {src for src, out in self._matrix().links if out == node_id}:
-                await self.coordinator.client.async_unlink(src_id, node_id)
+            for src in {src for src, out in self._matrix().links if out == self.node_name}:
+                await self.coordinator.client.async_unlink(src, self.node_name)
         await self.coordinator.async_request_refresh()
 
     async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs) -> None:

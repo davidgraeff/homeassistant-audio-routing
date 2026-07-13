@@ -188,6 +188,7 @@ deploy_addon() {
     --builder "$BUILDER" \
     --platform "$platform" \
     --tag "$image:$dev_version" \
+    --build-arg "ADDON_VERSION=$dev_version" \
     --cache-from "type=registry,ref=$image:buildcache" \
     --cache-to "type=registry,ref=$image:buildcache,mode=max" \
     --push \

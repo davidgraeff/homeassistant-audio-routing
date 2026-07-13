@@ -41,24 +41,27 @@ class RtpSourceState:
 @dataclass
 class RoutingNode:
     """One source or output in the bridge daemon's routing matrix
-    (`RoutingNode` in routing.rs). `node_id` is ephemeral (reassigned when
-    a PipeWire module reloads); `node_name` is stable and is what callers
-    should key off, re-resolving to a live `node_id` per link/unlink."""
+    (`RoutingNode` in routing.rs). `node_name` is the stable identity callers
+    route on. `present` is False for a configured/previously-routed entity
+    that isn't in the live graph right now (shown grayed; re-linked when it
+    returns). `node_id` is the ephemeral live id, present only when `present`."""
 
-    node_id: int
     node_name: str
     display_name: str
+    present: bool = True
+    configured: bool = True
+    node_id: int | None = None
 
 
 @dataclass
 class RoutingMatrix:
     """Mirrors bridge-daemon's `RoutingMatrix` (routing.rs). `links` are
-    `(source_node_id, output_node_id)` pairs — one entry per connected
-    source→output, node-level (channels are paired daemon-side)."""
+    `(source_node_name, output_node_name)` pairs — the persisted routing
+    intent (stable names), node-level (channels are paired daemon-side)."""
 
     sources: list[RoutingNode]
     outputs: list[RoutingNode]
-    links: list[tuple[int, int]]
+    links: list[tuple[str, str]]
 
 
 def _parse_routing_matrix(data: dict) -> RoutingMatrix:
@@ -66,19 +69,18 @@ def _parse_routing_matrix(data: dict) -> RoutingMatrix:
     REST fetch and the WebSocket push so both stay in lock-step."""
 
     def _node(item: dict) -> RoutingNode:
-        # `node_name` is additive on the daemon side (see routing.rs) — fall
-        # back to `display_name` so a newer integration still works against
-        # an older daemon that hasn't got the field yet.
         return RoutingNode(
-            node_id=item["node_id"],
             node_name=item.get("node_name") or item["display_name"],
             display_name=item["display_name"],
+            present=item.get("present", True),
+            configured=item.get("configured", True),
+            node_id=item.get("node_id"),
         )
 
     return RoutingMatrix(
         sources=[_node(s) for s in data.get("sources", [])],
         outputs=[_node(o) for o in data.get("outputs", [])],
-        links=[(int(src), int(out)) for src, out in data.get("links", [])],
+        links=[(str(link["source"]), str(link["output"])) for link in data.get("links", [])],
     )
 
 
@@ -215,23 +217,25 @@ class PipewireRouterApiClient:
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"routing websocket error: {err}") from err
 
-    async def async_link(self, source_node_id: int, output_node_id: int) -> None:
-        """Link a source into an output (`POST /api/routing/link`)."""
-        await self._async_routing_op("link", source_node_id, output_node_id)
+    async def async_link(self, source: str, output: str) -> None:
+        """Link a source into an output by stable node name
+        (`POST /api/routing/link`). Persists intent daemon-side; applies live
+        when both ends are present."""
+        await self._async_routing_op("link", source, output)
 
-    async def async_unlink(self, source_node_id: int, output_node_id: int) -> None:
-        """Remove every link feeding `output_node_id` from `source_node_id`
+    async def async_unlink(self, source: str, output: str) -> None:
+        """Remove the `source`→`output` route by stable node name
         (`POST /api/routing/unlink`). Idempotent daemon-side."""
-        await self._async_routing_op("unlink", source_node_id, output_node_id)
+        await self._async_routing_op("unlink", source, output)
 
-    async def _async_routing_op(self, op: str, source_node_id: int, output_node_id: int) -> None:
+    async def _async_routing_op(self, op: str, source: str, output: str) -> None:
         # The routing endpoints answer 200 even for a logical failure (e.g.
         # "no matching channel ports"), carrying `{ok, message}` — so a 2xx
         # status alone isn't success; the `ok` flag is authoritative.
         try:
             async with self._session.post(
                 f"{self._base_url}/api/routing/{op}",
-                json={"source_node_id": source_node_id, "output_node_id": output_node_id},
+                json={"source": source, "output": output},
             ) as resp:
                 resp.raise_for_status()
                 body = await resp.json()

@@ -27,10 +27,12 @@
 use crate::api::AppState;
 use crate::config::SENDSPIN_NODE_PREFIX;
 use crate::locks::LockRecover;
-use crate::raop::RAOP_NODE_PREFIX;
-use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, RegistryState, SharedState};
+use crate::outputs_store::OutputsStore;
+use crate::raop::{raop_node_name, RAOP_NODE_PREFIX};
+use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
+use crate::routing_store::{self, RoutingLink, SharedRouting};
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -38,26 +40,33 @@ use tokio::sync::oneshot;
 
 #[derive(Serialize, Clone)]
 pub struct RoutingNode {
-    node_id: u32,
-    /// Stable PipeWire node name (e.g. `"raop-out-kitchen"`,
-    /// `"shairport-sync"`). Unlike `node_id`, this survives a module
-    /// reload — the HA integration keys routing off this and re-resolves
-    /// it to a live `node_id` per link/unlink call, so an automation never
-    /// has to persist an ephemeral id. Additive field; existing web-client
-    /// consumers that only read `node_id`/`display_name` are unaffected.
+    /// Stable node name — the primary key everything routes on. Survives module
+    /// reloads and device disappearance/reappearance; the HA integration and
+    /// the persisted routing intent (routing_store.rs) both key off it.
     node_name: String,
     display_name: String,
+    /// Whether the node is in the live graph right now. `false` = configured or
+    /// previously-routed but currently absent — shown grayed in the UI; its
+    /// routing intent is kept and reapplied by reconcile() when it returns.
+    present: bool,
+    /// Live PipeWire node id when present (needed for per-node ops like
+    /// volume). `None` for offline entities.
+    node_id: Option<u32>,
+    /// Outputs only: a manually-configured store entry (`true`) vs an
+    /// mDNS-auto-discovered one (`false`) — drives the "auto-discovered" badge.
+    /// Always `true` for sources (they aren't mDNS-discovered here).
+    configured: bool,
 }
 
 #[derive(Serialize, Clone)]
 pub struct RoutingMatrix {
     sources: Vec<RoutingNode>,
     outputs: Vec<RoutingNode>,
-    /// `(source_node_id, output_node_id)` pairs currently linked — "linked"
-    /// means at least one channel is connected between them, matching the
-    /// same node-level simplification `RegistryState::node_has_incoming_link`
-    /// already uses elsewhere in this daemon.
-    links: Vec<(u32, u32)>,
+    /// Desired routing = persisted intent (routing_store.rs), by stable name.
+    /// The UI renders these as the linked cells (including links to a currently
+    /// offline endpoint, shown grayed); reconcile() makes the live graph match
+    /// for pairs whose endpoints are both present.
+    links: Vec<RoutingLink>,
 }
 
 fn is_output_node(node_name: &str) -> bool {
@@ -77,47 +86,82 @@ fn channel_suffix(port_name: &str) -> &str {
     port_name.rsplit('_').next().unwrap_or(port_name)
 }
 
-fn build_matrix(state: &RegistryState) -> RoutingMatrix {
-    let mut outputs = Vec::new();
-    let mut sources = Vec::new();
+/// Build the matrix from live registry + configured outputs + persisted intent.
+///
+/// Every routable entity is included even when it isn't in the graph right
+/// now: an output that's configured or has saved routing, and any source
+/// referenced by intent, appear as `present: false` (grayed in the UI) so its
+/// routing survives disappearance and is reapplied on return. Outputs also
+/// carry `configured` (store entry vs mDNS auto-discovered) for the badge.
+fn build_matrix(reg: &RegistryState, store: &OutputsStore, intent: &[RoutingLink]) -> RoutingMatrix {
+    use std::collections::{BTreeMap, BTreeSet};
 
-    for node in state.nodes.values() {
+    // Live nodes: highest id per name (newest), same "most recent wins" rule as
+    // node_id_for — a same-named node can briefly outlive its owner.
+    let mut present_outputs: BTreeMap<String, u32> = BTreeMap::new();
+    let mut present_sources: BTreeMap<String, u32> = BTreeMap::new();
+    for node in reg.nodes.values() {
         if is_output_node(&node.node_name) {
-            outputs.push(RoutingNode {
-                node_id: node.node_id,
-                node_name: node.node_name.clone(),
-                display_name: output_display_name(&node.node_name),
-            });
-            continue;
-        }
-        let has_real_source_port = state
-            .ports
-            .values()
-            .any(|p| p.node_id == node.node_id && p.direction == "out" && !p.port_name.starts_with("monitor_"));
-        if has_real_source_port {
-            sources.push(RoutingNode {
-                node_id: node.node_id,
-                node_name: node.node_name.clone(),
-                display_name: node.node_name.clone(),
-            });
+            let e = present_outputs.entry(node.node_name.clone()).or_insert(node.node_id);
+            *e = (*e).max(node.node_id);
+        } else {
+            let has_real_source_port = reg
+                .ports
+                .values()
+                .any(|p| p.node_id == node.node_id && p.direction == "out" && !p.port_name.starts_with("monitor_"));
+            if has_real_source_port {
+                let e = present_sources.entry(node.node_name.clone()).or_insert(node.node_id);
+                *e = (*e).max(node.node_id);
+            }
         }
     }
 
-    let output_ids: std::collections::HashSet<u32> = outputs.iter().map(|o| o.node_id).collect();
-    let source_ids: std::collections::HashSet<u32> = sources.iter().map(|s| s.node_id).collect();
-    let mut links: Vec<(u32, u32)> = state
-        .links
-        .values()
-        .filter(|l| source_ids.contains(&l.output_node) && output_ids.contains(&l.input_node))
-        .map(|l| (l.output_node, l.input_node))
+    // Configured RAOP outputs: node_name -> friendly display name.
+    let configured: BTreeMap<String, String> =
+        store.list().iter().map(|o| (raop_node_name(&o.name), o.name.clone())).collect();
+
+    // Union of every output/source name to show: present ∪ configured ∪ intent.
+    let mut output_names: BTreeSet<String> = present_outputs.keys().cloned().collect();
+    output_names.extend(configured.keys().cloned());
+    output_names.extend(intent.iter().map(|l| l.output.clone()));
+
+    let mut source_names: BTreeSet<String> = present_sources.keys().cloned().collect();
+    source_names.extend(intent.iter().map(|l| l.source.clone()));
+
+    let mut outputs: Vec<RoutingNode> = output_names
+        .into_iter()
+        .map(|name| {
+            let node_id = present_outputs.get(&name).copied();
+            let display_name = configured.get(&name).cloned().unwrap_or_else(|| output_display_name(&name));
+            RoutingNode { present: node_id.is_some(), node_id, configured: configured.contains_key(&name), display_name, node_name: name }
+        })
         .collect();
-    links.sort_unstable();
-    links.dedup();
+
+    let mut sources: Vec<RoutingNode> = source_names
+        .into_iter()
+        .map(|name| {
+            let node_id = present_sources.get(&name).copied();
+            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name: name.clone(), node_name: name }
+        })
+        .collect();
 
     outputs.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     sources.sort_by(|a, b| a.display_name.cmp(&b.display_name));
 
+    let mut links = intent.to_vec();
+    links.sort();
+
     RoutingMatrix { sources, outputs, links }
+}
+
+/// Snapshot the matrix from shared state (locks registry + outputs store +
+/// routing intent). Lock order is fixed here — routing first (released before
+/// the others), then registry, then store — to stay deadlock-free.
+fn build_snapshot(state: &AppState) -> RoutingMatrix {
+    let intent = routing_store::snapshot(&state.routing);
+    let reg = state.pw.lock_recover();
+    let store = state.store.lock_recover();
+    build_matrix(&reg, &store, &intent)
 }
 
 /// Every non-monitor output-direction port on `source_node_id` paired with the
@@ -154,10 +198,51 @@ fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: 
         .collect()
 }
 
+/// Highest (newest) live node id for a stable node name, or `None` if the node
+/// isn't present. Node names aren't unique at the PipeWire level and a
+/// same-named node can briefly outlive its owner, so "highest id" reliably
+/// means "most recently created" — same reasoning as sendspin_server's
+/// wait_for_node_id.
+fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32> {
+    state.nodes.values().filter(|n| n.node_name == node_name).map(|n| n.node_id).max()
+}
+
+/// Reapply persisted routing intent (routing_store.rs) to the live graph: for
+/// every stored `(source, output)` link whose *both* nodes are currently
+/// present, ensure the matched-channel PipeWire links exist. Idempotent —
+/// `CreateLinks` skips ports already linked — so this is safe to call on every
+/// registry change. **Additive only**: it never removes links, so a manual
+/// unlink (which also drops the intent) stays gone and this can't fight the
+/// user. Intent whose endpoint is absent is simply left pending until the node
+/// (re)appears and a later call links it.
+pub async fn reconcile(pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting) {
+    for link in routing_store::snapshot(routing) {
+        let ids = {
+            let st = pw.lock_recover();
+            node_id_for(&st, &link.source).zip(node_id_for(&st, &link.output))
+        };
+        let Some((source_id, output_id)) = ids else { continue };
+        let specs = matched_port_specs(pw, source_id, output_id);
+        if specs.is_empty() {
+            continue;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
+            return; // PipeWire thread gone; nothing more to do
+        }
+        let _ = reply_rx.await;
+    }
+}
+
+/// A routing operation, by stable node name (not ephemeral id) so it works
+/// even when an endpoint isn't currently present — linking an offline device
+/// just records the intent, which reconcile() applies when it appears.
 #[derive(Deserialize)]
 pub struct LinkPairRequest {
-    source_node_id: u32,
-    output_node_id: u32,
+    /// Source node name.
+    source: String,
+    /// Output node name.
+    output: String,
 }
 
 #[derive(Serialize)]
@@ -166,17 +251,27 @@ pub struct LinkOpResponse {
     message: String,
 }
 
-pub async fn get_routing(State(pw): State<SharedState>) -> Json<RoutingMatrix> {
-    Json(build_matrix(&pw.lock_recover()))
+pub async fn get_routing(State(state): State<AppState>) -> Json<RoutingMatrix> {
+    Json(build_snapshot(&state))
 }
 
 pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
-    let specs = matched_port_specs(&state.pw, req.source_node_id, req.output_node_id);
+    // Persist the desired route first; it's the source of truth and reconcile()
+    // (re)applies it whenever both endpoints are present.
+    if let Err(e) = state.routing.lock_recover().add(&req.source, &req.output) {
+        return Json(LinkOpResponse { ok: false, message: format!("failed to persist routing intent: {e}") });
+    }
+    // Apply live now if both ends are present; otherwise it stays pending.
+    let ids = {
+        let st = state.pw.lock_recover();
+        node_id_for(&st, &req.source).zip(node_id_for(&st, &req.output))
+    };
+    let Some((source_id, output_id)) = ids else {
+        return Json(LinkOpResponse { ok: true, message: "saved; will apply when both endpoints are present".to_string() });
+    };
+    let specs = matched_port_specs(&state.pw, source_id, output_id);
     if specs.is_empty() {
-        return Json(LinkOpResponse {
-            ok: false,
-            message: "no matching source/output node or no matching channel ports".to_string(),
-        });
+        return Json(LinkOpResponse { ok: true, message: "saved; no matching channel ports yet".to_string() });
     }
     let (reply_tx, reply_rx) = oneshot::channel();
     if state.pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
@@ -190,20 +285,31 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
 }
 
 pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
-    // Node-level unlink (matching the matrix's node-level "linked" semantics):
-    // remove every link feeding this output from this source. Resolve the ids
-    // from the current snapshot; destroy is idempotent, so any that raced away
-    // before we act are harmless — the desired "not linked" end state holds.
+    // Drop the intent first so reconcile() won't re-create what we remove.
+    // Works for offline pairs too — this is purely by name.
+    if let Err(e) = state.routing.lock_recover().remove(&req.source, &req.output) {
+        return Json(LinkOpResponse { ok: false, message: format!("failed to persist routing intent: {e}") });
+    }
+    // Destroy any live links if both ends are present; nothing to do otherwise.
+    let ids = {
+        let st = state.pw.lock_recover();
+        node_id_for(&st, &req.source).zip(node_id_for(&st, &req.output))
+    };
+    let Some((source_id, output_id)) = ids else {
+        return Json(LinkOpResponse { ok: true, message: "unlinked (endpoint offline; intent cleared)".to_string() });
+    };
+    // Node-level unlink: remove every channel link feeding this output from this
+    // source. Destroy is idempotent, so any that raced away are harmless.
     let link_ids: Vec<u32> = {
         let st = state.pw.lock_recover();
         st.links
             .values()
-            .filter(|l| l.output_node == req.source_node_id && l.input_node == req.output_node_id)
+            .filter(|l| l.output_node == source_id && l.input_node == output_id)
             .map(|l| l.link_id)
             .collect()
     };
     if link_ids.is_empty() {
-        return Json(LinkOpResponse { ok: true, message: "no links to remove".to_string() });
+        return Json(LinkOpResponse { ok: true, message: "no live links to remove".to_string() });
     }
     let (reply_tx, reply_rx) = oneshot::channel();
     if state.pw_cmd.send(PwCommand::DestroyLinks { link_ids, reply: reply_tx }).is_err() {
@@ -216,13 +322,25 @@ pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairReque
     }
 }
 
+/// Forget all persisted routing for a stable node name — used by the matrix's
+/// remove-✕ on an *offline* entity (an output or source that's configured/
+/// previously-routed but currently absent). Purely intent-side: nothing live
+/// to touch. After this the entity drops out of the matrix (no references
+/// left); if it's a real device it'll reappear on its own, unrouted.
+pub async fn forget_entity(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<LinkOpResponse> {
+    match state.routing.lock_recover().remove_entity(&node_name) {
+        Ok(()) => Json(LinkOpResponse { ok: true, message: format!("forgot routing for '{node_name}'") }),
+        Err(e) => Json(LinkOpResponse { ok: false, message: format!("failed to forget '{node_name}': {e}") }),
+    }
+}
+
 pub async fn routing_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut changes = state.changes.subscribe();
-    if send_snapshot(&mut socket, &state.pw).await.is_err() {
+    if send_snapshot(&mut socket, &state).await.is_err() {
         return;
     }
     loop {
@@ -230,14 +348,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             changed = changes.recv() => {
                 match changed {
                     Ok(()) => {
-                        if send_snapshot(&mut socket, &state.pw).await.is_err() {
+                        if send_snapshot(&mut socket, &state).await.is_err() {
                             break;
                         }
                     }
                     // A slow client missed some pings — one fresh snapshot
                     // catches it up completely, no need to replay history.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if send_snapshot(&mut socket, &state.pw).await.is_err() {
+                        if send_snapshot(&mut socket, &state).await.is_err() {
                             break;
                         }
                     }
@@ -255,8 +373,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
-async fn send_snapshot(socket: &mut WebSocket, pw: &SharedState) -> Result<(), axum::Error> {
-    let matrix = build_matrix(&pw.lock_recover());
+async fn send_snapshot(socket: &mut WebSocket, state: &AppState) -> Result<(), axum::Error> {
+    let matrix = build_snapshot(state);
     let json = serde_json::to_string(&matrix).unwrap_or_else(|_| "{}".to_string());
     socket.send(Message::Text(json)).await
 }

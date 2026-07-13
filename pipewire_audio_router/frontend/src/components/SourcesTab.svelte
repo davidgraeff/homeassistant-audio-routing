@@ -2,14 +2,12 @@
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import { run } from '../lib/toast';
-  import type { AirplaySourceInfo, RtpSourceInfo, SendspinInfo } from '../lib/types';
+  import type { AirplaySourceInfo, RtpSourceInfo } from '../lib/types';
 
   let airplay = $state<AirplaySourceInfo>({ name: null, running: false });
   let airplayName = $state('');
   let rtp = $state<RtpSourceInfo>({ enabled: false, port: 46000, loaded: false });
   let rtpPort = $state(46000);
-  let sendspin = $state<SendspinInfo[]>([]);
-  let newSendspin = $state('');
   let busy = $state(false);
 
   async function refresh() {
@@ -24,11 +22,6 @@
       rtpPort = rtp.port;
     } catch {
       /* keep last-known */
-    }
-    try {
-      sendspin = await api.sendspin();
-    } catch {
-      sendspin = [];
     }
   }
   onMount(refresh);
@@ -63,30 +56,12 @@
   async function disableRtp() {
     if (await run(() => api.disableRtpSource(), 'RTP source disabled')) await refresh();
   }
-
-  async function addSendspin(e: Event) {
-    e.preventDefault();
-    if (!newSendspin.trim()) return;
-    busy = true;
-    const ok = await run(() => api.addSendspin(newSendspin.trim()), `Added sendspin output '${newSendspin.trim()}'`);
-    busy = false;
-    if (ok) {
-      newSendspin = '';
-      await refresh();
-    }
-  }
-
-  async function removeSendspin(s: SendspinInfo) {
-    if (!confirm(`Remove sendspin output '${s.name}'?`)) return;
-    if (await run(() => api.removeSendspin(s.node_name), `Removed '${s.name}'`)) await refresh();
-  }
 </script>
 
 <div class="card">
   <h2>AirPlay-receive source</h2>
   <p class="card-sub">
-    A single AirPlay target that phones/PCs can cast into (runs <code>shairport-sync</code>). Clear the
-    name to disable it.
+    A single AirPlay target that phones/PCs can cast into. Clear the name to disable it.
   </p>
   <form onsubmit={saveAirplay}>
     <div class="row">
@@ -115,7 +90,7 @@
   <h2>Bluetooth bridge (RTP) source</h2>
   <p class="card-sub">
     Receives the RTP audio stream from the ESP32 Bluetooth bridge firmware and exposes it as a routable
-    source (<code>bt-bridge-rtp</code>). The listen port must match the port the firmware sends to.
+    source. The listen port must match the port the firmware sends to.
   </p>
   <form onsubmit={saveRtp}>
     <div class="row">
@@ -138,38 +113,4 @@
       <span class="badge off">disabled</span>
     {/if}
   </p>
-</div>
-
-<div class="card">
-  <h2>Sendspin outputs</h2>
-  <p class="card-sub">
-    ESPHome speakers that connect in to this router; each runs its own adapter process on an allocated
-    port.
-  </p>
-  {#if sendspin.length === 0}
-    <p class="empty">No sendspin outputs configured.</p>
-  {:else}
-    <table>
-      <thead><tr><th>Name</th><th>Port</th><th>Status</th><th></th></tr></thead>
-      <tbody>
-        {#each sendspin as s (s.node_name)}
-          <tr>
-            <td>{s.name}</td>
-            <td>{s.port}</td>
-            <td><span class="badge {s.running ? 'on' : 'off'}">{s.running ? 'running' : 'stopped'}</span></td>
-            <td style="text-align:right"><button class="danger" onclick={() => removeSendspin(s)}>Remove</button></td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  {/if}
-  <form onsubmit={addSendspin} style="margin-top:12px">
-    <div class="row">
-      <div class="grow field">
-        <label for="ss-name">New sendspin output name</label>
-        <input id="ss-name" type="text" bind:value={newSendspin} placeholder="Kitchen" />
-      </div>
-      <div class="field"><button class="primary" type="submit" disabled={busy || !newSendspin.trim()}>Add</button></div>
-    </div>
-  </form>
 </div>

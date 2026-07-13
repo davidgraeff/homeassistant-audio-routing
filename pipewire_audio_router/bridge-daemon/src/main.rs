@@ -9,6 +9,7 @@ mod pw_module;
 mod pw_thread;
 mod raop;
 mod routing;
+mod routing_store;
 mod rtp_source;
 mod sendspin_capture;
 mod sendspin_server;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_STORE_PATH: &str = "/data/raop-outputs.json";
 const DEFAULT_SOURCES_PATH: &str = "/data/sources.json";
+const DEFAULT_ROUTING_PATH: &str = "/data/routing.json";
 // Not 8080: with host_network the daemon binds a real host port, and 8080 is a
 // very common add-on port (collisions are likely). 8099 is distinctive and
 // rarely used; override with --listen (and config.yaml ingress_port) if needed.
@@ -51,6 +53,10 @@ enum Command {
         /// processes (AirPlay source, sendspin outputs).
         #[arg(long, default_value = DEFAULT_SOURCES_PATH)]
         sources: PathBuf,
+        /// Persistent routing intent (links by stable node name), reconciled
+        /// onto the live graph — survives node reloads and device churn.
+        #[arg(long, default_value = DEFAULT_ROUTING_PATH)]
+        routing: PathBuf,
         /// Directory of the built web UI (frontend/dist) served as static files.
         #[arg(long, default_value = DEFAULT_STATIC_DIR)]
         static_dir: PathBuf,
@@ -69,7 +75,9 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { store, sources, static_dir, listen } => serve(&store, &sources, &static_dir, &listen),
+        Command::Serve { store, sources, routing, static_dir, listen } => {
+            serve(&store, &sources, &routing, &static_dir, &listen)
+        }
     }
 }
 
@@ -88,7 +96,21 @@ fn discovery_mode() -> Option<discovery::Mode> {
     }
 }
 
-fn serve(store_path: &Path, sources_path: &Path, static_dir: &Path, listen: &str) -> anyhow::Result<()> {
+/// The Home Assistant add-on version, baked into the image at build time as the
+/// `ADDON_VERSION` env (from the `--build-arg` in scripts/deploy-dev.sh and the
+/// CI workflow, i.e. config.yaml's `version` / the dev tag). Read at runtime,
+/// not compile time, so bumping the version doesn't force a Rust rebuild. Falls
+/// back to the crate version when built/run outside the add-on image.
+fn addon_version() -> String {
+    match std::env::var("ADDON_VERSION") {
+        Ok(v) if !v.trim().is_empty() && v != "dev" => v,
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &str) -> anyhow::Result<()> {
+    tracing::info!("PipeWire Audio Router add-on v{}", addon_version());
+
     // No options.json seeding: both stores start empty on a fresh install and
     // are populated entirely at runtime via the API (and mDNS discovery).
     let store = outputs_store::OutputsStore::load(store_path)?;
@@ -104,6 +126,11 @@ fn serve(store_path: &Path, sources_path: &Path, static_dir: &Path, listen: &str
         sources_path.display()
     );
     let sources = std::sync::Arc::new(std::sync::Mutex::new(sources));
+
+    let routing = routing_store::RoutingStore::load(routing_path)?;
+    tracing::info!("{} persisted routing link(s) in {}", routing.links().count(), routing_path.display());
+    let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
+
     let supervisor = std::sync::Arc::new(tokio::sync::Mutex::new(supervisor::Supervisor::new()));
     let sendspin_servers: api::SharedSendspinServers =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -117,7 +144,7 @@ fn serve(store_path: &Path, sources_path: &Path, static_dir: &Path, listen: &str
     // stay alive for discovery to keep running, so it's held for the whole
     // process via `_discovery` (serve never returns in practice).
     let _discovery = match discovery_mode() {
-        Some(mode) => match discovery::spawn(pw_cmd.clone(), store.clone(), mode) {
+        Some(mode) => match discovery::spawn(pw_cmd.clone(), store.clone(), sources.clone(), mode) {
             Ok(daemon) => {
                 tracing::info!("mDNS RAOP discovery started ({mode:?})");
                 Some(daemon)
@@ -168,6 +195,29 @@ fn serve(store_path: &Path, sources_path: &Path, static_dir: &Path, listen: &str
         // re-added live.
         spawn_stored_sources(&sources, &supervisor, &sendspin_servers, pw_state.clone(), pw_cmd.clone()).await;
 
+        // Reconcile persisted routing intent onto the live graph, now and on
+        // every registry change: a node that (re)appears — a reloaded
+        // raop-sink, a rediscovered device — gets its saved links recreated.
+        // Additive only: it never removes links, so a manual unlink (which
+        // also drops the intent) stays gone. See routing_store.rs / routing.rs.
+        {
+            let pw = pw_state.clone();
+            let cmd = pw_cmd.clone();
+            let routing = routing.clone();
+            let mut rx = changes.subscribe();
+            tokio::spawn(async move {
+                routing::reconcile(&pw, &cmd, &routing).await;
+                loop {
+                    match rx.recv().await {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            routing::reconcile(&pw, &cmd, &routing).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         let app = api::router(
             pw_state,
             changes,
@@ -176,6 +226,7 @@ fn serve(store_path: &Path, sources_path: &Path, static_dir: &Path, listen: &str
             sources,
             supervisor.clone(),
             sendspin_servers.clone(),
+            routing,
             static_dir.to_path_buf(),
         );
         let listener = tokio::net::TcpListener::bind(listen).await?;

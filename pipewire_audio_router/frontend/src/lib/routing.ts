@@ -45,7 +45,7 @@ export const routing = readable<RoutingState>({ matrix: EMPTY, connected: false 
   };
 });
 
-/** Whether a given (source, output) pair is currently linked. */
-export function isLinked(matrix: RoutingMatrix, sourceId: number, outputId: number): boolean {
-  return matrix.links.some(([s, o]) => s === sourceId && o === outputId);
+/** Whether a given (source, output) pair is routed, by stable node name. */
+export function isLinked(matrix: RoutingMatrix, source: string, output: string): boolean {
+  return matrix.links.some((l) => l.source === source && l.output === output);
 }
