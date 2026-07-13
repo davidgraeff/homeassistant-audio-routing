@@ -1,5 +1,7 @@
 # Rust
 pipewire_audio_router/bridge-daemon/target/
+# Container-extracted binary from scripts/build-daemon.sh
+pipewire_audio_router/bridge-daemon/dist/
 
 # Python
 __pycache__/

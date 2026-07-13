@@ -5,45 +5,226 @@
 # real-hardware/network validation once a change looks right locally).
 #
 # Two independent targets:
-#   ./scripts/deploy-dev.sh addon         rsync the add-on to Supervisor's
-#                                         local add-ons folder, then
-#                                         install (first time) or rebuild
-#                                         (subsequent times) and tail logs.
+#   ./scripts/deploy-dev.sh addon         cross-build the add-on image on THIS
+#                                         host (docker buildx), push it to
+#                                         GHCR, then have Supervisor pull it —
+#                                         no on-device compile of the Rust
+#                                         bridge daemon (that's minutes on a
+#                                         Pi). See deploy_addon() for the why.
 #   ./scripts/deploy-dev.sh integration   rsync the HA integration into
 #                                         config/custom_components/ and do
 #                                         a targeted HA *core* restart
 #                                         (seconds, not a full OS reboot).
 #
-# Requires: SSH access to the HA OS host (default homeassistant.local,
-# override with HA_HOST) with a user that can write /addons and /config
-# and run the `ha` CLI — confirmed working as root over the built-in SSH
-# add-on/HAOS SSH on the target instance this was developed against.
+# Requires:
+#   * SSH access to the HA OS host (default homeassistant.local, override with
+#     HA_HOST) with a user that can write /addons and /config and run the `ha`
+#     CLI — confirmed as root over the built-in SSH add-on/HAOS SSH.
+#   * `addon` target only: docker with the buildx plugin on this host, and a
+#     GHCR login that can push (docker login ghcr.io -u <user>, PAT with
+#     write:packages — or set GHCR_TOKEN). Pruning old dev tags additionally
+#     needs delete:packages (same token, or a working `gh auth`).
 set -euo pipefail
 
 HA_HOST="${HA_HOST:-homeassistant.local}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADDON_SLUG="local_pipewire_audio_router"
+ADDON_NAME="pipewire_audio_router"     # dir under repo root and image suffix
+GHCR_OWNER="${GHCR_OWNER:-davidgraeff}" # ghcr.io/<owner>/<arch>-addon-<name>
+BUILDER="ha-addon-builder"             # dedicated buildx builder (see below)
+DEV_TAGS_KEEP=3                        # how many dev image tags to retain on GHCR
 
 usage() {
   echo "usage: $0 addon|integration" >&2
   exit 1
 }
 
+# Map the target's `uname -m` to Home Assistant's arch name and the buildx
+# --platform string. config.yaml's image ref uses the HA arch as {arch}, so
+# these must line up with what Supervisor substitutes on the target.
+remote_ha_arch() {
+  local m
+  m="$(ssh "root@$HA_HOST" "uname -m")"
+  case "$m" in
+    x86_64) echo amd64 ;;
+    aarch64) echo aarch64 ;;
+    armv7l) echo armv7 ;;
+    *) echo "unsupported target arch: $m" >&2; exit 1 ;;
+  esac
+}
+platform_for() {
+  case "$1" in
+    amd64) echo linux/amd64 ;;
+    aarch64) echo linux/arm64 ;;
+    armv7) echo linux/arm/v7 ;;
+  esac
+}
+
+# Fail early with an actionable message if this host can't push to GHCR,
+# rather than deep inside a multi-minute buildx run. GHCR_TOKEN (a PAT with
+# write:packages) auto-logs-in; otherwise we require an existing docker login.
+preflight_ghcr() {
+  command -v docker >/dev/null || { echo "ERROR: docker not found on this host" >&2; exit 1; }
+  docker buildx version >/dev/null 2>&1 || { echo "ERROR: docker buildx plugin not available" >&2; exit 1; }
+  if [ -n "${GHCR_TOKEN:-}" ]; then
+    echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin >/dev/null
+    return
+  fi
+  if [ -f "$HOME/.docker/config.json" ] && grep -q 'ghcr.io' "$HOME/.docker/config.json"; then
+    return
+  fi
+  echo "ERROR: not logged in to ghcr.io. Either:" >&2
+  echo "  docker login ghcr.io -u <github-user>   # paste a PAT with write:packages" >&2
+  echo "  # or: export GHCR_TOKEN=<that PAT> and re-run" >&2
+  exit 1
+}
+
+# A docker-container buildx builder (the default 'docker' driver can't export
+# a registry cache and is awkward for cross-arch). Created once, reused after.
+# Cross-arch emulation needs QEMU binfmt registered on the host; install it if
+# the target platform isn't already advertised.
+ensure_builder() {
+  local platform="$1"
+  if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+    echo "--- creating buildx builder '$BUILDER' (docker-container driver) ---"
+    docker buildx create --name "$BUILDER" --driver docker-container --bootstrap >/dev/null
+  fi
+  if ! docker buildx inspect "$BUILDER" | grep -q "$platform"; then
+    echo "--- registering QEMU binfmt for cross-arch builds ---"
+    docker run --privileged --rm docker.io/tonistiigi/binfmt --install all >/dev/null 2>&1 \
+      || echo "warning: could not auto-install QEMU binfmt; cross-build may fail" >&2
+    docker buildx inspect "$BUILDER" --bootstrap >/dev/null 2>&1 || true
+  fi
+}
+
+# Resolve a GHCR API token for tag pruning: explicit env, then gh CLI, then
+# reuse the credential docker login already stored. Empty if none available.
+ghcr_token() {
+  if [ -n "${GHCR_TOKEN:-}" ]; then echo "$GHCR_TOKEN"; return; fi
+  local t
+  t="$(gh auth token 2>/dev/null || true)"
+  if [ -n "$t" ]; then echo "$t"; return; fi
+  python3 - <<'PY' 2>/dev/null || true
+import json, base64, os
+try:
+    d = json.load(open(os.path.expanduser("~/.docker/config.json")))
+    a = d.get("auths", {}).get("ghcr.io", {}).get("auth")
+    if a:
+        print(base64.b64decode(a).decode().split(":", 1)[1])
+except Exception:
+    pass
+PY
+}
+
+# Keep only the newest $DEV_TAGS_KEEP dev tags on GHCR. Dev tags are the
+# 4-segment "<base>.<epoch>" versions this script pushes (release tags are
+# 3-segment and left untouched, as is the 'buildcache' entry). Best-effort:
+# a missing/under-scoped token just skips pruning with a warning.
+prune_dev_tags() {
+  local ha_arch="$1" token
+  token="$(ghcr_token)"
+  if [ -z "$token" ]; then
+    echo "--- skip prune: no GHCR token (set GHCR_TOKEN or run 'gh auth login' with delete:packages)" >&2
+    return 0
+  fi
+  GHCR_API_TOKEN="$token" python3 - "$GHCR_OWNER" "${ha_arch}-addon-${ADDON_NAME}" "$DEV_TAGS_KEEP" <<'PY'
+import os, sys, re, json, urllib.request
+token, owner, pkg, keep = os.environ["GHCR_API_TOKEN"], sys.argv[1], sys.argv[2], int(sys.argv[3])
+base = f"https://api.github.com/users/{owner}/packages/container/{pkg}/versions"
+def api(url, method="GET"):
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    return urllib.request.urlopen(req)
+try:
+    versions = json.load(api(base + "?per_page=100"))
+except Exception as e:
+    print(f"--- prune: list failed ({e}); skipping", file=sys.stderr); sys.exit(0)
+devs = []
+for v in versions:
+    for t in v.get("metadata", {}).get("container", {}).get("tags", []):
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", t):
+            devs.append((int(t.rsplit(".", 1)[1]), v["id"], t)); break
+devs.sort(reverse=True)  # newest epoch first
+for _epoch, vid, tag in devs[keep:]:
+    try:
+        api(f"{base}/{vid}", method="DELETE"); print(f"--- pruned old dev image tag {tag}")
+    except Exception as e:
+        print(f"--- prune: delete {tag} failed ({e})", file=sys.stderr)
+PY
+}
+
 deploy_addon() {
-  echo "--- rsyncing pipewire_audio_router/ to $HA_HOST:/addons/pipewire_audio_router/ ---"
-  # bridge-daemon/target/ is a local build cache (gitignored) and is huge —
-  # never worth syncing, Supervisor builds fresh via the Dockerfile anyway.
+  # Why this shape: the add-on's config.yaml carries an `image:` field, so
+  # Supervisor treats it as image-based (build: false) and PULLS the image
+  # instead of compiling the Rust bridge daemon on-device — even for a local
+  # /addons/ add-on. (An earlier note in this repo claimed local add-ons
+  # always build regardless; that's wrong once `image:` is set — verified on
+  # the target: `ha addons info` shows build:false and the ghcr.io image is
+  # present in Docker.) So the fast path is: build the image HERE, push to
+  # GHCR, and let Supervisor pull it.
+  local ha_arch platform image base_version dev_version
+  ha_arch="$(remote_ha_arch)"
+  platform="$(platform_for "$ha_arch")"
+  image="ghcr.io/${GHCR_OWNER}/${ha_arch}-addon-${ADDON_NAME}"
+
+  # Supervisor only re-pulls when the version increases, and for a local
+  # add-on the "latest" version is whatever config.yaml in /addons says. So we
+  # stamp a unique, monotonically-increasing dev version per deploy — the
+  # committed base version with an epoch as a 4th segment (e.g. 0.1.0.175...)
+  # — and tag the image to match. 4-segment > the 3-segment base, and later
+  # epochs > earlier ones, so `ha addons update` always fires and pulls. The
+  # committed config.yaml is never touched; only the rsync'd /addons copy is.
+  base_version="$(grep '^version:' "$REPO_ROOT/$ADDON_NAME/config.yaml" | head -1 | sed -E 's/^version: *"?([^"]+)"?.*/\1/')"
+  dev_version="${base_version}.$(date +%H%M)"
+
+  preflight_ghcr
+  ensure_builder "$platform"
+
+  echo "--- building & pushing $image:$dev_version ($platform) ---"
+  # --cache-{from,to} keep unchanged layers (apt, cargo deps) warm across
+  # deploys, so only what actually changed rebuilds under emulation.
+  docker buildx build \
+    --builder "$BUILDER" \
+    --platform "$platform" \
+    --tag "$image:$dev_version" \
+    --cache-from "type=registry,ref=$image:buildcache" \
+    --cache-to "type=registry,ref=$image:buildcache,mode=max" \
+    --push \
+    "$REPO_ROOT/$ADDON_NAME"
+
+  echo "--- rsyncing add-on metadata to $HA_HOST:/addons/$ADDON_NAME/ ---"
+  # Supervisor needs config.yaml (and the other add-on metadata) present to
+  # know the add-on and its image ref; it does NOT build from this tree.
+  # bridge-daemon/target/ is a huge gitignored build cache — never sync it.
   rsync -az --delete \
     --exclude 'bridge-daemon/target/' \
-    "$REPO_ROOT/pipewire_audio_router/" "root@$HA_HOST:/addons/pipewire_audio_router/"
+    "$REPO_ROOT/$ADDON_NAME/" "root@$HA_HOST:/addons/$ADDON_NAME/"
 
-  if ssh "root@$HA_HOST" "ha apps info $ADDON_SLUG" >/dev/null 2>&1; then
-    echo "--- already installed, rebuilding $ADDON_SLUG ---"
-    ssh "root@$HA_HOST" "ha apps rebuild $ADDON_SLUG"
-  else
-    echo "--- installing $ADDON_SLUG for the first time ---"
+  echo "--- pinning local add-on to dev version $dev_version ---"
+  # `ha store reload` (NOT `ha addons reload`) is what re-reads the local
+  # /addons repository and refreshes version_latest — confirmed on the
+  # target; addons reload leaves version_latest stale so no update fires.
+  ssh "root@$HA_HOST" \
+    "sed -i -E 's/^version: .*/version: \"$dev_version\"/' /addons/$ADDON_NAME/config.yaml && ha store reload"
+
+  # Detecting install state is subtle: `ha apps info` exposes an `installed:`
+  # field ONLY in the not-installed (store) view, where it's `false`. Once
+  # the add-on is installed that key is absent (null in --raw-json) and the
+  # YAML has no `installed:` line at all — so grepping for `installed: true`
+  # (or trusting the exit code) always reads "not installed" and the next
+  # `install` dies with "already installed". Reliable rule: install iff
+  # .data.installed == false, otherwise update.
+  if [ "$(ssh "root@$HA_HOST" "ha apps info $ADDON_SLUG --raw-json 2>/dev/null | jq -r '.data.installed'")" = "false" ]; then
+    echo "--- installing $ADDON_SLUG for the first time (pulls $image:$dev_version) ---"
     ssh "root@$HA_HOST" "ha apps install $ADDON_SLUG"
+  else
+    echo "--- updating $ADDON_SLUG (pulls $image:$dev_version) ---"
+    ssh "root@$HA_HOST" "ha apps update $ADDON_SLUG"
   fi
+
+  echo "--- pruning old dev image tags on GHCR (keeping newest $DEV_TAGS_KEEP) ---"
+  prune_dev_tags "$ha_arch"
 
   echo "--- starting (or restarting) $ADDON_SLUG ---"
   ssh "root@$HA_HOST" "ha apps restart $ADDON_SLUG"

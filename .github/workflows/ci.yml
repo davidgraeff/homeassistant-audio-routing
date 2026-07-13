@@ -1,0 +1,143 @@
+name: CI
+
+# Tests every part of the repo: the Rust bridge daemon, the Svelte web UI, the
+# Home Assistant integration, and the docker-based add-on end-to-end suite.
+# (The add-on image *build+push* is a separate workflow, build-addon.yml.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Rust formatting (rustfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Config in bridge-daemon/rustfmt.toml (max_width 140). No compile needed,
+      # so this job is fast and has no system deps. Run `cargo fmt` locally to fix.
+      - name: Check formatting
+        working-directory: pipewire_audio_router/bridge-daemon
+        run: cargo fmt --check
+
+  rust:
+    name: Rust bridge-daemon (clippy + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pipewire_audio_router/bridge-daemon
+    steps:
+      - uses: actions/checkout@v4
+      # Same build deps as the Dockerfile's build stage. libasound2-dev is for
+      # the embedded sendspin server's transitive cpal/alsa dependency (it has
+      # no feature flag to drop its audio-output module, even though we only use
+      # the server-role input path).
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libpipewire-0.3-dev libspa-0.2-dev libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Depends on the public `sendspin` git dependency (davidgraeff/sendspin-rs)
+      # — fetched anonymously over https; no token needed while that repo is public.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pipewire_audio_router/bridge-daemon
+      # `-A derivable_impls`: RaopEncryption keeps a hand-written `Default`
+      # (defaults to the 3rd variant, and reads clearer than a `#[default]`
+      # attr). Drop the `-D warnings` escalation if it's too strict mid-refactor.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings -A clippy::derivable_impls
+      - name: Tests
+        run: cargo test --all-targets
+
+  frontend:
+    name: Web UI (svelte-check + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pipewire_audio_router/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: pipewire_audio_router/frontend/package-lock.json
+      - run: npm ci
+      - name: Type-check
+        run: npm run check
+      - name: Build
+        run: npm run build
+
+  integration:
+    name: HA integration (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # pytest-homeassistant-custom-component bundles a specific Home Assistant
+      # release + the pytest plugins the tests rely on (the
+      # `enable_custom_integrations` fixture, asyncio_mode=auto from pytest.ini).
+      # Pinned for reproducible CI: 0.13.346 -> homeassistant==2026.7.2 (needs
+      # Python 3.13). Bump both this pin and setup-python when targeting a newer
+      # HA. (hacs.json declares a 2024.1.0 floor, but that predates Python 3.13,
+      # so the floor isn't testable on this runner.)
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'pytest-homeassistant-custom-component==0.13.346'
+      - name: Pytest
+        run: pytest custom_components/pipewire_audio_router/tests/ -q
+
+  e2e:
+    name: Add-on end-to-end (docker)
+    runs-on: ubuntu-latest
+    # Only worth the ~image-build cost once the unit builds pass — the docker
+    # build compiles the same Rust + frontend anyway.
+    needs: [rust, frontend]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure ffmpeg (fixture generation + signal analysis)
+        run: ffmpeg -version >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg; }
+      - name: Generate the audio fixture
+        # Replaces /usr/share/sounds/speech-dispatcher/pipe.wav (not present on
+        # CI runners) — the announce tests loop this as the "music" bed.
+        run: ffmpeg -y -loglevel error -f lavfi -i "sine=frequency=440:duration=2" -ar 44100 -ac 2 "$RUNNER_TEMP/music.wav"
+      - name: Build the add-on image
+        run: docker build -t pipewire_audio_router:dev pipewire_audio_router
+      - name: Run the CI-feasible e2e suite
+        env:
+          IMAGE: pipewire_audio_router:dev
+          MUSIC_WAV_HOST_PATH: ${{ runner.temp }}/music.wav
+          WAV_HOST_PATH: ${{ runner.temp }}/music.wav
+        # The whole add-on suite runs. phase2 / phase3 self-skip here: they need
+        # Music Assistant's proprietary `cliraop` (a real AirPlay sender) that
+        # isn't in this repo — run them locally with CLIRAOP_PATH set. The rest
+        # are self-contained (virtual PipeWire nodes, a mock Wyoming server, …).
+        run: |
+          fail=0
+          for t in phase1_e2e phase2_e2e phase3_multi_output hot_reload_e2e routing_ui_e2e announce_ducking_e2e announce_wyoming_e2e; do
+            echo "::group::test_addon_${t}.sh"
+            bash "tests/test_addon_${t}.sh" || { echo "FAILED: $t"; fail=1; }
+            echo "::endgroup::"
+          done
+          exit $fail

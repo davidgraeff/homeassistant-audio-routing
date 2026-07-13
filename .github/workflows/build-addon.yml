@@ -6,9 +6,13 @@ name: Build add-on image
 # (scripts/deploy-dev.sh) are unaffected — those always build from the
 # Dockerfile on-device by design, for fast iteration on uncommitted code.
 #
-# Our Dockerfile's base images (rust:1-slim-trixie, ubuntu:26.04) are
-# already multi-arch manifests, so a plain buildx cross-build under QEMU
-# is enough — no HA-specific build tooling/BUILD_FROM plumbing needed.
+# The Dockerfile pins its build stages `FROM --platform=$BUILDPLATFORM`, so
+# rustc runs natively on the amd64 runner and CROSS-compiles to the target
+# arch — the heavy Rust codegen is never emulated (measured ~20x faster than
+# emulating it: 50s vs 17m for this daemon). QEMU is still set up below because
+# the runtime stage (ubuntu:26.04) is built for the target arch and its
+# apt-install runs emulated — but that's cheap (no compilation). No HA-specific
+# BUILD_FROM plumbing needed; the base images are plain multi-arch manifests.
 
 on:
   push:
@@ -59,3 +63,8 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-addon-pipewire_audio_router:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-addon-pipewire_audio_router:latest
+          # Reuse unchanged layers (apt, cargo deps) across runs. Shares the
+          # per-arch :buildcache tag with scripts/deploy-dev.sh, so dev and CI
+          # warm each other's cache.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-addon-pipewire_audio_router:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-addon-pipewire_audio_router:buildcache,mode=max
