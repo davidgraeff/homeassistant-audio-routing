@@ -33,12 +33,14 @@ DATA_DIR="$(mktemp -d)"
 HOST_PORT="${HOST_PORT:-18099}"
 MUSIC_WAV_HOST_PATH="${MUSIC_WAV_HOST_PATH:-/usr/share/sounds/speech-dispatcher/pipe.wav}"
 CAPTURE_SECONDS=9
+# set -u means cleanup() must not reference this before it's assigned.
+TMP_MUSIC_LONG=""
 
 cleanup() {
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   timeout 5 docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
   rm -rf "$DATA_DIR"
-  rm -f /tmp/wyoming_e2e_full.raw
+  rm -f /tmp/wyoming_e2e_full.raw "$TMP_MUSIC_LONG"
 }
 trap cleanup EXIT
 
@@ -87,8 +89,13 @@ done
 echo "OK: music source linked"
 
 echo "--- staging the looped 'music' clip and a mock Wyoming TTS server ---"
-docker cp "$MUSIC_WAV_HOST_PATH" "$CONTAINER_NAME:/tmp/music_one_loop.wav"
-docker exec "$CONTAINER_NAME" bash -c 'ffmpeg -y -loglevel error -stream_loop 40 -i /tmp/music_one_loop.wav -c copy /tmp/music_long.wav'
+# Looped on the HOST (ffmpeg is no longer in the add-on image — announce
+# audio is decoded by the bridge daemon's own symphonia-based decoder,
+# decode.rs) and copied in as a finished file.
+TMP_MUSIC_LONG="$(mktemp -u --suffix=.wav)"
+ffmpeg -y -loglevel error -stream_loop 40 -i "$MUSIC_WAV_HOST_PATH" -c copy "$TMP_MUSIC_LONG"
+docker cp "$TMP_MUSIC_LONG" "$CONTAINER_NAME:/tmp/music_long.wav"
+rm -f "$TMP_MUSIC_LONG"
 
 # A real Wyoming wire-protocol server: one JSON header line per event,
 # `payload_length` raw PCM bytes immediately following when present, no

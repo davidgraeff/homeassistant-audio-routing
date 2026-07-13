@@ -35,6 +35,9 @@ DATA_DIR="$(mktemp -d)"
 HOST_PORT="${HOST_PORT:-18098}"
 MUSIC_WAV_HOST_PATH="${MUSIC_WAV_HOST_PATH:-/usr/share/sounds/speech-dispatcher/pipe.wav}"
 CAPTURE_SECONDS=9
+# set -u means cleanup() must not reference these before they're assigned.
+TMP_MUSIC_LONG=""
+TMP_ANNOUNCE=""
 
 cleanup() {
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -45,11 +48,11 @@ cleanup() {
   # whole test; a leaked test-only bridge network is a harmless leftover.
   timeout 5 docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
   rm -rf "$DATA_DIR"
-  rm -f /tmp/announce_e2e_full.raw
+  rm -f /tmp/announce_e2e_full.raw "$TMP_MUSIC_LONG" "$TMP_ANNOUNCE"
 }
 trap cleanup EXIT
 
-echo "--- building add-on image (includes ffmpeg + announce endpoint) ---"
+echo "--- building add-on image (includes the announce endpoint) ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
 cat > "$DATA_DIR/options.json" << 'EOF'
@@ -101,10 +104,18 @@ done
 echo "OK: music source linked"
 
 echo "--- staging audio: a long looped 'music' clip + a short announce tone, served over HTTP inside the container ---"
-docker cp "$MUSIC_WAV_HOST_PATH" "$CONTAINER_NAME:/tmp/music_one_loop.wav"
+# Generated on the HOST (ffmpeg is no longer in the add-on image itself —
+# announce audio is decoded by the bridge daemon's own symphonia-based
+# decoder, decode.rs — so the container has nothing to generate these
+# fixtures with) and copied in as finished files.
+TMP_MUSIC_LONG="$(mktemp -u --suffix=.wav)"
+TMP_ANNOUNCE="$(mktemp -u --suffix=.wav)"
+ffmpeg -y -loglevel error -stream_loop 40 -i "$MUSIC_WAV_HOST_PATH" -c copy "$TMP_MUSIC_LONG"
+ffmpeg -y -loglevel error -f lavfi -i "sine=frequency=440:duration=3" "$TMP_ANNOUNCE"
+docker cp "$TMP_MUSIC_LONG" "$CONTAINER_NAME:/tmp/music_long.wav"
+docker cp "$TMP_ANNOUNCE" "$CONTAINER_NAME:/tmp/announce.wav"
+rm -f "$TMP_MUSIC_LONG" "$TMP_ANNOUNCE"
 docker exec "$CONTAINER_NAME" bash -c '
-ffmpeg -y -loglevel error -stream_loop 40 -i /tmp/music_one_loop.wav -c copy /tmp/music_long.wav
-ffmpeg -y -loglevel error -f lavfi -i "sine=frequency=440:duration=3" /tmp/announce.wav
 mkdir -p /tmp/servedir && cp /tmp/announce.wav /tmp/servedir/announce.wav
 cd /tmp/servedir && nohup python3 -m http.server 8765 >/tmp/httpserver.log 2>&1 &
 '
