@@ -1,0 +1,6 @@
+# Wider than rustfmt's 100 default to match this codebase's dense style
+# (single-line match arms, wide struct literals). The longest existing line is
+# 137, so 140 avoids width-driven rewrapping; `Max` heuristics keep small
+# items on one line up to that width rather than eagerly wrapping them.
+max_width = 140
+use_small_heuristics = "Max"

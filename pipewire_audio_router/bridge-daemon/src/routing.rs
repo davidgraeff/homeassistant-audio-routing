@@ -26,17 +26,26 @@
 
 use crate::api::AppState;
 use crate::config::SENDSPIN_NODE_PREFIX;
-use crate::pw_config_gen::RAOP_NODE_PREFIX;
-use crate::pw_thread::{PortInfo, RegistryState, SharedState};
+use crate::locks::LockRecover;
+use crate::raop::RAOP_NODE_PREFIX;
+use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, RegistryState, SharedState};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 #[derive(Serialize, Clone)]
 pub struct RoutingNode {
     node_id: u32,
+    /// Stable PipeWire node name (e.g. `"raop-out-kitchen"`,
+    /// `"shairport-sync"`). Unlike `node_id`, this survives a module
+    /// reload — the HA integration keys routing off this and re-resolves
+    /// it to a live `node_id` per link/unlink call, so an automation never
+    /// has to persist an ephemeral id. Additive field; existing web-client
+    /// consumers that only read `node_id`/`display_name` are unaffected.
+    node_name: String,
     display_name: String,
 }
 
@@ -76,6 +85,7 @@ fn build_matrix(state: &RegistryState) -> RoutingMatrix {
         if is_output_node(&node.node_name) {
             outputs.push(RoutingNode {
                 node_id: node.node_id,
+                node_name: node.node_name.clone(),
                 display_name: output_display_name(&node.node_name),
             });
             continue;
@@ -87,6 +97,7 @@ fn build_matrix(state: &RegistryState) -> RoutingMatrix {
         if has_real_source_port {
             sources.push(RoutingNode {
                 node_id: node.node_id,
+                node_name: node.node_name.clone(),
                 display_name: node.node_name.clone(),
             });
         }
@@ -109,18 +120,15 @@ fn build_matrix(state: &RegistryState) -> RoutingMatrix {
     RoutingMatrix { sources, outputs, links }
 }
 
-/// Every non-monitor output-direction port on `source_node_id` paired with
-/// the same-channel input-direction port on `output_node_id`, as full
-/// `"node:port"` strings ready for `pw-link`/`pw-link -d`. Empty if either
-/// node doesn't exist or no channel suffixes match on both sides.
-fn matched_port_pairs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<(String, String)> {
-    let state = state.lock().unwrap();
-    let Some(source_name) = state.nodes.get(&source_node_id).map(|n| n.node_name.clone()) else {
+/// Every non-monitor output-direction port on `source_node_id` paired with the
+/// same-channel input-direction port on `output_node_id`, as `LinkSpec`s
+/// (resolved to PipeWire object ids) ready for a `CreateLinks` command. Empty
+/// if either node doesn't exist or no channel suffixes match on both sides.
+fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<LinkSpec> {
+    let state = state.lock_recover();
+    if !state.nodes.contains_key(&source_node_id) || !state.nodes.contains_key(&output_node_id) {
         return Vec::new();
-    };
-    let Some(output_name) = state.nodes.get(&output_node_id).map(|n| n.node_name.clone()) else {
-        return Vec::new();
-    };
+    }
 
     let source_ports: Vec<&PortInfo> = state
         .ports
@@ -136,7 +144,12 @@ fn matched_port_pairs(state: &SharedState, source_node_id: u32, output_node_id: 
             output_ports
                 .iter()
                 .find(|op| channel_suffix(&op.port_name) == suffix)
-                .map(|op| (format!("{source_name}:{}", sp.port_name), format!("{output_name}:{}", op.port_name)))
+                .map(|op| LinkSpec {
+                    out_node: source_node_id,
+                    out_port: sp.port_id,
+                    in_node: output_node_id,
+                    in_port: op.port_id,
+                })
         })
         .collect()
 }
@@ -154,62 +167,53 @@ pub struct LinkOpResponse {
 }
 
 pub async fn get_routing(State(pw): State<SharedState>) -> Json<RoutingMatrix> {
-    Json(build_matrix(&pw.lock().unwrap()))
+    Json(build_matrix(&pw.lock_recover()))
 }
 
-pub async fn link(State(pw): State<SharedState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
-    let pairs = matched_port_pairs(&pw, req.source_node_id, req.output_node_id);
-    if pairs.is_empty() {
+pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
+    let specs = matched_port_specs(&state.pw, req.source_node_id, req.output_node_id);
+    if specs.is_empty() {
         return Json(LinkOpResponse {
             ok: false,
             message: "no matching source/output node or no matching channel ports".to_string(),
         });
     }
-    let mut ok = true;
-    let mut messages = Vec::with_capacity(pairs.len());
-    for (from, to) in &pairs {
-        let output = tokio::process::Command::new("pw-link").arg(from).arg(to).output().await;
-        match output {
-            Ok(o) if o.status.success() => messages.push(format!("linked {from} -> {to}")),
-            // Idempotent, same reasoning as api.rs's create_link: a UI
-            // double-click or a retried request must not read as failure.
-            Ok(o) if String::from_utf8_lossy(&o.stderr).contains("File exists") => {
-                messages.push(format!("{from} -> {to} already linked"))
-            }
-            Ok(o) => {
-                ok = false;
-                messages.push(format!("{from} -> {to} failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
-            }
-            Err(e) => {
-                ok = false;
-                messages.push(format!("failed to run pw-link: {e}"));
-            }
-        }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state.pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
+        return Json(LinkOpResponse { ok: false, message: "pipewire thread unavailable".to_string() });
     }
-    Json(LinkOpResponse { ok, message: messages.join("; ") })
+    match reply_rx.await {
+        Ok(Ok(message)) => Json(LinkOpResponse { ok: true, message }),
+        Ok(Err(message)) => Json(LinkOpResponse { ok: false, message }),
+        Err(_) => Json(LinkOpResponse { ok: false, message: "pipewire thread dropped the request".to_string() }),
+    }
 }
 
-pub async fn unlink(State(pw): State<SharedState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
-    let pairs = matched_port_pairs(&pw, req.source_node_id, req.output_node_id);
-    if pairs.is_empty() {
-        return Json(LinkOpResponse {
-            ok: false,
-            message: "no matching source/output node or no matching channel ports".to_string(),
-        });
+pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
+    // Node-level unlink (matching the matrix's node-level "linked" semantics):
+    // remove every link feeding this output from this source. Resolve the ids
+    // from the current snapshot; destroy is idempotent, so any that raced away
+    // before we act are harmless — the desired "not linked" end state holds.
+    let link_ids: Vec<u32> = {
+        let st = state.pw.lock_recover();
+        st.links
+            .values()
+            .filter(|l| l.output_node == req.source_node_id && l.input_node == req.output_node_id)
+            .map(|l| l.link_id)
+            .collect()
+    };
+    if link_ids.is_empty() {
+        return Json(LinkOpResponse { ok: true, message: "no links to remove".to_string() });
     }
-    let mut messages = Vec::with_capacity(pairs.len());
-    for (from, to) in &pairs {
-        // Always report success for -d: whether the link existed a moment
-        // ago (race with the registry snapshot the UI acted on) or was
-        // already gone, the end state the caller wants — "not linked" —
-        // holds either way.
-        let output = tokio::process::Command::new("pw-link").arg("-d").arg(from).arg(to).output().await;
-        match output {
-            Ok(_) => messages.push(format!("unlinked {from} -> {to}")),
-            Err(e) => messages.push(format!("failed to run pw-link -d: {e}")),
-        }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state.pw_cmd.send(PwCommand::DestroyLinks { link_ids, reply: reply_tx }).is_err() {
+        return Json(LinkOpResponse { ok: false, message: "pipewire thread unavailable".to_string() });
     }
-    Json(LinkOpResponse { ok: true, message: messages.join("; ") })
+    match reply_rx.await {
+        Ok(Ok(message)) => Json(LinkOpResponse { ok: true, message }),
+        Ok(Err(message)) => Json(LinkOpResponse { ok: false, message }),
+        Err(_) => Json(LinkOpResponse { ok: false, message: "pipewire thread dropped the request".to_string() }),
+    }
 }
 
 pub async fn routing_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -252,7 +256,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 }
 
 async fn send_snapshot(socket: &mut WebSocket, pw: &SharedState) -> Result<(), axum::Error> {
-    let matrix = build_matrix(&pw.lock().unwrap());
+    let matrix = build_matrix(&pw.lock_recover());
     let json = serde_json::to_string(&matrix).unwrap_or_else(|_| "{}".to_string());
     socket.send(Message::Text(json)).await
 }

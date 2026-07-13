@@ -14,3 +14,29 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Serve the built Svelte frontend (frontend/dist) as static files.
+tower-http = { version = "0.6", features = ["fs"] }
+# Pure-Rust decode for announce clips (decode.rs) — replaces an ffmpeg
+# subprocess that pulled ~250-300MB of unrelated GPU/video-transcoding
+# system dependencies into the runtime image for what was only ever
+# "decode a short spoken-word clip." "all" enables every bundled codec/
+# container (mp3, aac, ogg/vorbis, flac, wav, ...); the size cost is a bit
+# more compiled Rust in our own ~8MB binary, not a system dependency
+# tree, so there's no real reason to hand-pick a narrower feature set.
+symphonia = { version = "0.5", features = ["all"] }
+# Pure-Rust mDNS/DNS-SD for auto-discovering RAOP (AirPlay) receivers on the
+# LAN (_raop._tcp) — no avahi/system daemon dependency, so it works the same
+# in the add-on container as on a dev box (needs multicast reachability, i.e.
+# host networking in the container).
+mdns-sd = "0.13"
+# Embedded Sendspin server role (replaces the sendspin-adapter.py subprocess
+# wrapping aiosendspin[server], removing ~212MB of av/numpy/pillow from the
+# runtime image and the last continuous shellout, pw-record, from the audio
+# path — see docs/decisions.md). Pinned to a commit, not a branch: this is
+# our own fork's server-role-prototype branch, not yet merged upstream (only
+# the client/receiver role exists there); a branch reference could move out
+# from under a build. Depends transitively on mdns-sd 0.20, distinct from
+# this crate's own 0.13 (used by discovery.rs for RAOP) — left to resolve as
+# two separate versions rather than risking discovery.rs's working RAOP
+# lookup code to unify them.
+sendspin = { git = "https://github.com/davidgraeff/sendspin-rs.git", rev = "1594c06cf6ace1bee95dde6f2beb088669ca56d6" }

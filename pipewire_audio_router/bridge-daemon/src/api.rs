@@ -1,29 +1,60 @@
 //! REST API: health check, live PipeWire registry state, and manual link
-//! creation (PLAN.md Section 8's eventual routing UI talks to this same
-//! API — Section 9 decision #2). Grows into the custom HA integration's
-//! backing API too.
+//! creation
 
-use crate::pw_config_gen::RAOP_NODE_PREFIX;
-use crate::pw_thread::{ChangeNotifier, SharedState};
-use crate::config::SENDSPIN_NODE_PREFIX;
+use crate::config::{RaopOutputConfig, SENDSPIN_NODE_PREFIX};
+use crate::locks::LockRecover;
+use crate::outputs_store::OutputsStore;
+use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
+use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME, RAOP_NODE_PREFIX};
 use crate::routing;
+use crate::rtp_source::{rtp_source_module_args, DEFAULT_RTP_PORT, RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME};
+use crate::sources_store::{self, RtpSourceConfig, SourcesStore};
+use crate::supervisor::Supervisor;
 use axum::{
     extract::{FromRef, Path, State},
     http::StatusCode,
-    response::Html,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
+use tower_http::services::ServeDir;
 
-/// Shared axum state: both the live PipeWire registry snapshot and the
-/// routing UI's change-notification channel (Section 8, routing.rs).
-/// Existing handlers below extract just `SharedState` via `FromRef` —
-/// they don't need to know this type grew a second field.
+/// Runtime-managed set of RAOP outputs, shared between the CRUD handlers.
+pub type SharedStore = Arc<Mutex<OutputsStore>>;
+
+/// Runtime config for the daemon-supervised source/adapter processes.
+pub type SharedSources = Arc<Mutex<SourcesStore>>;
+
+/// The child-process supervisor (async: spawning/killing awaits). `tokio`'s
+/// mutex, since it's held across `.await`. Sendspin outputs no longer go
+/// through this — they're native, embedded servers (sendspin_server.rs), not
+/// subprocesses. Still used for the AirPlay-receive source (`shairport-sync`).
+pub type SharedSupervisor = Arc<tokio::sync::Mutex<Supervisor>>;
+
+/// Running native sendspin servers, keyed by node name — the in-process
+/// equivalent of what `Supervisor` is for subprocesses. Dropping a handle
+/// tears down everything that output's server started (see
+/// `sendspin_server::SendspinServerHandle`).
+pub type SharedSendspinServers =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::sendspin_server::SendspinServerHandle>>>;
+
+/// Shared axum state: the live PipeWire registry snapshot, the routing UI's
+/// change-notification channel (Section 8, routing.rs), the command sender for
+/// runtime module load/unload (pw_thread.rs), and the persistent outputs store.
+/// Existing handlers extract just the piece they need via `FromRef` — they
+/// don't need to know this type grew more fields.
 #[derive(Clone)]
 pub struct AppState {
     pub pw: SharedState,
     pub changes: ChangeNotifier,
+    pub pw_cmd: PwCommandSender,
+    pub store: SharedStore,
+    pub sources: SharedSources,
+    pub supervisor: SharedSupervisor,
+    pub sendspin_servers: SharedSendspinServers,
 }
 
 impl FromRef<AppState> for SharedState {
@@ -38,15 +69,31 @@ impl FromRef<AppState> for ChangeNotifier {
     }
 }
 
-const ROUTING_UI_HTML: &str = include_str!("../static/routing_ui.html");
-
-pub fn router(pw_state: SharedState, changes: ChangeNotifier) -> Router {
-    let state = AppState { pw: pw_state, changes };
+// Internal wiring, not a public API surface with a stability concern — each
+// param is a distinct shared handle `AppState` needs, not something a struct
+// wrapper would make clearer to call sites (main.rs's one call site).
+#[allow(clippy::too_many_arguments)]
+pub fn router(
+    pw_state: SharedState,
+    changes: ChangeNotifier,
+    pw_cmd: PwCommandSender,
+    store: SharedStore,
+    sources: SharedSources,
+    supervisor: SharedSupervisor,
+    sendspin_servers: SharedSendspinServers,
+    static_dir: PathBuf,
+) -> Router {
+    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_servers };
     Router::new()
-        .route("/", get(routing_ui))
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))
         .route("/api/links", post(create_link))
+        .route("/api/outputs", get(list_outputs).post(add_output))
+        .route("/api/outputs/:node_name", delete(remove_output))
+        .route("/api/source/airplay", get(get_airplay_source).put(set_airplay_source).delete(delete_airplay_source))
+        .route("/api/source/rtp", get(get_rtp_source).put(set_rtp_source).delete(delete_rtp_source))
+        .route("/api/sendspin_outputs", get(list_sendspin_outputs).post(add_sendspin_output))
+        .route("/api/sendspin_outputs/:node_name", delete(remove_sendspin_output))
         .route("/api/media_players", get(list_media_players))
         .route("/api/media_players/:node_id/volume", get(get_volume).post(set_volume))
         .route("/api/media_players/:node_id/announce", post(announce))
@@ -54,11 +101,11 @@ pub fn router(pw_state: SharedState, changes: ChangeNotifier) -> Router {
         .route("/api/routing/link", post(routing::link))
         .route("/api/routing/unlink", post(routing::unlink))
         .route("/api/routing/ws", get(routing::routing_ws))
+        // Everything else (`/`, `/assets/*`, favicon, …) is the built Svelte
+        // SPA (frontend/, served from `static_dir`). `ServeDir` returns
+        // `index.html` for `/`.
+        .fallback_service(ServeDir::new(static_dir))
         .with_state(state)
-}
-
-async fn routing_ui() -> Html<&'static str> {
-    Html(ROUTING_UI_HTML)
 }
 
 async fn health() -> &'static str {
@@ -72,7 +119,7 @@ struct NodesResponse {
 }
 
 async fn list_nodes(State(pw_state): State<SharedState>) -> Json<NodesResponse> {
-    let state = pw_state.lock().unwrap();
+    let state = pw_state.lock_recover();
     Json(NodesResponse {
         nodes: state.nodes.values().cloned().collect(),
         ports: state.ports.values().cloned().collect(),
@@ -84,9 +131,9 @@ async fn list_nodes(State(pw_state): State<SharedState>) -> Json<NodesResponse> 
 /// caller (eventually the routing UI / HA integration, for now this
 /// project's own test scripts) is responsible for pairing FL/FR etc.
 ///
-/// Implemented via a `pw-link` subprocess rather than pipewire-rs's native
-/// `Core::create_object` — a deliberate scope decision, not an oversight;
-/// see pw_thread.rs's module doc for why.
+/// Created natively via `Core::create_object` on the PipeWire thread (see
+/// pw_thread.rs) — the port names are resolved to object ids against the live
+/// registry here, then handed over as a `CreateLinks` command.
 #[derive(Deserialize)]
 struct CreateLinkRequest {
     from_port: String,
@@ -99,48 +146,481 @@ struct CreateLinkResponse {
     message: String,
 }
 
-async fn create_link(Json(req): Json<CreateLinkRequest>) -> (StatusCode, Json<CreateLinkResponse>) {
-    let output = tokio::process::Command::new("pw-link")
-        .arg(&req.from_port)
-        .arg(&req.to_port)
-        .output()
-        .await;
+/// Resolves a full `"node.name:port.name"` string to its `(node_id, port_id)`
+/// in the live registry, or `None` if either isn't present. Splits on the last
+/// `:` so a node name containing `:` still resolves (port names never do).
+fn resolve_port(pw: &SharedState, full_name: &str) -> Option<(u32, u32)> {
+    let (node_name, port_name) = full_name.rsplit_once(':')?;
+    let state = pw.lock_recover();
+    let node_id = state.nodes.values().find(|n| n.node_name == node_name).map(|n| n.node_id)?;
+    let port_id = state
+        .ports
+        .values()
+        .find(|p| p.node_id == node_id && p.port_name == port_name)
+        .map(|p| p.port_id)?;
+    Some((node_id, port_id))
+}
 
-    match output {
-        Ok(output) if output.status.success() => (
-            StatusCode::OK,
-            Json(CreateLinkResponse {
-                ok: true,
-                message: format!("linked {} -> {}", req.from_port, req.to_port),
-            }),
-        ),
-        // pw-link fails with "File exists" if the link is already present.
-        // Treat that as success, not an error — the caller asked for a
-        // link to exist between these two ports, and it does. Without
-        // this, a caller retrying a create-link call (e.g. while racing a
-        // short-lived source node, as real AirPlay sources are — see
-        // spikes/shairport-sync-source.md) sees a spurious failure on the
-        // second attempt even though the first one already succeeded.
-        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("File exists") => (
-            StatusCode::OK,
-            Json(CreateLinkResponse {
-                ok: true,
-                message: format!("{} -> {} already linked", req.from_port, req.to_port),
-            }),
-        ),
-        Ok(output) => (
+async fn create_link(State(app): State<AppState>, Json(req): Json<CreateLinkRequest>) -> (StatusCode, Json<CreateLinkResponse>) {
+    let Some((out_node, out_port)) = resolve_port(&app.pw, &req.from_port) else {
+        return (
             StatusCode::BAD_REQUEST,
-            Json(CreateLinkResponse {
-                ok: false,
-                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            }),
+            Json(CreateLinkResponse { ok: false, message: format!("unknown output port: {}", req.from_port) }),
+        );
+    };
+    let Some((in_node, in_port)) = resolve_port(&app.pw, &req.to_port) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(CreateLinkResponse { ok: false, message: format!("unknown input port: {}", req.to_port) }),
+        );
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = PwCommand::CreateLinks {
+        specs: vec![LinkSpec { out_node, out_port, in_node, in_port }],
+        reply: reply_tx,
+    };
+    if app.pw_cmd.send(cmd).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CreateLinkResponse { ok: false, message: "pipewire thread unavailable".to_string() }),
+        );
+    }
+    match reply_rx.await {
+        Ok(Ok(message)) => (StatusCode::OK, Json(CreateLinkResponse { ok: true, message })),
+        Ok(Err(message)) => (StatusCode::BAD_REQUEST, Json(CreateLinkResponse { ok: false, message })),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CreateLinkResponse { ok: false, message: "pipewire thread dropped the request".to_string() }),
+        ),
+    }
+}
+
+// ---- Runtime-managed RAOP outputs ----------------------------------------
+//
+// Hot-reloadable: add/remove loads/unloads one `libpipewire-module-raop-sink`
+// into the daemon's own PipeWire context, live, with no restart and no
+// disturbance to audio on the other outputs. See docs/decisions.md "Loading
+// PipeWire modules at runtime". The outputs store (outputs_store.rs) is the
+// persistent source of truth; the live registry is what actually has a node.
+
+/// One configured RAOP output, plus whether its module is loaded right now
+/// (its node is present in the live registry). `loaded` can be `false` briefly
+/// after add if the node hasn't been observed yet, or if libpipewire dropped
+/// the module.
+#[derive(Serialize)]
+struct OutputInfo {
+    name: String,
+    ip: String,
+    port: u16,
+    encryption: String,
+    node_name: String,
+    loaded: bool,
+}
+
+#[derive(Serialize)]
+struct OutputOpResponse {
+    ok: bool,
+    message: String,
+}
+
+async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
+    // Snapshot which RAOP node names PipeWire actually has right now, then
+    // release that lock before touching the store.
+    let present: std::collections::HashSet<String> = {
+        let pw = state.pw.lock_recover();
+        pw.nodes.values().map(|n| n.node_name.clone()).collect()
+    };
+    let store = state.store.lock_recover();
+    let outputs = store
+        .list()
+        .iter()
+        .map(|o| {
+            let node_name = raop_node_name(&o.name);
+            OutputInfo {
+                loaded: present.contains(&node_name),
+                node_name,
+                name: o.name.clone(),
+                ip: o.ip.clone(),
+                port: o.port,
+                encryption: o.encryption.as_pipewire_arg().to_string(),
+            }
+        })
+        .collect();
+    Json(outputs)
+}
+
+/// Add a RAOP output and load its module live. Request body is a full output
+/// config (`{ "name", "ip", "port"?, "encryption"? }`) — the same shape as one
+/// entry of the add-on's `outputs`. The module is loaded first; only on success
+/// is the output persisted, so a failed load leaves no stale store entry.
+async fn add_output(
+    State(state): State<AppState>,
+    Json(output): Json<RaopOutputConfig>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let node_name = raop_node_name(&output.name);
+
+    if state.store.lock_recover().contains(&node_name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(OutputOpResponse { ok: false, message: format!("output '{}' already exists", output.name) }),
+        );
+    }
+
+    let args = raop_module_args(&output);
+    let (tx, rx) = oneshot::channel();
+    if state
+        .pw_cmd
+        .send(PwCommand::Load { node_name: node_name.clone(), module_name: RAOP_MODULE_NAME.to_string(), args, reply: tx })
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+        );
+    }
+
+    match rx.await {
+        Ok(Ok(())) => match state.store.lock_recover().add(output) {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(OutputOpResponse { ok: true, message: format!("added output '{node_name}'") }),
+            ),
+            // Loaded but not persisted: works this session, wouldn't survive a
+            // restart — report it rather than pretend clean success.
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OutputOpResponse { ok: false, message: format!("loaded '{node_name}' but failed to persist it: {e}") }),
+            ),
+        },
+        Ok(Err(e)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(OutputOpResponse { ok: false, message: format!("failed to load RAOP module: {e}") }),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: "no reply from PipeWire thread".to_string() }),
+        ),
+    }
+}
+
+/// Remove a RAOP output by node name and unload its module live. Unload is
+/// idempotent, so the store entry is dropped regardless — the caller's intent
+/// ("gone") always holds afterward.
+async fn remove_output(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if !state.store.lock_recover().contains(&node_name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(OutputOpResponse { ok: false, message: format!("no such output: {node_name}") }),
+        );
+    }
+
+    let (tx, rx) = oneshot::channel();
+    if state
+        .pw_cmd
+        .send(PwCommand::Unload { node_name: node_name.clone(), reply: tx })
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+        );
+    }
+    let unloaded = rx.await;
+    let removed = state.store.lock_recover().remove(&node_name);
+
+    match (unloaded, removed) {
+        (Ok(Ok(())), Ok(_)) => (
+            StatusCode::OK,
+            Json(OutputOpResponse { ok: true, message: format!("removed output '{node_name}'") }),
+        ),
+        (_, Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("unloaded '{node_name}' but failed to persist removal: {e}") }),
+        ),
+        (Ok(Err(e)), _) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to unload module: {e}") }),
+        ),
+        (Err(_), _) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: "no reply from PipeWire thread".to_string() }),
+        ),
+    }
+}
+
+// ---- Daemon-supervised source/adapter processes ---------------------------
+//
+// The AirPlay-receive source (shairport-sync) and sendspin outputs
+// (sendspin-adapter.py) are external processes, not PipeWire modules — the
+// daemon supervises them (supervisor.rs) from config persisted in the sources
+// store (sources_store.rs, seeded from options.json). Same "runtime, no
+// restart" model as /api/outputs, backed by child processes.
+
+#[derive(Serialize)]
+struct AirplaySourceInfo {
+    /// `None` when the source is disabled.
+    name: Option<String>,
+    /// Whether the `shairport-sync` process is running right now.
+    running: bool,
+}
+
+#[derive(Deserialize)]
+struct SetAirplaySourceRequest {
+    /// The advertised AirPlay name; an empty string disables the source.
+    name: String,
+}
+
+async fn get_airplay_source(State(state): State<AppState>) -> Json<AirplaySourceInfo> {
+    let name = state.sources.lock_recover().airplay_source_name().map(str::to_string);
+    let running = state.supervisor.lock().await.is_running(sources_store::AIRPLAY_KEY);
+    Json(AirplaySourceInfo { name, running })
+}
+
+async fn set_airplay_source(
+    State(state): State<AppState>,
+    Json(req): Json<SetAirplaySourceRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    // Persist first, then reconcile the process to the (normalized) stored value.
+    let stored = {
+        let mut sources = state.sources.lock_recover();
+        if let Err(e) = sources.set_airplay_source_name(Some(req.name.clone())) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+            );
+        }
+        sources.airplay_source_name().map(str::to_string)
+    };
+
+    let mut supervisor = state.supervisor.lock().await;
+    match stored {
+        Some(name) => match supervisor.respawn(sources_store::AIRPLAY_KEY, &sources_store::airplay_spec(&name)).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(OutputOpResponse { ok: true, message: format!("AirPlay source set to '{name}'") }),
+            ),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(OutputOpResponse { ok: false, message: format!("saved '{name}' but failed to start it: {e}") }),
+            ),
+        },
+        None => {
+            supervisor.stop(sources_store::AIRPLAY_KEY).await;
+            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() }))
+        }
+    }
+}
+
+async fn delete_airplay_source(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
+    if let Err(e) = state.sources.lock_recover().set_airplay_source_name(None) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+        );
+    }
+    state.supervisor.lock().await.stop(sources_store::AIRPLAY_KEY).await;
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() }))
+}
+
+// ---- RTP source (Bluetooth bridge firmware target) ------------------------
+//
+// A single source, but — unlike the AirPlay source — a native PipeWire module,
+// not a subprocess. So it's loaded/unloaded via the PipeWire thread
+// (PwCommand::Load/Unload, keyed by RTP_SOURCE_NODE_NAME), exactly like a RAOP
+// sink, rather than through the process supervisor. Enable/disable and
+// re-point the port live, no restart. Once loaded, its node shows up in the
+// routing matrix automatically (routing.rs classifies it as a source).
+
+#[derive(Serialize)]
+struct RtpSourceInfo {
+    /// Whether the source is enabled in the store.
+    enabled: bool,
+    /// UDP port it listens on (the stored value, or the default when disabled).
+    port: u16,
+    /// Whether the `bt-bridge-rtp` node is actually present in the live
+    /// registry right now — the module analogue of the AirPlay source's
+    /// `running`. Can lag briefly after enabling, or be `false` if libpipewire
+    /// refused the load.
+    loaded: bool,
+}
+
+#[derive(Deserialize)]
+struct SetRtpSourceRequest {
+    /// UDP port to listen on; must match the firmware's configured target port.
+    #[serde(default = "default_rtp_source_port")]
+    port: u16,
+}
+
+fn default_rtp_source_port() -> u16 {
+    DEFAULT_RTP_PORT
+}
+
+/// Whether the RTP source node is present in the live registry right now.
+fn rtp_source_loaded(pw: &SharedState) -> bool {
+    pw.lock_recover().nodes.values().any(|n| n.node_name == RTP_SOURCE_NODE_NAME)
+}
+
+/// (Re)load the rtp-source module on `port`. Unloads any existing instance
+/// first so a re-enable or a port change is a clean reload — `Load` errors if
+/// a module is already registered under the node name. Unload is idempotent, so
+/// its result is intentionally ignored.
+async fn reload_rtp_source(pw_cmd: &PwCommandSender, port: u16) -> Result<(), String> {
+    let (tx, rx) = oneshot::channel();
+    if pw_cmd.send(PwCommand::Unload { node_name: RTP_SOURCE_NODE_NAME.to_string(), reply: tx }).is_err() {
+        return Err("PipeWire thread is not running".to_string());
+    }
+    let _ = rx.await;
+
+    let args = rtp_source_module_args(port);
+    let (tx, rx) = oneshot::channel();
+    if pw_cmd
+        .send(PwCommand::Load {
+            node_name: RTP_SOURCE_NODE_NAME.to_string(),
+            module_name: RTP_SOURCE_MODULE_NAME.to_string(),
+            args,
+            reply: tx,
+        })
+        .is_err()
+    {
+        return Err("PipeWire thread is not running".to_string());
+    }
+    match rx.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("no reply from PipeWire thread".to_string()),
+    }
+}
+
+async fn get_rtp_source(State(state): State<AppState>) -> Json<RtpSourceInfo> {
+    let cfg = state.sources.lock_recover().rtp_source();
+    Json(RtpSourceInfo {
+        enabled: cfg.is_some(),
+        port: cfg.map(|c| c.port).unwrap_or(DEFAULT_RTP_PORT),
+        loaded: rtp_source_loaded(&state.pw),
+    })
+}
+
+/// Enable the RTP source (or change its port). Persists first, then reconciles
+/// the module — same "saved even if the load fails" contract as the AirPlay
+/// source, so a transient PipeWire failure never silently drops the setting.
+async fn set_rtp_source(
+    State(state): State<AppState>,
+    Json(req): Json<SetRtpSourceRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if let Err(e) = state.sources.lock_recover().set_rtp_source(Some(RtpSourceConfig { port: req.port })) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+        );
+    }
+    match reload_rtp_source(&state.pw_cmd, req.port).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(OutputOpResponse { ok: true, message: format!("RTP source enabled on port {}", req.port) }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(OutputOpResponse { ok: false, message: format!("saved port {} but failed to start it: {e}", req.port) }),
+        ),
+    }
+}
+
+async fn delete_rtp_source(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
+    if let Err(e) = state.sources.lock_recover().set_rtp_source(None) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+        );
+    }
+    let (tx, rx) = oneshot::channel();
+    if state.pw_cmd.send(PwCommand::Unload { node_name: RTP_SOURCE_NODE_NAME.to_string(), reply: tx }).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+        );
+    }
+    let _ = rx.await;
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "RTP source disabled".to_string() }))
+}
+
+#[derive(Serialize)]
+struct SendspinInfo {
+    name: String,
+    port: u16,
+    node_name: String,
+    /// Whether this output's native embedded sendspin server is running now.
+    running: bool,
+}
+
+#[derive(Deserialize)]
+struct AddSendspinRequest {
+    name: String,
+}
+
+async fn list_sendspin_outputs(State(state): State<AppState>) -> Json<Vec<SendspinInfo>> {
+    let outputs = state.sources.lock_recover().sendspin_outputs().to_vec();
+    let servers = state.sendspin_servers.lock().await;
+    let infos = outputs
+        .into_iter()
+        .map(|o| {
+            let node_name = o.node_name();
+            let running = servers.get(&node_name).is_some_and(|h| h.is_running());
+            SendspinInfo { name: o.name, port: o.port, node_name, running }
+        })
+        .collect();
+    Json(infos)
+}
+
+async fn add_sendspin_output(
+    State(state): State<AppState>,
+    Json(req): Json<AddSendspinRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let output = {
+        let mut sources = state.sources.lock_recover();
+        match sources.add_sendspin(&req.name) {
+            Ok(o) => o,
+            Err(e) => return (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: e.to_string() })),
+        }
+    };
+    let node_name = output.node_name();
+    match crate::sendspin_server::start(&output, state.pw.clone(), state.pw_cmd.clone()).await {
+        Ok(handle) => {
+            state.sendspin_servers.lock().await.insert(node_name, handle);
+            (
+                StatusCode::CREATED,
+                Json(OutputOpResponse { ok: true, message: format!("added sendspin output '{}' on port {}", output.name, output.port) }),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(OutputOpResponse { ok: false, message: format!("added '{}' but failed to start it: {e}", output.name) }),
+        ),
+    }
+}
+
+async fn remove_sendspin_output(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let removed = state.sources.lock_recover().remove_sendspin(&node_name);
+    match removed {
+        Ok(Some(_)) => {
+            // Dropping the handle tears down every task/thread that output's
+            // server started (see SendspinServerHandle's Drop impl).
+            state.sendspin_servers.lock().await.remove(&node_name);
+            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed sendspin output '{node_name}'") }))
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(OutputOpResponse { ok: false, message: format!("no such sendspin output: {node_name}") }),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CreateLinkResponse {
-                ok: false,
-                message: format!("failed to run pw-link: {e}"),
-            }),
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist removal: {e}") }),
         ),
     }
 }
@@ -161,17 +641,17 @@ struct MediaPlayerInfo {
     /// see PLAN.md Section 6 for why this entity's state model is
     /// necessarily simpler than a real playback device's.
     state: &'static str,
-    /// Included inline (one `wpctl` call per output, run concurrently)
+    /// Included inline (read natively from the node's Props param, volume.rs)
     /// rather than requiring the HA integration to make a second request
-    /// per output on every poll — `None` if `wpctl` failed for that node.
+    /// per output on every poll — `None` if the node has no volume control.
     volume: Option<f32>,
 }
 
 async fn list_media_players(State(pw_state): State<SharedState>) -> Json<Vec<MediaPlayerInfo>> {
-    // Snapshot and release the lock before the async wpctl calls below —
+    // Snapshot and release the lock before the async volume reads below —
     // std::sync::MutexGuard isn't safe to hold across an .await point.
     let candidates: Vec<(u32, String, bool)> = {
-        let state = pw_state.lock().unwrap();
+        let state = pw_state.lock_recover();
         state
             .nodes
             .values()
@@ -184,7 +664,7 @@ async fn list_media_players(State(pw_state): State<SharedState>) -> Json<Vec<Med
     // rooms), and this avoids pulling in a join_all dependency for it.
     let mut players = Vec::with_capacity(candidates.len());
     for (node_id, node_name, playing) in candidates {
-        let volume = fetch_wpctl_volume(node_id).await;
+        let volume = crate::volume::get_volume(node_id).await.ok().flatten();
         players.push(MediaPlayerInfo {
             node_id,
             node_name,
@@ -196,65 +676,20 @@ async fn list_media_players(State(pw_state): State<SharedState>) -> Json<Vec<Med
     Json(players)
 }
 
-async fn fetch_wpctl_volume(node_id: u32) -> Option<f32> {
-    let output = tokio::process::Command::new("wpctl")
-        .arg("get-volume")
-        .arg(node_id.to_string())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_wpctl_volume(&String::from_utf8_lossy(&output.stdout))
-}
-
 #[derive(Serialize)]
 struct VolumeResponse {
     volume: Option<f32>,
     message: Option<String>,
 }
 
-/// `wpctl get-volume`'s only output format, confirmed empirically:
-/// `Volume: 0.50` (optionally with a trailing `[MUTED]`).
-fn parse_wpctl_volume(stdout: &str) -> Option<f32> {
-    stdout.trim().strip_prefix("Volume:")?.split_whitespace().next()?.parse().ok()
-}
-
 async fn get_volume(Path(node_id): Path<u32>) -> (StatusCode, Json<VolumeResponse>) {
-    let output = tokio::process::Command::new("wpctl")
-        .arg("get-volume")
-        .arg(node_id.to_string())
-        .output()
-        .await;
-    match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            match parse_wpctl_volume(&stdout) {
-                Some(volume) => (StatusCode::OK, Json(VolumeResponse { volume: Some(volume), message: None })),
-                None => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(VolumeResponse {
-                        volume: None,
-                        message: Some(format!("could not parse wpctl output: {stdout}")),
-                    }),
-                ),
-            }
-        }
-        Ok(output) => (
-            StatusCode::BAD_REQUEST,
-            Json(VolumeResponse {
-                volume: None,
-                message: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
-            }),
+    match crate::volume::get_volume(node_id).await {
+        Ok(Some(volume)) => (StatusCode::OK, Json(VolumeResponse { volume: Some(volume), message: None })),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(VolumeResponse { volume: None, message: Some(format!("node {node_id} has no volume control")) }),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(VolumeResponse {
-                volume: None,
-                message: Some(format!("failed to run wpctl: {e}")),
-            }),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(VolumeResponse { volume: None, message: Some(e) })),
     }
 }
 
@@ -266,28 +701,9 @@ struct SetVolumeRequest {
 }
 
 async fn set_volume(Path(node_id): Path<u32>, Json(req): Json<SetVolumeRequest>) -> (StatusCode, Json<VolumeResponse>) {
-    let output = tokio::process::Command::new("wpctl")
-        .arg("set-volume")
-        .arg(node_id.to_string())
-        .arg(req.volume.to_string())
-        .output()
-        .await;
-    match output {
-        Ok(output) if output.status.success() => (StatusCode::OK, Json(VolumeResponse { volume: Some(req.volume), message: None })),
-        Ok(output) => (
-            StatusCode::BAD_REQUEST,
-            Json(VolumeResponse {
-                volume: None,
-                message: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(VolumeResponse {
-                volume: None,
-                message: Some(format!("failed to run wpctl: {e}")),
-            }),
-        ),
+    match crate::volume::set_volume(node_id, req.volume).await {
+        Ok(()) => (StatusCode::OK, Json(VolumeResponse { volume: Some(req.volume), message: None })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(VolumeResponse { volume: None, message: Some(e) })),
     }
 }
 
@@ -296,16 +712,18 @@ async fn set_volume(Path(node_id): Path<u32>, Json(req): Json<SetVolumeRequest>)
 /// volume (not link volume — PipeWire Links have no Props/gain stage at
 /// all, only a Format param; disproven empirically in
 /// spikes/05-tts-ducking-mechanism.md), plays the announce clip into the
-/// sink via `pw-cat --target`, then restores every ducked source to its
-/// original volume, always — even if playback fails — so an announce
-/// error can never leave music stuck at duck volume.
+/// sink natively via a `pw::stream` (player.rs), then restores every ducked
+/// source to its original volume, always — even if playback fails — so an
+/// announce error can never leave music stuck at duck volume.
 ///
 /// The announce audio itself comes from exactly one of two mutually
 /// exclusive sources — **additive**, not a v1→v2 migration (Phase 3.5):
 /// - `url` (**v1**, unchanged): a rendered TTS clip fetched over HTTP
 ///   (LAN-local, e.g. HA's own `tts` integration), decoded to WAV via
-///   ffmpeg (pw-cat/libsndfile can't decode compressed formats like mp3
-///   itself).
+///   `decode.rs` (pure-Rust `symphonia` — pw-cat/libsndfile can't decode
+///   compressed formats like mp3 itself, and shelling out to `ffmpeg` for
+///   this used to pull ~250-300MB of unrelated GPU/video-transcoding
+///   system dependencies into the runtime image for no benefit here).
 /// - `wyoming` (**v2**, new): synthesized directly against a local
 ///   Wyoming TTS server (e.g. Piper, see wyoming.rs), skipping the
 ///   render-to-file-then-HTTP-fetch round trip for lower first-audible-
@@ -355,7 +773,7 @@ async fn announce(
     Json(req): Json<AnnounceRequest>,
 ) -> (StatusCode, Json<AnnounceResponse>) {
     let (target_name, source_node_ids): (String, Vec<u32>) = {
-        let state = pw_state.lock().unwrap();
+        let state = pw_state.lock_recover();
         match state.nodes.get(&node_id) {
             Some(target) => {
                 // A stereo source contributes two Link objects (FL + FR)
@@ -430,16 +848,29 @@ async fn announce(
             );
         }
 
-        let ffmpeg_result = tokio::process::Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-i")
-            .arg(&fetch_path)
-            .arg(&wav_path)
-            .output()
-            .await;
+        let decode_result = crate::decode::decode_file_to_wav(&fetch_path).await;
         let _ = tokio::fs::remove_file(&fetch_path).await;
-        if let Err(e) = check_command_result(ffmpeg_result, "ffmpeg") {
-            return (StatusCode::BAD_REQUEST, Json(AnnounceResponse { ok: false, message: e }));
+        match decode_result {
+            Ok(wav_bytes) => {
+                if let Err(e) = tokio::fs::write(&wav_path, &wav_bytes).await {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(AnnounceResponse {
+                            ok: false,
+                            message: format!("failed to write decoded audio: {e}"),
+                        }),
+                    );
+                }
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AnnounceResponse {
+                        ok: false,
+                        message: format!("failed to decode announce audio: {e}"),
+                    }),
+                )
+            }
         }
     } else if let Some(w) = wyoming_req {
         // No ffmpeg decode step needed here — we build the WAV ourselves
@@ -470,28 +901,31 @@ async fn announce(
 
     let mut original_volumes = Vec::with_capacity(source_node_ids.len());
     for &src_id in &source_node_ids {
-        if let Some(vol) = fetch_wpctl_volume(src_id).await {
+        if let Ok(Some(vol)) = crate::volume::get_volume(src_id).await {
             original_volumes.push((src_id, vol));
-            let _ = set_wpctl_volume(src_id, req.duck_volume).await;
+            let _ = crate::volume::set_volume(src_id, req.duck_volume).await;
         }
     }
 
-    let play_result = tokio::process::Command::new("pw-cat")
-        .arg("--target")
-        .arg(&target_name)
-        .arg("--playback")
-        .arg(&wav_path)
-        .output()
-        .await;
-
-    // Restore unconditionally, before inspecting play_result — a failed
-    // announce must never leave music stuck at duck volume.
-    for (src_id, vol) in &original_volumes {
-        let _ = set_wpctl_volume(*src_id, *vol).await;
-    }
+    // Play the WAV natively (pw::stream on a blocking thread — player.rs),
+    // replacing a `pw-cat --playback` subprocess. `play_wav_to_target` blocks
+    // until the clip has drained, matching pw-cat's blocking behaviour.
+    let wav_bytes = tokio::fs::read(&wav_path).await;
     let _ = tokio::fs::remove_file(&wav_path).await;
+    let play_result = match wav_bytes {
+        Ok(bytes) => tokio::task::spawn_blocking(move || crate::player::play_wav_to_target(node_id, &bytes))
+            .await
+            .unwrap_or_else(|e| Err(format!("playback task panicked: {e}"))),
+        Err(e) => Err(format!("could not read announce audio back: {e}")),
+    };
 
-    match check_command_result(play_result, "pw-cat") {
+    // Restore unconditionally, after playback returns — a failed announce must
+    // never leave music stuck at duck volume.
+    for (src_id, vol) in &original_volumes {
+        let _ = crate::volume::set_volume(*src_id, *vol).await;
+    }
+
+    match play_result {
         Ok(()) => (
             StatusCode::OK,
             Json(AnnounceResponse {
@@ -503,28 +937,9 @@ async fn announce(
     }
 }
 
-fn check_command_result(result: std::io::Result<std::process::Output>, program: &str) -> Result<(), String> {
-    match result {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(format!("{program} failed: {}", String::from_utf8_lossy(&output.stderr).trim())),
-        Err(e) => Err(format!("failed to run {program}: {e}")),
-    }
-}
-
 async fn fetch_to_file(url: &str, path: &std::path::Path) -> anyhow::Result<()> {
     let response = reqwest::get(url).await?.error_for_status()?;
     let bytes = response.bytes().await?;
     tokio::fs::write(path, &bytes).await?;
     Ok(())
-}
-
-async fn set_wpctl_volume(node_id: u32, volume: f32) -> bool {
-    tokio::process::Command::new("wpctl")
-        .arg("set-volume")
-        .arg(node_id.to_string())
-        .arg(volume.to_string())
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }

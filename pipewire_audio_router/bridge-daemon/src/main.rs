@@ -1,16 +1,34 @@
 mod api;
 mod config;
-mod pw_config_gen;
+mod decode;
+mod discovery;
+mod locks;
+mod outputs_store;
+mod player;
+mod pw_module;
 mod pw_thread;
+mod raop;
 mod routing;
+mod rtp_source;
+mod sendspin_capture;
+mod sendspin_server;
+mod sources_store;
+mod supervisor;
+mod volume;
+mod wav;
 mod wyoming;
 
+use crate::locks::LockRecover;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-const DEFAULT_OPTIONS_PATH: &str = "/data/options.json";
-const DEFAULT_CONF_D_PATH: &str = "/etc/pipewire/pipewire.conf.d/10-outputs.conf";
-const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
+const DEFAULT_STORE_PATH: &str = "/data/raop-outputs.json";
+const DEFAULT_SOURCES_PATH: &str = "/data/sources.json";
+// Not 8080: with host_network the daemon binds a real host port, and 8080 is a
+// very common add-on port (collisions are likely). 8099 is distinctive and
+// rarely used; override with --listen (and config.yaml ingress_port) if needed.
+const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8099";
+const DEFAULT_STATIC_DIR: &str = "/app/www";
 
 #[derive(Parser)]
 struct Cli {
@@ -20,33 +38,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Render the static PipeWire conf.d snippet for configured RAOP
-    /// outputs. Must run (and its output must exist) before `pipewire`
-    /// itself starts — see pw_config_gen.rs for why this can't be done at
-    /// runtime instead.
-    GenerateConfig {
-        #[arg(long, default_value = DEFAULT_OPTIONS_PATH)]
-        options: PathBuf,
-        #[arg(long, default_value = DEFAULT_CONF_D_PATH)]
-        out: PathBuf,
-    },
     /// Run the long-lived daemon: connect to the already-running PipeWire
-    /// instance and serve the REST API.
+    /// instance, load a `raop-sink` module for every stored RAOP output, start
+    /// every stored source/adapter process, and serve the REST API — all of
+    /// which can be reconfigured live (api.rs's `/api/outputs`,
+    /// `/api/source/airplay`, `/api/sendspin_outputs`).
     Serve {
-        #[arg(long, default_value = DEFAULT_OPTIONS_PATH)]
-        options: PathBuf,
+        /// Persistent, runtime-managed RAOP output store.
+        #[arg(long, default_value = DEFAULT_STORE_PATH)]
+        store: PathBuf,
+        /// Persistent, runtime-managed store for the supervised source/adapter
+        /// processes (AirPlay source, sendspin outputs).
+        #[arg(long, default_value = DEFAULT_SOURCES_PATH)]
+        sources: PathBuf,
+        /// Directory of the built web UI (frontend/dist) served as static files.
+        #[arg(long, default_value = DEFAULT_STATIC_DIR)]
+        static_dir: PathBuf,
         #[arg(long, default_value = DEFAULT_HTTP_ADDR)]
         listen: String,
-    },
-    /// Print every non-PipeWire/WirePlumber process `run.sh` needs to
-    /// start, one per line, as tab-separated fields: `run.sh` shells out
-    /// to this instead of re-implementing options.json parsing in bash.
-    /// Lines:
-    ///   airplay_source\t<display name>
-    ///   sendspin_adapter\t<node name>\t<display name>\t<port>
-    RuntimePlan {
-        #[arg(long, default_value = DEFAULT_OPTIONS_PATH)]
-        options: PathBuf,
     },
 }
 
@@ -60,64 +69,205 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::GenerateConfig { options, out } => generate_config(&options, &out),
-        Command::Serve { options, listen } => serve(&options, &listen),
-        Command::RuntimePlan { options } => runtime_plan(&options),
+        Command::Serve { store, sources, static_dir, listen } => serve(&store, &sources, &static_dir, &listen),
     }
 }
 
-fn runtime_plan(options_path: &std::path::Path) -> anyhow::Result<()> {
-    let options = config::AddonOptions::load(options_path)?;
-    for component in options.runtime_components() {
-        match component {
-            config::RuntimeComponent::AirplaySource { display_name } => {
-                println!("airplay_source\t{display_name}");
-            }
-            config::RuntimeComponent::SendspinAdapter {
-                node_name,
-                display_name,
-                port,
-            } => {
-                println!("sendspin_adapter\t{node_name}\t{display_name}\t{port}");
-            }
+/// Reads `BRIDGE_DISCOVERY`: unset or `on`/`1`/`true` → load discovered
+/// receivers, `log` → dry-run (report only), `off`/`0`/`false`/`no` → disabled
+/// (returns `None`).
+fn discovery_mode() -> Option<discovery::Mode> {
+    match std::env::var("BRIDGE_DISCOVERY").ok().as_deref().map(str::trim) {
+        None | Some("") | Some("on") | Some("1") | Some("true") | Some("yes") => Some(discovery::Mode::Load),
+        Some("log") | Some("dry-run") | Some("dryrun") => Some(discovery::Mode::DryRun),
+        Some("off") | Some("0") | Some("false") | Some("no") => None,
+        Some(other) => {
+            tracing::warn!("unrecognized BRIDGE_DISCOVERY='{other}'; defaulting to enabled");
+            Some(discovery::Mode::Load)
         }
     }
-    Ok(())
 }
 
-fn generate_config(options_path: &std::path::Path, out_path: &std::path::Path) -> anyhow::Result<()> {
-    let options = config::AddonOptions::load(options_path)?;
-    let rendered = pw_config_gen::render(&options);
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out_path, rendered)?;
+fn serve(store_path: &Path, sources_path: &Path, static_dir: &Path, listen: &str) -> anyhow::Result<()> {
+    // No options.json seeding: both stores start empty on a fresh install and
+    // are populated entirely at runtime via the API (and mDNS discovery).
+    let store = outputs_store::OutputsStore::load(store_path)?;
+    tracing::info!("{} RAOP output(s) in store {}", store.list().len(), store_path.display());
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+
+    let sources = sources_store::SourcesStore::load(sources_path)?;
     tracing::info!(
-        "wrote PipeWire config for {} output(s) to {}",
-        options.outputs.len(),
-        out_path.display()
+        "sources: airplay={:?}, rtp={:?}, {} sendspin output(s) in {}",
+        sources.airplay_source_name(),
+        sources.rtp_source().map(|c| c.port),
+        sources.sendspin_outputs().len(),
+        sources_path.display()
     );
-    Ok(())
-}
+    let sources = std::sync::Arc::new(std::sync::Mutex::new(sources));
+    let supervisor = std::sync::Arc::new(tokio::sync::Mutex::new(supervisor::Supervisor::new()));
+    let sendspin_servers: api::SharedSendspinServers =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-fn serve(options_path: &std::path::Path, listen: &str) -> anyhow::Result<()> {
-    // Config is loaded here too (even though pipewire.conf.d was already
-    // generated by a prior `generate-config` run) so the API can eventually
-    // report on outputs the user configured but that haven't shown up in
-    // the PipeWire registry yet (e.g. misconfigured IP) — not used for that
-    // yet in this skeleton, but loading it now avoids a second entrypoint
-    // convention later.
-    let options = config::AddonOptions::load(options_path)?;
-    tracing::info!("loaded {} configured output(s)", options.outputs.len());
+    let (pw_state, changes, pw_cmd) = pw_thread::spawn()?;
 
-    let (pw_state, changes) = pw_thread::spawn()?;
+    // mDNS auto-discovery of RAOP receivers (overrides-only: store-managed
+    // outputs win, everything else is picked up live). `BRIDGE_DISCOVERY`
+    // controls it: unset/`on` loads discovered receivers, `log` only reports
+    // what it finds (safe dry-run), `off` disables it. The daemon handle must
+    // stay alive for discovery to keep running, so it's held for the whole
+    // process via `_discovery` (serve never returns in practice).
+    let _discovery = match discovery_mode() {
+        Some(mode) => match discovery::spawn(pw_cmd.clone(), store.clone(), mode) {
+            Ok(daemon) => {
+                tracing::info!("mDNS RAOP discovery started ({mode:?})");
+                Some(daemon)
+            }
+            Err(e) => {
+                tracing::warn!("mDNS discovery unavailable ({e}); continuing without it");
+                None
+            }
+        },
+        None => {
+            tracing::info!("mDNS RAOP discovery disabled (BRIDGE_DISCOVERY=off)");
+            None
+        }
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let app = api::router(pw_state, changes);
+        // Load a module for every stored RAOP output before serving. The
+        // PipeWire thread processes these once its loop is running (and the
+        // context is connected), so awaiting each reply here is safe.
+        let outputs: Vec<config::RaopOutputConfig> = store.lock_recover().list().to_vec();
+        for output in outputs {
+            let node_name = raop::raop_node_name(&output.name);
+            let args = raop::raop_module_args(&output);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let sent = pw_cmd.send(pw_thread::PwCommand::Load {
+                node_name: node_name.clone(),
+                module_name: raop::RAOP_MODULE_NAME.to_string(),
+                args,
+                reply: tx,
+            });
+            if sent.is_err() {
+                tracing::error!("PipeWire thread unavailable while loading '{node_name}'");
+                continue;
+            }
+            match rx.await {
+                Ok(Ok(())) => tracing::info!("loaded RAOP output '{node_name}'"),
+                // A bad device must not abort startup — the others still load,
+                // and it can be fixed/re-added live via the API.
+                Ok(Err(e)) => tracing::warn!("skipping RAOP output '{node_name}': {e}"),
+                Err(_) => tracing::warn!("no reply loading RAOP output '{node_name}'"),
+            }
+        }
+
+        // Start every stored source/adapter process (AirPlay source via
+        // Supervisor; sendspin outputs as native embedded servers). A failed
+        // spawn is logged, not fatal — the rest still start and it can be
+        // re-added live.
+        spawn_stored_sources(&sources, &supervisor, &sendspin_servers, pw_state.clone(), pw_cmd.clone()).await;
+
+        let app = api::router(
+            pw_state,
+            changes,
+            pw_cmd,
+            store,
+            sources,
+            supervisor.clone(),
+            sendspin_servers.clone(),
+            static_dir.to_path_buf(),
+        );
         let listener = tokio::net::TcpListener::bind(listen).await?;
         tracing::info!("listening on {listen}");
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+
+        // On SIGTERM/SIGINT (run.sh's trap / container stop), kill the child
+        // processes and tear down the native sendspin servers we own before
+        // exiting so nothing is orphaned.
+        tracing::info!("shutting down; stopping supervised processes");
+        supervisor.lock().await.stop_all().await;
+        sendspin_servers.lock().await.clear();
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Spawns the AirPlay source (via `Supervisor`) and every sendspin output
+/// (as a native embedded server — see sendspin_server.rs) from the persisted
+/// sources store.
+async fn spawn_stored_sources(
+    sources: &api::SharedSources,
+    supervisor: &api::SharedSupervisor,
+    sendspin_servers: &api::SharedSendspinServers,
+    pw_state: pw_thread::SharedState,
+    pw_cmd: pw_thread::PwCommandSender,
+) {
+    // Snapshot the config and drop the (std) lock before awaiting anything.
+    let (airplay, sendspins, rtp) = {
+        let s = sources.lock_recover();
+        (s.airplay_source_name().map(str::to_string), s.sendspin_outputs().to_vec(), s.rtp_source())
+    };
+
+    // The RTP source (bt-bridge) is a native PipeWire module, not a subprocess
+    // — load it via the PipeWire thread like a RAOP sink, not the supervisor. A
+    // failed load is logged, not fatal; it can be re-enabled live via the API.
+    if let Some(rtp) = rtp {
+        let args = rtp_source::rtp_source_module_args(rtp.port);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sent = pw_cmd.send(pw_thread::PwCommand::Load {
+            node_name: rtp_source::RTP_SOURCE_NODE_NAME.to_string(),
+            module_name: rtp_source::RTP_SOURCE_MODULE_NAME.to_string(),
+            args,
+            reply: tx,
+        });
+        if sent.is_err() {
+            tracing::error!("PipeWire thread unavailable while loading RTP source");
+        } else {
+            match rx.await {
+                Ok(Ok(())) => tracing::info!("started RTP source on port {}", rtp.port),
+                Ok(Err(e)) => tracing::warn!("failed to start RTP source: {e}"),
+                Err(_) => tracing::warn!("no reply loading RTP source"),
+            }
+        }
+    }
+
+    if let Some(name) = airplay {
+        match supervisor.lock().await.respawn(sources_store::AIRPLAY_KEY, &sources_store::airplay_spec(&name)).await {
+            Ok(()) => tracing::info!("started AirPlay source '{name}'"),
+            Err(e) => tracing::warn!("failed to start AirPlay source '{name}': {e}"),
+        }
+    }
+    for output in sendspins {
+        let node_name = output.node_name();
+        match sendspin_server::start(&output, pw_state.clone(), pw_cmd.clone()).await {
+            Ok(handle) => {
+                sendspin_servers.lock().await.insert(node_name, handle);
+                tracing::info!("started sendspin output '{}' (port {})", output.name, output.port);
+            }
+            Err(e) => tracing::warn!("failed to start sendspin output '{}': {e}", output.name),
+        }
+    }
+}
+
+/// Completes on SIGTERM or SIGINT — the trigger for axum's graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => tracing::warn!("could not install SIGTERM handler: {e}"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

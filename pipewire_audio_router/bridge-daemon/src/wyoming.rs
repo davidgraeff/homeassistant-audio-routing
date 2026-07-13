@@ -1,6 +1,5 @@
-//! Minimal Wyoming protocol TTS client (PLAN.md Section 5.6, v2 —
-//! Phase 3.5), used as an **additive alternative** to the v1 file+URL
-//! announce path (api.rs's `AnnounceRequest::url`), not a replacement:
+//! Minimal Wyoming protocol TTS client used as an **additive alternative** to the v1 file+URL
+//! announce path (api.rs's `AnnounceRequest::url`):
 //! `POST /api/media_players/:node_id/announce` accepts either `url` (HA's
 //! existing `tts`-rendered-file contract, unchanged) or `wyoming`
 //! (synthesize directly against a local Piper instance, skipping the
@@ -23,6 +22,7 @@
 //! clips are short (a sentence or two) — no need for the seek-and-patch
 //! streaming-WAV-header dance a longer recording would require.
 
+use crate::wav::build_wav;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -119,48 +119,4 @@ pub async fn synthesize_to_wav(host: &str, port: u16, text: &str, voice: Option<
     }
 
     Ok(build_wav(&pcm, sample_rate, width_bytes * 8, channels))
-}
-
-/// Builds a minimal PCM WAV file in memory — no external encoder needed
-/// since we already have raw samples in the exact format Wyoming reported.
-fn build_wav(pcm: &[u8], sample_rate: u32, bits_per_sample: u16, channels: u16) -> Vec<u8> {
-    let byte_rate = sample_rate * channels as u32 * (bits_per_sample as u32 / 8);
-    let block_align = channels * (bits_per_sample / 8);
-    let data_len = pcm.len() as u32;
-
-    let mut out = Vec::with_capacity(44 + pcm.len());
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_len).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&channels.to_le_bytes());
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&byte_rate.to_le_bytes());
-    out.extend_from_slice(&block_align.to_le_bytes());
-    out.extend_from_slice(&bits_per_sample.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
-    out.extend_from_slice(pcm);
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wav_header_matches_input_format() {
-        let pcm = vec![0u8; 100];
-        let wav = build_wav(&pcm, 22050, 16, 1);
-        assert_eq!(&wav[0..4], b"RIFF");
-        assert_eq!(&wav[8..12], b"WAVE");
-        assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), 36 + 100);
-        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1); // channels
-        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 22050); // rate
-        assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16); // bits/sample
-        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 100); // data size
-        assert_eq!(&wav[44..], pcm.as_slice());
-    }
 }
