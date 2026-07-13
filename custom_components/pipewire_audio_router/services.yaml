@@ -1,0 +1,27 @@
+# Low-level routing actions. For the common "one source per output" case
+# prefer media_player.select_source (exclusive); these are the additive
+# primitives for advanced automations that manage individual links.
+
+link:
+  target:
+    entity:
+      integration: pipewire_audio_router
+      domain: media_player
+  fields:
+    source:
+      required: true
+      example: shairport-sync
+      selector:
+        text:
+
+unlink:
+  target:
+    entity:
+      integration: pipewire_audio_router
+      domain: media_player
+  fields:
+    source:
+      required: false
+      example: shairport-sync
+      selector:
+        text:

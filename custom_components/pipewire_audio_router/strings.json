@@ -15,5 +15,27 @@
     "abort": {
       "already_configured": "This bridge daemon is already configured."
     }
+  },
+  "services": {
+    "link": {
+      "name": "Link source",
+      "description": "Connect an audio source to this output. Additive: any source already linked to the output stays connected.",
+      "fields": {
+        "source": {
+          "name": "Source",
+          "description": "Name of the source to connect, as shown in the output's source list."
+        }
+      }
+    },
+    "unlink": {
+      "name": "Unlink source",
+      "description": "Disconnect an audio source from this output. If no source is given, every source currently feeding the output is disconnected.",
+      "fields": {
+        "source": {
+          "name": "Source",
+          "description": "Name of the source to disconnect. Leave empty to disconnect all sources from the output."
+        }
+      }
+    }
   }
 }

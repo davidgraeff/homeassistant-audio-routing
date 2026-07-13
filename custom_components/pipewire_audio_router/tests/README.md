@@ -16,3 +16,14 @@ python3 -m pytest custom_components/pipewire_audio_router/tests/ -p pytest_homea
 
 `pytest.ini` at the repo root sets `asyncio_mode = auto`, required for the
 `async def test_...` functions here to run at all.
+
+## What each file covers
+
+- `test_config_flow.py` — the host/port config flow (success, cannot-connect,
+  duplicate-abort).
+- `test_media_player.py` — one `media_player` per output: state/volume,
+  announce (URL + Wyoming), `select_source`/`link`/`unlink`, and the live
+  routing WebSocket.
+- `test_rtp_source.py` — the Bluetooth-bridge RTP `switch`/`number`: entities
+  reflect daemon state, enable/disable, live vs. remembered port changes, and
+  the API client's `/api/source/rtp` calls (parsing + `ok`-flag errors).
