@@ -13,6 +13,7 @@ mod routing_store;
 mod rtp_source;
 mod sendspin_capture;
 mod sendspin_discovery;
+mod sendspin_group;
 mod sendspin_server;
 mod sources_store;
 mod supervisor;
@@ -168,7 +169,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     // the grouping reconciler (sendspin_group.rs) builds the audio path from
     // the routing intent. Handle held for the process lifetime.
     let _sendspin_discovery = if discovery_mode().is_some() {
-        match sendspin_discovery::spawn(sendspin_devices.clone()) {
+        match sendspin_discovery::spawn(sendspin_devices.clone(), changes.clone()) {
             Ok(daemon) => {
                 tracing::info!("mDNS sendspin device discovery started");
                 Some(daemon)
@@ -218,21 +219,25 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         spawn_stored_sources(&sources, &supervisor, &sendspin_servers, pw_state.clone(), pw_cmd.clone()).await;
 
         // Reconcile persisted routing intent onto the live graph, now and on
-        // every registry change: a node that (re)appears — a reloaded
-        // raop-sink, a rediscovered device — gets its saved links recreated.
-        // Additive only: it never removes links, so a manual unlink (which
-        // also drops the intent) stays gone. See routing_store.rs / routing.rs.
+        // every registry/device change: a node that (re)appears — a reloaded
+        // raop-sink, a rediscovered device — gets its saved links recreated
+        // (routing::reconcile, additive only), and sendspin devices sharing a
+        // source are (re)formed into synchronized groups (sendspin_group).
         {
             let pw = pw_state.clone();
             let cmd = pw_cmd.clone();
             let routing = routing.clone();
+            let devices = sendspin_devices.clone();
+            let groups = std::sync::Arc::new(tokio::sync::Mutex::new(sendspin_group::GroupReconciler::new()));
             let mut rx = changes.subscribe();
             tokio::spawn(async move {
                 routing::reconcile(&pw, &cmd, &routing).await;
+                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices).await;
                 loop {
                     match rx.recv().await {
                         Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             routing::reconcile(&pw, &cmd, &routing).await;
+                            groups.lock().await.reconcile(&pw, &cmd, &routing, &devices).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }

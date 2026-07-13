@@ -67,6 +67,13 @@ pub const SENDSPIN_NODE_PREFIX: &str = "sendspin-out-";
 /// Outputs tab, mirroring how RAOP receivers show up. See sendspin_discovery.rs.
 pub const SENDSPIN_DEV_PREFIX: &str = "sendspin-dev-";
 
+/// Node-name prefix for a sendspin *group sink* — one real PipeWire sink per
+/// set of co-routed devices, created by the grouping reconciler
+/// (sendspin_group.rs). Internal plumbing: deliberately NOT matched by the
+/// matrix's output classification, so groups never show up as their own
+/// column (only the member devices do).
+pub const SENDSPIN_GRP_PREFIX: &str = "sendspin-grp-";
+
 /// Turns an output's display name into something safe to use as a PipeWire
 /// object name and (later) an HA entity-id fragment: lowercase,
 /// spaces/punctuation collapsed to underscores.

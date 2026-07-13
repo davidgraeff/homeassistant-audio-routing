@@ -233,6 +233,28 @@ fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32> {
     state.nodes.values().filter(|n| n.node_name == node_name).map(|n| n.node_id).max()
 }
 
+/// Ensure the matched-channel PipeWire links from `source` to `output` exist,
+/// by stable node name. Idempotent (CreateLinks skips already-linked ports);
+/// a no-op if either node is absent or no channels match. Used by the sendspin
+/// grouping reconciler to wire a source into a group sink (which isn't in the
+/// routing intent by name — the member *devices* are).
+pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, source: &str, output: &str) {
+    let ids = {
+        let st = pw.lock_recover();
+        node_id_for(&st, source).zip(node_id_for(&st, output))
+    };
+    let Some((source_id, output_id)) = ids else { return };
+    let specs = matched_port_specs(pw, source_id, output_id);
+    if specs.is_empty() {
+        return;
+    }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
+        return;
+    }
+    let _ = reply_rx.await;
+}
+
 /// Reapply persisted routing intent (routing_store.rs) to the live graph: for
 /// every stored `(source, output)` link whose *both* nodes are currently
 /// present, ensure the matched-channel PipeWire links exist. Idempotent —

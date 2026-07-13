@@ -77,16 +77,35 @@ impl Drop for SendspinServerHandle {
     }
 }
 
-/// Start a native sendspin server for `output`: create its sink node, wait
-/// for it to appear in the registry snapshot, start capturing from it, and
-/// run the embedded server (accept inbound + discover/dial embedded devices)
-/// pushing captured audio to one shared `Group`.
+/// Start a native sendspin server for a manually-added `output`. Dials every
+/// discovered sendspin device (unfiltered), as before — the grouping
+/// reconciler uses [`start_server`] with a filter instead.
 pub async fn start(
     output: &SendspinOutput,
     pw_state: SharedState,
     pw_cmd: PwCommandSender,
 ) -> anyhow::Result<SendspinServerHandle> {
-    let node_name = output.node_name();
+    start_server(&output.node_name(), &output.name, output.port, None, pw_state, pw_cmd).await
+}
+
+/// Start a native sendspin server on `node_name`/`port`: create its sink node,
+/// wait for it to appear in the registry snapshot, capture from it, and run the
+/// embedded server (accept inbound + discover/dial devices) pushing captured
+/// audio to one shared `Group`.
+///
+/// `device_filter`, when `Some`, restricts dialing to devices whose mDNS
+/// fullname is in the set — this is what makes a *group*: one sink + one
+/// synchronized `Group` dialing exactly its member devices. `None` dials every
+/// discovered device (the manual-output behavior).
+pub async fn start_server(
+    node_name: &str,
+    display_name: &str,
+    port: u16,
+    device_filter: Option<std::collections::HashSet<String>>,
+    pw_state: SharedState,
+    pw_cmd: PwCommandSender,
+) -> anyhow::Result<SendspinServerHandle> {
+    let node_name = node_name.to_string();
 
     let (reply_tx, reply_rx) = oneshot::channel();
     pw_cmd
@@ -114,21 +133,22 @@ pub async fn start(
     let (capture_handle, mut pcm_rx) = crate::sendspin_capture::spawn(node_id)
         .map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
 
-    let listener = ServerListener::bind(("0.0.0.0", output.port), &node_name, &output.name)
+    let listener = ServerListener::bind(("0.0.0.0", port), &node_name, display_name)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to bind sendspin server on port {}: {e}", output.port))?
+        .map_err(|e| anyhow::anyhow!("failed to bind sendspin server on port {port}: {e}"))?
         .path(SENDSPIN_PATH);
-    let advertisement = Advertisement::new(&node_name, &output.name, output.port, SENDSPIN_PATH)
+    let advertisement = Advertisement::new(&node_name, display_name, port, SENDSPIN_PATH)
         .map_err(|e| anyhow::anyhow!("failed to advertise sendspin server '{node_name}': {e}"))?;
 
     let group = Arc::new(Mutex::new(Group::new(Arc::new(DefaultClock::default()))));
 
     let accept_task = spawn_accept_loop(listener, Arc::clone(&group));
 
-    let (client_manager, mut events) = ClientManager::start(
+    let (client_manager, mut events) = ClientManager::start_filtered(
         node_name.clone(),
-        output.name.clone(),
+        display_name.to_string(),
         Arc::new(DefaultClock::default()),
+        move |fullname| device_filter.as_ref().map_or(true, |set| set.contains(fullname)),
     )
     .map_err(|e| anyhow::anyhow!("failed to start sendspin client discovery for '{node_name}': {e}"))?;
     let event_task = {

@@ -18,6 +18,7 @@
 
 use crate::config::{slugify, SENDSPIN_DEV_PREFIX};
 use crate::locks::LockRecover;
+use crate::pw_thread::ChangeNotifier;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -61,7 +62,7 @@ fn display_name_from_service(info: &ServiceInfo) -> String {
 /// the daemon handle — hold it alive for discovery to keep running (dropping
 /// it stops the browse). Mirrors discovery.rs's own-thread, blocking-recv
 /// shape.
-pub fn spawn(devices: SharedSendspinDevices) -> anyhow::Result<ServiceDaemon> {
+pub fn spawn(devices: SharedSendspinDevices, changes: ChangeNotifier) -> anyhow::Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
     let receiver = daemon.browse(SENDSPIN_SERVICE_TYPE)?;
     std::thread::Builder::new()
@@ -82,12 +83,16 @@ pub fn spawn(devices: SharedSendspinDevices) -> anyhow::Result<ServiceDaemon> {
                             .is_none();
                         if is_new {
                             tracing::info!("discovered sendspin device '{display_name}' ({node_name})");
+                            // Wake the matrix WS + grouping reconciler so the
+                            // new device shows up and gets grouped/dialed.
+                            let _ = changes.send(());
                         }
                     }
                     ServiceEvent::ServiceRemoved(_ty, fullname) => {
                         if let Some(node_name) = by_fullname.remove(&fullname) {
                             devices.lock_recover().remove(&node_name);
                             tracing::info!("sendspin device '{fullname}' went away; removing {node_name}");
+                            let _ = changes.send(());
                         }
                     }
                     _ => {}
