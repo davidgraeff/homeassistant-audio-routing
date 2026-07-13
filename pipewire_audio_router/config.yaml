@@ -5,6 +5,12 @@ description: >-
   PipeWire-based whole-home audio router (RAOP/sendspin outputs), replacing
   Music Assistant's Python audio engine.
 url: "https://github.com/davidgraeff/homeassistant-audio-routing"
+# Prebuilt by .github/workflows/build-addon.yml and pushed to GHCR — a
+# store-based install (the community path) pulls this instead of
+# compiling the Rust bridge daemon on-device. Local dev installs under
+# /addons/ (scripts/deploy-dev.sh) always build from the Dockerfile
+# directly regardless of this field — that's the point of a local add-on.
+image: "ghcr.io/davidgraeff/{arch}-addon-pipewire_audio_router"
 arch:
   - amd64
   - aarch64
