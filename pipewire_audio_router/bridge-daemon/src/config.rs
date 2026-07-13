@@ -57,9 +57,15 @@ pub struct RaopOutputConfig {
     pub encryption: RaopEncryption,
 }
 
-/// Node-name prefix for sendspin output nodes (shared with sources_store.rs
-/// and the output classification in api.rs/routing.rs).
+/// Node-name prefix for sendspin output sink nodes (shared with
+/// sources_store.rs and the output classification in api.rs/routing.rs).
 pub const SENDSPIN_NODE_PREFIX: &str = "sendspin-out-";
+
+/// Node-name prefix for a discovered sendspin *device* — a virtual routing
+/// output (no PipeWire node of its own; audio reaches it via whatever group
+/// sink it's dialed into). This is what appears as a matrix column and on the
+/// Outputs tab, mirroring how RAOP receivers show up. See sendspin_discovery.rs.
+pub const SENDSPIN_DEV_PREFIX: &str = "sendspin-dev-";
 
 /// Turns an output's display name into something safe to use as a PipeWire
 /// object name and (later) an HA entity-id fragment: lowercase,

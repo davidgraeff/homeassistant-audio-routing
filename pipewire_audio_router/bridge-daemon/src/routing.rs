@@ -25,12 +25,14 @@
 //! being hardcoded per source/output type.
 
 use crate::api::AppState;
-use crate::config::SENDSPIN_NODE_PREFIX;
+use crate::config::{SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
 use crate::outputs_store::OutputsStore;
 use crate::raop::{raop_node_name, RAOP_NODE_PREFIX};
 use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
+use crate::sendspin_discovery::SendspinDevice;
+use std::collections::BTreeMap;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -74,7 +76,7 @@ fn is_output_node(node_name: &str) -> bool {
 }
 
 fn output_display_name(node_name: &str) -> String {
-    for prefix in [RAOP_NODE_PREFIX, SENDSPIN_NODE_PREFIX] {
+    for prefix in [RAOP_NODE_PREFIX, SENDSPIN_NODE_PREFIX, SENDSPIN_DEV_PREFIX] {
         if let Some(rest) = node_name.strip_prefix(prefix) {
             return rest.replace(['_', '-'], " ");
         }
@@ -93,8 +95,13 @@ fn channel_suffix(port_name: &str) -> &str {
 /// referenced by intent, appear as `present: false` (grayed in the UI) so its
 /// routing survives disappearance and is reapplied on return. Outputs also
 /// carry `configured` (store entry vs mDNS auto-discovered) for the badge.
-fn build_matrix(reg: &RegistryState, store: &OutputsStore, intent: &[RoutingLink]) -> RoutingMatrix {
-    use std::collections::{BTreeMap, BTreeSet};
+fn build_matrix(
+    reg: &RegistryState,
+    store: &OutputsStore,
+    devices: &BTreeMap<String, SendspinDevice>,
+    intent: &[RoutingLink],
+) -> RoutingMatrix {
+    use std::collections::BTreeSet;
 
     // Live nodes: highest id per name (newest), same "most recent wins" rule as
     // node_id_for — a same-named node can briefly outlive its owner.
@@ -120,9 +127,14 @@ fn build_matrix(reg: &RegistryState, store: &OutputsStore, intent: &[RoutingLink
     let configured: BTreeMap<String, String> =
         store.list().iter().map(|o| (raop_node_name(&o.name), o.name.clone())).collect();
 
-    // Union of every output/source name to show: present ∪ configured ∪ intent.
+    // Discovered sendspin devices are virtual outputs (present, auto, no live
+    // node id — audio reaches them via a group sink, sendspin_group.rs).
+
+    // Union of every output/source name to show: present ∪ configured ∪
+    // discovered devices ∪ intent.
     let mut output_names: BTreeSet<String> = present_outputs.keys().cloned().collect();
     output_names.extend(configured.keys().cloned());
+    output_names.extend(devices.keys().cloned());
     output_names.extend(intent.iter().map(|l| l.output.clone()));
 
     let mut source_names: BTreeSet<String> = present_sources.keys().cloned().collect();
@@ -132,8 +144,21 @@ fn build_matrix(reg: &RegistryState, store: &OutputsStore, intent: &[RoutingLink
         .into_iter()
         .map(|name| {
             let node_id = present_outputs.get(&name).copied();
-            let display_name = configured.get(&name).cloned().unwrap_or_else(|| output_display_name(&name));
-            RoutingNode { present: node_id.is_some(), node_id, configured: configured.contains_key(&name), display_name, node_name: name }
+            let is_device = devices.contains_key(&name);
+            let display_name = configured
+                .get(&name)
+                .cloned()
+                .or_else(|| devices.get(&name).map(|d| d.display_name.clone()))
+                .unwrap_or_else(|| output_display_name(&name));
+            RoutingNode {
+                // A device is "present" when it's in the live discovery registry.
+                present: node_id.is_some() || is_device,
+                node_id,
+                // Devices and offline entries are never manually configured.
+                configured: configured.contains_key(&name),
+                display_name,
+                node_name: name,
+            }
         })
         .collect();
 
@@ -159,9 +184,10 @@ fn build_matrix(reg: &RegistryState, store: &OutputsStore, intent: &[RoutingLink
 /// the others), then registry, then store — to stay deadlock-free.
 fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let intent = routing_store::snapshot(&state.routing);
+    let devices = state.sendspin_devices.lock_recover().clone();
     let reg = state.pw.lock_recover();
     let store = state.store.lock_recover();
-    build_matrix(&reg, &store, &intent)
+    build_matrix(&reg, &store, &devices, &intent)
 }
 
 /// Every non-monitor output-direction port on `source_node_id` paired with the

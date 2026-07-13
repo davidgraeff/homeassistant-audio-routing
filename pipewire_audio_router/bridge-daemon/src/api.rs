@@ -8,6 +8,7 @@ use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, Sha
 use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME, RAOP_NODE_PREFIX};
 use crate::routing;
 use crate::routing_store::SharedRouting;
+use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::rtp_source::{rtp_source_module_args, DEFAULT_RTP_PORT, RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME};
 use crate::sources_store::{self, RtpSourceConfig, SourcesStore};
 use crate::supervisor::Supervisor;
@@ -56,6 +57,9 @@ pub struct AppState {
     pub sources: SharedSources,
     pub supervisor: SharedSupervisor,
     pub sendspin_servers: SharedSendspinServers,
+    /// Live mDNS-discovered sendspin devices (sendspin_discovery.rs), surfaced
+    /// as virtual routing outputs.
+    pub sendspin_devices: SharedSendspinDevices,
     /// Persistent routing intent (routing_store.rs): links by stable node
     /// name, reconciled onto the live graph so routing survives node reloads
     /// and device disappearance/reappearance.
@@ -86,10 +90,12 @@ pub fn router(
     sources: SharedSources,
     supervisor: SharedSupervisor,
     sendspin_servers: SharedSendspinServers,
+    sendspin_devices: SharedSendspinDevices,
     routing: SharedRouting,
     static_dir: PathBuf,
 ) -> Router {
-    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_servers, routing };
+    let state =
+        AppState { pw: pw_state, changes, pw_cmd, store, sources, supervisor, sendspin_servers, sendspin_devices, routing };
     Router::new()
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))

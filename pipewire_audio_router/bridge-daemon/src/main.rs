@@ -12,6 +12,7 @@ mod routing;
 mod routing_store;
 mod rtp_source;
 mod sendspin_capture;
+mod sendspin_discovery;
 mod sendspin_server;
 mod sources_store;
 mod supervisor;
@@ -134,6 +135,8 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     let supervisor = std::sync::Arc::new(tokio::sync::Mutex::new(supervisor::Supervisor::new()));
     let sendspin_servers: api::SharedSendspinServers =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     let (pw_state, changes, pw_cmd) = pw_thread::spawn()?;
 
@@ -158,6 +161,25 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             tracing::info!("mDNS RAOP discovery disabled (BRIDGE_DISCOVERY=off)");
             None
         }
+    };
+
+    // mDNS auto-discovery of sendspin devices (same BRIDGE_DISCOVERY gate).
+    // Only populates the shared registry — no per-device sink is loaded here;
+    // the grouping reconciler (sendspin_group.rs) builds the audio path from
+    // the routing intent. Handle held for the process lifetime.
+    let _sendspin_discovery = if discovery_mode().is_some() {
+        match sendspin_discovery::spawn(sendspin_devices.clone()) {
+            Ok(daemon) => {
+                tracing::info!("mDNS sendspin device discovery started");
+                Some(daemon)
+            }
+            Err(e) => {
+                tracing::warn!("sendspin discovery unavailable ({e}); continuing without it");
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -226,6 +248,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             sources,
             supervisor.clone(),
             sendspin_servers.clone(),
+            sendspin_devices,
             routing,
             static_dir.to_path_buf(),
         );
