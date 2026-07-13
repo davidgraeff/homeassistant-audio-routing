@@ -1,0 +1,8 @@
+# Build-context excludes (context = pipewire_audio_router/). Keeps the host's
+# node_modules/dist and the root-owned Rust target out of the image build — the
+# frontend stage runs its own `npm ci`, and the Rust stage its own `cargo build`.
+frontend/node_modules
+frontend/dist
+bridge-daemon/target
+**/*.tsbuildinfo
+.git

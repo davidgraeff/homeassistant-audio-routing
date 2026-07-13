@@ -1,15 +1,17 @@
 name: PipeWire Audio Router
-version: "0.1.0"
+version: "0.2.0"
 slug: pipewire_audio_router
 description: >-
   PipeWire-based whole-home audio router (RAOP/sendspin outputs), replacing
   Music Assistant's Python audio engine.
 url: "https://github.com/davidgraeff/homeassistant-audio-routing"
-# Prebuilt by .github/workflows/build-addon.yml and pushed to GHCR — a
-# store-based install (the community path) pulls this instead of
-# compiling the Rust bridge daemon on-device. Local dev installs under
-# /addons/ (scripts/deploy-dev.sh) always build from the Dockerfile
-# directly regardless of this field — that's the point of a local add-on.
+# Prebuilt image, pushed to GHCR (release images by
+# .github/workflows/build-addon.yml, dev images by scripts/deploy-dev.sh).
+# Because this field is set, Supervisor treats the add-on as image-based
+# (build: false) and PULLS this image rather than compiling the Rust bridge
+# daemon on-device — true even for the local /addons/ dev install, which is
+# the whole point (a Rust release build on a Pi is minutes). Supervisor
+# substitutes {arch} with the target's HA arch (aarch64/amd64/…).
 image: "ghcr.io/davidgraeff/{arch}-addon-pipewire_audio_router"
 arch:
   - amd64
@@ -21,19 +23,31 @@ boot: auto
 # the host's other interfaces by design — confirmed necessary empirically,
 # see spikes/02-raop-static-sink.md and spikes/03b-rtp-pc-transfer.md.
 host_network: true
-options:
-  outputs: []
-  sendspin_outputs: []
-  airplay_source_name: "PipeWire Router"
-schema:
-  outputs:
-    - name: str
-      ip: str
-      port: int(1,65535)?
-      encryption: "list(none|RSA|auth_setup)?"
-  # sendspin devices connect *to* this add-on (Section 5.4b) — no per-device
-  # IP needed, unlike RAOP outputs which we connect *out* to.
-  sendspin_outputs:
-    - name: str
-  # Empty string disables the AirPlay-receive source entirely (Section 5.2).
-  airplay_source_name: str?
+# Extra Linux capabilities for glitch-free audio under host load (an OS update
+# or compile on the same Pi) — not full_access, just these two:
+#   SYS_NICE: lets PipeWire's realtime module raise the audio data-loop to
+#     SCHED_FIFO directly (no RTKit — see Dockerfile), so CPU contention can't
+#     starve it.
+#   IPC_LOCK: lets PipeWire mlockall() the audio path (mem.mlock-all, see the
+#     pipewire.conf.d/client.conf.d drop-ins) bypassing the container's
+#     RLIMIT_MEMLOCK ceiling, so memory pressure can't page it out mid-stream.
+privileged:
+  - SYS_NICE
+  - IPC_LOCK
+# Surface the daemon's web UI in HA's sidebar via ingress (authenticated,
+# no separate login). The daemon serves the built Svelte UI at its listen
+# port; ingress proxies to it. With host_network the add-on listens on the
+# host, so ingress_port must match the daemon's port (8099 — not 8080, which
+# commonly collides with other add-ons). The UI uses relative asset/API paths,
+# so it works both here and opened directly at :8099. (Ingress + host_network
+# can be finicky per Supervisor version — verify in the sidebar after install.)
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:speaker-multiple
+panel_title: Audio Router
+# No add-on options. Everything user-facing — RAOP outputs, the AirPlay-receive
+# source, and sendspin outputs — is configured at runtime via the bridge
+# daemon's REST API / web UI and persisted under /data (raop-outputs.json,
+# sources.json). User testing found the static seed options confusing (they
+# looked authoritative but were ignored after first run), so they were removed.
+# See docs/api-reference.md.

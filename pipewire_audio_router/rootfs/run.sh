@@ -19,14 +19,11 @@ dbus-daemon --system --fork
 eval "$(dbus-launch --sh-syntax)"
 export DBUS_SESSION_BUS_ADDRESS
 
-# Static RAOP output config must exist *before* pipewire starts — PipeWire's
-# core protocol has no remote "load module" RPC (confirmed against
-# pipewire/core.h directly), so outputs can't be added/changed at runtime
-# without a restart. See bridge-daemon/src/pw_config_gen.rs.
-mkdir -p /etc/pipewire/pipewire.conf.d
-bridge-daemon generate-config \
-    --options /data/options.json \
-    --out /etc/pipewire/pipewire.conf.d/10-outputs.conf
+# RAOP outputs are NOT statically configured before pipewire starts anymore.
+# The bridge daemon loads one libpipewire-module-raop-sink per output into its
+# own PipeWire context at runtime — hot-reloadable via the /api/outputs API —
+# so there's nothing to generate up front. See docs/decisions.md "Loading
+# PipeWire modules at runtime" and bridge-daemon/src/pw_module.rs.
 
 pipewire &
 PIDS=("$!")
@@ -41,35 +38,19 @@ PIDS+=("$!")
 
 sleep 1
 
-# avahi-daemon is only actually needed if an AirPlay-receive source is
-# configured, but starting it unconditionally is harmless and simpler
-# than conditioning on runtime-plan's output twice.
+# avahi-daemon is needed by shairport-sync (the AirPlay-receive source) and
+# for RAOP mDNS discovery. It's cheap and harmless to run unconditionally, and
+# it must be up *before* the bridge daemon, which now spawns shairport-sync
+# itself.
 avahi-daemon --daemonize --no-drop-root
 
-# Every source/output process beyond PipeWire/WirePlumber/the bridge
-# daemon itself, derived from options.json by the same code that already
-# parses it for generate-config — see bridge-daemon's
-# `runtime-plan` subcommand doc for the line format.
-while IFS=$'\t' read -r kind a b c; do
-    case "$kind" in
-        airplay_source)
-            shairport-sync -a "$a" &
-            PIDS+=("$!")
-            ;;
-        sendspin_adapter)
-            python3 /usr/local/bin/sendspin-adapter.py \
-                --node-name "$a" --sendspin-name "$b" --sendspin-port "$c" &
-            PIDS+=("$!")
-            ;;
-        *)
-            echo "run.sh: unknown runtime-plan component kind '$kind', skipping" >&2
-            ;;
-    esac
-done < <(bridge-daemon runtime-plan --options /data/options.json)
-
-sleep 1
-
-bridge-daemon serve --options /data/options.json &
+# The bridge daemon owns everything user-configurable at runtime: it loads a
+# raop-sink module per RAOP output, and spawns/supervises the source/adapter
+# processes (shairport-sync, sendspin-adapter.py) from its own persisted stores
+# (seeded once from options.json). No boot-time process plan anymore — outputs,
+# the AirPlay source, and sendspin outputs are all managed live via the API
+# (see bridge-daemon/src/{supervisor,sources_store}.rs and docs/decisions.md).
+bridge-daemon serve &
 PIDS+=("$!")
 
 trap 'kill "${PIDS[@]}" 2>/dev/null' TERM INT
