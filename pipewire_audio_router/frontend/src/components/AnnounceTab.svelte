@@ -16,11 +16,16 @@
   let text = $state('');
   let voice = $state('');
 
-  // Default the target to the first available output once the matrix loads.
+  // Announce is node-id based (the daemon ducks + plays into a live sink), so
+  // only outputs with a live node_id are valid targets — this excludes virtual
+  // sendspin devices and offline outputs (both node_id: null), which also keeps
+  // the <option> list keyed uniquely (several share node_id null).
+  const announceable = $derived($routing.matrix.outputs.filter((o) => o.node_id != null));
+
+  // Default the target to the first announceable output once the matrix loads.
   $effect(() => {
-    const outs = $routing.matrix.outputs;
-    if ((target === null || !outs.some((o) => o.node_id === target)) && outs.length > 0) {
-      target = outs[0].node_id;
+    if ((target === null || !announceable.some((o) => o.node_id === target)) && announceable.length > 0) {
+      target = announceable[0].node_id;
     }
   });
 
@@ -52,14 +57,14 @@
     request blocks until playback finishes.
   </p>
 
-  {#if $routing.matrix.outputs.length === 0}
+  {#if announceable.length === 0}
     <p class="empty">No outputs available to announce to.</p>
   {:else}
     <form onsubmit={send}>
       <div class="field">
         <label for="an-target">Output</label>
         <select id="an-target" bind:value={target}>
-          {#each $routing.matrix.outputs as o (o.node_id)}
+          {#each announceable as o (o.node_name)}
             <option value={o.node_id}>{o.display_name}</option>
           {/each}
         </select>

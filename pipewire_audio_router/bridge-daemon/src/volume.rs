@@ -49,10 +49,7 @@ fn channel_volumes_props_pod(linear: &[f32]) -> Result<Vec<u8>, String> {
     let object = Object {
         type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
         id: pw::spa::sys::SPA_PARAM_Props,
-        properties: vec![Property::new(
-            pw::spa::sys::SPA_PROP_channelVolumes,
-            Value::ValueArray(ValueArray::Float(linear.to_vec())),
-        )],
+        properties: vec![Property::new(pw::spa::sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(linear.to_vec())))],
     };
     let bytes = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(object))
         .map_err(|e| format!("serialize Props pod: {e}"))?
@@ -163,10 +160,7 @@ pub fn get_volume_blocking(node_id: u32) -> Result<Option<f32>, String> {
     let Some(node) = session.bind_node(node_id) else {
         return Ok(None);
     };
-    Ok(session
-        .read_channel_volumes(&node)
-        .and_then(|v| v.first().copied())
-        .map(linear_to_cubic))
+    Ok(session.read_channel_volumes(&node).and_then(|v| v.first().copied()).map(linear_to_cubic))
 }
 
 /// Sets `node_id`'s volume (cubic 0.0-1.0), applied to every channel. Blocks;
@@ -190,16 +184,12 @@ pub fn set_volume_blocking(node_id: u32, volume: f32) -> Result<(), String> {
 
 /// Async wrapper: reads volume on a blocking thread.
 pub async fn get_volume(node_id: u32) -> Result<Option<f32>, String> {
-    tokio::task::spawn_blocking(move || get_volume_blocking(node_id))
-        .await
-        .map_err(|e| format!("volume task panicked: {e}"))?
+    tokio::task::spawn_blocking(move || get_volume_blocking(node_id)).await.map_err(|e| format!("volume task panicked: {e}"))?
 }
 
 /// Async wrapper: sets volume on a blocking thread.
 pub async fn set_volume(node_id: u32, volume: f32) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || set_volume_blocking(node_id, volume))
-        .await
-        .map_err(|e| format!("volume task panicked: {e}"))?
+    tokio::task::spawn_blocking(move || set_volume_blocking(node_id, volume)).await.map_err(|e| format!("volume task panicked: {e}"))?
 }
 
 #[cfg(test)]

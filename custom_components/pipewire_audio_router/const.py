@@ -11,6 +11,12 @@ DEFAULT_PORT = 8099
 # used to seed the port `number` entity before the daemon reports a value.
 DEFAULT_RTP_PORT = 46000
 
+# Default receiver-side jitter buffer (ms) for the RTP source. Matches the
+# daemon's own default (bridge-daemon/src/rtp_source.rs) — used to seed the
+# latency `number` entity before the daemon reports a value. Raise it on a
+# weak-signal bridge to trade latency for fewer audible dropouts.
+DEFAULT_RTP_LATENCY_MSEC = 200
+
 # Poll interval for GET /api/media_players (volume + playing/idle state) —
 # there's no push channel for those. Routing is NOT polled: it's pushed live
 # over the daemon's /api/routing/ws WebSocket (see PipewireRouterCoordinator).
@@ -28,3 +34,7 @@ SOURCE_NONE = "None"
 SERVICE_LINK = "link"
 SERVICE_UNLINK = "unlink"
 ATTR_SOURCE = "source"
+
+# Integration-wide service to purge media_player entities the daemon no longer
+# reports (e.g. renamed/removed devices left behind as `unavailable`).
+SERVICE_CLEANUP_ENTITIES = "cleanup_entities"

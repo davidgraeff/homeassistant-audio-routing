@@ -19,7 +19,7 @@
         <mxCell id="pw_group" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#82b366;dashed=1;verticalAlign=top;fontStyle=1;align=left;spacingLeft=8;spacingTop=4;arcSize=5;" value="PipeWire + WirePlumber graph" vertex="1">
           <mxGeometry height="440" width="300" x="620" y="80" as="geometry" />
         </mxCell>
-        <mxCell id="node_shairport" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="shairport-sync&#xa;(AirPlay source node)" vertex="1">
+        <mxCell id="node_shairport" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="airplay-in&#xa;(native RAOP receiver,&#xa;shairplay crate, in-process)" vertex="1">
           <mxGeometry height="50" width="260" x="640" y="120" as="geometry" />
         </mxCell>
         <mxCell id="node_rtpsource" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="rtp-source&#xa;(libpipewire-module-rtp-source)" vertex="1">
@@ -28,13 +28,13 @@
         <mxCell id="node_raopout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="raop-out-*&#xa;(libpipewire-module-raop-sink,&#xa;hot-loaded at runtime)" vertex="1">
           <mxGeometry height="60" width="180" x="720" y="320" as="geometry" />
         </mxCell>
-        <mxCell id="node_sendspinout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="sendspin-out-*&#xa;(null-audio-sink, created&#xa;natively by the daemon)" vertex="1">
+        <mxCell id="node_sendspinout" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="sendspin-grp-*&#xa;(group sink; devices auto-&#xa;discovered as sendspin-dev-*)" vertex="1">
           <mxGeometry height="60" width="190" x="640" y="420" as="geometry" />
         </mxCell>
         <mxCell id="bridge_daemon" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Bridge Daemon (Rust)&#xa;pipewire-rs registry observer +&#xa;native links / volume / playback&#xa;axum REST + WebSocket API :8099" vertex="1">
           <mxGeometry height="110" width="240" x="960" y="90" as="geometry" />
         </mxCell>
-        <mxCell id="sendspin_adapter" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Sendspin server&#xa;(embedded in Bridge Daemon,&#xa;one per output)" vertex="1">
+        <mxCell id="sendspin_adapter" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Sendspin server&#xa;(embedded in Bridge Daemon,&#xa;one per synchronized group)" vertex="1">
           <mxGeometry height="70" width="240" x="960" y="415" as="geometry" />
         </mxCell>
         <mxCell id="out_avr" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" value="AVR Receiver&#xa;(Yamaha / Pioneer, RAOP)" vertex="1">

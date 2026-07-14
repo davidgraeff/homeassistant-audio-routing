@@ -35,6 +35,7 @@ class RtpSourceState:
 
     enabled: bool
     port: int
+    latency_msec: int
     loaded: bool
 
 
@@ -118,6 +119,31 @@ class PipewireRouterApiClient:
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not set volume: {err}") from err
 
+    async def async_get_sendspin_volumes(self) -> dict[str, int]:
+        """Desired per-device sendspin volumes (`GET /api/sendspin/volumes`),
+        keyed by virtual device node name (0–100). Sparse — a device with no
+        entry is at full scale."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/sendspin/volumes") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        return {str(k): int(v) for k, v in data.items()}
+
+    async def async_set_sendspin_volume(self, node_name: str, volume: int) -> None:
+        """Set one sendspin device's volume (`PUT /api/sendspin/volume`, 0–100).
+        Sent in-band to the device; stored daemon-side and re-applied on
+        reconnect. There is no PipeWire node volume for these virtual outputs."""
+        try:
+            async with self._session.put(
+                f"{self._base_url}/api/sendspin/volume",
+                json={"node_name": node_name, "volume": volume},
+            ) as resp:
+                resp.raise_for_status()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not set sendspin volume: {err}") from err
+
     async def async_announce(self, node_id: int, url: str, duck_volume: float | None = None) -> None:
         """Ducks whatever is currently linked into this output and plays
         `url` into the same sink (bridge-daemon's `/announce` endpoint,
@@ -154,16 +180,23 @@ class PipewireRouterApiClient:
         return RtpSourceState(
             enabled=bool(data.get("enabled", False)),
             port=int(data.get("port", 0)),
+            latency_msec=int(data.get("latency_msec", 0)),
             loaded=bool(data.get("loaded", False)),
         )
 
-    async def async_set_rtp_source(self, port: int) -> None:
-        """Enable (or re-point) the RTP source on `port` (`PUT /api/source/rtp`).
+    async def async_set_rtp_source(self, port: int, latency_msec: int) -> None:
+        """Enable (or re-point) the RTP source (`PUT /api/source/rtp`). Sends both
+        the listen `port` and the jitter-buffer `latency_msec` — the daemon
+        replaces the whole config each call, so both are always supplied (the
+        caller passes the current value for whichever knob it isn't changing).
         The daemon reports logical failure (e.g. the module refusing to load) as
         `{ok: false}` carried on a non-2xx status, so — like the routing ops —
         the `ok` flag, not the HTTP status alone, is authoritative."""
         try:
-            async with self._session.put(f"{self._base_url}/api/source/rtp", json={"port": port}) as resp:
+            async with self._session.put(
+                f"{self._base_url}/api/source/rtp",
+                json={"port": port, "latency_msec": latency_msec},
+            ) as resp:
                 body = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not enable RTP source: {err}") from err

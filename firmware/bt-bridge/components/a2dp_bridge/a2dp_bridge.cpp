@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esphome/core/log.h"
 
@@ -17,6 +18,34 @@ namespace esphome {
 namespace a2dp_bridge {
 
 static const char *const TAG = "a2dp_bridge";
+
+// --- RTP TX decoupling (Fix 3) ---------------------------------------------
+// The Bluedroid audio callback (BTC task) must never block on the network, or
+// it stalls A2DP decoding. So it only *enqueues* finished RTP packets into this
+// ring buffer; a dedicated task drains it and owns every sendto(). Because that
+// task isn't the BT audio task, it can afford to briefly retry on a full WiFi
+// TX buffer (ENOMEM) instead of dropping — turning transient coex/power-save
+// stalls into slightly-late packets the receiver's jitter buffer absorbs.
+//
+// ~24 KB holds ~22 max-size packets (~130 ms of 44.1 kHz stereo). It only fills
+// during a stall; a healthy link drains it to near-empty, so it adds no
+// steady-state latency. This is safe only because `sram1_as_iram` (bt-bridge.
+// yaml) frees ~40 KB of DRAM — without that headroom a ring this size starves
+// Bluedroid's buffer pools and crashes the BT controller in host_recv_pkt_cb
+// (learned the hard way). dump_config() logs the free heap so the margin stays
+// visible; keep RTP_TX_MAX_BACKOFF_MS comfortably under this ring's ~130 ms.
+static constexpr size_t RTP_TX_RINGBUF_BYTES = 24 * 1024;
+static constexpr uint32_t RTP_TX_TASK_STACK = 4096;
+static constexpr UBaseType_t RTP_TX_TASK_PRIO = 10;  // above idle, below WiFi/BT
+// How long a packet may wait for a full WiFi TX buffer to drain before we give
+// up and count it dropped. The TX task sleeps (vTaskDelay) between attempts, so
+// this costs no CPU and no heap — the cheap lever once the ring exists. Kept
+// under the ring's ~130 ms time capacity: a stall shorter than this is
+// ridden out by retrying while the ring holds the incoming backlog, so it
+// produces zero drops; only stalls longer than the ring can buffer still drop.
+// Expressed in ms and converted with pdMS_TO_TICKS in the loop so it's correct
+// regardless of CONFIG_FREERTOS_HZ (1000 on this build → 1 ms ticks).
+static constexpr uint32_t RTP_TX_MAX_BACKOFF_MS = 60;
 
 // ESP-IDF Bluedroid callbacks are plain C function pointers; there is
 // exactly one instance of this component per firmware, so a single global
@@ -40,12 +69,41 @@ static void avrc_cb_trampoline(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_para
   if (g_instance != nullptr)
     g_instance->on_avrc_event(event, param);
 }
+// FreeRTOS task entry points are plain C function pointers too; the instance is
+// passed as the task argument rather than via g_instance so the coupling is
+// explicit at xTaskCreate.
+static void rtp_tx_task_trampoline(void *arg) { static_cast<A2DPBridge *>(arg)->rtp_tx_task_run(); }
 
 void A2DPBridge::setup() {
   g_instance = this;
   this->rtp_ssrc_ = esp_random();
   this->setup_rtp_socket_();
+  this->start_rtp_tx_task_();
   this->start_bt_stack_();
+}
+
+void A2DPBridge::start_rtp_tx_task_() {
+  this->rtp_tx_ringbuf_ = xRingbufferCreate(RTP_TX_RINGBUF_BYTES, RINGBUF_TYPE_NOSPLIT);
+  if (this->rtp_tx_ringbuf_ == nullptr) {
+    // OOM at setup: leave the ring null and degrade to a direct send from the
+    // audio callback (enqueue_rtp_packets_ handles this branch). Audio still
+    // flows, just without the retry/decoupling benefit.
+    ESP_LOGE(TAG, "RTP TX ring buffer alloc failed (%u bytes); using direct send", (unsigned) RTP_TX_RINGBUF_BYTES);
+    return;
+  }
+  // Log the heap headroom left after this allocation. This build shares tight
+  // internal DRAM between classic BT and WiFi; if this number is low, Bluedroid
+  // can run out of RX buffers and crash (host_recv_pkt_cb assert), so it's the
+  // number to watch before raising RTP_TX_RINGBUF_BYTES or any WiFi buffer.
+  ESP_LOGI(TAG, "RTP TX ring buffer: %u bytes; free internal heap now %u bytes", (unsigned) RTP_TX_RINGBUF_BYTES,
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  BaseType_t ok = xTaskCreate(rtp_tx_task_trampoline, "rtp_tx", RTP_TX_TASK_STACK, this, RTP_TX_TASK_PRIO,
+                              &this->rtp_tx_task_handle_);
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG, "RTP TX task create failed; using direct send");
+    vRingbufferDelete(this->rtp_tx_ringbuf_);
+    this->rtp_tx_ringbuf_ = nullptr;
+  }
 }
 
 void A2DPBridge::start_bt_stack_() {
@@ -121,22 +179,29 @@ void A2DPBridge::loop() {
     this->request_track_metadata_();
   }
 
-  // RTP TX health, logged from the main task (never from the audio
-  // callback). Reports deltas per interval so a nonzero "failed" count
-  // points squarely at sender-side drops (WiFi TX buffer full) as opposed
-  // to WiFi-layer loss or receiver jitter, which are invisible here.
+  // RTP TX health, logged from the main task (never from the audio callback).
+  // Reports deltas per interval and splits the two drop causes: `errno` drops
+  // are packets the TX task gave up on after exhausting its WiFi-buffer retries
+  // (transient stalls that got worse), while `queue-full` drops are packets the
+  // audio task couldn't even enqueue because the TX task can't drain fast
+  // enough — a sustained link problem. Both are the loss the receiver jitter
+  // buffer can't hide, so both stay visible; a healthy link logs neither.
   if (now - this->last_stats_log_ >= 5000) {
     this->last_stats_log_ = now;
     uint32_t sent = this->rtp_packets_sent_.load(std::memory_order_relaxed);
     uint32_t failed = this->rtp_send_failures_.load(std::memory_order_relaxed);
+    uint32_t qfull = this->rtp_queue_full_drops_.load(std::memory_order_relaxed);
     uint32_t d_sent = sent - this->last_packets_sent_;
     uint32_t d_failed = failed - this->last_send_failures_;
+    uint32_t d_qfull = qfull - this->last_queue_full_drops_;
     this->last_packets_sent_ = sent;
     this->last_send_failures_ = failed;
-    if (d_sent != 0 || d_failed != 0) {
-      if (d_failed != 0) {
-        ESP_LOGW(TAG, "RTP TX: %u sent, %u DROPPED (errno=%d) in last 5s", d_sent, d_failed,
-                 this->last_send_errno_.load(std::memory_order_relaxed));
+    this->last_queue_full_drops_ = qfull;
+    uint32_t d_dropped = d_failed + d_qfull;
+    if (d_sent != 0 || d_dropped != 0) {
+      if (d_dropped != 0) {
+        ESP_LOGW(TAG, "RTP TX: %u sent, %u DROPPED (%u WiFi errno=%d, %u queue-full) in last 5s", d_sent, d_dropped,
+                 d_failed, this->last_send_errno_.load(std::memory_order_relaxed), d_qfull);
       } else {
         ESP_LOGD(TAG, "RTP TX: %u sent, 0 dropped in last 5s", d_sent);
       }
@@ -148,6 +213,11 @@ void A2DPBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "A2DP Bluetooth Bridge:");
   ESP_LOGCONFIG(TAG, "  Device name: %s", this->device_name_.c_str());
   ESP_LOGCONFIG(TAG, "  RTP target: %s:%u", this->rtp_host_.c_str(), this->rtp_port_);
+  ESP_LOGCONFIG(TAG, "  RTP TX ring: %u bytes", (unsigned) RTP_TX_RINGBUF_BYTES);
+  // Free internal DRAM after all setup — the margin BT/WiFi and the ring share.
+  // Watch this: if it dips low, shrink the ring before Bluedroid runs out of
+  // RX buffers (host_recv_pkt_cb assert).
+  ESP_LOGCONFIG(TAG, "  Free internal heap: %u bytes", (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
 void A2DPBridge::on_gap_event(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
@@ -209,6 +279,11 @@ void A2DPBridge::on_a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *par
             this->track_title_sensor_->publish_state("");
           if (this->track_artist_sensor_ != nullptr)
             this->track_artist_sensor_->publish_state("");
+          // Keep the dedupe cache in sync with the cleared sensors, or a
+          // reconnect to the same track would match the stale cache and never
+          // re-publish, leaving the title/artist blank.
+          this->last_published_title_.clear();
+          this->last_published_artist_.clear();
         }
       });
       break;
@@ -243,25 +318,20 @@ void A2DPBridge::on_a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *par
 }
 
 void A2DPBridge::on_a2dp_data(const uint8_t *buf, uint32_t len) {
-  // Runs directly on the Bluedroid audio task at real-time rate — no
-  // logging, no defer(), nothing beyond the UDP send itself belongs here.
-  this->send_rtp_packet_(buf, len);
+  // Runs directly on the Bluedroid audio task at real-time rate — no logging,
+  // no defer(), and (crucially) no blocking network I/O. It only builds RTP
+  // packets and hands them to the TX task via the ring buffer; the actual
+  // sendto() happens off this task. See RTP_TX_* notes at the top of the file.
+  this->enqueue_rtp_packets_(buf, len);
 }
 
-void A2DPBridge::send_rtp_packet_(const uint8_t *payload, size_t len) {
+void A2DPBridge::enqueue_rtp_packets_(const uint8_t *payload, size_t len) {
   if (this->rtp_socket_ < 0 || this->rtp_host_.empty())
     return;
 
-  struct sockaddr_in dest {};
-  dest.sin_family = AF_INET;
-  dest.sin_port = htons(this->rtp_port_);
-  if (inet_pton(AF_INET, this->rtp_host_.c_str(), &dest.sin_addr) != 1)
-    return;
-
   // 16-bit stereo PCM frames only (4 bytes/frame) — the A2DP sink always
-  // hands us whole frames, but the fragment boundary must stay
-  // frame-aligned too, or the split would shift left/right channels on
-  // the receiving end.
+  // hands us whole frames, but the fragment boundary must stay frame-aligned
+  // too, or the split would shift left/right channels on the receiving end.
   constexpr size_t MAX_PAYLOAD = 1024 - (1024 % 4);
   size_t offset = 0;
   while (offset < len) {
@@ -289,23 +359,75 @@ void A2DPBridge::send_rtp_packet_(const uint8_t *payload, size_t len) {
     packet[11] = static_cast<uint8_t>(this->rtp_ssrc_);
     memcpy(packet + 12, payload + offset, chunk);
 
-    // Fire-and-forget UDP, but do NOT ignore the result: on lwIP a full
-    // WiFi TX buffer (typical during power-save bursts / BT+WiFi coex
-    // stalls) fails here with ENOMEM/EWOULDBLOCK and silently drops this
-    // packet — the exact mechanism behind audible RTP stutter. We can't
-    // log from this Bluedroid-task callback, so just bump atomic counters
-    // and let loop() report them from the main task.
-    if (sendto(this->rtp_socket_, packet, 12 + chunk, 0, reinterpret_cast<struct sockaddr *>(&dest),
-               sizeof(dest)) < 0) {
-      this->rtp_send_failures_.fetch_add(1, std::memory_order_relaxed);
-      this->last_send_errno_.store(errno, std::memory_order_relaxed);
+    if (this->rtp_tx_ringbuf_ != nullptr) {
+      // Timeout 0: never block the audio task. A full ring means the TX task
+      // can't drain fast enough (a *sustained* WiFi stall, not a transient
+      // one) — drop and count it. This is the drop the receiver jitter buffer
+      // genuinely can't hide, and it's reported separately from WiFi-layer
+      // (errno) drops so the two causes stay distinguishable in the logs.
+      if (xRingbufferSend(this->rtp_tx_ringbuf_, packet, 12 + chunk, 0) != pdTRUE)
+        this->rtp_queue_full_drops_.fetch_add(1, std::memory_order_relaxed);
     } else {
-      this->rtp_packets_sent_.fetch_add(1, std::memory_order_relaxed);
+      // Degraded fallback (ring alloc failed at setup): direct best-effort
+      // send from this task, single attempt, no retry.
+      if (this->raw_rtp_send_(packet, 12 + chunk) >= 0) {
+        this->rtp_packets_sent_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        this->rtp_send_failures_.fetch_add(1, std::memory_order_relaxed);
+        this->last_send_errno_.store(errno, std::memory_order_relaxed);
+      }
     }
 
+    // Advance the RTP sequence/timestamp for every packet we *intended* to
+    // send, even a dropped one — leaving a gap the receiver detects is the
+    // correct RTP semantic; renumbering would hide the loss.
     this->rtp_sequence_++;
     this->rtp_timestamp_ += chunk / 4;  // stereo 16-bit frames, RTP clock rate == sample_rate_
     offset += chunk;
+  }
+}
+
+ssize_t A2DPBridge::raw_rtp_send_(const uint8_t *packet, size_t len) {
+  struct sockaddr_in dest {};
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons(this->rtp_port_);
+  if (inet_pton(AF_INET, this->rtp_host_.c_str(), &dest.sin_addr) != 1) {
+    errno = EINVAL;
+    return -1;
+  }
+  return sendto(this->rtp_socket_, packet, len, 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
+}
+
+void A2DPBridge::rtp_tx_task_run() {
+  for (;;) {
+    size_t item_size = 0;
+    // Blocks until a packet is enqueued; the audio task is the only producer.
+    void *item = xRingbufferReceive(this->rtp_tx_ringbuf_, &item_size, portMAX_DELAY);
+    if (item == nullptr)
+      continue;
+
+    bool sent = false;
+    const TickType_t max_ticks = pdMS_TO_TICKS(RTP_TX_MAX_BACKOFF_MS);
+    for (TickType_t waited = 0;; waited++) {
+      if (this->raw_rtp_send_(static_cast<const uint8_t *>(item), item_size) >= 0) {
+        sent = true;
+        break;
+      }
+      // Only a full TX buffer is worth waiting on; a real error (bad host,
+      // closed socket) won't clear by retrying, so bail immediately.
+      if (errno != ENOMEM && errno != EAGAIN && errno != EWOULDBLOCK)
+        break;
+      if (waited >= max_ticks)
+        break;  // waited out the whole backoff budget; give up and count it dropped
+      vTaskDelay(1);  // let the WiFi driver drain, then retry (safe off the BT task)
+    }
+    if (sent) {
+      this->rtp_packets_sent_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      this->rtp_send_failures_.fetch_add(1, std::memory_order_relaxed);
+      this->last_send_errno_.store(errno, std::memory_order_relaxed);
+    }
+    vRingbufferReturnItem(this->rtp_tx_ringbuf_, item);
   }
 }
 
@@ -323,10 +445,22 @@ void A2DPBridge::on_avrc_event(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_para
       std::string text(reinterpret_cast<const char *>(param->meta_rsp.attr_text),
                         std::max(0, param->meta_rsp.attr_length));
       this->defer([this, attr_id, text]() {
+        // Only publish on an actual change. The metadata is polled every 5 s
+        // (no AVRC notifications), so without this we'd ship the same title/
+        // artist over the API every 5 s — needless periodic WiFi traffic that
+        // competes with Bluetooth reception on the shared radio. The last_*
+        // members are touched only here (main-loop task via defer), so no
+        // synchronization is needed.
         if (attr_id == ESP_AVRC_MD_ATTR_TITLE && this->track_title_sensor_ != nullptr) {
-          this->track_title_sensor_->publish_state(text);
+          if (text != this->last_published_title_) {
+            this->last_published_title_ = text;
+            this->track_title_sensor_->publish_state(text);
+          }
         } else if (attr_id == ESP_AVRC_MD_ATTR_ARTIST && this->track_artist_sensor_ != nullptr) {
-          this->track_artist_sensor_->publish_state(text);
+          if (text != this->last_published_artist_) {
+            this->last_published_artist_ = text;
+            this->track_artist_sensor_->publish_state(text);
+          }
         }
       });
       break;

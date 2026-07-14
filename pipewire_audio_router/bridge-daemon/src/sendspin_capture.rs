@@ -72,19 +72,10 @@ pub fn spawn(target_node_id: u32) -> Result<(CaptureHandle, tokio::sync::mpsc::U
         })
         .map_err(|e| format!("failed to spawn capture thread: {e}"))?;
 
-    Ok((
-        CaptureHandle {
-            cmd_tx: Some(cmd_tx),
-        },
-        pcm_rx,
-    ))
+    Ok((CaptureHandle { cmd_tx: Some(cmd_tx) }, pcm_rx))
 }
 
-fn run(
-    target_node_id: u32,
-    pcm_tx: UnboundedSender<Vec<u8>>,
-    cmd_rx: pw::channel::Receiver<CaptureCmd>,
-) -> Result<(), String> {
+fn run(target_node_id: u32, pcm_tx: UnboundedSender<Vec<u8>>, cmd_rx: pw::channel::Receiver<CaptureCmd>) -> Result<(), String> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| format!("context: {e}"))?;

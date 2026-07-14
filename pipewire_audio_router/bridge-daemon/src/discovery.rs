@@ -31,9 +31,18 @@ use crate::pw_thread::{PwCommand, PwCommandSender};
 use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
+
+/// How long a discovered RAOP receiver may be mDNS-absent before we unload its
+/// sink. An mDNS "removed" is usually a TTL-expiry flap (the receiver never
+/// left), so we wait out the grace and cancel on any re-resolve — mirroring the
+/// sendspin liveness policy, without a per-device connection to lean on.
+const RAOP_ABSENT_GRACE: Duration = Duration::from_secs(90);
+/// How often the discovery loop wakes (when idle) to expire pending unloads.
+const RAOP_ABSENT_TICK: Duration = Duration::from_secs(15);
 
 /// Whether discovery loads modules, or only logs what it would load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,108 +118,146 @@ fn output_from_service(info: &ServiceInfo) -> Option<RaopOutputConfig> {
 pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources, mode: Mode) -> anyhow::Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
     let receiver = daemon.browse(RAOP_SERVICE_TYPE)?;
-    std::thread::Builder::new()
-        .name("mdns-discovery".into())
-        .spawn(move || {
-            // mDNS fullname -> RAOP node name, for receivers WE loaded, so a
-            // later removal unloads exactly those (never store-managed ones).
-            let mut loaded: HashMap<String, String> = HashMap::new();
-            while let Ok(event) = receiver.recv() {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        let Some(output) = output_from_service(&info) else {
-                            tracing::warn!(
-                                "discovered RAOP service {} with no IPv4 address yet; skipping",
-                                info.get_fullname()
-                            );
-                            continue;
-                        };
-                        let node_name = raop_node_name(&output.name);
-                        let fullname = info.get_fullname().to_string();
+    std::thread::Builder::new().name("mdns-discovery".into()).spawn(move || {
+        // mDNS fullname -> RAOP node name, for receivers WE loaded, so a
+        // later removal unloads exactly those (never store-managed ones).
+        let mut loaded: HashMap<String, String> = HashMap::new();
+        // Fullnames we've already warned lack IPv4. mdns-sd re-emits
+        // ServiceResolved on every announcement, so a peer that never
+        // exposes an IPv4 A record would otherwise spam the log many times
+        // a second. Warn once; clear the flag if/when it finally resolves.
+        let mut warned_no_ipv4: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Fullname -> when it went mDNS-absent. Grace-delayed unload; a
+        // re-resolve cancels it. recv_timeout wakes us to expire these even
+        // when no mDNS events are arriving.
+        let mut pending_unload: HashMap<String, Instant> = HashMap::new();
+        'discovery: loop {
+            match receiver.recv_timeout(RAOP_ABSENT_TICK) {
+                Err(_) if receiver.is_disconnected() => break, // daemon dropped
+                Err(_) => {}                                   // timeout — fall through to expire pending unloads
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    let fullname = info.get_fullname().to_string();
+                    // A resolve (even a re-announce mid-flap) cancels any
+                    // scheduled unload for this receiver.
+                    pending_unload.remove(&fullname);
 
-                        // Skip our OWN AirPlay-receive source. The embedded
-                        // receiver (airplay_source.rs) advertises itself on
-                        // _raop._tcp, so without this the daemon discovers the
-                        // receiver it just started and loads a raop-sink
-                        // pointing back at itself — a bogus output / feedback
-                        // loop. Match on the mDNS instance MAC (our derived
-                        // hwaddr), which is stable even when mDNS appends
-                        // " (2)" to our name on a transient conflict; fall back
-                        // to a friendly-name slug match too.
-                        let airplay_name = sources.lock_recover().airplay_source_name().map(str::to_string);
-                        if let Some(ap) = &airplay_name {
-                            let own_mac = crate::airplay_source::mdns_mac(ap);
-                            if instance_mac(&fullname).eq_ignore_ascii_case(&own_mac)
-                                || slugify(ap) == slugify(&output.name)
-                            {
-                                tracing::debug!(
-                                    "discovered '{}' is our own AirPlay receiver; not loading it as an output",
-                                    output.name
-                                );
-                                continue;
-                            }
-                        }
-
-                        if store.lock_recover().contains(&node_name) {
-                            tracing::debug!(
-                                "discovered '{}' is store-managed ({node_name}); leaving it to the store",
-                                output.name
-                            );
+                    // Skip our OWN AirPlay-receive source as early as
+                    // possible — by instance MAC (our derived hwaddr), which
+                    // is present even before an IPv4 address resolves and is
+                    // stable across the " (N)" suffix mDNS appends on a name
+                    // conflict. The embedded receiver (airplay_source.rs)
+                    // advertises on every interface (incl. docker/IPv6), so
+                    // some of its own resolutions carry no IPv4; skipping it
+                    // here (before the IPv4 check) avoids both a feedback
+                    // loop AND a resolve/log storm from our own registration.
+                    let airplay_name = sources.lock_recover().airplay_source_name().map(str::to_string);
+                    if let Some(ap) = &airplay_name {
+                        let own_mac = crate::airplay_source::mdns_mac(ap);
+                        if instance_mac(&fullname).eq_ignore_ascii_case(&own_mac) {
                             continue;
                         }
-                        if loaded.contains_key(&fullname) {
-                            continue; // already auto-loaded
-                        }
+                    }
 
-                        if mode == Mode::DryRun {
-                            tracing::info!(
-                                "[discovery dry-run] would load '{}' at {}:{} ({}) as {node_name}",
-                                output.name, output.ip, output.port, output.encryption.as_pipewire_arg()
-                            );
+                    let Some(output) = output_from_service(&info) else {
+                        if warned_no_ipv4.insert(fullname.clone()) {
+                            tracing::warn!("discovered RAOP service {fullname} with no IPv4 address yet; skipping");
+                        }
+                        continue;
+                    };
+                    warned_no_ipv4.remove(&fullname); // it resolved now
+
+                    let node_name = raop_node_name(&output.name);
+
+                    // Friendly-name-slug fallback for our own receiver (the
+                    // instance-MAC check above is the primary guard).
+                    if let Some(ap) = &airplay_name {
+                        if slugify(ap) == slugify(&output.name) {
+                            tracing::debug!("discovered '{}' is our own AirPlay receiver; not loading it as an output", output.name);
                             continue;
                         }
+                    }
 
+                    if store.lock_recover().contains(&node_name) {
+                        tracing::debug!("discovered '{}' is store-managed ({node_name}); leaving it to the store", output.name);
+                        continue;
+                    }
+                    if loaded.contains_key(&fullname) {
+                        continue; // already auto-loaded
+                    }
+
+                    if mode == Mode::DryRun {
                         tracing::info!(
-                            "auto-discovered RAOP receiver '{}' at {}:{} ({}); loading {node_name}",
-                            output.name, output.ip, output.port, output.encryption.as_pipewire_arg()
+                            "[discovery dry-run] would load '{}' at {}:{} ({}) as {node_name}",
+                            output.name,
+                            output.ip,
+                            output.port,
+                            output.encryption.as_pipewire_arg()
                         );
-                        let args = raop_module_args(&output);
-                        let (tx, rx) = oneshot::channel();
-                        let sent = pw_cmd.send(PwCommand::Load {
-                            node_name: node_name.clone(),
-                            module_name: RAOP_MODULE_NAME.to_string(),
-                            args,
-                            reply: tx,
-                        });
-                        if sent.is_err() {
-                            tracing::error!("PipeWire thread unavailable; stopping discovery");
-                            break;
-                        }
-                        match rx.blocking_recv() {
-                            Ok(Ok(())) => {
-                                loaded.insert(fullname, node_name);
-                            }
-                            Ok(Err(e)) => tracing::warn!("failed to load discovered '{node_name}': {e}"),
-                            Err(_) => tracing::warn!("no reply loading discovered '{node_name}'"),
-                        }
+                        continue;
                     }
-                    ServiceEvent::ServiceRemoved(_ty, fullname) => {
-                        let Some(node_name) = loaded.remove(&fullname) else {
-                            continue; // not one we loaded (store-managed, or dry-run)
-                        };
-                        tracing::info!("RAOP receiver '{fullname}' went away; unloading {node_name}");
-                        let (tx, rx) = oneshot::channel();
-                        if pw_cmd.send(PwCommand::Unload { node_name, reply: tx }).is_err() {
-                            tracing::error!("PipeWire thread unavailable; stopping discovery");
-                            break;
-                        }
-                        let _ = rx.blocking_recv();
+
+                    tracing::info!(
+                        "auto-discovered RAOP receiver '{}' at {}:{} ({}); loading {node_name}",
+                        output.name,
+                        output.ip,
+                        output.port,
+                        output.encryption.as_pipewire_arg()
+                    );
+                    let args = raop_module_args(&output);
+                    let (tx, rx) = oneshot::channel();
+                    let sent = pw_cmd.send(PwCommand::Load {
+                        node_name: node_name.clone(),
+                        module_name: RAOP_MODULE_NAME.to_string(),
+                        args,
+                        reply: tx,
+                    });
+                    if sent.is_err() {
+                        tracing::error!("PipeWire thread unavailable; stopping discovery");
+                        break;
                     }
-                    _ => {}
+                    match rx.blocking_recv() {
+                        Ok(Ok(())) => {
+                            loaded.insert(fullname, node_name);
+                        }
+                        Ok(Err(e)) => tracing::warn!("failed to load discovered '{node_name}': {e}"),
+                        Err(_) => tracing::warn!("no reply loading discovered '{node_name}'"),
+                    }
+                }
+                Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
+                    warned_no_ipv4.remove(&fullname); // let a re-appear warn again
+                                                      // Don't unload now — schedule a grace-delayed unload so a
+                                                      // TTL-flap re-resolve can cancel it. Only receivers WE
+                                                      // loaded are candidates.
+                    if loaded.contains_key(&fullname) {
+                        pending_unload.entry(fullname).or_insert_with(Instant::now);
+                    }
+                }
+                Ok(_) => {}
+            }
+
+            // Expire pending unloads: receivers absent past the grace window
+            // are genuinely gone (a flap would have re-resolved and cancelled).
+            if !pending_unload.is_empty() {
+                let expired: Vec<String> = pending_unload
+                    .iter()
+                    .filter(|(_, since)| since.elapsed() >= RAOP_ABSENT_GRACE)
+                    .map(|(fullname, _)| fullname.clone())
+                    .collect();
+                for fullname in expired {
+                    pending_unload.remove(&fullname);
+                    let Some(node_name) = loaded.remove(&fullname) else { continue };
+                    tracing::info!("RAOP receiver '{fullname}' absent > {}s; unloading {node_name}", RAOP_ABSENT_GRACE.as_secs());
+                    let (tx, rx) = oneshot::channel();
+                    if pw_cmd.send(PwCommand::Unload { node_name, reply: tx }).is_err() {
+                        tracing::error!("PipeWire thread unavailable; stopping discovery");
+                        break 'discovery;
+                    }
+                    let _ = rx.blocking_recv();
                 }
             }
-            tracing::info!("mDNS discovery loop ended");
-        })?;
+        }
+        tracing::info!("mDNS discovery loop ended");
+    })?;
     Ok(daemon)
 }
 
@@ -220,18 +267,12 @@ mod tests {
 
     #[test]
     fn friendly_name_taken_from_after_the_at_sign() {
-        assert_eq!(
-            output_name_from_fullname("AABBCCDDEEFF@Living Room._raop._tcp.local."),
-            "Living Room"
-        );
+        assert_eq!(output_name_from_fullname("AABBCCDDEEFF@Living Room._raop._tcp.local."), "Living Room");
     }
 
     #[test]
     fn falls_back_to_whole_instance_without_at_sign() {
-        assert_eq!(
-            output_name_from_fullname("Dusche._raop._tcp.local."),
-            "Dusche"
-        );
+        assert_eq!(output_name_from_fullname("Dusche._raop._tcp.local."), "Dusche");
     }
 
     #[test]

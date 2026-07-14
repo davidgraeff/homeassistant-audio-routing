@@ -21,10 +21,9 @@ impl OutputsStore {
     /// file is created on the first `add`).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("reading outputs store {}: {e}", path.display()))?;
-            let outputs: Vec<RaopOutputConfig> = serde_json::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("parsing outputs store {}: {e}", path.display()))?;
+            let raw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading outputs store {}: {e}", path.display()))?;
+            let outputs: Vec<RaopOutputConfig> =
+                serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing outputs store {}: {e}", path.display()))?;
             Ok(Self { path: path.to_path_buf(), outputs })
         } else {
             Ok(Self { path: path.to_path_buf(), outputs: Vec::new() })
@@ -71,8 +70,7 @@ impl OutputsStore {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(&self.outputs)?;
-        std::fs::write(&self.path, json)
-            .map_err(|e| anyhow::anyhow!("writing outputs store {}: {e}", self.path.display()))?;
+        std::fs::write(&self.path, json).map_err(|e| anyhow::anyhow!("writing outputs store {}: {e}", self.path.display()))?;
         Ok(())
     }
 }
@@ -83,12 +81,7 @@ mod tests {
     use crate::config::{RaopEncryption, RaopOutputConfig};
 
     fn output(name: &str, ip: &str) -> RaopOutputConfig {
-        RaopOutputConfig {
-            name: name.to_string(),
-            ip: ip.to_string(),
-            port: 7000,
-            encryption: RaopEncryption::AuthSetup,
-        }
+        RaopOutputConfig { name: name.to_string(), ip: ip.to_string(), port: 7000, encryption: RaopEncryption::AuthSetup }
     }
 
     #[test]

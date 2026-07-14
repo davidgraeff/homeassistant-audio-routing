@@ -24,8 +24,9 @@ COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
 
 SWITCH = "switch.bluetooth_bridge_rtp_source"
 NUMBER = "number.bluetooth_bridge_rtp_port"
+LATENCY = "number.bluetooth_bridge_rtp_jitter_buffer"
 
-RTP_DISABLED = RtpSourceState(enabled=False, port=46000, loaded=False)
+RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 
 
 def _make_entry(hass):
@@ -46,6 +47,7 @@ async def _setup(hass, stack, rtp=RTP_DISABLED):
         patch(f"{API}.async_get_routing", new=AsyncMock(return_value=RoutingMatrix(sources=[], outputs=[], links=[])))
     )
     stack.enter_context(patch(f"{API}.async_get_rtp_source", new=AsyncMock(return_value=rtp)))
+    stack.enter_context(patch(f"{API}.async_get_sendspin_volumes", new=AsyncMock(return_value={})))
     stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -66,7 +68,7 @@ async def test_entities_created_disabled_by_default(hass):
 
 async def test_switch_and_number_reflect_enabled_state(hass):
     with ExitStack() as stack:
-        await _setup(hass, stack, RtpSourceState(enabled=True, port=46001, loaded=True))
+        await _setup(hass, stack, RtpSourceState(enabled=True, port=46001, latency_msec=200, loaded=True))
     assert hass.states.get(SWITCH).state == "on"
     # An enabled source's stored port is authoritative for the number.
     assert float(hass.states.get(NUMBER).state) == 46001
@@ -80,13 +82,13 @@ async def test_turn_on_enables_with_desired_port(hass):
         await _setup(hass, stack, RTP_DISABLED)
         with patch(f"{API}.async_set_rtp_source", new=AsyncMock()) as mock_set:
             await hass.services.async_call("switch", "turn_on", {"entity_id": SWITCH}, blocking=True)
-            # Default desired port when nothing set yet.
-            mock_set.assert_awaited_once_with(46000)
+            # Default desired port + latency when nothing set yet.
+            mock_set.assert_awaited_once_with(46000, 200)
 
 
 async def test_turn_off_disables(hass):
     with ExitStack() as stack:
-        await _setup(hass, stack, RtpSourceState(enabled=True, port=46000, loaded=True))
+        await _setup(hass, stack, RtpSourceState(enabled=True, port=46000, latency_msec=200, loaded=True))
         with patch(f"{API}.async_disable_rtp_source", new=AsyncMock()) as mock_disable:
             await hass.services.async_call("switch", "turn_off", {"entity_id": SWITCH}, blocking=True)
             mock_disable.assert_awaited_once_with()
@@ -97,11 +99,41 @@ async def test_turn_off_disables(hass):
 
 async def test_set_port_while_enabled_repoints_live(hass):
     with ExitStack() as stack:
-        await _setup(hass, stack, RtpSourceState(enabled=True, port=46000, loaded=True))
+        await _setup(hass, stack, RtpSourceState(enabled=True, port=46000, latency_msec=200, loaded=True))
         with patch(f"{API}.async_set_rtp_source", new=AsyncMock()) as mock_set:
             await hass.services.async_call("number", "set_value", {"entity_id": NUMBER, "value": 47100}, blocking=True)
-            # Enabled → applied live (module reloads on the new port).
-            mock_set.assert_awaited_once_with(47100)
+            # Enabled → applied live (module reloads on the new port), current
+            # latency carried along since the daemon replaces the whole config.
+            mock_set.assert_awaited_once_with(47100, 200)
+
+
+async def test_latency_reflects_enabled_state(hass):
+    with ExitStack() as stack:
+        await _setup(hass, stack, RtpSourceState(enabled=True, port=46000, latency_msec=350, loaded=True))
+    # An enabled source's stored latency is authoritative for the number.
+    assert float(hass.states.get(LATENCY).state) == 350
+
+
+async def test_set_latency_while_enabled_repoints_live(hass):
+    with ExitStack() as stack:
+        await _setup(hass, stack, RtpSourceState(enabled=True, port=46000, latency_msec=200, loaded=True))
+        with patch(f"{API}.async_set_rtp_source", new=AsyncMock()) as mock_set:
+            await hass.services.async_call("number", "set_value", {"entity_id": LATENCY, "value": 350}, blocking=True)
+            # Enabled → applied live, current port carried along.
+            mock_set.assert_awaited_once_with(46000, 350)
+
+
+async def test_set_latency_while_disabled_only_remembers_then_used_on_enable(hass):
+    with ExitStack() as stack:
+        await _setup(hass, stack, RTP_DISABLED)
+        with patch(f"{API}.async_set_rtp_source", new=AsyncMock()) as mock_set:
+            await hass.services.async_call("number", "set_value", {"entity_id": LATENCY, "value": 350}, blocking=True)
+            mock_set.assert_not_awaited()
+        assert float(hass.states.get(LATENCY).state) == 350
+        # The next enable uses the remembered latency (default port).
+        with patch(f"{API}.async_set_rtp_source", new=AsyncMock()) as mock_set:
+            await hass.services.async_call("switch", "turn_on", {"entity_id": SWITCH}, blocking=True)
+            mock_set.assert_awaited_once_with(46000, 350)
 
 
 async def test_set_port_while_disabled_only_remembers_then_used_on_enable(hass):
@@ -115,7 +147,7 @@ async def test_set_port_while_disabled_only_remembers_then_used_on_enable(hass):
         # ...but the next enable uses the remembered port.
         with patch(f"{API}.async_set_rtp_source", new=AsyncMock()) as mock_set:
             await hass.services.async_call("switch", "turn_on", {"entity_id": SWITCH}, blocking=True)
-            mock_set.assert_awaited_once_with(47100)
+            mock_set.assert_awaited_once_with(47100, 200)
 
 
 # ---- API client: RTP endpoints -------------------------------------------
@@ -156,10 +188,10 @@ class _FakeHttpSession:
 
 async def test_get_rtp_source_parses_shape():
     client = PipewireRouterApiClient(
-        _FakeHttpSession(_FakeResp({"enabled": True, "port": 46000, "loaded": True})), "h", 8099
+        _FakeHttpSession(_FakeResp({"enabled": True, "port": 46000, "latency_msec": 250, "loaded": True})), "h", 8099
     )
     state = await client.async_get_rtp_source()
-    assert (state.enabled, state.port, state.loaded) == (True, 46000, True)
+    assert (state.enabled, state.port, state.latency_msec, state.loaded) == (True, 46000, 250, True)
 
 
 async def test_set_rtp_source_raises_daemon_message_on_ok_false():
@@ -168,7 +200,7 @@ async def test_set_rtp_source_raises_daemon_message_on_ok_false():
         _FakeHttpSession(_FakeResp({"ok": False, "message": "failed to load module"}, status=502)), "h", 8099
     )
     with pytest.raises(PipewireRouterApiError, match="failed to load module"):
-        await client.async_set_rtp_source(46000)
+        await client.async_set_rtp_source(46000, 200)
 
 
 async def test_disable_rtp_source_ok():

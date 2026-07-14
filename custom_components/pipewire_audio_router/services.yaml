@@ -25,3 +25,8 @@ unlink:
       example: shairport-sync
       selector:
         text:
+
+# Purge media_player entities the daemon no longer reports (renamed/removed
+# devices left behind as `unavailable`). No fields — cleans every configured
+# daemon. Run it while the daemon is reachable so its live matrix is accurate.
+cleanup_entities:

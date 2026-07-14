@@ -30,14 +30,19 @@ PipeWire `rtp-source` would do).
 
 1. **Sources** feed PCM into the PipeWire graph running inside the add-on
    container:
-   - Phones/PCs stream to it as an AirPlay receiver
-     (`shairport-sync`, appearing as an ordinary `Stream/Output/Audio`
-     node).
+   - Phones/PCs stream to it as an AirPlay receiver. This is a **native,
+     in-process** RAOP receiver (a vendored+patched pure-Rust `shairplay`
+     crate, `airplay_source.rs`) whose decoded PCM is pushed through a
+     small jitter buffer into a PipeWire source node (`airplay-in`) —
+     **not** a `shairport-sync` subprocess (which had no PipeWire backend
+     in the Ubuntu build, so its audio never reached the graph). See
+     [decisions.md](decisions.md#native-airplay-receive-source-vendored-shairplay-not-shairport-sync).
    - The Bluetooth bridge box (a real ESP32 acting as a classic-Bluetooth
      A2DP sink) RTP-encodes what it receives and sends it to the
      container's `rtp-source` node — see
      [bt-bridge-firmware.svg](diagrams/bt-bridge-firmware.svg) for that
-     device's internal flow.
+     device's internal flow. The RTP source can bind a multicast group so
+     several PipeWire hosts share one bridge stream.
 2. **The PipeWire graph** is a plain many-to-many routing/mixing graph —
    any source node can be linked to any sink node, including multiple
    sinks at once (the "one AirPlay source → RAOP output + sendspin
@@ -50,29 +55,41 @@ PipeWire `rtp-source` would do).
      one module per device — hot-loaded into the bridge daemon's own
      PipeWire context at runtime so outputs can be added/removed without
      restarting PipeWire (see [decisions.md](decisions.md#loading-pipewire-modules-at-runtime)).
-   - **Sendspin** (ESPHome speaker devices): a null-sink node created and
-     captured natively by the daemon, which runs an embedded Sendspin
-     server per output (`sendspin_server.rs`, on the `sendspin` crate)
-     that pushes the captured audio to the real device over the Sendspin
-     WebSocket protocol — all in-process, no subprocess.
+   - **Sendspin** (ESPHome speaker devices, e.g. HA Voice PE): devices are
+     **auto-discovered** over mDNS (`sendspin_discovery.rs`) and appear as
+     virtual routing outputs. Devices routed from the *same* set of sources
+     are automatically formed into one **synchronized group**
+     (`sendspin_group.rs`): a null-sink node captured natively by the
+     daemon, feeding one embedded Sendspin server (`sendspin_server.rs`, on
+     a vendored+patched `sendspin` crate) that dials exactly that group's
+     devices over the Sendspin WebSocket — all in-process, no subprocess.
+     Per-device volume is sent in-band over the protocol
+     (`sendspin_volume.rs`), and online/offline is decided by the live
+     connection plus a TCP liveness probe — mDNS is discovery-only
+     (`sendspin_liveness.rs`), so a flapping mDNS record never tears down a
+     live group. See
+     [decisions.md](decisions.md#sendspin-auto-discovery-grouping-per-device-volume-and-connection-driven-liveness).
 4. **The bridge daemon** (Rust) is the only thing that knows about HA,
    config files, or "what a room is." It observes the live PipeWire
    registry on a dedicated thread (PipeWire's core types aren't `Send`)
    and exposes that state — plus native mutation endpoints (links via
    `Core::create_object`/`Registry::destroy_global`, volume via the node's
    `Props` param, announce playback via a `pw::stream`; no subprocesses) —
-   over a REST + WebSocket API. It also supervises the one remaining external
-   process — the AirPlay-receive source (`shairport-sync`) — from its
-   persisted store, spawning/stopping it live; the Sendspin servers run
-   inside the daemon itself rather than as subprocesses. Full endpoint
-   reference: [api-reference.md](api-reference.md).
+   over a REST + WebSocket API. There are **no subprocesses left** — the
+   AirPlay receiver, the Sendspin servers, and the RTP source all run
+   natively in-process, so `run.sh` is just infrastructure + the daemon.
+   Full endpoint reference: [api-reference.md](api-reference.md).
 5. **Home Assistant** talks to that API through the `custom_components`
-   integration, which creates one `media_player` entity per configured
-   output. Volume, `play_media`/announce (with real
-   `MediaPlayerEntityFeature.MEDIA_ANNOUNCE` support, ducking the
-   existing source rather than replacing it), and state all round-trip
-   through the daemon's REST API — nothing talks to PipeWire directly
-   except the daemon itself.
+   integration, which creates one `media_player` entity per routing-matrix
+   **output** — RAOP receivers *and* discovered sendspin devices alike. The
+   entity set follows the matrix: an output that leaves it (a discovered
+   device that's truly gone) has its entity removed; a configured-but-offline
+   one stays `unavailable`; a `cleanup_entities` service purges any stale
+   leftovers. Volume (per-device, including sendspin), `play_media`/announce
+   (real `MediaPlayerEntityFeature.MEDIA_ANNOUNCE`, ducking the existing
+   source rather than replacing it), source selection, and state all
+   round-trip through the daemon's REST API — nothing talks to PipeWire
+   directly except the daemon itself.
 6. **The manual routing UI** (`GET /` on the daemon) is a separate,
    simpler way to do the same linking a human would otherwise do via
    `pw-link`/Helvum — a source × output matrix, live-updated over the

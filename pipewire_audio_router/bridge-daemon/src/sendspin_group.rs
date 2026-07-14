@@ -117,7 +117,14 @@ impl GroupReconciler {
         port
     }
 
-    pub async fn reconcile(&mut self, pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting, devices: &SharedSendspinDevices) {
+    pub async fn reconcile(
+        &mut self,
+        pw: &SharedState,
+        pw_cmd: &PwCommandSender,
+        routing: &SharedRouting,
+        devices: &SharedSendspinDevices,
+        control: &crate::sendspin_volume::SharedSendspinControl,
+    ) {
         let desired = compute_desired(routing, devices);
 
         // Tear down running groups that are gone or whose membership changed
@@ -151,6 +158,8 @@ impl GroupReconciler {
                     Some(d.device_fullnames.clone()),
                     pw.clone(),
                     pw_cmd.clone(),
+                    control.clone(),
+                    devices.clone(),
                 )
                 .await
                 {

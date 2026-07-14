@@ -121,6 +121,21 @@ different PipeWire instance from Home Assistant without reflashing.
 Whatever you set persists across reboots; the YAML `secrets.yaml` value
 only matters for the very first boot before anything's been set.
 
+### Sending to more than one receiver (multicast)
+
+A plain host is **unicast** — the stream reaches exactly one PipeWire box.
+To feed several receivers from one bridge (e.g. a dev box *and* the HA
+add-on) set **"PipeWire RTP Host"** to an IPv4 **multicast group** such as
+`239.255.42.42`. No firmware change is needed: `sendto()` to a multicast
+address just works (default TTL 1 keeps it on the local subnet, which is
+where whole-home audio lives).
+
+On each receiver, set the rtp-source's **Source address** (Sources tab in
+the add-on UI, or `source.ip`) to that same group so PipeWire joins it via
+`IP_ADD_MEMBERSHIP`; leave it `0.0.0.0` for unicast. Note your switch must
+forward multicast to those ports — most home switches do (flood, or IGMP
+snooping with a querier present).
+
 ## Known limitations
 
 - **AVRCP metadata is polled every 5s**, not push-notified (would need

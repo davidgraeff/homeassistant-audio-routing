@@ -50,7 +50,10 @@ class PipewireRtpSourceSwitch(CoordinatorEntity[PipewireRouterCoordinator], Swit
         return rtp.enabled if rtp is not None else None
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self.coordinator.client.async_set_rtp_source(self.coordinator.rtp_desired_port)
+        await self.coordinator.client.async_set_rtp_source(
+            self.coordinator.rtp_desired_port,
+            self.coordinator.rtp_desired_latency_msec,
+        )
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:

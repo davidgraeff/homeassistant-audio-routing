@@ -78,39 +78,44 @@ unload its module live.
 Unknown `node_name` → 404. The unload is idempotent, so once the output
 existed it's gone afterward regardless of registry-timing races.
 
-## Sources & sendspin outputs
+## Sources
 
-Config for the non-RAOP sources/outputs, persisted in a daemon-owned store
+Config for the non-RAOP sources, persisted in a daemon-owned store
 (`/data/sources.json`) that starts empty on a fresh install (no
 `options.json` seeding) and is managed live here with no restart
-(`sources_store.rs`). Three different mechanisms under the hood — reflected
-in whether each reports `running` or `loaded`:
+(`sources_store.rs`). Both sources run **natively in-process** — there are
+no supervised subprocesses:
 
-- the **AirPlay-receive source** (`shairport-sync`) is an external process
-  the daemon supervises (`supervisor.rs`) — no in-daemon equivalent exists;
-- the **RTP source** is a native `libpipewire-module-rtp-source` (see below);
-- **sendspin outputs** are embedded native servers running inside the daemon
-  itself (`sendspin_server.rs`, on the `sendspin` crate) — not subprocesses.
+- the **AirPlay-receive source** is a native, embedded RAOP receiver (a
+  vendored+patched pure-Rust `shairplay` crate, `airplay_source.rs`) — not
+  a `shairport-sync` subprocess;
+- the **RTP source** is a native `libpipewire-module-rtp-source` (see below).
+
+(Sendspin devices are auto-discovered, not configured here — see
+[Sendspin devices](#sendspin-devices).)
 
 ### `GET /api/source/airplay`
 ```json
-{ "name": "PipeWire Router", "running": true }
+{ "name": "PipeWire Router", "running": true, "latency_msec": 150 }
 ```
 `name` is `null` when the source is disabled; `running` is whether the
-`shairport-sync` process is up right now.
+embedded receiver is up right now; `latency_msec` is the producer jitter
+buffer (higher = fewer stutters, more latency).
 
 ### `PUT /api/source/airplay`
 ```json
-// Request  (empty string disables the source)
-{ "name": "Living Room" }
+// Request  (empty string disables the source; latency_msec optional)
+{ "name": "Living Room", "latency_msec": 150 }
 // Response
 { "ok": true, "message": "AirPlay source set to 'Living Room'" }
 ```
-Persists the advertised AirPlay name, then (re)starts `shairport-sync`
-with it (an empty/whitespace name stops the process and disables it). The
-name is saved *before* the process is reconciled, so if the process fails
-to start the setting still persists and the response is `ok: false` with
-the reason (502).
+Persists the advertised AirPlay name + jitter buffer, then (re)starts the
+embedded receiver with it (an empty/whitespace name stops it and disables
+the source). Saved *before* the receiver is reconciled, so if it fails to
+start the setting still persists and the response is `ok: false` with the
+reason (502). The receiver advertises unencrypted ALAC (`et=0`, `cn=1`);
+see [decisions.md](decisions.md#native-airplay-receive-source-vendored-shairplay-not-shairport-sync)
+for why that combination is what PipeWire senders actually drive.
 
 ### `DELETE /api/source/airplay`
 Disables the source — stops the process and clears the stored name.
@@ -130,24 +135,28 @@ see `bridge-daemon/src/rtp_source.rs`.
 
 ### `GET /api/source/rtp`
 ```json
-{ "enabled": true, "port": 46000, "loaded": true }
+{ "enabled": true, "port": 46000, "latency_msec": 200, "source_addr": "0.0.0.0", "loaded": true }
 ```
 `enabled` is whether it's on in the store; `port` is the stored UDP port (or
-the `46000` default when disabled); `loaded` is whether the `bt-bridge-rtp`
-node is present in the live PipeWire graph right now.
+the `46000` default when disabled); `latency_msec` is the receiver jitter
+buffer (raise on a weak link to trade latency for fewer dropouts);
+`source_addr` is the bind address — `0.0.0.0` for a normal unicast target, or
+a multicast group so several receivers share one bridge stream; `loaded` is
+whether the `bt-bridge-rtp` node is present in the live graph right now.
 
 ### `PUT /api/source/rtp`
 ```json
-// Request  (port optional; defaults to 46000)
-{ "port": 46000 }
+// Request  (all but the daemon replaces the whole config; omitted fields default)
+{ "port": 46000, "latency_msec": 200, "source_addr": "239.255.42.42" }
 // Response
-{ "ok": true, "message": "RTP source enabled on port 46000" }
+{ "ok": true, "message": "RTP source enabled on 239.255.42.42:46000 (200 ms jitter buffer)" }
 ```
-Enables the source (or changes its port): persists the port, then reloads the
-module on it (unload-then-load, so a re-enable or port change is a clean
-reload). The port is saved *before* the module is reconciled — if the load
-fails the setting still persists and the response is `ok: false` with the
-reason (502).
+Enables the source (or changes it): persists the config, then reloads the
+module (unload-then-load, so a change is a clean reload). Saved *before* the
+module is reconciled — if the load fails the setting still persists and the
+response is `ok: false` with the reason (502). Set `source_addr` to a
+multicast group (and point the firmware's RTP host at the same group) to fan
+one bridge stream out to several PipeWire hosts.
 
 ### `DELETE /api/source/rtp`
 Disables the source — unloads the module (its node disappears live) and clears
@@ -156,33 +165,35 @@ the stored config.
 { "ok": true, "message": "RTP source disabled" }
 ```
 
-### `GET /api/sendspin_outputs`
-```json
-[ { "name": "Kitchen", "port": 8927, "node_name": "sendspin-out-kitchen", "running": true } ]
-```
-`running` is whether that output's embedded sendspin server is active
-(sink node created + capture + server role up), all in-process.
+## Sendspin devices
 
-### `POST /api/sendspin_outputs`
+Sendspin speakers (ESPHome, e.g. HA Voice PE) are **auto-discovered** over
+mDNS (`sendspin_discovery.rs`) — there is no per-output config to create.
+Each discovered device shows up as a virtual routing output
+(`sendspin-dev-<slug>`); devices routed from the same source set are formed
+into one synchronized group automatically (`sendspin_group.rs`). Online/offline
+is decided by the live connection plus a TCP liveness probe, not raw mDNS
+(`sendspin_liveness.rs`). The only per-device control is volume, carried
+in-band over the protocol (there is no PipeWire node volume for these virtual
+outputs).
+
+### `GET /api/sendspin/volumes`
+Desired per-device volume (0–100), keyed by device node name. Sparse — a
+device with no entry is at full scale.
+```json
+{ "sendspin-dev-home_assistant_voice_093ca8": 60 }
+```
+
+### `PUT /api/sendspin/volume`
 ```json
 // Request
-{ "name": "Kitchen" }
-// Response (201)
-{ "ok": true, "message": "added sendspin output 'Kitchen' on port 8927" }
+{ "node_name": "sendspin-dev-home_assistant_voice_093ca8", "volume": 60 }
+// Response
+{ "ok": true, "message": "set 'sendspin-dev-home_assistant_voice_093ca8' to 60%" }
 ```
-Adds an output, allocates the lowest free port at/above the base
-(`8927`), persists it, and starts its embedded sendspin server —
-creating the sink node, capturing from it, and running the server role,
-all in-process (`sendspin_server.rs`). A duplicate (same slugified name)
-→ 409; the server failing to start → 502 (still persisted).
-
-### `DELETE /api/sendspin_outputs/:node_name`
-Removes the output (e.g. `sendspin-out-kitchen`) and stops its embedded
-server, tearing down its sink node and capture.
-```json
-{ "ok": true, "message": "removed sendspin output 'sendspin-out-kitchen'" }
-```
-Unknown `node_name` → 404.
+Sends the volume to the device in-band and stores it (re-applied on the
+device's next reconnect). If the device isn't connected the value is still
+stored (`"saved … (device not connected)"`).
 
 ## Linking
 
@@ -192,7 +203,7 @@ Caller is responsible for pairing FL/FR etc. themselves.
 
 ```json
 // Request
-{ "from_port": "alsa_playback.shairport-sync:output_FL", "to_port": "raop-out-pioneer:playback_FL" }
+{ "from_port": "airplay-in:output_FL", "to_port": "raop-out-pioneer:playback_FL" }
 // Response
 { "ok": true, "message": "linked ... -> ..." }
 ```
@@ -212,21 +223,24 @@ See "Routing matrix" below.
 ## Media players
 
 ### `GET /api/media_players`
-Returns every node the daemon recognizes as a configured output — node
-names starting with `raop-out-` or `sendspin-out-` — with live state.
-This is exactly what backs the HA integration's entities.
+Returns the **live RAOP output** nodes (`raop-out-*`) with their state +
+node-level volume. It's the RAOP volume/state overlay the HA integration
+layers on top of the routing matrix.
 
 ```json
 [
-  { "node_id": 42, "node_name": "raop-out-pioneer", "state": "playing", "volume": 0.62 },
-  { "node_id": 51, "node_name": "sendspin-out-kitchen", "state": "idle", "volume": null }
+  { "node_id": 42, "node_name": "raop-out-pioneer", "state": "playing", "volume": 0.62 }
 ]
 ```
 
 `state` is `"playing"` if any link currently feeds the node, else
 `"idle"`. `volume` is read natively from the node's SPA `Props` param
 (`channelVolumes`, `volume.rs`); `null` if the node exposes no volume
-control.
+control. Sendspin devices are **not** here — they're virtual (no PipeWire
+node); the integration sources them from the routing matrix and gets their
+volume from [`/api/sendspin/volumes`](#sendspin-devices). The HA integration
+creates one `media_player` per routing-matrix **output** (RAOP + sendspin),
+not from this list directly.
 
 ### `GET /api/media_players/:node_id/volume`
 ```json
@@ -288,39 +302,49 @@ call.
 ## Routing matrix (manual routing UI)
 
 ### `GET /api/routing`
+The matrix is keyed by **stable `node_name`**, not the ephemeral id — so
+routing intent survives module reloads and device churn, and links to a
+currently-offline endpoint are kept and reapplied when it returns.
+
 ```json
 {
-  "sources": [ { "node_id": 12, "node_name": "shairport-sync", "display_name": "PipeWire Router" } ],
-  "outputs": [
-    { "node_id": 42, "node_name": "raop-out-pioneer", "display_name": "Pioneer" },
-    { "node_id": 51, "node_name": "sendspin-out-kitchen", "display_name": "Kitchen" }
+  "sources": [
+    { "node_name": "airplay-in", "display_name": "Music Now", "present": true, "configured": true, "node_id": 12, "peak": 0.31 },
+    { "node_name": "bt-bridge-rtp", "display_name": "BT Bridge (RTP)", "present": true, "configured": true, "node_id": 44, "peak": 0.0 }
   ],
-  "links": [ [12, 42] ]
+  "outputs": [
+    { "node_name": "raop-out-pioneer", "display_name": "Pioneer", "present": true, "configured": false, "node_id": 42, "peak": 0.0 },
+    { "node_name": "sendspin-dev-voice_kitchen", "display_name": "Voice Kitchen", "present": true, "configured": false, "node_id": null, "peak": 0.0 }
+  ],
+  "links": [ { "source": "airplay-in", "output": "raop-out-pioneer" } ]
 }
 ```
-- Each node carries both its ephemeral `node_id` and its stable
-  `node_name` (unchanged across a module reload); links are keyed by id.
-- **Outputs** = the same `raop-out-`/`sendspin-out-` nodes
-  `/api/media_players` recognizes (shared source of truth).
-- **Sources** = any other node with at least one non-`monitor_*`
-  output-direction port (excludes every sink's own `pw-record` monitor
-  tap).
-- Both lists sorted alphabetically by `display_name` (prefix stripped,
-  `_`/`-` replaced with spaces).
+- Each node carries its stable `node_name`, an ephemeral `node_id`
+  (`null` when offline, or always for virtual sendspin devices), `present`
+  (in the live graph now — `false` = configured/known but offline, shown
+  grayed), `configured` (manually added vs auto-discovered), and `peak`
+  (a live input-level meter for sources, populated only while the matrix WS
+  is open — see `metering.rs`).
+- **Outputs** = live RAOP sinks + discovered sendspin devices + any
+  offline endpoint with saved routing intent. **Sources** = the AirPlay
+  receiver, the RTP source, and any other non-monitor output-direction node.
+- `links` are `{source, output}` **name** pairs — the persisted intent.
 
 ### `POST /api/routing/link` / `POST /api/routing/unlink`
 ```json
-{ "source_node_id": 12, "output_node_id": 42 }
+{ "source": "airplay-in", "output": "raop-out-pioneer" }
 ```
-Pairs every non-monitor output port on the source with the input port
-on the output sharing the same channel suffix (`output_FL` ~ `send_FL`
-~ `playback_FL` all match as `FL`), then creates/destroys those links
-natively via the PipeWire thread (`Core::create_object` /
-`Registry::destroy_global`). `link` returns `ok: false` if either node
-doesn't exist or no channel pairs match. `unlink` removes every link
-between the two nodes by id and returns `ok: true` even when there were
-none (the desired "not linked" end state holds regardless of registry
-races).
+By stable **name**. `link` records the intent and, if both endpoints are
+present, pairs every non-monitor output port on the source with the matching
+channel-suffix input on the output (`output_FL` ~ `send_FL` ~ `playback_FL`
+all match as `FL`) and creates those links natively; the intent is reapplied
+automatically if an endpoint (re)appears later. `unlink` removes the intent
+and any live links and returns `ok: true` even if there were none.
+
+### `DELETE /api/routing/entity/:node_name`
+Forget an offline endpoint entirely — drops its saved routing intent so it
+stops appearing (grayed) in the matrix. A real device that later reappears
+comes back unrouted.
 
 ### `GET /api/routing/ws`
 WebSocket. Sends one JSON `RoutingMatrix` snapshot (same shape as
@@ -336,8 +360,12 @@ Serves the built web UI — a Vite + Svelte single-page app (source in
 `pipewire_audio_router/frontend/`, served as static files from
 `--static-dir`), styled to match Home Assistant with light/dark themes and
 also surfaced in the HA sidebar via ingress. It's a full admin console: the
-source × output routing matrix (live over `/api/routing/ws`, clickable
-link/unlink cells, per-output volume sliders) plus RAOP-output, AirPlay/RTP-
-source, and sendspin management and an announce test. The volume sliders
-poll `/api/media_players` every few seconds for sync, since volume changes
-aren't a registry event.
+routing matrix (outputs as rows, sources as columns, live over
+`/api/routing/ws`, clickable link/unlink cells, per-output volume sliders
+including sendspin devices, offline endpoints grayed with a forget button,
+synchronized-group badges, and a live input-level meter per source) plus
+RAOP-output and AirPlay/RTP-source management and an announce test. Sendspin
+devices are auto-discovered, so there's no manual sendspin management — just a
+capabilities note. Volume sliders poll `/api/media_players` +
+`/api/sendspin/volumes` every few seconds, since volume changes aren't a
+registry event.

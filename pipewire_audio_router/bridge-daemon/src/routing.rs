@@ -29,16 +29,16 @@ use crate::api::AppState;
 use crate::config::{SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
 use crate::outputs_store::OutputsStore;
-use crate::raop::{raop_node_name, RAOP_NODE_PREFIX};
 use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
+use crate::raop::{raop_node_name, RAOP_NODE_PREFIX};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
 use crate::sendspin_discovery::SendspinDevice;
-use std::collections::BTreeMap;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tokio::sync::oneshot;
 
 #[derive(Serialize, Clone)]
@@ -59,6 +59,9 @@ pub struct RoutingNode {
     /// mDNS-auto-discovered one (`false`) — drives the "auto-discovered" badge.
     /// Always `true` for sources (they aren't mDNS-discovered here).
     configured: bool,
+    /// Recent peak level (0.0–1.0) for the UI meter. Sources only (metered
+    /// on-demand while the matrix is watched); `0.0` for outputs and unmetered.
+    peak: f32,
 }
 
 #[derive(Serialize, Clone)]
@@ -101,6 +104,7 @@ fn build_matrix(
     store: &OutputsStore,
     devices: &BTreeMap<String, SendspinDevice>,
     airplay_display: Option<&str>,
+    meters: &crate::metering::MeterHub,
     intent: &[RoutingLink],
 ) -> RoutingMatrix {
     use std::collections::BTreeSet;
@@ -114,10 +118,8 @@ fn build_matrix(
             let e = present_outputs.entry(node.node_name.clone()).or_insert(node.node_id);
             *e = (*e).max(node.node_id);
         } else {
-            let has_real_source_port = reg
-                .ports
-                .values()
-                .any(|p| p.node_id == node.node_id && p.direction == "out" && !p.port_name.starts_with("monitor_"));
+            let has_real_source_port =
+                reg.ports.values().any(|p| p.node_id == node.node_id && p.direction == "out" && !p.port_name.starts_with("monitor_"));
             if has_real_source_port {
                 let e = present_sources.entry(node.node_name.clone()).or_insert(node.node_id);
                 *e = (*e).max(node.node_id);
@@ -126,8 +128,7 @@ fn build_matrix(
     }
 
     // Configured RAOP outputs: node_name -> friendly display name.
-    let configured: BTreeMap<String, String> =
-        store.list().iter().map(|o| (raop_node_name(&o.name), o.name.clone())).collect();
+    let configured: BTreeMap<String, String> = store.list().iter().map(|o| (raop_node_name(&o.name), o.name.clone())).collect();
 
     // Discovered sendspin devices are virtual outputs (present, auto, no live
     // node id — audio reaches them via a group sink, sendspin_group.rs).
@@ -146,20 +147,24 @@ fn build_matrix(
         .into_iter()
         .map(|name| {
             let node_id = present_outputs.get(&name).copied();
-            let is_device = devices.contains_key(&name);
+            let device = devices.get(&name);
             let display_name = configured
                 .get(&name)
                 .cloned()
-                .or_else(|| devices.get(&name).map(|d| d.display_name.clone()))
+                .or_else(|| device.map(|d| d.display_name.clone()))
                 .unwrap_or_else(|| output_display_name(&name));
             RoutingNode {
-                // A device is "present" when it's in the live discovery registry.
-                present: node_id.is_some() || is_device,
+                // Present if live in the graph, or a discovered sendspin device
+                // the liveness task still deems online. An offline device stays
+                // listed (grayed) until liveness removes it — an mDNS blip no
+                // longer makes it vanish.
+                present: node_id.is_some() || device.is_some_and(|d| d.present),
                 node_id,
                 // Devices and offline entries are never manually configured.
                 configured: configured.contains_key(&name),
                 display_name,
                 node_name: name,
+                peak: 0.0, // outputs aren't metered
             }
         })
         .collect();
@@ -174,7 +179,8 @@ fn build_matrix(
                 Some(ap) if name == AIRPLAY_NODE_NAME => ap.to_string(),
                 _ => name.clone(),
             };
-            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name }
+            let peak = meters.peak(&name);
+            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name, peak }
         })
         .collect();
 
@@ -196,7 +202,13 @@ fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let airplay = state.sources.lock_recover().airplay_source_name().map(str::to_string);
     let reg = state.pw.lock_recover();
     let store = state.store.lock_recover();
-    build_matrix(&reg, &store, &devices, airplay.as_deref(), &intent)
+    build_matrix(&reg, &store, &devices, airplay.as_deref(), &state.meters, &intent)
+}
+
+/// Present source nodes as `(node_name, node_id)` — the set the meter hub taps
+/// while the matrix is being watched.
+fn present_source_meters(matrix: &RoutingMatrix) -> Vec<(String, u32)> {
+    matrix.sources.iter().filter_map(|s| s.node_id.map(|id| (s.node_name.clone(), id))).collect()
 }
 
 /// Every non-monitor output-direction port on `source_node_id` paired with the
@@ -220,15 +232,12 @@ fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: 
         .iter()
         .filter_map(|sp| {
             let suffix = channel_suffix(&sp.port_name);
-            output_ports
-                .iter()
-                .find(|op| channel_suffix(&op.port_name) == suffix)
-                .map(|op| LinkSpec {
-                    out_node: source_node_id,
-                    out_port: sp.port_id,
-                    in_node: output_node_id,
-                    in_port: op.port_id,
-                })
+            output_ports.iter().find(|op| channel_suffix(&op.port_name) == suffix).map(|op| LinkSpec {
+                out_node: source_node_id,
+                out_port: sp.port_id,
+                in_node: output_node_id,
+                in_port: op.port_id,
+            })
         })
         .collect()
 }
@@ -359,11 +368,7 @@ pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairReque
     // source. Destroy is idempotent, so any that raced away are harmless.
     let link_ids: Vec<u32> = {
         let st = state.pw.lock_recover();
-        st.links
-            .values()
-            .filter(|l| l.output_node == source_id && l.input_node == output_id)
-            .map(|l| l.link_id)
-            .collect()
+        st.links.values().filter(|l| l.output_node == source_id && l.input_node == output_id).map(|l| l.link_id).collect()
     };
     if link_ids.is_empty() {
         return Json(LinkOpResponse { ok: true, message: "no live links to remove".to_string() });
@@ -397,26 +402,44 @@ pub async fn routing_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut changes = state.changes.subscribe();
-    if send_snapshot(&mut socket, &state).await.is_err() {
+    // A watching client turns on source peak metering (turned off when the last
+    // client leaves — see MeterHub). reconcile_sources on each registry change
+    // keeps the tapped set matching the present sources.
+    state.meters.watch();
+
+    // Peak levels change continuously, but the registry `changes` channel only
+    // fires on graph changes — so also push a fresh snapshot on a timer while
+    // watched, giving the UI a live meter. This cost is only paid while a
+    // client is connected.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let matrix = build_snapshot(&state);
+    state.meters.reconcile_sources(&present_source_meters(&matrix));
+    if send_matrix(&mut socket, &matrix).await.is_err() {
+        state.meters.unwatch();
         return;
     }
     loop {
         tokio::select! {
             changed = changes.recv() => {
                 match changed {
-                    Ok(()) => {
-                        if send_snapshot(&mut socket, &state).await.is_err() {
-                            break;
-                        }
-                    }
-                    // A slow client missed some pings — one fresh snapshot
-                    // catches it up completely, no need to replay history.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if send_snapshot(&mut socket, &state).await.is_err() {
+                    // On any graph change, rebuild + re-tap the current sources.
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let matrix = build_snapshot(&state);
+                        state.meters.reconcile_sources(&present_source_meters(&matrix));
+                        if send_matrix(&mut socket, &matrix).await.is_err() {
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            // Live peak refresh (levels move without graph changes).
+            _ = tick.tick() => {
+                let matrix = build_snapshot(&state);
+                if send_matrix(&mut socket, &matrix).await.is_err() {
+                    break;
                 }
             }
             // This UI never sends messages; we only poll the socket here
@@ -428,10 +451,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
+    state.meters.unwatch();
 }
 
-async fn send_snapshot(socket: &mut WebSocket, state: &AppState) -> Result<(), axum::Error> {
-    let matrix = build_snapshot(state);
-    let json = serde_json::to_string(&matrix).unwrap_or_else(|_| "{}".to_string());
+async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(), axum::Error> {
+    let json = serde_json::to_string(matrix).unwrap_or_else(|_| "{}".to_string());
     socket.send(Message::Text(json)).await
 }

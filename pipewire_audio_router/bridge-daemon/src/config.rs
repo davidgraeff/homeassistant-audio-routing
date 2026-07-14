@@ -78,11 +78,7 @@ pub const SENDSPIN_GRP_PREFIX: &str = "sendspin-grp-";
 /// object name and (later) an HA entity-id fragment: lowercase,
 /// spaces/punctuation collapsed to underscores.
 pub fn slugify(name: &str) -> String {
-    name.trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect::<String>()
+    name.trim().to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>()
 }
 
 #[cfg(test)]

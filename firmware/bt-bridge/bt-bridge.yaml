@@ -7,6 +7,20 @@ esp32:
   board: esp32dev
   framework:
     type: esp-idf
+    advanced:
+      # Remap SRAM1 as IRAM to free ~40 KB of DRAM heap (the bootloader logs
+      # that it supports this). This build shares tight internal DRAM between
+      # classic BT and WiFi; the extra headroom keeps Bluedroid's HCI RX pool
+      # safe and lets the RTP TX ring (a2dp_bridge.cpp) be sized to absorb
+      # BT/WiFi coexistence stalls. Only the app changes, so it applies over OTA.
+      sram1_as_iram: true
+    # NOTE: do NOT bump CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM here. An earlier
+    # attempt (64, ~+50 KB heap) starved Bluedroid's HCI RX pool on this
+    # BT-classic + WiFi build and crashed the BT controller task with an
+    # assert in host_recv_pkt_cb (hci_hal_h4.c) on the next inbound ACL packet.
+    # The firmware's own RTP TX task (a2dp_bridge.cpp, "Fix 3") already handles
+    # a full WiFi TX buffer by retrying instead of dropping, which is what the
+    # extra driver buffers were for — so the bump is both redundant and unsafe.
 
 # Deliberately NOT included: esp32_ble, esp32_ble_tracker, bluetooth_proxy,
 # esp32_improv_ble. Omitting all four is what keeps the classic-BT radio

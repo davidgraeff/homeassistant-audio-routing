@@ -4,6 +4,7 @@ mod config;
 mod decode;
 mod discovery;
 mod locks;
+mod metering;
 mod outputs_store;
 mod player;
 mod pw_module;
@@ -15,7 +16,9 @@ mod rtp_source;
 mod sendspin_capture;
 mod sendspin_discovery;
 mod sendspin_group;
+mod sendspin_liveness;
 mod sendspin_server;
+mod sendspin_volume;
 mod sources_store;
 mod volume;
 mod wav;
@@ -70,16 +73,13 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "bridge_daemon=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "bridge_daemon=info,shairplay=info".into()),
         )
         .init();
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { store, sources, routing, static_dir, listen } => {
-            serve(&store, &sources, &routing, &static_dir, &listen)
-        }
+        Command::Serve { store, sources, routing, static_dir, listen } => serve(&store, &sources, &routing, &static_dir, &listen),
     }
 }
 
@@ -133,6 +133,8 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
 
     let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let meters = metering::MeterHub::new();
+    let sendspin_control = sendspin_volume::shared();
     let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
@@ -214,6 +216,11 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         // — the rest still start and it can be re-enabled live.
         spawn_stored_sources(&sources, &airplay, pw_cmd.clone()).await;
 
+        // Own sendspin device online/offline (and eventual removal) from the
+        // live connection state + an active TCP probe — mDNS only ever adds.
+        // Without this, an mDNS TTL flap would tear down live groups.
+        sendspin_liveness::spawn(sendspin_devices.clone(), sendspin_control.clone(), changes.clone());
+
         // Reconcile persisted routing intent onto the live graph, now and on
         // every registry/device change: a node that (re)appears — a reloaded
         // raop-sink, a rediscovered device — gets its saved links recreated
@@ -224,19 +231,17 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             let cmd = pw_cmd.clone();
             let routing = routing.clone();
             let devices = sendspin_devices.clone();
+            let control = sendspin_control.clone();
             let groups = std::sync::Arc::new(tokio::sync::Mutex::new(sendspin_group::GroupReconciler::new()));
             let mut rx = changes.subscribe();
             tokio::spawn(async move {
                 routing::reconcile(&pw, &cmd, &routing).await;
-                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices).await;
-                loop {
-                    match rx.recv().await {
-                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            routing::reconcile(&pw, &cmd, &routing).await;
-                            groups.lock().await.reconcile(&pw, &cmd, &routing, &devices).await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
+                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control).await;
+                // Loops until the change channel closes (RecvError::Closed ends the
+                // `while let`); a Lagged wakeup reconciles just like a normal one.
+                while let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+                    routing::reconcile(&pw, &cmd, &routing).await;
+                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control).await;
                 }
             });
         }
@@ -248,8 +253,10 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             store,
             sources,
             airplay.clone(),
+            meters,
             sendspin_devices,
             routing,
+            sendspin_control,
             static_dir.to_path_buf(),
         );
         let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -271,22 +278,18 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
 /// and the RTP source (a PipeWire module). (Sendspin devices aren't started
 /// here — they're auto-discovered and grouped from the routing intent; see
 /// sendspin_group.rs.)
-async fn spawn_stored_sources(
-    sources: &api::SharedSources,
-    airplay: &api::SharedAirplay,
-    pw_cmd: pw_thread::PwCommandSender,
-) {
+async fn spawn_stored_sources(sources: &api::SharedSources, airplay: &api::SharedAirplay, pw_cmd: pw_thread::PwCommandSender) {
     // Snapshot the config and drop the (std) lock before awaiting anything.
-    let (airplay_name, rtp) = {
+    let (airplay_name, airplay_latency, airplay_auth_setup, rtp) = {
         let s = sources.lock_recover();
-        (s.airplay_source_name().map(str::to_string), s.rtp_source())
+        (s.airplay_source_name().map(str::to_string), s.airplay_latency_msec(), s.airplay_auth_setup(), s.rtp_source())
     };
 
     // The RTP source (bt-bridge) is a native PipeWire module, not a subprocess
     // — load it via the PipeWire thread like a RAOP sink, not the supervisor. A
     // failed load is logged, not fatal; it can be re-enabled live via the API.
     if let Some(rtp) = rtp {
-        let args = rtp_source::rtp_source_module_args(rtp.port);
+        let args = rtp_source::rtp_source_module_args(rtp.port, rtp.latency_msec, &rtp.source_addr);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let sent = pw_cmd.send(pw_thread::PwCommand::Load {
             node_name: rtp_source::RTP_SOURCE_NODE_NAME.to_string(),
@@ -298,7 +301,9 @@ async fn spawn_stored_sources(
             tracing::error!("PipeWire thread unavailable while loading RTP source");
         } else {
             match rx.await {
-                Ok(Ok(())) => tracing::info!("started RTP source on port {}", rtp.port),
+                Ok(Ok(())) => {
+                    tracing::info!("started RTP source on port {} ({} ms jitter buffer)", rtp.port, rtp.latency_msec)
+                }
                 Ok(Err(e)) => tracing::warn!("failed to start RTP source: {e}"),
                 Err(_) => tracing::warn!("no reply loading RTP source"),
             }
@@ -306,7 +311,7 @@ async fn spawn_stored_sources(
     }
 
     if let Some(name) = airplay_name {
-        match airplay_source::start(name.clone()).await {
+        match airplay_source::start(name.clone(), airplay_latency, airplay_auth_setup).await {
             Ok(handle) => {
                 *airplay.lock().await = Some(handle);
                 tracing::info!("started AirPlay source '{name}'");

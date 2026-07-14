@@ -61,10 +61,7 @@ impl Drop for SendspinServerHandle {
         // forget, matching how removing a RAOP output doesn't block on the
         // unload either.
         let (reply_tx, _reply_rx) = oneshot::channel();
-        let _ = self.pw_cmd.send(PwCommand::DestroySinkNode {
-            node_id: self.node_id,
-            reply: reply_tx,
-        });
+        let _ = self.pw_cmd.send(PwCommand::DestroySinkNode { node_id: self.node_id, reply: reply_tx });
     }
 }
 
@@ -77,6 +74,9 @@ impl Drop for SendspinServerHandle {
 /// fullname is in the set — this is what makes a *group*: one sink + one
 /// synchronized `Group` dialing exactly its member devices. `None` dials every
 /// discovered device (the manual-output behavior).
+// Each parameter is a distinct shared handle the server needs; a struct wrapper
+// wouldn't clarify the one call site (sendspin_group.rs).
+#[allow(clippy::too_many_arguments)]
 pub async fn start_server(
     node_name: &str,
     display_name: &str,
@@ -84,20 +84,16 @@ pub async fn start_server(
     device_filter: Option<std::collections::HashSet<String>>,
     pw_state: SharedState,
     pw_cmd: PwCommandSender,
+    control: crate::sendspin_volume::SharedSendspinControl,
+    devices: crate::sendspin_discovery::SharedSendspinDevices,
 ) -> anyhow::Result<SendspinServerHandle> {
     let node_name = node_name.to_string();
 
     let (reply_tx, reply_rx) = oneshot::channel();
     pw_cmd
-        .send(PwCommand::CreateSinkNode {
-            node_name: node_name.clone(),
-            reply: reply_tx,
-        })
+        .send(PwCommand::CreateSinkNode { node_name: node_name.clone(), reply: reply_tx })
         .map_err(|_| anyhow::anyhow!("pipewire thread is gone"))?;
-    reply_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("pipewire thread dropped the reply"))?
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    reply_rx.await.map_err(|_| anyhow::anyhow!("pipewire thread dropped the reply"))?.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let node_id = wait_for_node_id(&pw_state, &node_name)
         .await
@@ -110,8 +106,8 @@ pub async fn start_server(
     // once the handle is actually built.
     let node_guard = SinkNodeGuard::new(node_id, pw_cmd.clone());
 
-    let (capture_handle, mut pcm_rx) = crate::sendspin_capture::spawn(node_id)
-        .map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
+    let (capture_handle, mut pcm_rx) =
+        crate::sendspin_capture::spawn(node_id).map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
 
     let listener = ServerListener::bind(("0.0.0.0", port), &node_name, display_name)
         .await
@@ -122,32 +118,43 @@ pub async fn start_server(
 
     let group = Arc::new(Mutex::new(Group::new(Arc::new(DefaultClock::default()))));
 
-    let accept_task = spawn_accept_loop(listener, Arc::clone(&group));
+    let accept_task = spawn_accept_loop(listener, Arc::clone(&group), control.clone());
 
-    let (client_manager, mut events) = ClientManager::start_filtered(
-        node_name.clone(),
-        display_name.to_string(),
-        Arc::new(DefaultClock::default()),
-        move |fullname| device_filter.as_ref().map_or(true, |set| set.contains(fullname)),
-    )
-    .map_err(|e| anyhow::anyhow!("failed to start sendspin client discovery for '{node_name}': {e}"))?;
+    let (client_manager, mut events) =
+        ClientManager::start_filtered(node_name.clone(), display_name.to_string(), Arc::new(DefaultClock::default()), move |fullname| {
+            device_filter.as_ref().is_none_or(|set| set.contains(fullname))
+        })
+        .map_err(|e| anyhow::anyhow!("failed to start sendspin client discovery for '{node_name}': {e}"))?;
     let event_task = {
         let group = Arc::clone(&group);
+        let control = control.clone();
+        let devices = devices.clone();
+        // The group keys members by client_id (an opaque MAC), but volume
+        // control keys by the virtual device node name; remember the mapping so
+        // a Disconnected (which only carries client_id) can unregister volume.
+        let mut client_to_node: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
-                    ClientEvent::Connected {
-                        client_id, sender, ..
-                    } => {
+                    ClientEvent::Connected { client_id, fullname, sender, .. } => {
+                        // Resolve the discovered device's node name from the
+                        // dialed mDNS fullname (client_id is a MAC and won't
+                        // match). Register for volume control (applies any
+                        // stored per-device volume), then add to the sync group.
+                        let node_name = resolve_node_name(&devices, &fullname);
+                        client_to_node.insert(client_id.clone(), node_name.clone());
+                        control.lock().await.register(node_name, sender.clone()).await;
                         if let Err(e) = group.lock().await.add_member(client_id, sender).await {
                             tracing::warn!("failed to add sendspin group member: {e}");
                         }
                     }
-                    // client/state, client/command — no group-level reaction
-                    // needed yet (volume/mute persistence per client is a
-                    // later refinement, not required for parity with today).
+                    // client/state, client/command from the device — no
+                    // server-side reaction needed (we push volume, not poll it).
                     ClientEvent::Message { .. } => {}
                     ClientEvent::Disconnected { client_id } => {
+                        if let Some(node_name) = client_to_node.remove(&client_id) {
+                            control.lock().await.unregister(&node_name);
+                        }
                         group.lock().await.remove_member(&client_id);
                     }
                 }
@@ -215,27 +222,32 @@ impl Drop for SinkNodeGuard {
     fn drop(&mut self) {
         if self.armed {
             let (reply_tx, _reply_rx) = oneshot::channel();
-            let _ = self.pw_cmd.send(PwCommand::DestroySinkNode {
-                node_id: self.node_id,
-                reply: reply_tx,
-            });
+            let _ = self.pw_cmd.send(PwCommand::DestroySinkNode { node_id: self.node_id, reply: reply_tx });
         }
     }
 }
 
 /// Accept clients that dial in to us (some real Sendspin clients do; see
 /// sendspin-rs's `ServerListener` docs).
-fn spawn_accept_loop(listener: ServerListener, group: Arc<Mutex<Group>>) -> JoinHandle<()> {
+fn spawn_accept_loop(
+    listener: ServerListener,
+    group: Arc<Mutex<Group>>,
+    control: crate::sendspin_volume::SharedSendspinControl,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((conn, _addr)) => {
                     let client_id = conn.client_id().to_string();
+                    // Inbound dial-ins carry no mDNS fullname; derive the node
+                    // name from the client's self-reported hello name instead.
+                    let node_name = crate::sendspin_discovery::device_node_name(&conn.hello().name);
                     let sender = conn.sender();
-                    tokio::spawn(drain_messages(conn));
-                    if let Err(e) = group.lock().await.add_member(client_id, sender).await {
+                    control.lock().await.register(node_name.clone(), sender.clone()).await;
+                    if let Err(e) = group.lock().await.add_member(client_id.clone(), sender).await {
                         tracing::warn!("failed to add inbound sendspin group member: {e}");
                     }
+                    tokio::spawn(drain_messages(conn, client_id, node_name, Arc::clone(&group), control.clone()));
                 }
                 Err(e) => {
                     tracing::warn!("sendspin accept error: {e}");
@@ -248,9 +260,31 @@ fn spawn_accept_loop(listener: ServerListener, group: Arc<Mutex<Group>>) -> Join
 
 /// `ServerConnection::recv_message` must be polled for the connection to make
 /// progress at all (it also drives the underlying message loop) — this just
-/// keeps that going. No group-level reaction needed yet.
-async fn drain_messages(mut conn: ServerConnection) {
+/// keeps that going, then drops the client from the group + volume control when
+/// the connection ends (the dial path gets this from `ClientEvent`; inbound
+/// connections have no such event, so we clean up here).
+async fn drain_messages(
+    mut conn: ServerConnection,
+    client_id: String,
+    node_name: String,
+    group: Arc<Mutex<Group>>,
+    control: crate::sendspin_volume::SharedSendspinControl,
+) {
     while conn.recv_message().await.is_some() {}
+    control.lock().await.unregister(&node_name);
+    group.lock().await.remove_member(&client_id);
+}
+
+/// Map a dialed mDNS fullname to the discovered device's virtual node name.
+/// Prefers the exact discovery-registry entry (so it matches whatever
+/// display-name rule discovery used); falls back to deriving from the mDNS
+/// instance label when the device isn't in the registry yet.
+fn resolve_node_name(devices: &crate::sendspin_discovery::SharedSendspinDevices, fullname: &str) -> String {
+    if let Some(node_name) = devices.lock_recover().iter().find(|(_, d)| d.fullname == fullname).map(|(node_name, _)| node_name.clone()) {
+        return node_name;
+    }
+    let label = fullname.split("._sendspin._tcp").next().unwrap_or(fullname);
+    crate::sendspin_discovery::device_node_name(label)
 }
 
 /// Polls the shared registry snapshot for a node named `node_name`. Needed

@@ -14,7 +14,8 @@ from datetime import timedelta
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -28,9 +29,11 @@ from .api import (
 from .const import (
     CONF_HOST,
     CONF_PORT,
+    DEFAULT_RTP_LATENCY_MSEC,
     DEFAULT_RTP_PORT,
     DOMAIN,
     ROUTING_WS_RECONNECT_SECONDS,
+    SERVICE_CLEANUP_ENTITIES,
     UPDATE_INTERVAL_SECONDS,
 )
 
@@ -75,6 +78,14 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         # `number` entity restores it across restarts) so a chosen-but-not-yet-
         # enabled port isn't lost.
         self.rtp_desired_port: int = DEFAULT_RTP_PORT
+        # Same story for the jitter-buffer latency: tracked here so a value
+        # chosen while the source is disabled survives until the next enable
+        # (and is restored across restarts by its `number` entity).
+        self.rtp_desired_latency_msec: int = DEFAULT_RTP_LATENCY_MSEC
+        # Desired per-device sendspin volumes (node_name -> 0-100), refreshed
+        # each poll. Sendspin devices are virtual (no PipeWire node volume), so
+        # their media_player volume comes from here, not from `.data`.
+        self.sendspin_volumes: dict[str, int] = {}
 
     async def _async_update_data(self) -> list[MediaPlayerState]:
         try:
@@ -86,11 +97,17 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         try:
             self.rtp = await self.client.async_get_rtp_source()
             if self.rtp.enabled:
-                # An enabled source's stored port is authoritative.
+                # An enabled source's stored config is authoritative.
                 self.rtp_desired_port = self.rtp.port
+                self.rtp_desired_latency_msec = self.rtp.latency_msec
         except PipewireRouterApiError as err:
             _LOGGER.debug("rtp source state unavailable: %s", err)
             self.rtp = None
+        # Sendspin volumes are secondary too — never take entities down for it.
+        try:
+            self.sendspin_volumes = await self.client.async_get_sendspin_volumes()
+        except PipewireRouterApiError as err:
+            _LOGGER.debug("sendspin volumes unavailable: %s", err)
         return players
 
     async def async_init_routing(self) -> None:
@@ -140,7 +157,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _async_register_cleanup_service(hass)
     return True
+
+
+@callback
+def _async_register_cleanup_service(hass: HomeAssistant) -> None:
+    """Register the domain-wide `cleanup_entities` service once. It deletes
+    media_player registry entries whose output the daemon no longer reports —
+    the manual purge for stale/renamed devices left behind as `unavailable`.
+    Run it while the daemon is reachable so the live matrix is authoritative."""
+    if hass.services.has_service(DOMAIN, SERVICE_CLEANUP_ENTITIES):
+        return
+
+    async def _handle_cleanup(_call: ServiceCall) -> None:
+        registry = er.async_get(hass)
+        removed = 0
+        for entry_id, coordinator in hass.data.get(DOMAIN, {}).items():
+            valid = {f"{entry_id}_{o.node_name}" for o in coordinator.routing.outputs}
+            for entity in er.async_entries_for_config_entry(registry, entry_id):
+                if entity.domain != "media_player":
+                    continue
+                # unique_id is f"{entry_id}_{node_name}"; keep only current ones.
+                if entity.unique_id not in valid:
+                    registry.async_remove(entity.entity_id)
+                    removed += 1
+        _LOGGER.info("cleanup_entities removed %d stale media_player entit%s", removed, "y" if removed == 1 else "ies")
+
+    hass.services.async_register(DOMAIN, SERVICE_CLEANUP_ENTITIES, _handle_cleanup)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

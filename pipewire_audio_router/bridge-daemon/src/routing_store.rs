@@ -47,10 +47,9 @@ impl RoutingStore {
     /// first mutation).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("reading routing store {}: {e}", path.display()))?;
-            let config: RoutingConfig = serde_json::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("parsing routing store {}: {e}", path.display()))?;
+            let raw = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading routing store {}: {e}", path.display()))?;
+            let config: RoutingConfig =
+                serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing routing store {}: {e}", path.display()))?;
             Ok(Self { path: path.to_path_buf(), config })
         } else {
             Ok(Self { path: path.to_path_buf(), config: RoutingConfig::default() })
@@ -110,8 +109,7 @@ impl RoutingStore {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(&self.config)?;
-        std::fs::write(&self.path, json)
-            .map_err(|e| anyhow::anyhow!("writing routing store {}: {e}", self.path.display()))?;
+        std::fs::write(&self.path, json).map_err(|e| anyhow::anyhow!("writing routing store {}: {e}", self.path.display()))?;
         Ok(())
     }
 }

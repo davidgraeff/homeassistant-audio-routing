@@ -13,7 +13,7 @@ from custom_components.pipewire_audio_router.const import DOMAIN
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
 EMPTY_ROUTING = RoutingMatrix(sources=[], outputs=[], links=[])
-RTP_DISABLED = RtpSourceState(enabled=False, port=46000, loaded=False)
+RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 
 
 def _patch_setup():
@@ -23,6 +23,7 @@ def _patch_setup():
     stack = ExitStack()
     stack.enter_context(patch(f"{API}.async_get_routing", new=AsyncMock(return_value=EMPTY_ROUTING)))
     stack.enter_context(patch(f"{API}.async_get_rtp_source", new=AsyncMock(return_value=RTP_DISABLED)))
+    stack.enter_context(patch(f"{API}.async_get_sendspin_volumes", new=AsyncMock(return_value={})))
     stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
     return stack
 

@@ -2330,7 +2330,6 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 [[package]]
 name = "sendspin"
 version = "0.3.5"
-source = "git+https://github.com/davidgraeff/sendspin-rs.git?rev=1594c06cf6ace1bee95dde6f2beb088669ca56d6#1594c06cf6ace1bee95dde6f2beb088669ca56d6"
 dependencies = [
  "cpal",
  "crossbeam",
@@ -2448,8 +2447,6 @@ dependencies = [
 [[package]]
 name = "shairplay"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c792c7751a561e8df0d0fb7d5da96f0345e15a392b11e7f5485587f54cf99d23"
 dependencies = [
  "aes",
  "astro-dnssd",

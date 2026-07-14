@@ -17,7 +17,7 @@
 use crate::locks::LockRecover;
 use pipewire as pw;
 use pw::spa;
-use shairplay::{AudioFormat, AudioHandler, AudioSession, RaopServer};
+use shairplay::{Ap1Encryption, AudioFormat, AudioHandler, AudioSession, RaopServer};
 use spa::pod::Pod;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
@@ -39,13 +39,24 @@ const AIRPLAY_PORT: u16 = 5000;
 const RATE: u32 = 44_100;
 const CHANNELS: usize = 2;
 
+/// Default receiver-side jitter buffer target, in milliseconds. shairplay's
+/// RaopBuffer paces packet playout, but its clock and PipeWire's graph clock
+/// drift; without a cushion the producer ring underruns and you hear stutter.
+/// The producer prebuffers this much before draining and re-buffers on
+/// underrun. 150 ms rides out LAN jitter + drift while staying imperceptible
+/// for one-way audio. Stored per install (sources_store.rs) and settable via
+/// `/api/source/airplay`, so a noisy install can trade latency for fewer
+/// dropouts.
+pub const DEFAULT_AIRPLAY_LATENCY_MSEC: u32 = 150;
+
 /// Shared interleaved-f32 ring buffer between shairplay's audio thread (push)
 /// and the PipeWire producer callback (pop).
 type Ring = Arc<Mutex<VecDeque<f32>>>;
 
-/// Cap the buffer at ~0.5 s so a paused/absent consumer can't grow it without
-/// bound; oldest samples are dropped past this.
-const RING_CAP: usize = (RATE as usize) * CHANNELS / 2;
+/// Interleaved-f32 samples for `msec` of audio at the producer's rate/channels.
+fn samples_for_ms(msec: u32) -> usize {
+    (RATE as usize) * CHANNELS * (msec as usize) / 1000
+}
 
 enum ProducerCmd {
     Stop,
@@ -90,25 +101,35 @@ impl Drop for AirplayHandle {
 }
 
 /// Start the AirPlay source advertised as `name`: bring up the PipeWire
-/// producer node, then the embedded RAOP server feeding it.
-pub async fn start(name: String) -> anyhow::Result<AirplayHandle> {
-    let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAP)));
+/// producer node, then the embedded RAOP server feeding it. `latency_msec` is
+/// the jitter-buffer target the producer prebuffers before draining.
+///
+/// `auth_setup` additionally advertises the MFi auth-setup encryption mode
+/// (`et=0,4`) so encryption-*requiring* senders can negotiate. Off by default:
+/// PipeWire's raop-discover selects the highest `et`, so enabling it switches
+/// PipeWire from unencrypted to auth_setup — a different (still-supported) path
+/// that broadens compatibility to non-Apple senders that demand encryption.
+pub async fn start(name: String, latency_msec: u32, auth_setup: bool) -> anyhow::Result<AirplayHandle> {
+    let target = samples_for_ms(latency_msec);
+    // Bound growth well past the prebuffer target so a stalled consumer can't
+    // grow the ring without limit; oldest samples are dropped past this.
+    let cap = (target * 4).max(samples_for_ms(1000));
+    let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(cap)));
     let peak = Arc::new(AtomicU32::new(0));
 
-    let producer_stop = spawn_producer(ring.clone(), peak.clone())
+    let producer_stop = spawn_producer(ring.clone(), peak.clone(), target)
         .map_err(|e| anyhow::anyhow!("failed to start AirPlay PipeWire producer: {e}"))?;
 
-    let handler = Arc::new(Handler { ring, peak: peak.clone() });
-    let mut server = RaopServer::builder()
-        .name(name.clone())
-        .hwaddr(derive_hwaddr(&name))
-        .port(AIRPLAY_PORT)
-        .build(handler)
-        .map_err(|e| anyhow::anyhow!("failed to build AirPlay server: {e}"))?;
-    server
-        .start()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to start AirPlay server on port {AIRPLAY_PORT}: {e}"))?;
+    let handler = Arc::new(Handler { ring, peak: peak.clone(), cap });
+    let mut builder = RaopServer::builder().name(name.clone()).hwaddr(derive_hwaddr(&name)).port(AIRPLAY_PORT);
+    if auth_setup {
+        // Offer both — the sender picks. Leaving RSA out (et=1) is deliberate:
+        // PipeWire's RSA path is broken (see decisions.md). Codecs stay at the
+        // crate default (cn=0,1 = PCM+ALAC).
+        builder = builder.advertise_encryption(vec![Ap1Encryption::None, Ap1Encryption::AuthSetup]);
+    }
+    let mut server = builder.build(handler).map_err(|e| anyhow::anyhow!("failed to build AirPlay server: {e}"))?;
+    server.start().await.map_err(|e| anyhow::anyhow!("failed to start AirPlay server on port {AIRPLAY_PORT}: {e}"))?;
 
     Ok(AirplayHandle { server: Some(server), producer_stop: Some(producer_stop), peak })
 }
@@ -138,20 +159,26 @@ fn derive_hwaddr(name: &str) -> [u8; 6] {
 struct Handler {
     ring: Ring,
     peak: Arc<AtomicU32>,
+    /// Drop-oldest bound for the ring (see [`start`]).
+    cap: usize,
 }
 
 impl AudioHandler for Handler {
     fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession> {
-        if format.sample_rate != RATE || format.channels as usize != CHANNELS {
-            tracing::warn!(
-                "AirPlay session format {}Hz/{}ch differs from the producer's {RATE}Hz/{CHANNELS}ch — audio may be wrong-pitched; resampling not yet implemented",
-                format.sample_rate,
-                format.channels
-            );
+        // The producer node is fixed at RATE/CHANNELS (a stable graph identity
+        // for routing). A session may negotiate a different rate/channel count
+        // (raw L16/PCM senders can) — adapt it here rather than push mismatched
+        // samples: channel up/down-mix to stereo, and a streaming linear
+        // resampler for the rate. 44100/2 stays a zero-cost passthrough.
+        let in_rate = format.sample_rate.max(1);
+        let in_channels = (format.channels as usize).max(1);
+        let resampler = (in_rate != RATE).then(|| Resampler::new(in_rate));
+        if in_rate != RATE || in_channels != CHANNELS {
+            tracing::info!("AirPlay stream {in_rate}Hz/{in_channels}ch → adapting to {RATE}Hz/{CHANNELS}ch");
         } else {
-            tracing::info!("AirPlay stream started ({}Hz/{}ch)", format.sample_rate, format.channels);
+            tracing::info!("AirPlay stream started ({in_rate}Hz/{in_channels}ch)");
         }
-        Box::new(Session { ring: self.ring.clone(), peak: self.peak.clone() })
+        Box::new(Session { ring: self.ring.clone(), peak: self.peak.clone(), cap: self.cap, in_channels, resampler })
     }
 
     fn on_client_connected(&self, addr: &str) {
@@ -167,6 +194,12 @@ impl AudioHandler for Handler {
 struct Session {
     ring: Ring,
     peak: Arc<AtomicU32>,
+    cap: usize,
+    /// Channels the sender negotiated (adapted to CHANNELS before the ring).
+    in_channels: usize,
+    /// `Some` when the session rate differs from RATE (streaming resample);
+    /// `None` = same rate, no resampling.
+    resampler: Option<Resampler>,
 }
 
 impl AudioSession for Session {
@@ -178,26 +211,119 @@ impl AudioSession for Session {
         self.peak.store(chunk_peak.max(cur).to_bits(), Ordering::Relaxed);
 
         let mut ring = self.ring.lock_recover();
-        ring.extend(samples.iter().copied());
+        if self.resampler.is_none() && self.in_channels == CHANNELS {
+            // Fast path: already RATE/CHANNELS — push through unchanged.
+            ring.extend(samples.iter().copied());
+        } else {
+            let frames = to_stereo_frames(samples, self.in_channels);
+            match &mut self.resampler {
+                Some(rs) => rs.process(&frames, &mut ring),
+                None => {
+                    for f in &frames {
+                        ring.push_back(f[0]);
+                        ring.push_back(f[1]);
+                    }
+                }
+            }
+        }
         // Bound latency: drop oldest beyond the cap.
-        while ring.len() > RING_CAP {
+        while ring.len() > self.cap {
             ring.pop_front();
         }
     }
 
     fn audio_flush(&mut self) {
         self.ring.lock_recover().clear();
+        if let Some(rs) = &mut self.resampler {
+            rs.reset();
+        }
+    }
+}
+
+/// Interleaved input samples (`in_channels`-wide) → stereo frames. Mono is
+/// duplicated to both channels; >2 channels take the first two (front L/R).
+fn to_stereo_frames(samples: &[f32], in_channels: usize) -> Vec<[f32; 2]> {
+    match in_channels {
+        1 => samples.iter().map(|&s| [s, s]).collect(),
+        ch => samples.chunks_exact(ch).map(|f| [f[0], f[1]]).collect(),
+    }
+}
+
+/// Streaming linear-interpolation resampler, stereo, from a source rate to
+/// RATE. Carries the last input frame across calls so interpolation is
+/// continuous over `audio_process` chunk boundaries. Linear (not sinc) is a
+/// deliberate trade-off: the common case is 44100/2 (this resampler is never
+/// constructed then), so it only runs for the rare off-rate sender, where
+/// "correct pitch, modest quality" beats the previous wrong-pitch behavior.
+struct Resampler {
+    /// Source frames consumed per output frame (`in_rate / RATE`).
+    ratio: f64,
+    /// Fractional read position, measured from `prev` (virtual index 0).
+    pos: f64,
+    /// Last input frame of the previous chunk (virtual index 0 next call).
+    prev: [f32; 2],
+    have_prev: bool,
+}
+
+impl Resampler {
+    fn new(in_rate: u32) -> Self {
+        Self { ratio: in_rate as f64 / RATE as f64, pos: 0.0, prev: [0.0; 2], have_prev: false }
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0.0;
+        self.have_prev = false;
+    }
+
+    /// Resample `input` stereo frames into `out` as interleaved f32 at RATE.
+    fn process(&mut self, input: &[[f32; 2]], out: &mut VecDeque<f32>) {
+        if input.is_empty() {
+            return;
+        }
+        let (prev, have_prev) = (self.prev, self.have_prev);
+        // Virtual buffer: [prev?, input...]; index 0 is `prev` when carried.
+        let get = |idx: usize| -> [f32; 2] {
+            if have_prev {
+                if idx == 0 {
+                    prev
+                } else {
+                    input[idx - 1]
+                }
+            } else {
+                input[idx]
+            }
+        };
+        let vlen = input.len() + usize::from(have_prev);
+        if vlen >= 2 {
+            // Emit output frames while both interpolation neighbors exist.
+            let last = (vlen - 1) as f64;
+            let mut pos = self.pos;
+            while pos < last {
+                let i = pos.floor() as usize;
+                let frac = (pos - i as f64) as f32;
+                let a = get(i);
+                let b = get(i + 1);
+                out.push_back(a[0] + (b[0] - a[0]) * frac);
+                out.push_back(a[1] + (b[1] - a[1]) * frac);
+                pos += self.ratio;
+            }
+            // Carry the leftover, now measured from the new `prev`.
+            self.pos = pos - last;
+        }
+        self.prev = *input.last().unwrap();
+        self.have_prev = true;
     }
 }
 
 /// Spawn the PipeWire producer on a dedicated thread (mirrors
 /// sendspin_capture's thread+channel+mainloop shape). Returns a stop sender.
-fn spawn_producer(ring: Ring, peak: Arc<AtomicU32>) -> Result<pw::channel::Sender<ProducerCmd>, String> {
+/// `target` is the jitter-buffer prebuffer, in interleaved-f32 samples.
+fn spawn_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize) -> Result<pw::channel::Sender<ProducerCmd>, String> {
     let (cmd_tx, cmd_rx) = pw::channel::channel::<ProducerCmd>();
     std::thread::Builder::new()
         .name("airplay-producer".into())
         .spawn(move || {
-            if let Err(e) = run_producer(ring, peak, cmd_rx) {
+            if let Err(e) = run_producer(ring, peak, target, cmd_rx) {
                 tracing::error!("AirPlay PipeWire producer exited with error: {e}");
             }
         })
@@ -205,7 +331,7 @@ fn spawn_producer(ring: Ring, peak: Arc<AtomicU32>) -> Result<pw::channel::Sende
     Ok(cmd_tx)
 }
 
-fn run_producer(ring: Ring, peak: Arc<AtomicU32>, cmd_rx: pw::channel::Receiver<ProducerCmd>) -> Result<(), String> {
+fn run_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::channel::Receiver<ProducerCmd>) -> Result<(), String> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| format!("context: {e}"))?;
@@ -224,12 +350,17 @@ fn run_producer(ring: Ring, peak: Arc<AtomicU32>, cmd_rx: pw::channel::Receiver<
 
     let stride = CHANNELS * std::mem::size_of::<f32>(); // bytes per frame
     let error: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
+    // Jitter-buffer state: start in prebuffer mode (draining = false). Fill with
+    // silence until the ring holds `target` samples, then drain; on any underrun
+    // fall back to prebuffering so a brief gap doesn't turn into ongoing stutter.
+    let draining = std::rc::Rc::new(std::cell::Cell::new(false));
 
     let _listener = stream
         .add_local_listener_with_user_data(())
         .process({
             let ring = ring.clone();
             let peak = peak.clone();
+            let draining = draining.clone();
             move |stream, _| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
@@ -244,19 +375,30 @@ fn run_producer(ring: Ring, peak: Arc<AtomicU32>, cmd_rx: pw::channel::Receiver<
                     let mut got = 0usize;
                     {
                         let mut ring = ring.lock_recover();
-                        while got < want {
-                            match ring.pop_front() {
-                                Some(s) => {
-                                    let b = s.to_le_bytes();
-                                    slice[got * 4..got * 4 + 4].copy_from_slice(&b);
-                                    got += 1;
+                        // Leave prebuffer once we've accumulated the target.
+                        if !draining.get() && ring.len() >= target {
+                            draining.set(true);
+                        }
+                        if draining.get() {
+                            while got < want {
+                                match ring.pop_front() {
+                                    Some(s) => {
+                                        let b = s.to_le_bytes();
+                                        slice[got * 4..got * 4 + 4].copy_from_slice(&b);
+                                        got += 1;
+                                    }
+                                    None => break, // underrun
                                 }
-                                None => break, // underrun
+                            }
+                            // Underran mid-quantum: re-prebuffer before draining
+                            // again so we don't dribble out repeated micro-gaps.
+                            if got < want {
+                                draining.set(false);
                             }
                         }
                     }
-                    // Zero-pad the rest of the quantum on underrun (silence) and
-                    // decay the meter so it falls when audio stops.
+                    // Zero-pad the rest of the quantum (prebuffering or underrun)
+                    // and decay the meter so it falls when audio stops.
                     if got < want {
                         for b in &mut slice[got * 4..cap_frames * stride] {
                             *b = 0;
@@ -314,12 +456,7 @@ fn run_producer(ring: Ring, peak: Arc<AtomicU32>, cmd_rx: pw::channel::Receiver<
     // where the user routes it. No RT_PROCESS since the process callback takes
     // a mutex (avoid RT priority inversion).
     stream
-        .connect(
-            spa::utils::Direction::Output,
-            None,
-            pw::stream::StreamFlags::MAP_BUFFERS,
-            &mut params,
-        )
+        .connect(spa::utils::Direction::Output, None, pw::stream::StreamFlags::MAP_BUFFERS, &mut params)
         .map_err(|e| format!("connect producer stream: {e}"))?;
 
     let mainloop_for_cmd = mainloop.clone();
@@ -334,4 +471,64 @@ fn run_producer(ring: Ring, peak: Arc<AtomicU32>, cmd_rx: pw::channel::Receiver<
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_stereo_frames_adapts_channel_counts() {
+        // Mono → duplicated to both channels.
+        assert_eq!(to_stereo_frames(&[0.5, -0.5], 1), vec![[0.5, 0.5], [-0.5, -0.5]]);
+        // Stereo → unchanged pairs.
+        assert_eq!(to_stereo_frames(&[0.1, 0.2, 0.3, 0.4], 2), vec![[0.1, 0.2], [0.3, 0.4]]);
+        // >2 channels → first two (front L/R). Two 6-channel frames = 12 samples.
+        let two_6ch: Vec<f32> = (1..=12).map(|n| n as f32).collect();
+        assert_eq!(to_stereo_frames(&two_6ch, 6), vec![[1.0, 2.0], [7.0, 8.0]]);
+    }
+
+    #[test]
+    fn resampler_downsamples_48k_to_44100_at_the_right_rate() {
+        // 48000 → 44100: expect ~44100/48000 output frames, streamed in chunks,
+        // and continuous across chunk boundaries (no per-chunk reset).
+        let mut rs = Resampler::new(48_000);
+        let mut out = VecDeque::new();
+        // One second of input as 100 chunks of 480 stereo frames = 48000 frames.
+        let chunk: Vec<[f32; 2]> = (0..480).map(|i| [i as f32, 0.0]).collect();
+        let _ = chunk; // shape only; use a ramp below for continuity
+        let mut frame = 0i64;
+        for _ in 0..100 {
+            let block: Vec<[f32; 2]> = (0..480)
+                .map(|_| {
+                    frame += 1;
+                    [frame as f32, -(frame as f32)]
+                })
+                .collect();
+            rs.process(&block, &mut out);
+        }
+        let out_frames = out.len() / 2;
+        let expected = 48_000f64 * (RATE as f64 / 48_000f64); // = 44100
+                                                              // Within a couple of frames of the ideal ratio (boundary rounding).
+        assert!((out_frames as f64 - expected).abs() <= 2.0, "got {out_frames} output frames, expected ~{expected}");
+        // Right channel is the negation of the left everywhere (interpolation is
+        // per-channel and the input satisfied R = -L).
+        let v: Vec<f32> = out.into_iter().collect();
+        for f in v.as_chunks::<2>().0 {
+            assert!((f[0] + f[1]).abs() < 1e-3, "L/R not mirrored after resample");
+        }
+    }
+
+    #[test]
+    fn resampler_upsamples_and_stays_monotonic() {
+        // 22050 → 44100 (2×): a monotonically increasing ramp must stay
+        // non-decreasing through linear interpolation.
+        let mut rs = Resampler::new(22_050);
+        let mut out = VecDeque::new();
+        let block: Vec<[f32; 2]> = (0..100).map(|i| [i as f32, i as f32]).collect();
+        rs.process(&block, &mut out);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!(left.len() >= 190, "2x upsample should ~double the frame count");
+        assert!(left.windows(2).all(|w| w[1] >= w[0] - 1e-6), "ramp not monotonic");
+    }
 }

@@ -25,11 +25,12 @@ subcommand — was superseded by runtime module loading, see Phase 6.)
 
 ## Phase 2 — Single source → single sink, end to end — done
 
-`tests/test_addon_phase2_e2e.sh`. Real AirPlay source
-(`shairport-sync`) plus a real sendspin output (an embedded native
-sendspin server, `sendspin_server.rs`), linked via a real
-`POST /api/links` call, verified with independent signal analysis
-(peak/RMS via `ffmpeg astats`), not just byte counts.
+`tests/test_addon_phase2_e2e.sh`. A real AirPlay-receive source (then
+`shairport-sync`; since replaced by a native in-process receiver — see the
+refinements section below) plus a real sendspin output (an embedded native
+sendspin server, `sendspin_server.rs`), linked via a real `POST /api/links`
+call, verified with independent signal analysis (peak/RMS via `ffmpeg
+astats`), not just byte counts.
 
 ## Phase 3 — Multi-output mixing + HA entities — done
 
@@ -39,8 +40,8 @@ sendspin server, `sendspin_server.rs`), linked via a real
   Required no new mixing logic; PipeWire's graph already supports one
   output port linking to many inputs.
 - **`media_player` entities**: `custom_components/pipewire_audio_router/`,
-  one entity per output the daemon reports, backed by
-  `GET /api/media_players`. Verified with 7 real tests against actual HA
+  one entity per routing-matrix output (RAOP + discovered sendspin devices;
+  see refinements below). Verified with real tests against actual HA
   internals (`pytest-homeassistant-custom-component`) — only the
   network layer is mocked.
 - **TTS/announce ducking**: `POST /api/media_players/:id/announce`,
@@ -149,15 +150,15 @@ PipeWire API and owns every configurable object.
   loaded automatically (`discovery.rs`), encryption picked from the mDNS
   `et` field; store-managed outputs act as overrides.
   `BRIDGE_DISCOVERY=off|log|on`.
-- **Sources/outputs beyond RAOP**: the AirPlay-receive source
-  (`shairport-sync`) is an external process the daemon supervises
-  (`supervisor.rs`) — no in-daemon equivalent exists; the RTP source is a
-  native `rtp-source` module (like RAOP); and sendspin outputs are embedded
-  native servers running in-process (`sendspin_server.rs`, on the `sendspin`
-  crate — no Python `adapter.py` subprocess). All are managed live via the
-  API (`/api/source/airplay`, `/api/source/rtp`, `/api/sendspin_outputs`)
-  from a persisted store (`sources_store.rs`). `run.sh` shrank to
-  infrastructure + the daemon; the `runtime-plan` subcommand is gone.
+- **Sources/outputs beyond RAOP**: the AirPlay-receive source and sendspin
+  outputs were the two remaining subprocesses at this phase (a supervised
+  `shairport-sync`, and embedded native sendspin servers). The RTP source is
+  a native `rtp-source` module (like RAOP). All managed live via the API from
+  a persisted store (`sources_store.rs`); `run.sh` shrank to infrastructure +
+  the daemon; the `runtime-plan` subcommand is gone. *(Both the AirPlay
+  source and sendspin were reworked afterward — AirPlay to a native
+  in-process receiver, sendspin to auto-discovery + grouping — removing
+  `supervisor.rs` entirely; see the refinements section below.)*
 - **Runtime-only config**: the add-on's `options.json` seed fields and
   their `schema` were removed — user testing found seed-then-ignored
   options confusing. All stores start empty and are populated only at
@@ -172,6 +173,34 @@ real PipeWire — native link create/idempotency/destroy, volume matching
 real Pioneer/Dusche receivers, and AirPlay/sendspin CRUD persisting across
 a daemon restart. Rationale in
 [decisions.md](decisions.md#link-mutation-is-native-pipewire-rs-not-a-pw-link-subprocess).
+
+## Post-Phase-6 refinements — done
+
+Hardening and feature work after the native-control-plane cutover, driven by
+real-hardware use:
+
+- **Native AirPlay-receive source**: replaced the `shairport-sync` subprocess
+  (no PipeWire backend on Ubuntu → its audio never reached the graph) with a
+  native in-process RAOP receiver on a vendored+patched `shairplay` crate
+  (`airplay_source.rs`). Removed `supervisor.rs` (no subprocesses left) and
+  shairport's D-Bus/avahi requirement. Needed three PipeWire-sender interop
+  fixes (Server header, unencrypted-ALAC advertisement) — see
+  [decisions.md](decisions.md#native-airplay-receive-source-vendored-shairplay-not-shairport-sync).
+  Configurable jitter buffer to ride out clock drift.
+- **Sendspin auto-discovery + grouping + per-device volume + liveness**:
+  devices are discovered over mDNS and grouped from routing intent; per-device
+  volume is sent in-band (needing a `sendspin` crate patch to map a connection
+  to its device); online/offline is connection- + TCP-probe-driven, so an mDNS
+  flap no longer tears down a live group — see
+  [decisions.md](decisions.md#sendspin-auto-discovery-grouping-per-device-volume-and-connection-driven-liveness).
+- **Matrix-driven `media_player` entities**: one per routing-matrix output
+  (RAOP + sendspin devices), removed when an output leaves the matrix, plus a
+  `cleanup_entities` service for stale leftovers and a `sendspin_group_members`
+  attribute for grouped devices.
+- **RTP multicast + jitter buffer**: the RTP source can bind a multicast group
+  (fan one bridge stream out to several PipeWire hosts) and its jitter buffer
+  is tunable; both exposed on `PUT /api/source/rtp` and the firmware's HA
+  entities.
 
 ## Phase 7 — Cutover — not started
 

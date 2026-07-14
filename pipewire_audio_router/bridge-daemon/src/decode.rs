@@ -41,12 +41,7 @@ fn decode_file_to_wav_blocking(path: &Path) -> anyhow::Result<Vec<u8>> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe().format(
-        &hint,
-        mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
-    )?;
+    let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())?;
     let mut format = probed.format;
 
     let track = format
@@ -55,15 +50,8 @@ fn decode_file_to_wav_blocking(path: &Path) -> anyhow::Result<Vec<u8>> {
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or_else(|| anyhow::anyhow!("no decodable audio track found"))?;
     let track_id = track.id;
-    let sample_rate = track
-        .codec_params
-        .sample_rate
-        .ok_or_else(|| anyhow::anyhow!("announce audio has no known sample rate"))?;
-    let channels = track
-        .codec_params
-        .channels
-        .ok_or_else(|| anyhow::anyhow!("announce audio has no known channel layout"))?
-        .count() as u16;
+    let sample_rate = track.codec_params.sample_rate.ok_or_else(|| anyhow::anyhow!("announce audio has no known sample rate"))?;
+    let channels = track.codec_params.channels.ok_or_else(|| anyhow::anyhow!("announce audio has no known channel layout"))?.count() as u16;
 
     let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
 

@@ -46,4 +46,13 @@ sendspin = { git = "https://github.com/davidgraeff/sendspin-rs.git", rev = "1594
 # the shairport-sync subprocess, which had no PipeWire backend in the Ubuntu
 # build so its audio never reached the graph. LGPL-3.0-or-later. Decodes ALAC/
 # AAC via symphonia (already a dep) and advertises via mdns-sd (already a dep).
-shairplay = "0.7"
+# Vendored (path) so we can instrument the RTSP handshake — see vendor/shairplay.
+shairplay = { path = "vendor/shairplay" }
+
+# Override the sendspin git dep with a vendored copy patched to expose the
+# dialed mDNS fullname on ClientEvent::Connected (upstream only forwards the
+# client_id, which for ESPHome devices is an opaque MAC that doesn't match the
+# advertised name — we need the fullname to map a connection to its discovered
+# device for per-device volume). Upstream this and drop the patch later.
+[patch."https://github.com/davidgraeff/sendspin-rs.git"]
+sendspin = { path = "vendor/sendspin" }

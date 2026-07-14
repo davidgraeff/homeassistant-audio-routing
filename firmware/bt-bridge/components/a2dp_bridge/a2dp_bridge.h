@@ -6,9 +6,15 @@
 
 #ifdef USE_ESP_IDF
 
+#include <sys/types.h>  // ssize_t
+
 #include <atomic>
 #include <cstdint>
 #include <string>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/ringbuf.h"
+#include "freertos/task.h"
 
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
@@ -59,10 +65,22 @@ class A2DPBridge : public Component {
   void on_a2dp_data(const uint8_t *buf, uint32_t len);
   void on_avrc_event(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
 
+  // The RTP TX task's run loop. Public for the same reason as the callbacks
+  // above: the FreeRTOS task trampoline in the .cpp is a plain C function that
+  // needs to reach it. Never returns.
+  void rtp_tx_task_run();
+
  protected:
   void start_bt_stack_();
   void setup_rtp_socket_();
-  void send_rtp_packet_(const uint8_t *payload, size_t len);
+  void start_rtp_tx_task_();
+  // Build RTP packet(s) from a PCM chunk and hand them to the TX task (or send
+  // directly in the ring-alloc-failed fallback). Runs on the Bluedroid task.
+  void enqueue_rtp_packets_(const uint8_t *payload, size_t len);
+  // One sendto() of an already-built packet to the current RTP target. Returns
+  // the sendto() result (<0 with errno set on failure). No counters/no retry —
+  // callers own the retry policy and accounting.
+  ssize_t raw_rtp_send_(const uint8_t *packet, size_t len);
   void request_track_metadata_();
 
   std::string device_name_{"HA Audio Bridge"};
@@ -92,16 +110,31 @@ class A2DPBridge : public Component {
   bool avrc_connected_{false};
   uint8_t avrc_transaction_label_{0};
   uint32_t last_metadata_poll_{0};
+  // Last title/artist actually published, so the 5 s metadata poll only pushes
+  // over the API on a real change. Touched only from the main-loop task (the
+  // defer() lambdas in on_avrc_event/on_a2dp_event), so no locking needed.
+  std::string last_published_title_;
+  std::string last_published_artist_;
 
-  // RTP TX health counters. Written from the Bluedroid audio task in
-  // send_rtp_packet_(), read/logged from the main-loop task — hence
-  // atomic. The last_* mirrors and last_stats_log_ are touched only by
-  // loop() (main task), so they need no synchronization.
+  // Decoupled RTP TX (Fix 3): the audio task enqueues into the ring, the TX
+  // task drains it. `rtp_tx_ringbuf_` is null only if allocation failed at
+  // setup, in which case enqueue_rtp_packets_() falls back to a direct send.
+  RingbufHandle_t rtp_tx_ringbuf_{nullptr};
+  TaskHandle_t rtp_tx_task_handle_{nullptr};
+
+  // RTP TX health counters. `rtp_packets_sent_`/`rtp_send_failures_` are
+  // written by the TX task (or the audio task in the direct-send fallback);
+  // `rtp_queue_full_drops_` is written by the audio task when the ring is full.
+  // All read/logged from the main-loop task — hence atomic. The last_* mirrors
+  // and last_stats_log_ are touched only by loop() (main task), so they need no
+  // synchronization.
   std::atomic<uint32_t> rtp_packets_sent_{0};
   std::atomic<uint32_t> rtp_send_failures_{0};
+  std::atomic<uint32_t> rtp_queue_full_drops_{0};
   std::atomic<int> last_send_errno_{0};
   uint32_t last_packets_sent_{0};
   uint32_t last_send_failures_{0};
+  uint32_t last_queue_full_drops_{0};
   uint32_t last_stats_log_{0};
 };
 

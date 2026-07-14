@@ -85,11 +85,19 @@ export const api = {
 
   // AirPlay-receive source (single)
   airplaySource: () => request<AirplaySourceInfo>('GET', 'api/source/airplay'),
-  setAirplaySource: (name: string) => request<OpResponse>('PUT', 'api/source/airplay', { name }),
+  setAirplaySource: (name: string, latencyMsec: number, authSetup: boolean) =>
+    request<OpResponse>('PUT', 'api/source/airplay', { name, latency_msec: latencyMsec, auth_setup: authSetup }),
   disableAirplaySource: () => request<OpResponse>('DELETE', 'api/source/airplay'),
+
+  // Sendspin per-device volume (virtual outputs; volume is carried in-band over
+  // the sendspin protocol, not a PipeWire node volume). Map is node_name -> 0-100.
+  sendspinVolumes: () => request<Record<string, number>>('GET', 'api/sendspin/volumes'),
+  setSendspinVolume: (nodeName: string, volume: number) =>
+    request<OpResponse>('PUT', 'api/sendspin/volume', { node_name: nodeName, volume }),
 
   // RTP source (single — Bluetooth bridge firmware target)
   rtpSource: () => request<RtpSourceInfo>('GET', 'api/source/rtp'),
-  setRtpSource: (port: number) => request<OpResponse>('PUT', 'api/source/rtp', { port }),
+  setRtpSource: (port: number, latencyMsec: number, sourceAddr: string) =>
+    request<OpResponse>('PUT', 'api/source/rtp', { port, latency_msec: latencyMsec, source_addr: sourceAddr }),
   disableRtpSource: () => request<OpResponse>('DELETE', 'api/source/rtp'),
 };

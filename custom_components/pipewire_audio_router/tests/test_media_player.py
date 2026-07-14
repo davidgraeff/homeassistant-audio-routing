@@ -1,6 +1,11 @@
 """Real integration-setup tests: loads the actual config entry through
 hass.config_entries.async_setup, not just instantiating the entity class
-directly, so the coordinator/platform-forwarding wiring is exercised too."""
+directly, so the coordinator/platform-forwarding wiring is exercised too.
+
+Entities are driven by the routing *matrix* outputs (RAOP `raop-out-*` sinks
+and auto-discovered sendspin devices `sendspin-dev-*`), not the polled
+media_players feed — so an output that leaves the matrix loses its entity,
+while a configured-but-offline one (present=False) stays as `unavailable`."""
 
 import json
 from contextlib import ExitStack
@@ -9,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import aiohttp
 import pytest
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pipewire_audio_router.api import (
@@ -23,7 +29,7 @@ from custom_components.pipewire_audio_router.const import DOMAIN
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
 EMPTY_ROUTING = RoutingMatrix(sources=[], outputs=[], links=[])
-RTP_DISABLED = RtpSourceState(enabled=False, port=46000, loaded=False)
+RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 
 
 def _make_entry(hass):
@@ -32,59 +38,69 @@ def _make_entry(hass):
     return entry
 
 
-def _patch_daemon(players, routing=EMPTY_ROUTING, rtp=RTP_DISABLED):
-    """Keep setup/refresh fully offline: mock the polled players + RTP-source
-    fetches and the one-shot routing seed, and stub out the routing WebSocket
-    loop so no real socket is opened (routing is driven directly in the WS
-    tests)."""
+def _patch_daemon(players, routing=EMPTY_ROUTING, rtp=RTP_DISABLED, sendspin_volumes=None):
+    """Keep setup/refresh fully offline: mock the polled players + RTP-source +
+    sendspin-volume fetches and the one-shot routing seed, and stub out the
+    routing WebSocket loop so no real socket is opened (routing is driven
+    directly in the WS tests)."""
     stack = ExitStack()
     stack.enter_context(patch(f"{API}.async_get_media_players", new=AsyncMock(return_value=players)))
     stack.enter_context(patch(f"{API}.async_get_routing", new=AsyncMock(return_value=routing)))
     stack.enter_context(patch(f"{API}.async_get_rtp_source", new=AsyncMock(return_value=rtp)))
+    stack.enter_context(
+        patch(f"{API}.async_get_sendspin_volumes", new=AsyncMock(return_value=sendspin_volumes or {}))
+    )
     stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
     return stack
 
 
-# One kitchen output fed by shairport-sync, with bt-bridge available as a
+# One kitchen RAOP output fed by shairport-sync, with bt-bridge available as a
 # second selectable source — the shared fixture for the routing tests.
 def _routing_players():
-    return [MediaPlayerState(node_id=50, node_name="sendspin-out-kitchen", state="playing", volume=1.0)]
+    return [MediaPlayerState(node_id=50, node_name="raop-out-kitchen", state="playing", volume=1.0)]
 
 
-def _routing_matrix(links):
+def _routing_matrix(links, outputs=None):
     return RoutingMatrix(
         sources=[
             RoutingNode(node_id=10, node_name="shairport-sync", display_name="shairport-sync"),
             RoutingNode(node_id=11, node_name="bt-bridge", display_name="bt-bridge"),
         ],
-        outputs=[RoutingNode(node_id=50, node_name="sendspin-out-kitchen", display_name="kitchen")],
+        outputs=outputs
+        if outputs is not None
+        else [RoutingNode(node_id=50, node_name="raop-out-kitchen", display_name="Kitchen")],
         links=links,
     )
 
 
-async def test_entities_created_from_bridge_daemon_state(hass):
+async def test_entities_created_from_matrix_including_sendspin(hass):
     entry = _make_entry(hass)
-    fake_players = [
-        MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0),
-        MediaPlayerState(node_id=50, node_name="sendspin-out-kitchen", state="playing", volume=0.5),
-    ]
-    with _patch_daemon(fake_players):
+    routing = RoutingMatrix(
+        sources=[],
+        outputs=[
+            RoutingNode(node_id=35, node_name="raop-out-pioneer", display_name="Pioneer"),
+            # Virtual sendspin device: no node_id, not in the media_players feed.
+            RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False),
+        ],
+        links=[],
+    )
+    players = [MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)]
+    with _patch_daemon(players, routing, sendspin_volumes={"sendspin-dev-bath": 50}):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
     pioneer = hass.states.get("media_player.pioneer")
-    kitchen = hass.states.get("media_player.kitchen")
-    assert pioneer is not None
-    assert kitchen is not None
-    assert pioneer.state == "idle"
-    assert kitchen.state == "playing"
-    assert float(kitchen.attributes["volume_level"]) == 0.5
+    bath = hass.states.get("media_player.bath")
+    assert pioneer is not None and pioneer.state == "idle"
+    # Sendspin device: exists (from the matrix), volume from the sendspin store,
+    # state derived from routing (nothing linked -> idle).
+    assert bath is not None and bath.state == "idle"
+    assert float(bath.attributes["volume_level"]) == 0.5
 
 
 async def test_set_volume_calls_bridge_daemon_api(hass):
     entry = _make_entry(hass)
-    fake_players = [MediaPlayerState(node_id=50, node_name="sendspin-out-kitchen", state="idle", volume=1.0)]
-    with _patch_daemon(fake_players):
+    with _patch_daemon(_routing_players(), _routing_matrix([])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -99,14 +115,61 @@ async def test_set_volume_calls_bridge_daemon_api(hass):
             mock_set_volume.assert_awaited_once_with(50, 0.3)
 
 
-async def test_play_media_calls_announce_on_bridge_daemon(hass):
-    """`play_media` (with or without `announce=True`) is this entity's
-    only playback contract — it must always go through the bridge
-    daemon's ducked `/announce` endpoint, per Section 5.6/media_player.py's
-    docstring, since there is no other playback mode implemented."""
+async def test_set_volume_on_sendspin_device_uses_sendspin_api(hass):
+    """A sendspin device has no PipeWire node volume — volume_set must go
+    through the in-band per-device sendspin volume API (0.0-1.0 -> 0-100)."""
     entry = _make_entry(hass)
-    fake_players = [MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)]
-    with _patch_daemon(fake_players):
+    routing = RoutingMatrix(
+        sources=[],
+        outputs=[RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False)],
+        links=[],
+    )
+    with _patch_daemon([], routing):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        with (
+            patch(f"{API}.async_set_sendspin_volume", new=AsyncMock()) as mock_sendspin_vol,
+            patch(f"{API}.async_set_volume", new=AsyncMock()) as mock_node_vol,
+        ):
+            await hass.services.async_call(
+                "media_player",
+                "volume_set",
+                {"entity_id": "media_player.bath", "volume_level": 0.4},
+                blocking=True,
+            )
+            mock_sendspin_vol.assert_awaited_once_with("sendspin-dev-bath", 40)
+            mock_node_vol.assert_not_awaited()
+
+
+async def test_sendspin_group_membership_attribute(hass):
+    """Two sendspin devices routed from the same source form a synchronized
+    group; each exposes the group's members as an attribute."""
+    entry = _make_entry(hass)
+    routing = RoutingMatrix(
+        sources=[RoutingNode(node_id=10, node_name="shairport-sync", display_name="shairport-sync")],
+        outputs=[
+            RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False),
+            RoutingNode(node_id=None, node_name="sendspin-dev-den", display_name="Den", configured=False),
+        ],
+        links=[("shairport-sync", "sendspin-dev-bath"), ("shairport-sync", "sendspin-dev-den")],
+    )
+    with _patch_daemon([], routing):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    bath = hass.states.get("media_player.bath")
+    assert bath is not None
+    assert bath.attributes.get("sendspin_group_members") == ["Bath", "Den"]
+
+
+async def test_play_media_calls_announce_on_bridge_daemon(hass):
+    """`play_media` (with or without `announce=True`) is this entity's only
+    playback contract — it must go through the daemon's ducked `/announce`."""
+    entry = _make_entry(hass)
+    routing = _routing_matrix([], outputs=[RoutingNode(node_id=35, node_name="raop-out-pioneer", display_name="Pioneer")])
+    players = [MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)]
+    with _patch_daemon(players, routing):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -126,12 +189,12 @@ async def test_play_media_calls_announce_on_bridge_daemon(hass):
 
 
 async def test_play_media_with_wyoming_extra_calls_announce_wyoming(hass):
-    """Section 5.6 v2 (Phase 3.5): a caller opts into the Wyoming path
-    per call via `play_media`'s standard `extra` dict — additive, the
-    v1 `async_announce` path must not be touched for this call."""
+    """Section 5.6 v2: a caller opts into the Wyoming path per call via
+    `play_media`'s standard `extra` dict — additive, v1 untouched."""
     entry = _make_entry(hass)
-    fake_players = [MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)]
-    with _patch_daemon(fake_players):
+    routing = _routing_matrix([], outputs=[RoutingNode(node_id=35, node_name="raop-out-pioneer", display_name="Pioneer")])
+    players = [MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)]
+    with _patch_daemon(players, routing):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -154,22 +217,39 @@ async def test_play_media_with_wyoming_extra_calls_announce_wyoming(hass):
             mock_announce_url.assert_not_awaited()
 
 
-async def test_unknown_node_is_unavailable_not_crashing(hass):
-    """An output the coordinator no longer reports (e.g. its RAOP module
-    failed to load) must show as unavailable, not raise."""
+async def test_offline_output_is_unavailable(hass):
+    """A configured output that goes offline stays in the matrix with
+    present=False → the entity shows unavailable (not removed, not crashing)."""
     entry = _make_entry(hass)
-    with _patch_daemon([MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)]):
+    online = _routing_matrix([], outputs=[RoutingNode(node_id=35, node_name="raop-out-pioneer", display_name="Pioneer", present=True)])
+    with _patch_daemon([MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)], online):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    with _patch_daemon([]):
-        coordinator = hass.data[DOMAIN][entry.entry_id]
-        await coordinator.async_refresh()
-        await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator._apply_routing(
+        _routing_matrix([], outputs=[RoutingNode(node_id=None, node_name="raop-out-pioneer", display_name="Pioneer", present=False)])
+    )
+    await hass.async_block_till_done()
 
     state = hass.states.get("media_player.pioneer")
-    assert state is not None
-    assert state.state == "unavailable"
+    assert state is not None and state.state == "unavailable"
+
+
+async def test_output_gone_from_matrix_is_removed(hass):
+    """An output that leaves the matrix entirely (a discovered device that's
+    gone) has its entity removed rather than lingering as unavailable."""
+    entry = _make_entry(hass)
+    with _patch_daemon([], _routing_matrix([], outputs=[RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False)])):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    assert hass.states.get("media_player.bath") is not None
+
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator._apply_routing(_routing_matrix([], outputs=[]))
+    await hass.async_block_till_done()
+
+    assert hass.states.get("media_player.bath") is None
 
 
 # ---- Routing: source selection & link/unlink services --------------------
@@ -177,15 +257,13 @@ async def test_unknown_node_is_unavailable_not_crashing(hass):
 
 async def test_source_list_and_current_source_from_routing(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "raop-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
     state = hass.states.get("media_player.kitchen")
     assert state is not None
-    # "None" is always offered first, then every source the daemon reports.
     assert state.attributes["source_list"] == ["None", "shairport-sync", "bt-bridge"]
-    # shairport-sync (node 10) is the one linked into kitchen (node 50).
     assert state.attributes["source"] == "shairport-sync"
 
 
@@ -200,7 +278,7 @@ async def test_current_source_is_none_when_nothing_linked(hass):
 
 async def test_select_source_unlinks_previous_then_links_new(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "raop-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -214,14 +292,13 @@ async def test_select_source_unlinks_previous_then_links_new(hass):
                 {"entity_id": "media_player.kitchen", "source": "bt-bridge"},
                 blocking=True,
             )
-            # Exclusive swap: old source (10) dropped, new source (11) linked.
-            mock_unlink.assert_awaited_once_with("shairport-sync", "sendspin-out-kitchen")
-            mock_link.assert_awaited_once_with("bt-bridge", "sendspin-out-kitchen")
+            mock_unlink.assert_awaited_once_with("shairport-sync", "raop-out-kitchen")
+            mock_link.assert_awaited_once_with("bt-bridge", "raop-out-kitchen")
 
 
 async def test_select_source_none_unlinks_without_linking(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "raop-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -235,13 +312,13 @@ async def test_select_source_none_unlinks_without_linking(hass):
                 {"entity_id": "media_player.kitchen", "source": "None"},
                 blocking=True,
             )
-            mock_unlink.assert_awaited_once_with("shairport-sync", "sendspin-out-kitchen")
+            mock_unlink.assert_awaited_once_with("shairport-sync", "raop-out-kitchen")
             mock_link.assert_not_awaited()
 
 
 async def test_select_source_already_selected_is_noop(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "raop-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -261,7 +338,7 @@ async def test_select_source_already_selected_is_noop(hass):
 
 async def test_select_unknown_source_raises(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "raop-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -276,7 +353,7 @@ async def test_select_unknown_source_raises(hass):
 
 async def test_link_service_is_additive(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "raop-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -290,14 +367,13 @@ async def test_link_service_is_additive(hass):
                 {"entity_id": "media_player.kitchen", "source": "bt-bridge"},
                 blocking=True,
             )
-            # Additive: bt-bridge added, shairport-sync left connected.
-            mock_link.assert_awaited_once_with("bt-bridge", "sendspin-out-kitchen")
+            mock_link.assert_awaited_once_with("bt-bridge", "raop-out-kitchen")
             mock_unlink.assert_not_awaited()
 
 
 async def test_unlink_service_named_source(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen")])):
+    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "raop-out-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -308,12 +384,15 @@ async def test_unlink_service_named_source(hass):
                 {"entity_id": "media_player.kitchen", "source": "shairport-sync"},
                 blocking=True,
             )
-            mock_unlink.assert_awaited_once_with("shairport-sync", "sendspin-out-kitchen")
+            mock_unlink.assert_awaited_once_with("shairport-sync", "raop-out-kitchen")
 
 
 async def test_unlink_service_without_source_drops_all(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "sendspin-out-kitchen"), ("bt-bridge", "sendspin-out-kitchen")])):
+    with _patch_daemon(
+        _routing_players(),
+        _routing_matrix([("shairport-sync", "raop-out-kitchen"), ("bt-bridge", "raop-out-kitchen")]),
+    ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -326,26 +405,56 @@ async def test_unlink_service_without_source_drops_all(hass):
             )
             assert mock_unlink.await_count == 2
             unlinked = {call.args for call in mock_unlink.await_args_list}
-            assert unlinked == {("shairport-sync", "sendspin-out-kitchen"), ("bt-bridge", "sendspin-out-kitchen")}
+            assert unlinked == {("shairport-sync", "raop-out-kitchen"), ("bt-bridge", "raop-out-kitchen")}
+
+
+# ---- cleanup_entities service --------------------------------------------
+
+
+async def test_cleanup_entities_service_removes_stale_registry_entries(hass):
+    """The domain service deletes media_player registry entries whose output
+    the daemon no longer reports, keeping the ones still in the matrix."""
+    entry = _make_entry(hass)
+    with _patch_daemon(_routing_players(), _routing_matrix([])):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        registry = er.async_get(hass)
+        # A leftover entity from a previous run: registered, no longer in the matrix.
+        ghost = registry.async_get_or_create(
+            "media_player",
+            DOMAIN,
+            f"{entry.entry_id}_raop-out-ghost",
+            config_entry=entry,
+            suggested_object_id="ghost",
+        )
+        assert registry.async_get(ghost.entity_id) is not None
+
+        await hass.services.async_call(DOMAIN, "cleanup_entities", {}, blocking=True)
+        await hass.async_block_till_done()
+
+        # Ghost purged; the live kitchen entity kept.
+        assert registry.async_get(ghost.entity_id) is None
+        assert hass.states.get("media_player.kitchen") is not None
 
 
 # ---- Routing over the WebSocket (push, not poll) -------------------------
 
 
 async def test_routing_push_updates_source_live(hass):
-    """A matrix pushed over the WebSocket (applied via `_apply_routing`)
-    re-renders the entity's `source` immediately, without waiting for a
-    poll."""
+    """A matrix pushed over the WebSocket re-renders the entity's `source`
+    immediately, without waiting for a poll."""
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), EMPTY_ROUTING):
+    # Seed with the kitchen output present but nothing linked, so the entity
+    # exists at setup; the push then adds a link.
+    with _patch_daemon(_routing_players(), _routing_matrix([])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    # Seeded empty at setup → nothing linked yet.
     assert hass.states.get("media_player.kitchen").attributes["source"] == "None"
 
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    coordinator._apply_routing(_routing_matrix([("shairport-sync", "sendspin-out-kitchen")]))
+    coordinator._apply_routing(_routing_matrix([("shairport-sync", "raop-out-kitchen")]))
     await hass.async_block_till_done()
 
     assert hass.states.get("media_player.kitchen").attributes["source"] == "shairport-sync"
@@ -397,8 +506,8 @@ async def test_async_routing_ws_messages_parses_pushes():
     matrix_json = json.dumps(
         {
             "sources": [{"node_id": 10, "node_name": "shairport-sync", "display_name": "shairport-sync", "present": True, "configured": True}],
-            "outputs": [{"node_id": 50, "node_name": "sendspin-out-kitchen", "display_name": "kitchen", "present": True, "configured": True}],
-            "links": [{"source": "shairport-sync", "output": "sendspin-out-kitchen"}],
+            "outputs": [{"node_id": 50, "node_name": "raop-out-kitchen", "display_name": "Kitchen", "present": True, "configured": True}],
+            "links": [{"source": "shairport-sync", "output": "raop-out-kitchen"}],
         }
     )
     ws = _FakeWS(
@@ -412,6 +521,6 @@ async def test_async_routing_ws_messages_parses_pushes():
     received = [m async for m in client.async_routing_ws_messages()]
 
     assert len(received) == 1
-    assert received[0].links == [("shairport-sync", "sendspin-out-kitchen")]
+    assert received[0].links == [("shairport-sync", "raop-out-kitchen")]
     assert [s.display_name for s in received[0].sources] == ["shairport-sync"]
-    assert [o.node_name for o in received[0].outputs] == ["sendspin-out-kitchen"]
+    assert [o.node_name for o in received[0].outputs] == ["raop-out-kitchen"]

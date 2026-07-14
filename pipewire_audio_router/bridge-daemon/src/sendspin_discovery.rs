@@ -33,6 +33,15 @@ const SENDSPIN_SERVICE_TYPE: &str = "_sendspin._tcp.local.";
 pub struct SendspinDevice {
     pub fullname: String,
     pub display_name: String,
+    /// Resolved server address, used by the liveness probe when the device has
+    /// no live connection (sendspin_liveness.rs). `None` until mDNS resolves an
+    /// IPv4 address.
+    pub addr: Option<std::net::SocketAddr>,
+    /// Liveness. mDNS only ever sets this `true` (on resolve) and never removes
+    /// the device — an mDNS "removed" is a TTL-expiry flap, not proof the
+    /// device left. The liveness task owns demotion (`present = false`) and
+    /// eventual removal, from the live connection state + an active TCP probe.
+    pub present: bool,
 }
 
 /// Live discovered devices, keyed by their virtual output node name
@@ -43,6 +52,13 @@ pub type SharedSendspinDevices = Arc<Mutex<BTreeMap<String, SendspinDevice>>>;
 /// Virtual output node name for a discovered device.
 pub fn device_node_name(display_name: &str) -> String {
     format!("{SENDSPIN_DEV_PREFIX}{}", slugify(display_name))
+}
+
+/// The resolved server address (first IPv4 + advertised port), or `None` if no
+/// IPv4 has resolved yet. Used by the liveness probe.
+fn addr_from_service(info: &ServiceInfo) -> Option<std::net::SocketAddr> {
+    let ip = info.get_addresses_v4().into_iter().next()?;
+    Some(std::net::SocketAddr::new(std::net::IpAddr::V4(*ip), info.get_port()))
 }
 
 /// Human name for a device from its resolved service: the `name` TXT if the
@@ -65,41 +81,60 @@ fn display_name_from_service(info: &ServiceInfo) -> String {
 pub fn spawn(devices: SharedSendspinDevices, changes: ChangeNotifier) -> anyhow::Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
     let receiver = daemon.browse(SENDSPIN_SERVICE_TYPE)?;
-    std::thread::Builder::new()
-        .name("sendspin-discovery".into())
-        .spawn(move || {
-            // mDNS fullname -> node name, so a removal drops the right entry.
-            let mut by_fullname: BTreeMap<String, String> = BTreeMap::new();
-            while let Ok(event) = receiver.recv() {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        let display_name = display_name_from_service(&info);
-                        let node_name = device_node_name(&display_name);
-                        let fullname = info.get_fullname().to_string();
-                        by_fullname.insert(fullname.clone(), node_name.clone());
-                        let is_new = devices
-                            .lock_recover()
-                            .insert(node_name.clone(), SendspinDevice { fullname, display_name: display_name.clone() })
-                            .is_none();
-                        if is_new {
+    std::thread::Builder::new().name("sendspin-discovery".into()).spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            match event {
+                ServiceEvent::ServiceResolved(info) => {
+                    let display_name = display_name_from_service(&info);
+                    let node_name = device_node_name(&display_name);
+                    let fullname = info.get_fullname().to_string();
+                    let addr = addr_from_service(&info);
+
+                    let mut devs = devices.lock_recover();
+                    let notify = match devs.get_mut(&node_name) {
+                        Some(dev) => {
+                            // Keep it online (a resolve is a strong "here"
+                            // signal), refresh addr/fullname, and notify only
+                            // if it had been demoted to offline.
+                            let came_online = !dev.present;
+                            dev.present = true;
+                            dev.fullname = fullname;
+                            if addr.is_some() {
+                                dev.addr = addr;
+                            }
+                            if came_online {
+                                tracing::info!("sendspin device '{display_name}' back online ({node_name})");
+                            }
+                            came_online
+                        }
+                        None => {
+                            devs.insert(
+                                node_name.clone(),
+                                SendspinDevice { fullname, display_name: display_name.clone(), addr, present: true },
+                            );
                             tracing::info!("discovered sendspin device '{display_name}' ({node_name})");
-                            // Wake the matrix WS + grouping reconciler so the
-                            // new device shows up and gets grouped/dialed.
-                            let _ = changes.send(());
+                            true
                         }
+                    };
+                    drop(devs);
+                    if notify {
+                        // Wake the matrix WS + grouping reconciler.
+                        let _ = changes.send(());
                     }
-                    ServiceEvent::ServiceRemoved(_ty, fullname) => {
-                        if let Some(node_name) = by_fullname.remove(&fullname) {
-                            devices.lock_recover().remove(&node_name);
-                            tracing::info!("sendspin device '{fullname}' went away; removing {node_name}");
-                            let _ = changes.send(());
-                        }
-                    }
-                    _ => {}
                 }
+                ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                    // Deliberately ignored: an mDNS "removed" is a TTL-expiry
+                    // flap (WiFi power-save, a missed re-announce), not proof
+                    // the device left — acting on it tore down live groups.
+                    // Liveness (sendspin_liveness.rs: connection state + an
+                    // active TCP probe) owns real offline/removal.
+                    tracing::debug!("mDNS removed {fullname} (ignored; liveness decides offline)");
+                }
+                _ => {}
             }
-            tracing::info!("sendspin discovery loop ended");
-        })?;
+        }
+        tracing::info!("sendspin discovery loop ended");
+    })?;
     Ok(daemon)
 }
 

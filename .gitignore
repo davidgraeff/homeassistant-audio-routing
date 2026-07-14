@@ -15,3 +15,6 @@ firmware/bt-bridge/secrets.yaml
 # Editor/OS cruft
 .DS_Store
 *.swp
+
+# Vendored path-dep crates: keep their sources, never their build output.
+pipewire_audio_router/bridge-daemon/vendor/*/target/

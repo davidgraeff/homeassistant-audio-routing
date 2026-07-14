@@ -184,11 +184,13 @@ with no `pw-link`/`pw-cat`/`wpctl`/`ffmpeg` subprocesses left. See
 
 ## Source & sendspin processes are daemon-supervised, not spawned by `run.sh`
 
-> **Update:** the sendspin half of this section is superseded — sendspin
-> outputs are now an embedded native server, not a supervised subprocess
-> (see "Sendspin sink adapter rewritten in Rust, embedded in bridge-daemon"
-> below). `Supervisor` now handles only `shairport-sync`; the rest of this
-> section describes the mechanism, which still applies to that one process.
+> **Update (fully superseded):** there are no supervised subprocesses left.
+> Sendspin outputs became an embedded native server (see "Sendspin sink
+> adapter rewritten in Rust" below), and the AirPlay-receive source became a
+> native in-process receiver too (see "Native AirPlay-receive source" below),
+> so `supervisor.rs` was removed entirely. `run.sh` is now just infrastructure
+> (D-Bus, PipeWire, WirePlumber, avahi) + the daemon. The paragraph below is
+> kept for historical context on the interim supervised design.
 
 `shairport-sync` (the AirPlay-receive source) and `sendspin-adapter.py`
 (one per sendspin output) are external processes — unlike RAOP outputs,
@@ -238,6 +240,11 @@ to map, so port-mapping doesn't help either — only host networking (or
 a macvlan/ipvlan network) removes the isolation.
 
 ## `shairport-sync` needs a real D-Bus system bus + avahi
+
+> **Update (superseded):** the AirPlay-receive source no longer uses
+> shairport-sync at all — it's a native in-process receiver (see "Native
+> AirPlay-receive source" below), which removes this D-Bus-system-bus
+> requirement. Kept for the historical finding.
 
 Discovered in `spikes/shairport-sync-source.md`: shairport-sync
 hard-requires a working `avahi-daemon` and a real D-Bus **system** bus
@@ -357,9 +364,14 @@ create-node`, alongside the existing `Load`/`CreateLinks` commands there),
 and continuous capture is native PipeWire (`sendspin_capture.rs`, mirroring
 `player.rs`'s stream setup but `Direction::Input` with
 `STREAM_CAPTURE_SINK`) instead of a `pw-record` subprocess. No longer
-daemon-supervised as an external process — the sendspin half of "Source &
-sendspin processes are daemon-supervised" (above) no longer applies;
-`Supervisor` is now exclusively for `shairport-sync`/AirPlay.
+daemon-supervised as an external process — and once the AirPlay source went
+native too (below), `supervisor.rs` was removed entirely.
+
+> **Update:** this "one server per configured output" model was itself
+> superseded — sendspin outputs are no longer manually configured. Devices
+> are auto-discovered and servers are formed per synchronized *group* from
+> the routing intent; see "Sendspin: auto-discovery, grouping, per-device
+> volume, and connection-driven liveness" below.
 
 **Payoff, measured**: image size **456MB → 193MB**; `python3`/`pip`/
 `aiosendspin` fully gone. `sendspin-rs` still compiles in `cpal`/`alsa` (its
@@ -379,6 +391,74 @@ so today's production adapter already has every output/process discover and
 dial every such device on the network — this port doesn't introduce a new
 device-to-output assignment problem, whatever already arbitrates which
 server's connection a device keeps continues to do so unchanged.
+
+## Native AirPlay-receive source: vendored shairplay, not shairport-sync
+
+The AirPlay-receive source was a supervised `shairport-sync` subprocess. On
+the Ubuntu base image that build has **no PipeWire output backend** (alsa/
+pipe/stdout only), so its decoded audio never reached the graph — the source
+could never appear in the routing matrix or be routed. It's replaced by a
+**native, in-process RAOP receiver**: a pure-Rust `shairplay` crate whose
+`AudioHandler` callback hands us decoded f32 PCM, which we push through a
+jitter buffer into a PipeWire source node (`airplay_source.rs`). This removes
+the last supervised subprocess *and* the D-Bus-system-bus + avahi requirement
+shairport-sync needed.
+
+The crate is **vendored** (`bridge-daemon/vendor/shairplay/`, a `path`
+dependency) so it can be patched for PipeWire-sender interop, which needed
+three findings (all reproduced locally against PipeWire 1.6.7 with a spike
+receiver + `shairport-sync` as a working reference + a loopback `tcpdump`):
+
+1. **A `Server:` header on every RTSP reply.** Without it PipeWire's sender
+   sends `OPTIONS`, gets our `200`, and then silently never sends `ANNOUNCE`.
+2. **Default to advertising `et=0` (no encryption).** PipeWire picks the
+   highest offered encryption, and its **RSA path is broken** in this build
+   (it stalls before `ANNOUNCE`), so offering `1` wedges the sender.
+   Unencrypted is the reliably-driven path on a trusted LAN. (The advertised
+   codecs/encryption are builder-configurable; `auth_setup` — what real
+   AirPlay-2 gear negotiates via `et=0,4` — is also handled, but isn't the
+   default.)
+3. **Advertise `cn=1` (ALAC), not `cn=0,1`.** PipeWire picks the first codec;
+   the receiver decodes ALAC (and now raw L16), and PipeWire's "PCM" mode is
+   uncompressed-ALAC on the wire anyway.
+
+So the receiver advertises **unencrypted ALAC** — the one combination
+PipeWire senders drive correctly on a trusted LAN. Tradeoff: real iOS senders
+(which require encryption) can't cast to it; fine for this PipeWire-fed router.
+A configurable producer **jitter buffer** (`/api/source/airplay` `latency_msec`,
+default 150 ms) rides out clock drift between the receiver and the graph.
+
+## Sendspin: auto-discovery, grouping, per-device volume, and connection-driven liveness
+
+Sendspin outputs were manually created one-per-output. They're now
+**auto-discovered** over mDNS (`sendspin_discovery.rs`) and surfaced as
+virtual routing outputs (`sendspin-dev-<slug>`), mirroring how RAOP devices
+appear. Devices a user routes from the **same set of sources** are formed into
+one **synchronized group** automatically (`sendspin_group.rs`): a single sink
++ one embedded server dialing exactly those devices, so "one source → several
+speakers in sync" needs no manual group setup and is visible as a group badge
+in the UI.
+
+**Per-device volume** (`sendspin_volume.rs`): these virtual outputs have no
+PipeWire node volume, so volume is sent in-band over the protocol
+(`ServerSender::send_player_command`). Mapping a connection to a device needed
+a patch to the (also vendored, `bridge-daemon/vendor/sendspin/`) `sendspin`
+crate: its `ClientEvent::Connected` only exposed the client's `client_id`,
+which for ESPHome devices is an opaque MAC that doesn't match the advertised
+name — the patch adds the dialed mDNS `fullname` so the daemon can map a
+connection to the right discovered device.
+
+**Liveness — mDNS is discovery-only.** An mDNS `ServiceRemoved` is usually a
+TTL-expiry flap (WiFi power-save on the speaker), not a real departure; acting
+on it tore down live groups (and raced the group's server-port rebind). Now a
+device is *present* if it has a **live server connection** or an active **TCP
+probe** succeeds; mDNS only ever *adds* (`sendspin_liveness.rs`). A device is
+demoted to offline (grayed) only after sustained failure, and removed only
+after a long grace — so a flap no longer disturbs a playing group. RAOP
+discovery got the same treatment more simply: a grace-debounce on mDNS removal
+(it has no per-device connection to lean on). The vendored sendspin server
+also binds with `SO_REUSEADDR` so a group recreated on the same port can't
+lose the port-rebind race.
 
 ## Runtime image trimming: `systemd-standalone-sysusers`, not full `systemd`
 
@@ -423,6 +503,13 @@ measurable benefit. Also checked and ruled out: dropping
 `shairport-sync`'s own hard Depends already pull in is the ~746KB
 `pipewire-alsa`/`pipewire-jack` shims — not worth the risk of retesting
 AirPlay-receive for that little).
+
+> **Update:** `shairport-sync` was later removed from the image entirely
+> (AirPlay is now the native in-process receiver, above), so this
+> package-baseline reasoning is superseded — the avahi/D-Bus chain is now
+> pulled only by the daemon's own mDNS + PipeWire's needs, not shairport. The
+> image-size *conclusions* still hold; only the "what already pulls X in"
+> attribution changed. Not re-measured here.
 
 ## Bluetooth bridge box: hardware and firmware constraints
 

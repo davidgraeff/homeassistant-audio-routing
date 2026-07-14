@@ -53,33 +53,19 @@ pub enum PwCommand {
     /// Load `module_name` with `args` and remember it under `node_name` so it
     /// can be unloaded later. `Err` if it's already loaded or libpipewire
     /// refuses the load.
-    Load {
-        node_name: String,
-        module_name: String,
-        args: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    Load { node_name: String, module_name: String, args: String, reply: oneshot::Sender<Result<(), String>> },
     /// Unload the module previously loaded under `node_name`. Idempotent:
     /// unloading something not loaded is `Ok` (the desired end state — gone —
     /// already holds).
-    Unload {
-        node_name: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    Unload { node_name: String, reply: oneshot::Sender<Result<(), String>> },
     /// Create every given link natively via the `link-factory`. Idempotent per
     /// channel: a port pairing already present in the observed registry is
     /// reported as success rather than recreated. Reply is Ok(summary) on full
     /// success, Err(summary) if any create failed.
-    CreateLinks {
-        specs: Vec<LinkSpec>,
-        reply: oneshot::Sender<Result<String, String>>,
-    },
+    CreateLinks { specs: Vec<LinkSpec>, reply: oneshot::Sender<Result<String, String>> },
     /// Destroy links by their registry global id. Missing/already-gone ids are
     /// fine — the caller wants them not to exist, and they don't.
-    DestroyLinks {
-        link_ids: Vec<u32>,
-        reply: oneshot::Sender<Result<String, String>>,
-    },
+    DestroyLinks { link_ids: Vec<u32>, reply: oneshot::Sender<Result<String, String>> },
     /// Create a `support.null-audio-sink` adapter node named `node_name` —
     /// the native equivalent of `pw-cli create-node adapter "{ ... }"`
     /// (sendspin_server.rs's capture target; replaces adapter.py's one-time
@@ -87,17 +73,11 @@ pub enum PwCommand {
     /// through the `global` listener same as any other, so the caller
     /// resolves `node_name` to a node id from the shared registry snapshot
     /// afterward rather than getting it back synchronously here.
-    CreateSinkNode {
-        node_name: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    CreateSinkNode { node_name: String, reply: oneshot::Sender<Result<(), String>> },
     /// Destroy a node by registry global id (resolved by the caller from the
     /// shared snapshot, same division of labor as `DestroyLinks`). Missing/
     /// already-gone ids are fine, same reasoning as `DestroyLinks`.
-    DestroySinkNode {
-        node_id: u32,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+    DestroySinkNode { node_id: u32, reply: oneshot::Sender<Result<(), String>> },
 }
 
 /// Send end of the command channel, handed to the axum side. Cheap to clone;
@@ -172,21 +152,15 @@ pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender)>
     let (cmd_tx, cmd_rx) = pw::channel::channel::<PwCommand>();
     let state_for_thread = state.clone();
     let changes_for_thread = changes.clone();
-    std::thread::Builder::new()
-        .name("pipewire".into())
-        .spawn(move || {
-            if let Err(e) = run(state_for_thread, changes_for_thread, cmd_rx) {
-                tracing::error!("pipewire thread exited with error: {e:#}");
-            }
-        })?;
+    std::thread::Builder::new().name("pipewire".into()).spawn(move || {
+        if let Err(e) = run(state_for_thread, changes_for_thread, cmd_rx) {
+            tracing::error!("pipewire thread exited with error: {e:#}");
+        }
+    })?;
     Ok((state, changes, cmd_tx))
 }
 
-fn run(
-    state: SharedState,
-    changes: ChangeNotifier,
-    cmd_rx: pw::channel::Receiver<PwCommand>,
-) -> anyhow::Result<()> {
+fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receiver<PwCommand>) -> anyhow::Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -218,45 +192,22 @@ fn run(
                 return;
             }
 
-            if let (Some(port_name), Some(node_id_str), Some(direction)) = (
-                props.get("port.name"),
-                props.get("node.id"),
-                props.get("port.direction"),
-            ) {
+            if let (Some(port_name), Some(node_id_str), Some(direction)) =
+                (props.get("port.name"), props.get("node.id"), props.get("port.direction"))
+            {
                 if let Ok(node_id) = node_id_str.parse::<u32>() {
-                    let info = PortInfo {
-                        port_id: global.id,
-                        node_id,
-                        port_name: port_name.to_string(),
-                        direction: direction.to_string(),
-                    };
+                    let info = PortInfo { port_id: global.id, node_id, port_name: port_name.to_string(), direction: direction.to_string() };
                     state_add.lock_recover().ports.insert(global.id, info);
                     let _ = changes_add.send(());
                     return;
                 }
             }
 
-            if let (Some(out_node_str), Some(in_node_str)) =
-                (props.get("link.output.node"), props.get("link.input.node"))
-            {
-                if let (Ok(output_node), Ok(input_node)) =
-                    (out_node_str.parse::<u32>(), in_node_str.parse::<u32>())
-                {
-                    let output_port = props
-                        .get("link.output.port")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    let input_port = props
-                        .get("link.input.port")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    let info = LinkInfo {
-                        link_id: global.id,
-                        output_node,
-                        input_node,
-                        output_port,
-                        input_port,
-                    };
+            if let (Some(out_node_str), Some(in_node_str)) = (props.get("link.output.node"), props.get("link.input.node")) {
+                if let (Ok(output_node), Ok(input_node)) = (out_node_str.parse::<u32>(), in_node_str.parse::<u32>()) {
+                    let output_port = props.get("link.output.port").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let input_port = props.get("link.input.port").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let info = LinkInfo { link_id: global.id, output_node, input_node, output_port, input_port };
                     tracing::info!("discovered link: node {output_node} -> node {input_node} (id={})", global.id);
                     state_add.lock_recover().links.insert(global.id, info);
                     let _ = changes_add.send(());
@@ -287,12 +238,7 @@ fn run(
     let registry_for_cmds = registry.clone();
     let state_for_cmds = state.clone();
     let _cmd_receiver = cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
-        PwCommand::Load {
-            node_name,
-            module_name,
-            args,
-            reply,
-        } => {
+        PwCommand::Load { node_name, module_name, args, reply } => {
             let mut modules = modules.borrow_mut();
             if modules.contains_key(&node_name) {
                 let _ = reply.send(Err(format!("a module for '{node_name}' is already loaded")));
@@ -355,9 +301,7 @@ fn create_links(core: &pw::core::CoreRc, state: &SharedState, specs: &[LinkSpec]
         // exact ports is already in the observed registry, don't recreate it.
         let already_linked = {
             let st = state.lock_recover();
-            st.links
-                .values()
-                .any(|l| l.output_port == spec.out_port && l.input_port == spec.in_port)
+            st.links.values().any(|l| l.output_port == spec.out_port && l.input_port == spec.in_port)
         };
         if already_linked {
             messages.push(format!("ports {} -> {} already linked", spec.out_port, spec.in_port));
@@ -426,7 +370,5 @@ fn create_sink_node(core: &pw::core::CoreRc, node_name: &str) -> Result<(), Stri
     // transiently in between).
     props.insert("object.linger", "true");
     props.insert("audio.position", "[FL,FR]");
-    core.create_object::<pw::node::Node>("adapter", &props)
-        .map(drop)
-        .map_err(|e| format!("failed to create sink node '{node_name}': {e}"))
+    core.create_object::<pw::node::Node>("adapter", &props).map(drop).map_err(|e| format!("failed to create sink node '{node_name}': {e}"))
 }

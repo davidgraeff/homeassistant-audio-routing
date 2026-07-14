@@ -12,6 +12,9 @@ export interface RoutingNode {
   configured: boolean;
   /** Live PipeWire object id when present (for volume calls); null offline. */
   node_id: number | null;
+  /** Recent peak level 0.0–1.0 for the meter (sources, while the matrix is
+   * open); 0 for outputs/unmetered. */
+  peak: number;
 }
 
 export interface RoutingLink {
@@ -54,6 +57,10 @@ export interface AddOutputRequest {
 export interface AirplaySourceInfo {
   name: string | null;
   running: boolean;
+  /** Producer jitter-buffer target in ms. Higher = fewer stutters, more latency. */
+  latency_msec: number;
+  /** Advertise the auth-setup encryption mode so encryption-requiring senders can connect. */
+  auth_setup: boolean;
 }
 
 export interface RtpSourceInfo {
@@ -61,6 +68,12 @@ export interface RtpSourceInfo {
   enabled: boolean;
   /** UDP port it listens on (the stored value, or the default when disabled). */
   port: number;
+  /** Receiver-side jitter buffer target in ms (stored value, or default when
+   *  disabled). Higher = more dropout tolerance on a weak link, more latency. */
+  latency_msec: number;
+  /** `source.ip`: `0.0.0.0` = unicast, or a multicast group so several
+   *  receivers can share one firmware stream. */
+  source_addr: string;
   /** Whether the `bt-bridge-rtp` node is present in the live PipeWire graph. */
   loaded: boolean;
 }
