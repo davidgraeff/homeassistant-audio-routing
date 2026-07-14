@@ -42,26 +42,34 @@ trap cleanup EXIT
 echo "--- building add-on image ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-# No options.json seeding — the two sendspin outputs are created via the API
-# once the daemon is up.
+# No options.json seeding — two virtual test sinks are created below once the
+# daemon is up.
 docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
+# --cap-add SYS_NICE/IPC_LOCK mirror the add-on config.yaml privileges. Without
+# IPC_LOCK, PipeWire's mem.mlock-all (50-mlock.conf) mlockall() fails and 1.6.2
+# then aborts context creation, so PipeWire never comes up in the container.
+docker run -d --cap-add SYS_NICE --cap-add IPC_LOCK --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
   -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
 
-echo "--- waiting for the bridge-daemon HTTP API, then creating two sendspin outputs ---"
+echo "--- waiting for the bridge-daemon HTTP API, then creating two virtual test sinks ---"
 for _ in $(seq 1 30); do curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-for NAME in Kitchen Bedroom; do
-  curl -s -X POST "http://localhost:$HOST_PORT/api/sendspin_outputs" -H 'Content-Type: application/json' \
-    -d "{\"name\":\"$NAME\"}" | grep -q '"ok":true' \
-    || { echo "FAIL: POST /api/sendspin_outputs ($NAME) failed"; docker logs "$CONTAINER_NAME"; exit 1; }
+# Sendspin outputs are discovery-only now (no create API) and need real devices
+# on the network, which CI has none of. Stand in plain null-audio-sinks named
+# with the `sendspin-out-` prefix so the daemon lists them as outputs exactly as
+# real sendspin sinks would be — this test only exercises the routing matrix /
+# link API against them, which is name-based.
+for NAME in kitchen bedroom; do
+  docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c "
+pw-cli create-node adapter \"{ factory.name=support.null-audio-sink node.name=sendspin-out-$NAME media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }\" >/dev/null
+" || { echo "FAIL: could not create the virtual test sink ($NAME)"; docker logs "$CONTAINER_NAME"; exit 1; }
 done
 
-echo "--- waiting for both sendspin outputs ---"
+echo "--- waiting for both outputs ---"
 READY=""
 for _ in $(seq 1 30); do
   MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing" 2>/dev/null || true)
-  if echo "$MATRIX" | grep -q '"kitchen"' && echo "$MATRIX" | grep -q '"bedroom"'; then
+  if echo "$MATRIX" | grep -q 'sendspin-out-kitchen' && echo "$MATRIX" | grep -q 'sendspin-out-bedroom'; then
     READY=1
     break
   fi
@@ -84,40 +92,44 @@ echo "--- creating a real source node ---"
 docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c '
 pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=test-music-src media.class=Audio/Source/Virtual object.linger=true audio.position=[FL,FR] }" >/dev/null
 '
-SOURCE_NODE_ID=""
+# Routing is name-based now (stable node names, not ephemeral PipeWire ids —
+# see routing.rs / the /api/routing/link API), so the link/unlink calls below
+# address endpoints by name. We only need to wait for the source to be
+# classified and appear in the matrix.
+SOURCE_NAME="test-music-src"
+OUTPUT_NAME="sendspin-out-kitchen"
+FOUND=""
 for _ in $(seq 1 30); do
   MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing" 2>/dev/null || true)
-  SOURCE_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"node_name":"[^"]*","display_name":"test-music-src"' | grep -oE '[0-9]+' | head -1) || true
-  [ -n "$SOURCE_NODE_ID" ] && break
+  echo "$MATRIX" | grep -q "\"node_name\":\"$SOURCE_NAME\"" && { FOUND=1; break; }
   sleep 1
 done
-if [ -z "$SOURCE_NODE_ID" ]; then
-  echo "FAIL: test-music-src never appeared as a source in /api/routing"
+if [ -z "$FOUND" ]; then
+  echo "FAIL: $SOURCE_NAME never appeared as a source in /api/routing: $MATRIX"
   exit 1
 fi
-OUTPUT_NODE_ID=$(echo "$MATRIX" | grep -oE '"node_id":[0-9]+,"node_name":"[^"]*","display_name":"kitchen"' | grep -oE '[0-9]+' | head -1)
-echo "OK: source node id = $SOURCE_NODE_ID, kitchen output node id = $OUTPUT_NODE_ID"
+echo "OK: source '$SOURCE_NAME' present, output '$OUTPUT_NAME' present"
 
 echo "--- POST /api/routing/link ---"
 LINK_RESPONSE=$(curl -s -X POST "http://localhost:$HOST_PORT/api/routing/link" -H 'Content-Type: application/json' \
-  -d "{\"source_node_id\":$SOURCE_NODE_ID,\"output_node_id\":$OUTPUT_NODE_ID}")
+  -d "{\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\"}")
 echo "$LINK_RESPONSE" | grep -q '"ok":true' || { echo "FAIL: link request did not report ok:true: $LINK_RESPONSE"; exit 1; }
 sleep 0.5
 REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
 echo "$REAL_LINKS" | grep -q "test-music-src:capture_FL" || { echo "FAIL: real pw-link state missing the FL link after /api/routing/link"; echo "$REAL_LINKS"; exit 1; }
 MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing")
-echo "$MATRIX" | grep -q "\[$SOURCE_NODE_ID,$OUTPUT_NODE_ID\]" || { echo "FAIL: matrix does not show the new link: $MATRIX"; exit 1; }
+echo "$MATRIX" | grep -q "\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\"" || { echo "FAIL: matrix does not show the new link: $MATRIX"; exit 1; }
 echo "OK: link created and reflected both in real PipeWire state and the matrix"
 
 echo "--- POST /api/routing/unlink ---"
 UNLINK_RESPONSE=$(curl -s -X POST "http://localhost:$HOST_PORT/api/routing/unlink" -H 'Content-Type: application/json' \
-  -d "{\"source_node_id\":$SOURCE_NODE_ID,\"output_node_id\":$OUTPUT_NODE_ID}")
+  -d "{\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\"}")
 echo "$UNLINK_RESPONSE" | grep -q '"ok":true' || { echo "FAIL: unlink request did not report ok:true: $UNLINK_RESPONSE"; exit 1; }
 sleep 0.5
 REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
 echo "$REAL_LINKS" | grep -q "test-music-src:capture_FL" && { echo "FAIL: real pw-link state still shows the FL link after /api/routing/unlink"; echo "$REAL_LINKS"; exit 1; }
 MATRIX=$(curl -sf "http://localhost:$HOST_PORT/api/routing")
-echo "$MATRIX" | grep -q "\[$SOURCE_NODE_ID,$OUTPUT_NODE_ID\]" && { echo "FAIL: matrix still shows the link after unlink: $MATRIX"; exit 1; }
+echo "$MATRIX" | grep -q "\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\"" && { echo "FAIL: matrix still shows the link after unlink: $MATRIX"; exit 1; }
 echo "OK: unlink removed the real PipeWire link and the matrix no longer shows it"
 
 echo "--- WebSocket: initial snapshot + live push on a real link change ---"
@@ -133,12 +145,23 @@ async def main():
         assert initial['links'] == [], f'expected no links in initial snapshot, got {initial[\"links\"]}'
         req = urllib.request.Request(
             'http://localhost:$HOST_PORT/api/routing/link',
-            data=json.dumps({'source_node_id': $SOURCE_NODE_ID, 'output_node_id': $OUTPUT_NODE_ID}).encode(),
+            data=json.dumps({'source': '$SOURCE_NAME', 'output': '$OUTPUT_NAME'}).encode(),
             headers={'Content-Type': 'application/json'},
         )
         urllib.request.urlopen(req).read()
-        pushed = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-        assert [$SOURCE_NODE_ID, $OUTPUT_NODE_ID] in pushed['links'], f'expected the new link in the pushed snapshot, got {pushed[\"links\"]}'
+        # The socket also pushes periodic snapshots for the live meters (~250ms
+        # tick), so the frame right after linking may be a stale meter tick that
+        # predates the change — read until the link shows up (bounded) rather
+        # than assuming the very next frame reflects it.
+        want = {'source': '$SOURCE_NAME', 'output': '$OUTPUT_NAME'}
+        pushed = {'links': None}
+        found = False
+        for _ in range(40):
+            pushed = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            if want in pushed['links']:
+                found = True
+                break
+        assert found, f'link never appeared in a pushed snapshot; last saw {pushed[\"links\"]}'
         print('WS_OK')
 
 asyncio.run(main())

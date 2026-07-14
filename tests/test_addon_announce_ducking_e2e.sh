@@ -37,9 +37,11 @@ MUSIC_WAV_HOST_PATH="${MUSIC_WAV_HOST_PATH:-/usr/share/sounds/speech-dispatcher/
 CAPTURE_SECONDS=9
 # set -u means cleanup() must not reference these before they're assigned.
 TMP_MUSIC_LONG=""
-TMP_ANNOUNCE=""
+SERVE_DIR=""
+SERVE_PID=""
 
 cleanup() {
+  [ -n "$SERVE_PID" ] && kill "$SERVE_PID" >/dev/null 2>&1 || true
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   # `docker network rm` right after `docker rm -f` on the same network has
   # been observed to hang for minutes (dockerd-side endpoint-detach race),
@@ -47,25 +49,36 @@ cleanup() {
   # nonzero exit. Bound it with `timeout` so a slow daemon can't wedge the
   # whole test; a leaked test-only bridge network is a harmless leftover.
   timeout 5 docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
-  rm -rf "$DATA_DIR"
-  rm -f /tmp/announce_e2e_full.raw "$TMP_MUSIC_LONG" "$TMP_ANNOUNCE"
+  rm -rf "$DATA_DIR" "$SERVE_DIR"
+  rm -f /tmp/announce_e2e_full.raw "$TMP_MUSIC_LONG"
 }
 trap cleanup EXIT
 
 echo "--- building add-on image (includes the announce endpoint) ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-# No options.json seeding — the sendspin output is created via the API below.
+# No options.json seeding — a virtual test sink is created below.
 docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
+# --cap-add SYS_NICE/IPC_LOCK mirror the add-on config.yaml privileges. Without
+# IPC_LOCK, PipeWire's mem.mlock-all (50-mlock.conf) mlockall() fails and 1.6.2
+# then aborts context creation, so PipeWire never comes up in the container.
+docker run -d --cap-add SYS_NICE --cap-add IPC_LOCK --add-host=host.docker.internal:host-gateway \
+  --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
   -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
 
-echo "--- waiting for the bridge-daemon HTTP API, then creating the sendspin output ---"
+echo "--- waiting for the bridge-daemon HTTP API, then creating a virtual test sink ---"
 for _ in $(seq 1 30); do curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -s -X POST "http://localhost:$HOST_PORT/api/sendspin_outputs" -H 'Content-Type: application/json' \
-  -d '{"name":"Kitchen"}' | grep -q '"ok":true' \
-  || { echo "FAIL: POST /api/sendspin_outputs failed"; docker logs "$CONTAINER_NAME"; exit 1; }
+# Sendspin outputs are discovery-only now (no create API) and need a real
+# sendspin device on the network, which CI has none of. Stand in a plain
+# timer-driven null-audio-sink named with the `sendspin-out-` prefix so the
+# daemon lists it as a media_player exactly as a real sendspin sink would be —
+# the announce/duck path and the pw-record capture only need a running sink
+# with a monitor, which this provides deterministically. (This is in fact what
+# the sendspin adapter created internally before.)
+docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c '
+pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=sendspin-out-kitchen media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }" >/dev/null
+' || { echo "FAIL: could not create the virtual test sink"; docker logs "$CONTAINER_NAME"; exit 1; }
 
 echo "--- waiting for the sendspin sink node ---"
 SINK_NODE_ID=""
@@ -102,22 +115,24 @@ for _ in $(seq 1 50); do
 done
 echo "OK: music source linked"
 
-echo "--- staging audio: a long looped 'music' clip + a short announce tone, served over HTTP inside the container ---"
+echo "--- staging audio: a looped 'music' clip in the container + a short announce tone served over HTTP from the host ---"
 # Generated on the HOST (ffmpeg is no longer in the add-on image itself —
 # announce audio is decoded by the bridge daemon's own symphonia-based
 # decoder, decode.rs — so the container has nothing to generate these
-# fixtures with) and copied in as finished files.
+# fixtures with). The music bed is copied into the container for pw-cat to
+# play; the announce clip is fetched by the daemon over HTTP.
 TMP_MUSIC_LONG="$(mktemp -u --suffix=.wav)"
-TMP_ANNOUNCE="$(mktemp -u --suffix=.wav)"
 ffmpeg -y -loglevel error -stream_loop 40 -i "$MUSIC_WAV_HOST_PATH" -c copy "$TMP_MUSIC_LONG"
-ffmpeg -y -loglevel error -f lavfi -i "sine=frequency=440:duration=3" "$TMP_ANNOUNCE"
 docker cp "$TMP_MUSIC_LONG" "$CONTAINER_NAME:/tmp/music_long.wav"
-docker cp "$TMP_ANNOUNCE" "$CONTAINER_NAME:/tmp/announce.wav"
-rm -f "$TMP_MUSIC_LONG" "$TMP_ANNOUNCE"
-docker exec "$CONTAINER_NAME" bash -c '
-mkdir -p /tmp/servedir && cp /tmp/announce.wav /tmp/servedir/announce.wav
-cd /tmp/servedir && nohup python3 -m http.server 8765 >/tmp/httpserver.log 2>&1 &
-'
+rm -f "$TMP_MUSIC_LONG"
+# Serve the announce clip from the HOST: python3 is no longer in the add-on
+# image (native Rust rewrite — see the Dockerfile), so the in-container
+# http.server is gone. The daemon fetches it via host.docker.internal (mapped
+# to the host gateway by --add-host on the container's docker run above).
+SERVE_DIR="$(mktemp -d)"
+ffmpeg -y -loglevel error -f lavfi -i "sine=frequency=440:duration=3" "$SERVE_DIR/announce.wav"
+python3 -m http.server 8765 --directory "$SERVE_DIR" >/dev/null 2>&1 &
+SERVE_PID=$!
 sleep 1
 
 echo "--- starting the 'music' source and one continuous capture spanning the whole test ---"
@@ -136,7 +151,7 @@ sleep 1
 echo "--- t=2s: baseline window captured, now triggering the real /announce call ---"
 curl -s --max-time 20 -X POST "http://localhost:$HOST_PORT/api/media_players/$SINK_NODE_ID/announce" \
   -H 'Content-Type: application/json' \
-  -d '{"url":"http://127.0.0.1:8765/announce.wav","duck_volume":0.1}' > /tmp/announce_response.json
+  -d '{"url":"http://host.docker.internal:8765/announce.wav","duck_volume":0.1}' > /tmp/announce_response.json
 # Expect "ducked 4 source(s)", not 2: each stereo source contributes two
 # separate PipeWire Link objects (FL + FR are distinct links, confirmed
 # via `pw-link -l` while debugging this script), and WirePlumber also

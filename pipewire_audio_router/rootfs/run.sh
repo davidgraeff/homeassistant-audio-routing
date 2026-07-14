@@ -5,6 +5,17 @@ export XDG_RUNTIME_DIR=/run/pipewire
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# Restart-idempotency: a `docker restart` (and the HA supervisor's stop/start of
+# an add-on) reuses the container's writable /run, so pid/socket files from the
+# previous boot survive. `dbus-daemon --system` aborts hard if /run/dbus/pid
+# already exists ("pid file exists, if the message bus is not running, remove
+# this file"), which with `set -e` would kill the whole restart. Clear the
+# stale runtime state so a restart boots exactly like a fresh start. (The
+# pipewire sockets are normally re-bound fine, but a leftover from an unclean
+# exit would block the daemon just the same, so drop them too.)
+rm -f /run/dbus/pid
+rm -f "$XDG_RUNTIME_DIR"/pipewire-0 "$XDG_RUNTIME_DIR"/pipewire-0-manager
+
 # A real D-Bus *system* bus (not just the private session bus below) is
 # required for avahi-daemon, which shairport-sync in turn hard-requires to
 # even start (fatal exit otherwise) — confirmed in

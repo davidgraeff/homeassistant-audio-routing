@@ -33,31 +33,45 @@ DATA_DIR="$(mktemp -d)"
 HOST_PORT="${HOST_PORT:-18099}"
 MUSIC_WAV_HOST_PATH="${MUSIC_WAV_HOST_PATH:-/usr/share/sounds/speech-dispatcher/pipe.wav}"
 CAPTURE_SECONDS=9
-# set -u means cleanup() must not reference this before it's assigned.
+# set -u means cleanup() must not reference these before they're assigned.
 TMP_MUSIC_LONG=""
+MOCK_SCRIPT=""
+MOCK_PID=""
 
 cleanup() {
+  [ -n "$MOCK_PID" ] && kill "$MOCK_PID" >/dev/null 2>&1 || true
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   timeout 5 docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
   rm -rf "$DATA_DIR"
-  rm -f /tmp/wyoming_e2e_full.raw "$TMP_MUSIC_LONG"
+  rm -f /tmp/wyoming_e2e_full.raw "$TMP_MUSIC_LONG" "$MOCK_SCRIPT"
 }
 trap cleanup EXIT
 
 echo "--- building add-on image (includes the Wyoming client) ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-# No options.json seeding — the sendspin output is created via the API below.
+# No options.json seeding — a virtual test sink is created below.
 docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
+# --cap-add SYS_NICE/IPC_LOCK mirror the add-on config.yaml privileges. Without
+# IPC_LOCK, PipeWire's mem.mlock-all (50-mlock.conf) mlockall() fails and 1.6.2
+# then aborts context creation, so PipeWire never comes up in the container.
+docker run -d --cap-add SYS_NICE --cap-add IPC_LOCK --add-host=host.docker.internal:host-gateway \
+  --name "$CONTAINER_NAME" --network "$NETWORK_NAME" \
   -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
 
-echo "--- waiting for the bridge-daemon HTTP API, then creating the sendspin output ---"
+echo "--- waiting for the bridge-daemon HTTP API, then creating a virtual test sink ---"
 for _ in $(seq 1 30); do curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -s -X POST "http://localhost:$HOST_PORT/api/sendspin_outputs" -H 'Content-Type: application/json' \
-  -d '{"name":"Kitchen"}' | grep -q '"ok":true' \
-  || { echo "FAIL: POST /api/sendspin_outputs failed"; docker logs "$CONTAINER_NAME"; exit 1; }
+# Sendspin outputs are discovery-only now (no create API) and need a real
+# sendspin device on the network, which CI has none of. Stand in a plain
+# timer-driven null-audio-sink named with the `sendspin-out-` prefix so the
+# daemon lists it as a media_player exactly as a real sendspin sink would be —
+# the announce/duck path and the pw-record capture only need a running sink
+# with a monitor, which this provides deterministically. (This is in fact what
+# the sendspin adapter created internally before.)
+docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c '
+pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=sendspin-out-kitchen media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }" >/dev/null
+' || { echo "FAIL: could not create the virtual test sink"; docker logs "$CONTAINER_NAME"; exit 1; }
 
 echo "--- waiting for the sendspin sink node ---"
 SINK_NODE_ID=""
@@ -102,7 +116,8 @@ rm -f "$TMP_MUSIC_LONG"
 # parses. The synthesized "speech" is a real 2s sine wave, not silence,
 # so ffmpeg astats on the captured output can actually tell it apart from
 # the ducked music bed.
-cat << 'PYEOF' | docker exec -i "$CONTAINER_NAME" tee /tmp/mock_wyoming_server.py > /dev/null
+MOCK_SCRIPT="$(mktemp --suffix=.py)"
+cat << 'PYEOF' > "$MOCK_SCRIPT"
 import json, math, array, socket
 
 RATE, WIDTH, CHANNELS = 22050, 2, 1
@@ -138,7 +153,12 @@ send_event(f, "audio-chunk", {"rate": RATE, "width": WIDTH, "channels": CHANNELS
 send_event(f, "audio-stop", {})
 conn.close()
 PYEOF
-docker exec -d -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" python3 /tmp/mock_wyoming_server.py
+# Run the mock TTS server on the HOST: python3 is no longer in the add-on image
+# (dropped when the sendspin adapter became native Rust — see the Dockerfile),
+# so the daemon inside the container reaches it via host.docker.internal, mapped
+# to the host gateway by --add-host on the container's docker run above.
+python3 "$MOCK_SCRIPT" &
+MOCK_PID=$!
 sleep 1
 
 echo "--- negative case: neither url nor wyoming given ---"
@@ -165,7 +185,7 @@ sleep 1
 echo "--- t=2s: baseline window captured, now triggering the real Wyoming /announce call ---"
 curl -s --max-time 20 -X POST "http://localhost:$HOST_PORT/api/media_players/$SINK_NODE_ID/announce" \
   -H 'Content-Type: application/json' \
-  -d '{"wyoming":{"host":"127.0.0.1","port":10200,"text":"this is a test announcement"},"duck_volume":0.1}' > /tmp/announce_response.json
+  -d '{"wyoming":{"host":"host.docker.internal","port":10200,"text":"this is a test announcement"},"duck_volume":0.1}' > /tmp/announce_response.json
 echo "announce response: $(cat /tmp/announce_response.json)"
 grep -q '"ok":true' /tmp/announce_response.json || { echo "FAIL: wyoming announce did not report ok:true"; docker logs "$CONTAINER_NAME" | tail -30; exit 1; }
 

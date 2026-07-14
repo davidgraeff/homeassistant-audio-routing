@@ -38,7 +38,10 @@ docker build -t "$IMAGE" "$ADDON_DIR"
 # created at runtime via the API below. /data is still mounted for the daemon's
 # own persisted stores.
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
+# --cap-add SYS_NICE/IPC_LOCK mirror the add-on config.yaml privileges. Without
+# IPC_LOCK, PipeWire's mem.mlock-all (50-mlock.conf) mlockall() fails and 1.6.2
+# then aborts context creation, so PipeWire never comes up in the container.
+docker run -d --cap-add SYS_NICE --cap-add IPC_LOCK --name "$CONTAINER_NAME" -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
 
 echo "--- waiting for bridge-daemon HTTP API ---"
 READY=""

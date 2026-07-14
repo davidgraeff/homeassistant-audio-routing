@@ -41,7 +41,10 @@ docker build -t "$IMAGE" "$ADDON_DIR"
 echo '{ "outputs": [] }' > "$DATA_DIR/options.json"
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
+# --cap-add SYS_NICE/IPC_LOCK mirror the add-on config.yaml privileges. Without
+# IPC_LOCK, PipeWire's mem.mlock-all (50-mlock.conf) mlockall() fails and 1.6.2
+# then aborts context creation, so PipeWire never comes up in the container.
+docker run -d --cap-add SYS_NICE --cap-add IPC_LOCK --name "$CONTAINER_NAME" -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
 
 echo "--- waiting for bridge-daemon HTTP API ---"
 READY=""
@@ -68,7 +71,7 @@ for _ in $(seq 1 15); do
   sleep 1
 done
 [ -n "$FOUND" ] || fail "added output never appeared in /api/nodes"
-curl -s "$BASE/api/outputs" | grep -q '"loaded":true' || fail "/api/outputs did not report loaded:true"
+curl -s "$BASE/api/outputs" | grep -q '"present":true' || fail "/api/outputs did not report present:true"
 echo "OK: output loaded live"
 
 echo "--- duplicate add is rejected (409) ---"
