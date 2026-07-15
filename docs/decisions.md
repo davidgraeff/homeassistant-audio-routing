@@ -455,8 +455,14 @@ device is *present* if it has a **live server connection** or an active **TCP
 probe** succeeds; mDNS only ever *adds* (`sendspin_liveness.rs`). A device is
 demoted to offline (grayed) only after sustained failure, and removed only
 after a long grace — so a flap no longer disturbs a playing group. RAOP
-discovery got the same treatment more simply: a grace-debounce on mDNS removal
-(it has no per-device connection to lean on). The vendored sendspin server
+discovery gets the same treatment: after a grace-debounce on mDNS removal it
+**TCP-probes the receiver's last-known address** (`discovery.rs`) and only
+unloads when that *also* fails, re-probing while the receiver stays
+mDNS-absent-but-reachable. RAOP has no per-device connection like sendspin's to
+lean on, so the probe is the sole liveness signal past the debounce — a receiver
+that stops announcing over mDNS but still answers on the wire stays loaded
+(previously it was unloaded 90s after the mDNS flap, then reloaded minutes later
+when it re-announced). The vendored sendspin server
 also binds with `SO_REUSEADDR` so a group recreated on the same port can't
 lose the port-rebind race.
 

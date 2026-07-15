@@ -36,13 +36,19 @@ use tokio::sync::oneshot;
 
 const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
 
-/// How long a discovered RAOP receiver may be mDNS-absent before we unload its
-/// sink. An mDNS "removed" is usually a TTL-expiry flap (the receiver never
-/// left), so we wait out the grace and cancel on any re-resolve — mirroring the
-/// sendspin liveness policy, without a per-device connection to lean on.
+/// Debounce before acting on an mDNS "removed". An mDNS removal is usually a
+/// TTL-expiry flap (the receiver never left), so we wait this out and cancel it
+/// on any re-resolve. After it elapses we don't blindly unload — we TCP-probe
+/// the receiver's last-known address (`probe_reachable`) and only unload when it
+/// is *also* unreachable, then re-probe at this same cadence while it stays
+/// mDNS-absent-but-reachable. This mirrors the sendspin liveness policy
+/// (connection/probe driven), which RAOP discovery previously lacked: a device
+/// that stops announcing over mDNS but still answers on the wire stays loaded.
 const RAOP_ABSENT_GRACE: Duration = Duration::from_secs(90);
 /// How often the discovery loop wakes (when idle) to expire pending unloads.
 const RAOP_ABSENT_TICK: Duration = Duration::from_secs(15);
+/// Per-probe TCP connect timeout for the mDNS-absent liveness fallback.
+const RAOP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Whether discovery loads modules, or only logs what it would load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +118,16 @@ fn output_from_service(info: &ServiceInfo) -> Option<RaopOutputConfig> {
     })
 }
 
+/// A short blocking TCP connect to `addr` — success means something is
+/// listening, i.e. the receiver is still on the network even if it has stopped
+/// announcing itself over mDNS. This runs on the discovery OS thread, which has
+/// no tokio runtime, so it uses `std::net` with an explicit connect timeout
+/// rather than the async connect `sendspin_liveness` uses. A refused connection
+/// returns immediately; only an unreachable host waits out the full timeout.
+fn probe_reachable(addr: std::net::SocketAddr) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, RAOP_PROBE_TIMEOUT).is_ok()
+}
+
 /// Starts mDNS discovery and returns the daemon handle. The handle must be
 /// kept alive for discovery to keep running — dropping it stops the browse and
 /// ends the worker thread.
@@ -127,10 +143,19 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
         // exposes an IPv4 A record would otherwise spam the log many times
         // a second. Warn once; clear the flag if/when it finally resolves.
         let mut warned_no_ipv4: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Fullname -> when it went mDNS-absent. Grace-delayed unload; a
-        // re-resolve cancels it. recv_timeout wakes us to expire these even
-        // when no mDNS events are arriving.
+        // Fullname -> when it went mDNS-absent (or when it was last probed
+        // while absent). Grace-delayed, probe-gated unload; a re-resolve
+        // cancels it. recv_timeout wakes us to expire these even when no mDNS
+        // events are arriving.
         let mut pending_unload: HashMap<String, Instant> = HashMap::new();
+        // Fullname -> last-resolved socket address, for the mDNS-absent TCP
+        // probe. Refreshed on every resolve so the probe always targets the
+        // most recently advertised address.
+        let mut last_addr: HashMap<String, std::net::SocketAddr> = HashMap::new();
+        // Receivers currently held loaded by the probe fallback (mDNS-absent
+        // but still reachable). Tracked only to log the hold once per episode
+        // instead of on every re-probe.
+        let mut held_by_probe: std::collections::HashSet<String> = std::collections::HashSet::new();
         'discovery: loop {
             match receiver.recv_timeout(RAOP_ABSENT_TICK) {
                 Err(_) if receiver.is_disconnected() => break, // daemon dropped
@@ -138,8 +163,10 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                 Ok(ServiceEvent::ServiceResolved(info)) => {
                     let fullname = info.get_fullname().to_string();
                     // A resolve (even a re-announce mid-flap) cancels any
-                    // scheduled unload for this receiver.
+                    // scheduled unload for this receiver and ends any
+                    // probe-hold episode.
                     pending_unload.remove(&fullname);
+                    held_by_probe.remove(&fullname);
 
                     // Skip our OWN AirPlay-receive source as early as
                     // possible — by instance MAC (our derived hwaddr), which
@@ -165,6 +192,13 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                         continue;
                     };
                     warned_no_ipv4.remove(&fullname); // it resolved now
+
+                    // Remember where to probe if this receiver later goes
+                    // mDNS-absent. Kept fresh on every resolve so a DHCP change
+                    // is reflected before the device drops off announcements.
+                    if let Ok(addr) = format!("{}:{}", output.ip, output.port).parse::<std::net::SocketAddr>() {
+                        last_addr.insert(fullname.clone(), addr);
+                    }
 
                     let node_name = raop_node_name(&output.name);
 
@@ -235,18 +269,45 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                 Ok(_) => {}
             }
 
-            // Expire pending unloads: receivers absent past the grace window
-            // are genuinely gone (a flap would have re-resolved and cancelled).
+            // Past the grace debounce, a still-absent receiver is either a
+            // genuine departure or an mDNS flap while the device is still up.
+            // TCP-probe its last-known address to tell them apart: a reachable
+            // device is kept loaded and re-probed one grace window later; only
+            // one that is *also* unreachable is unloaded. This is the sendspin
+            // liveness policy applied to RAOP.
             if !pending_unload.is_empty() {
-                let expired: Vec<String> = pending_unload
+                let due: Vec<String> = pending_unload
                     .iter()
                     .filter(|(_, since)| since.elapsed() >= RAOP_ABSENT_GRACE)
                     .map(|(fullname, _)| fullname.clone())
                     .collect();
-                for fullname in expired {
+                for fullname in due {
+                    let Some(node_name) = loaded.get(&fullname).cloned() else {
+                        pending_unload.remove(&fullname); // not ours (shouldn't happen)
+                        continue;
+                    };
+                    // Reachable = mDNS-absent but still answering on the wire:
+                    // hold it loaded and reset the timer so we re-probe later.
+                    // (No address on record — never fully resolved — counts as
+                    // unreachable, so it gets unloaded.)
+                    if last_addr.get(&fullname).is_some_and(|addr| probe_reachable(*addr)) {
+                        if held_by_probe.insert(fullname.clone()) {
+                            tracing::info!(
+                                "RAOP receiver '{fullname}' mDNS-absent but still reachable; keeping {node_name} loaded (probe fallback)"
+                            );
+                        }
+                        pending_unload.insert(fullname, Instant::now());
+                        continue;
+                    }
+                    // Genuinely gone: unreachable by probe after the grace window.
                     pending_unload.remove(&fullname);
-                    let Some(node_name) = loaded.remove(&fullname) else { continue };
-                    tracing::info!("RAOP receiver '{fullname}' absent > {}s; unloading {node_name}", RAOP_ABSENT_GRACE.as_secs());
+                    held_by_probe.remove(&fullname);
+                    last_addr.remove(&fullname);
+                    loaded.remove(&fullname);
+                    tracing::info!(
+                        "RAOP receiver '{fullname}' absent > {}s and unreachable; unloading {node_name}",
+                        RAOP_ABSENT_GRACE.as_secs()
+                    );
                     let (tx, rx) = oneshot::channel();
                     if pw_cmd.send(PwCommand::Unload { node_name, reply: tx }).is_err() {
                         tracing::error!("PipeWire thread unavailable; stopping discovery");
@@ -307,5 +368,17 @@ mod tests {
     fn et_unknown_or_fairplay_only_falls_back_to_auth_setup() {
         assert_eq!(encryption_from_et("2"), RaopEncryption::AuthSetup); // FairPlay DRM: unsupported
         assert_eq!(encryption_from_et(""), RaopEncryption::AuthSetup);
+    }
+
+    #[test]
+    fn probe_reachable_true_for_a_listening_socket_false_for_a_closed_one() {
+        use std::net::TcpListener;
+        // A bound listener is reachable; the same address is refused (fast,
+        // not a timeout) once nothing is listening on it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(probe_reachable(addr));
+        drop(listener);
+        assert!(!probe_reachable(addr));
     }
 }
