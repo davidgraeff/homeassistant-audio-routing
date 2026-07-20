@@ -13,6 +13,7 @@ mod pw_thread;
 mod raop;
 mod routing;
 mod routing_store;
+mod rtp_raop_anchor;
 mod rtp_source;
 mod sendspin_capture;
 mod sendspin_discovery;
@@ -248,11 +249,13 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             let mut rx = changes.subscribe();
             tokio::spawn(async move {
                 routing::reconcile(&pw, &cmd, &routing).await;
+                rtp_raop_anchor::reconcile(&pw, &cmd, &routing).await;
                 groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control).await;
                 // Loops until the change channel closes (RecvError::Closed ends the
                 // `while let`); a Lagged wakeup reconciles just like a normal one.
                 while let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
                     routing::reconcile(&pw, &cmd, &routing).await;
+                    rtp_raop_anchor::reconcile(&pw, &cmd, &routing).await;
                     groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control).await;
                 }
             });

@@ -32,6 +32,7 @@ use crate::outputs_store::OutputsStore;
 use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
 use crate::raop::{raop_node_name, RAOP_NODE_PREFIX};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
+use crate::rtp_source::RTP_SOURCE_NODE_NAME;
 use crate::sendspin_discovery::SendspinDevice;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
@@ -216,6 +217,21 @@ fn present_source_meters(matrix: &RoutingMatrix) -> Vec<(String, u32)> {
 /// (resolved to PipeWire object ids) ready for a `CreateLinks` command. Empty
 /// if either node doesn't exist or no channel suffixes match on both sides.
 fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<LinkSpec> {
+    matched_port_specs_impl(state, source_node_id, output_node_id, false)
+}
+
+/// Like `matched_port_specs`, but takes the source side's **monitor** output
+/// ports (`monitor_FL`/`monitor_FR`) instead of its normal outputs. Used to
+/// wire a null-sink *anchor*'s monitor into a RAOP output (rtp_raop_anchor.rs):
+/// a null sink's only outputs are its monitor ports, which the normal matcher
+/// deliberately excludes.
+fn matched_monitor_port_specs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<LinkSpec> {
+    matched_port_specs_impl(state, source_node_id, output_node_id, true)
+}
+
+/// `want_monitor` selects which of the source node's output ports to match:
+/// `false` = normal outputs (excluding `monitor_*`), `true` = only `monitor_*`.
+fn matched_port_specs_impl(state: &SharedState, source_node_id: u32, output_node_id: u32, want_monitor: bool) -> Vec<LinkSpec> {
     let state = state.lock_recover();
     if !state.nodes.contains_key(&source_node_id) || !state.nodes.contains_key(&output_node_id) {
         return Vec::new();
@@ -224,7 +240,7 @@ fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: 
     let source_ports: Vec<&PortInfo> = state
         .ports
         .values()
-        .filter(|p| p.node_id == source_node_id && p.direction == "out" && !p.port_name.starts_with("monitor_"))
+        .filter(|p| p.node_id == source_node_id && p.direction == "out" && p.port_name.starts_with("monitor_") == want_monitor)
         .collect();
     let output_ports: Vec<&PortInfo> = state.ports.values().filter(|p| p.node_id == output_node_id && p.direction == "in").collect();
 
@@ -247,8 +263,24 @@ fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: 
 /// same-named node can briefly outlive its owner, so "highest id" reliably
 /// means "most recently created" — same reasoning as sendspin_server's
 /// wait_for_node_id.
-fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32> {
+pub(crate) fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32> {
     state.nodes.values().filter(|n| n.node_name == node_name).map(|n| n.node_id).max()
+}
+
+/// Whether `name` is a RAOP output node (`raop-out-*`).
+pub(crate) fn is_raop_output(name: &str) -> bool {
+    name.starts_with(RAOP_NODE_PREFIX)
+}
+
+/// Whether a source must be routed to RAOP outputs through a null-sink anchor
+/// rather than linked directly. True for the RTP source: `module-rtp-source` is
+/// a `node.network` RateMatch *follower* that can't drive a graph cycle, and a
+/// RAOP sink can't either, so a direct link is a driverless cycle that stalls
+/// the whole component. Driver-capable sources (the AirPlay receive source)
+/// return false and link directly. See rtp_raop_anchor.rs and
+/// docs/rtp-source-to-raop-routing.md.
+pub(crate) fn source_needs_raop_anchor(name: &str) -> bool {
+    name == RTP_SOURCE_NODE_NAME
 }
 
 /// Ensure the matched-channel PipeWire links from `source` to `output` exist,
@@ -273,6 +305,26 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
     let _ = reply_rx.await;
 }
 
+/// Like `ensure_link_by_name`, but links `monitor`'s **monitor** output ports
+/// (a null sink's only outputs) into `output`'s inputs. Used to feed a RAOP
+/// output from the RTP→RAOP anchor's monitor (rtp_raop_anchor.rs). Idempotent.
+pub async fn ensure_monitor_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, monitor: &str, output: &str) {
+    let ids = {
+        let st = pw.lock_recover();
+        node_id_for(&st, monitor).zip(node_id_for(&st, output))
+    };
+    let Some((monitor_id, output_id)) = ids else { return };
+    let specs = matched_monitor_port_specs(pw, monitor_id, output_id);
+    if specs.is_empty() {
+        return;
+    }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
+        return;
+    }
+    let _ = reply_rx.await;
+}
+
 /// Reapply persisted routing intent (routing_store.rs) to the live graph: for
 /// every stored `(source, output)` link whose *both* nodes are currently
 /// present, ensure the matched-channel PipeWire links exist. Idempotent —
@@ -283,6 +335,12 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
 /// (re)appears and a later call links it.
 pub async fn reconcile(pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting) {
     for link in routing_store::snapshot(routing) {
+        // RTP-source → RAOP routes go through a null-sink anchor
+        // (rtp_raop_anchor.rs), not a direct link — a direct link is a
+        // driverless cycle that stalls the graph. Skip them here.
+        if source_needs_raop_anchor(&link.source) && is_raop_output(&link.output) {
+            continue;
+        }
         let ids = {
             let st = pw.lock_recover();
             node_id_for(&st, &link.source).zip(node_id_for(&st, &link.output))
@@ -327,6 +385,15 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
     if let Err(e) = state.routing.lock_recover().add(&req.source, &req.output) {
         return Json(LinkOpResponse { ok: false, message: format!("failed to persist routing intent: {e}") });
     }
+    // Nudge the reconcilers (routing/groups/anchor) so intent changes take
+    // effect promptly, not only on the next PipeWire registry event.
+    let _ = state.changes.send(());
+    // RTP-source → RAOP goes through the null-sink anchor (rtp_raop_anchor.rs),
+    // never a direct link (which stalls). The anchor reconciler, woken by the
+    // notification above, builds the path.
+    if source_needs_raop_anchor(&req.source) && is_raop_output(&req.output) {
+        return Json(LinkOpResponse { ok: true, message: "saved; routing via RTP→RAOP anchor".to_string() });
+    }
     // Apply live now if both ends are present; otherwise it stays pending.
     let ids = {
         let st = state.pw.lock_recover();
@@ -356,6 +423,10 @@ pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairReque
     if let Err(e) = state.routing.lock_recover().remove(&req.source, &req.output) {
         return Json(LinkOpResponse { ok: false, message: format!("failed to persist routing intent: {e}") });
     }
+    // Wake the reconcilers: for an RTP→RAOP route the live links live on the
+    // anchor (not a direct source→output link), so the anchor reconciler must
+    // run to tear them (and the anchor) down.
+    let _ = state.changes.send(());
     // Destroy any live links if both ends are present; nothing to do otherwise.
     let ids = {
         let st = state.pw.lock_recover();

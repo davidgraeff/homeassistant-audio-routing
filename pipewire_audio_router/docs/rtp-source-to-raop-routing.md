@@ -64,7 +64,11 @@ streaming; **both still stalled**:
 Conclusion: this cannot be fixed with properties on the RTP source. The module
 is not driver-capable, full stop.
 
-## Fix: insert a null-sink clock anchor ("option 1")
+## Fix: insert a null-sink clock anchor ("option 1") — implemented
+
+Implemented in `bridge-daemon/src/rtp_raop_anchor.rs` (a stateless reconciler
+run from the same loop as `routing::reconcile`/`sendspin_group`). Option 2
+(properties on the RTP source) was ruled out first — see above.
 
 Route a non-driver source to a RAOP output **through a real driver** — the same
 pattern `sendspin_group.rs` already uses:
