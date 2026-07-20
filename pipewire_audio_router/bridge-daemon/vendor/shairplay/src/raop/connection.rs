@@ -10,8 +10,10 @@ use crate::crypto::rsa::RsaKey;
 use crate::net::server::{ConnectionHandler, HttpdCallbacks};
 use crate::proto::digest;
 use crate::proto::http::{HttpRequest, HttpResponse};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 /// Shared state passed to each connection.
 pub(crate) struct RaopShared {
@@ -20,6 +22,15 @@ pub(crate) struct RaopShared {
     pub(crate) hwaddr: Vec<u8>,
     pub(crate) password: String,
     pub(crate) handler: Arc<dyn AudioHandler>,
+    /// The client that currently holds the audio session, if any — passed to
+    /// `AudioHandler::authorize_session` as the incumbent so an embedder can
+    /// enforce single-session / anti-takeover / priority policy. Claimed at RTSP
+    /// SETUP, released when the owning connection drops.
+    pub(crate) session_owner: std::sync::Mutex<Option<SessionInfo>>,
+    /// Live connections keyed by peer IP, each with a one-shot "please close"
+    /// signal. Lets `disconnect_client` (embedder-driven force-disconnect, and
+    /// takeover) tear down a specific session; the connection loop selects on it.
+    pub(crate) connections: std::sync::Mutex<HashMap<String, watch::Sender<bool>>>,
     #[cfg(feature = "ap2")]
     pub(crate) pairing_store: Arc<dyn PairingStore>,
     /// Accessory's long-term Ed25519 identity seed (random, persisted via the store).
@@ -67,6 +78,60 @@ impl RaopShared {
     }
 }
 
+impl RaopShared {
+    /// The current session owner if it isn't `me` (an IP) — i.e. the incumbent a
+    /// newly-arriving `me` would be competing with. `None` when the session is
+    /// free or already held by `me`.
+    pub(crate) fn current_session_excluding(&self, me: &str) -> Option<SessionInfo> {
+        self.session_owner.lock().ok().and_then(|g| g.clone()).filter(|o| o.addr != me)
+    }
+
+    /// Record `me` as the current session owner, replacing any previous owner.
+    /// Callers gate this on `authorize_session` first.
+    pub(crate) fn claim_session(&self, addr: &str, name: Option<&str>) {
+        if let Ok(mut g) = self.session_owner.lock() {
+            *g = Some(SessionInfo { addr: addr.to_string(), name: name.map(str::to_string) });
+        }
+    }
+
+    /// Release the session iff `me` currently owns it (so a later owner that
+    /// took over isn't cleared by the earlier connection's teardown).
+    pub(crate) fn release_session(&self, me: &str) {
+        if let Ok(mut g) = self.session_owner.lock() {
+            if g.as_ref().is_some_and(|o| o.addr == me) {
+                *g = None;
+            }
+        }
+    }
+
+    /// Register a live connection (by peer IP) and return the receiver its loop
+    /// should select on; a `true` value means "close now".
+    pub(crate) fn register_connection(&self, addr: &str) -> watch::Receiver<bool> {
+        let (tx, rx) = watch::channel(false);
+        if let Ok(mut m) = self.connections.lock() {
+            m.insert(addr.to_string(), tx);
+        }
+        rx
+    }
+
+    /// Deregister a connection (on teardown).
+    pub(crate) fn deregister_connection(&self, addr: &str) {
+        if let Ok(mut m) = self.connections.lock() {
+            m.remove(addr);
+        }
+    }
+
+    /// Ask the connection from `addr` to close. Used for embedder-driven
+    /// force-disconnect and for takeover. No-op if there's no such connection.
+    pub(crate) fn disconnect_client(&self, addr: &str) {
+        if let Ok(m) = self.connections.lock() {
+            if let Some(tx) = m.get(addr) {
+                let _ = tx.send(true);
+            }
+        }
+    }
+}
+
 impl HttpdCallbacks for RaopShared {
     fn conn_init(self: Arc<Self>, local: SocketAddr, remote: SocketAddr) -> Option<Box<dyn ConnectionHandler>> {
         let local_bytes = match local.ip() {
@@ -109,10 +174,12 @@ impl HttpdCallbacks for RaopShared {
             shared: self.clone(),
         };
         let remote_str = remote.ip().to_string();
+        let cancel_rx = self.register_connection(&remote_str);
         conn.shared.handler.on_client_connected(&remote_str);
         Some(Box::new(RaopConnectionHandler {
             conn,
             remote_addr: remote_str,
+            cancel_rx: Some(cancel_rx),
             connected_at: std::time::Instant::now(),
             #[cfg(feature = "ap2")]
             cipher: None,
@@ -125,6 +192,9 @@ impl HttpdCallbacks for RaopShared {
 struct RaopConnectionHandler {
     conn: handlers::RaopConnection,
     remote_addr: String,
+    /// Taken once by the connection loop (`ConnectionHandler::cancellation`); a
+    /// `true` value means an external caller asked to close this connection.
+    cancel_rx: Option<watch::Receiver<bool>>,
     /// Connection-start instant, used to log per-request elapsed time for
     /// connect-latency diagnostics (AP2 PTP-sync wait vs AP1 fast path).
     connected_at: std::time::Instant,
@@ -136,11 +206,19 @@ struct RaopConnectionHandler {
 
 impl Drop for RaopConnectionHandler {
     fn drop(&mut self) {
+        // Free the session slot if we held it (so the next sender isn't seen as
+        // arriving while "busy") and drop our entry from the connection table.
+        self.conn.shared.release_session(&self.remote_addr);
+        self.conn.shared.deregister_connection(&self.remote_addr);
         self.conn.shared.handler.on_client_disconnected(&self.remote_addr);
     }
 }
 
 impl ConnectionHandler for RaopConnectionHandler {
+    fn cancellation(&mut self) -> Option<watch::Receiver<bool>> {
+        self.cancel_rx.take()
+    }
+
     fn conn_request(&mut self, request: &HttpRequest) -> HttpResponse {
         // Connect-latency timeline: one line per RTSP request, elapsed since the
         // connection opened. `/feedback` is a ~2s keep-alive heartbeat, so it drops

@@ -2,6 +2,30 @@
 
 use std::sync::Arc;
 
+/// Identity of the client currently holding the audio session, passed to
+/// [`AudioHandler::authorize_session`] so the embedder can compare a new
+/// sender against the incumbent (e.g. by priority).
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// Peer IP of the incumbent.
+    pub addr: String,
+    /// Friendly name of the incumbent, if it advertised one.
+    pub name: Option<String>,
+}
+
+/// What the embedder decides for a session request in
+/// [`AudioHandler::authorize_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDecision {
+    /// Admit the sender (claim the session for it).
+    Allow,
+    /// Refuse the sender — the connection is dropped before any audio flows.
+    Reject,
+    /// Disconnect the incumbent, then admit the sender. Equivalent to `Allow`
+    /// when there is no incumbent.
+    Takeover,
+}
+
 /// Runtime protocol mode selection.
 ///
 /// When the `ap2` feature is enabled, this controls whether the server
@@ -129,8 +153,22 @@ pub trait AudioHandler: Send + Sync + 'static {
 
     // --- Connection lifecycle ---
 
-    /// Called when a client connects.
+    /// Called when a client connects. Only the peer IP is known this early.
     fn on_client_connected(&self, _addr: &str) {}
+    /// Consulted before a client is allowed to hold the audio session (at RTSP
+    /// SETUP). `name` is `Some` once the sender advertised one; `current`
+    /// describes the client that already holds the session, if any, so the
+    /// embedder can compare (e.g. priorities). Return a [`SessionDecision`]:
+    /// admit, refuse, or take over from the incumbent. Default:
+    /// [`SessionDecision::Allow`]. Lets an embedder enforce bans /
+    /// single-session / priority policy without the library knowing the policy.
+    fn authorize_session(&self, _addr: &str, _name: Option<&str>, _current: Option<&SessionInfo>) -> SessionDecision {
+        SessionDecision::Allow
+    }
+    /// Called once a connected client (`addr`) reveals a friendly device name
+    /// during the RTSP handshake (e.g. the `X-Apple-Client-Name` header). May
+    /// never fire for senders that don't advertise one. Default: no-op.
+    fn on_client_named(&self, _addr: &str, _name: &str) {}
     /// Called when a client disconnects.
     fn on_client_disconnected(&self, _addr: &str) {}
     /// Called when the library hits a runtime error on a connection — e.g. a

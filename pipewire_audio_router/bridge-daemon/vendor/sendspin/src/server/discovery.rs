@@ -4,7 +4,8 @@
 // ABOUTME: (`_sendspin._tcp.local.`) and need to be dialed instead.
 
 use crate::error::Error;
-use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{Receiver, ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::net::IpAddr;
 
 /// Service type clients browse for to discover a Sendspin server (matches
 /// aiosendspin's `server/server.py`; distinct from `_sendspin._tcp.local.`,
@@ -12,13 +13,9 @@ use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInf
 /// see `examples/server_initiated_metadata.rs`).
 const SERVER_SERVICE_TYPE: &str = "_sendspin-server._tcp.local.";
 
-/// Service type clients that run their own embedded server advertise for
-/// *themselves*. Real hardware needs this far more often than you'd expect:
-/// e.g. ESPHome's `sendspin:` component (as shipped on Home Assistant Voice
-/// PE, via the `sendspin-cpp` library) only ever starts its own embedded
-/// WebSocket server — nothing on the device initiates an outbound
-/// connection, so a real server must discover and dial *it*. Matches
-/// aiosendspin's `SendspinServer._start_mdns_discovery`.
+/// Service type that clients which only run their own embedded server (e.g.
+/// ESPHome's `sendspin:` component) advertise for themselves, to be discovered
+/// and dialed by a server.
 const CLIENT_SERVICE_TYPE: &str = "_sendspin._tcp.local.";
 
 /// A live mDNS advertisement. Unregisters and shuts down its background
@@ -87,31 +84,63 @@ impl ClientBrowser {
         Ok(Self { daemon, receiver })
     }
 
-    /// Wait for the next discovered client with a usable address and path,
-    /// returning its WebSocket URL (e.g. `ws://192.168.1.42:8928/sendspin`,
-    /// ready to hand to [`crate::server::dial_client`]). Silently skips
-    /// events that aren't a fully-resolved, usable service — callers loop on
-    /// this to keep discovering. Returns `None` once the daemon shuts down.
-    pub async fn next_client_url(&self) -> Option<String> {
-        self.next_client().await.map(|(_fullname, url)| url)
-    }
-
-    /// Like [`Self::next_client_url`], but also returns the mDNS instance's
-    /// full name (e.g. `my-device._sendspin._tcp.local.`) — stable identity
-    /// for *this device* across address changes, unlike the URL itself.
-    /// [`crate::server::ClientManager`] uses this to notice "same device,
-    /// new address" and reconnect there instead of endlessly retrying a
-    /// stale address.
-    pub async fn next_client(&self) -> Option<(String, String)> {
+    /// Wait for the next discovery event: a client resolving at a usable URL,
+    /// or a previously-advertised client being removed. Skips events that
+    /// aren't a fully-resolved, usable service or a removal. Returns `None`
+    /// once the daemon shuts down. Callers loop on this to keep discovering.
+    pub async fn next_event(&self) -> Option<Discovered> {
         while let Ok(event) = self.receiver.recv_async().await {
-            if let ServiceEvent::ServiceResolved(info) = event {
-                if let Some(url) = resolve_client_url(&info) {
-                    return Some((info.fullname.clone(), url));
+            match event {
+                ServiceEvent::ServiceResolved(info) => {
+                    if let Some(url) = resolve_client_url(&info) {
+                        return Some(Discovered::Found {
+                            fullname: info.fullname.clone(),
+                            url,
+                        });
+                    }
                 }
+                ServiceEvent::ServiceRemoved(_service_type, fullname) => {
+                    return Some(Discovered::Removed { fullname });
+                }
+                _ => {}
             }
         }
         None
     }
+
+    /// Wait for the next resolved client, returning its mDNS instance full name
+    /// (stable identity across address changes) and WebSocket URL (ready to
+    /// hand to [`crate::server::dial_client`]). Removal events are skipped.
+    pub async fn next_client(&self) -> Option<(String, String)> {
+        loop {
+            match self.next_event().await? {
+                Discovered::Found { fullname, url } => return Some((fullname, url)),
+                Discovered::Removed { .. } => continue,
+            }
+        }
+    }
+
+    /// Like [`Self::next_client`], but returns only the WebSocket URL.
+    pub async fn next_client_url(&self) -> Option<String> {
+        self.next_client().await.map(|(_fullname, url)| url)
+    }
+}
+
+/// An event from [`ClientBrowser::next_event`].
+#[derive(Debug, Clone)]
+pub enum Discovered {
+    /// A client resolved at a usable WebSocket URL.
+    Found {
+        /// mDNS instance full name — stable identity across address changes.
+        fullname: String,
+        /// WebSocket URL, ready to hand to [`crate::server::dial_client`].
+        url: String,
+    },
+    /// A previously-advertised client's service was removed from mDNS.
+    Removed {
+        /// mDNS instance full name of the service that went away.
+        fullname: String,
+    },
 }
 
 impl Drop for ClientBrowser {
@@ -122,25 +151,19 @@ impl Drop for ClientBrowser {
     }
 }
 
-/// Build a WebSocket URL from a resolved client service, or `None` if it's
-/// missing a usable address or a well-formed `path` TXT property. Mirrors
-/// aiosendspin's `_get_first_valid_ip`/`_handle_service_added`.
-///
-/// `get_addresses_v4()` returns a `HashSet` — unordered, so picking "the
-/// first" element without imposing our own order means a multi-homed host
-/// (e.g. one with both a loopback and a LAN address, as any dev machine
-/// running this crate's own test suite is) can resolve to a *different*
-/// address on repeated, otherwise-identical resolutions of the exact same
-/// service. [`crate::server::ClientManager`] treats an address change as
-/// "the device moved, reconnect" — without sorting here first, that logic
-/// was observed thrashing (reconnecting in a loop) against a service whose
-/// address set never actually changed, purely from `HashSet` iteration-order
-/// noise between resolutions.
+/// Build a WebSocket URL from a resolved client service, or `None` if it has
+/// no usable address or well-formed `path` TXT property. Addresses are sorted
+/// before selection: the resolver returns them unordered, and [`ClientBrowser`]
+/// callers treat an address change as "device moved, reconnect", so a stable
+/// choice avoids reconnect thrashing on multi-homed hosts.
 fn resolve_client_url(info: &ResolvedService) -> Option<String> {
-    let mut addrs: Vec<_> = info
-        .get_addresses_v4()
-        .into_iter()
-        .filter(|a| !a.is_link_local() && !a.is_unspecified())
+    // Accept both IPv4 and IPv6; drop loopback/link-local/unspecified so we
+    // never dial an address that isn't routable to the device.
+    let mut addrs: Vec<IpAddr> = info
+        .get_addresses()
+        .iter()
+        .map(ScopedIp::to_ip_addr)
+        .filter(|a| !a.is_loopback() && !is_link_local(a) && !a.is_unspecified())
         .collect();
     addrs.sort();
     let addr = addrs.into_iter().next()?;
@@ -148,5 +171,18 @@ fn resolve_client_url(info: &ResolvedService) -> Option<String> {
     if !path.starts_with('/') {
         return None;
     }
-    Some(format!("ws://{addr}:{port}{path}", port = info.get_port()))
+    // IPv6 literals must be bracketed in a URL authority.
+    let host = match addr {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    Some(format!("ws://{host}:{port}{path}", port = info.get_port()))
+}
+
+/// Whether an address is link-local (IPv4 169.254.0.0/16 or IPv6 fe80::/10).
+fn is_link_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }

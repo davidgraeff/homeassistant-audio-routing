@@ -167,7 +167,7 @@ pub async fn start_server(
         let stream_started = AtomicBool::new(false);
         tokio::spawn(async move {
             while let Some(pcm) = pcm_rx.recv().await {
-                let mut group = group.lock().await;
+                let group = group.lock().await;
                 if !stream_started.swap(true, Ordering::Relaxed) {
                     group
                         .start_stream(StreamPlayerConfig {
@@ -179,7 +179,7 @@ pub async fn start_server(
                         })
                         .await;
                 }
-                group.push_audio(&pcm).await;
+                group.push_audio(&pcm);
             }
         })
     };

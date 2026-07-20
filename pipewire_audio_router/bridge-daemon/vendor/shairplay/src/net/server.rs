@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio::sync::{Semaphore, watch};
 
 use crate::error::NetworkError;
@@ -125,6 +126,14 @@ pub(crate) trait ConnectionHandler: Send {
 
     /// Called after a response is written. Activates pending encryption.
     fn after_response(&mut self) {}
+
+    /// A one-shot "please close this connection" signal, taken once by the
+    /// connection loop, which selects on it alongside socket reads so an
+    /// external caller can drop a specific live connection. `None` (default) =
+    /// not cancellable from outside.
+    fn cancellation(&mut self) -> Option<watch::Receiver<bool>> {
+        None
+    }
 }
 
 /// Async TCP server supporting IPv4 and IPv6. Equivalent to httpd_t.
@@ -132,6 +141,11 @@ pub(crate) struct HttpServer {
     callbacks: Arc<dyn HttpdCallbacks>,
     max_connections: usize,
     shutdown_tx: Option<watch::Sender<bool>>,
+    /// Accept-loop tasks (one per bound listener). Each owns its `TcpListener`,
+    /// so `stop()` awaits them to guarantee the listen sockets are dropped
+    /// before it returns — otherwise a quick restart races the old listener and
+    /// fails to rebind the port (drifting to +1 under `auto_port`).
+    accept_tasks: Vec<JoinHandle<()>>,
     port: u16,
     running: bool,
     bind_config: BindConfig,
@@ -144,6 +158,7 @@ impl HttpServer {
             callbacks,
             max_connections,
             shutdown_tx: None,
+            accept_tasks: Vec::new(),
             port: 0,
             running: false,
             bind_config: BindConfig::default(),
@@ -197,7 +212,7 @@ impl HttpServer {
             if let Ok(addr) = listener.local_addr() {
                 tracing::debug!(%addr, "Listener bound");
             }
-            spawn_accept_loop(listener, callbacks.clone(), semaphore.clone(), shutdown_rx.clone());
+            self.accept_tasks.push(spawn_accept_loop(listener, callbacks.clone(), semaphore.clone(), shutdown_rx.clone()));
         }
 
         Ok(actual_port)
@@ -213,10 +228,16 @@ impl HttpServer {
         self.port
     }
 
-    /// Stop the server and close all listeners.
+    /// Stop the server and close all listeners. Awaits the accept-loop tasks so
+    /// the listen sockets are fully dropped before returning — a subsequent
+    /// `start()` can then rebind the same port instead of racing the old
+    /// listener and drifting to `port + 1`.
     pub(crate) async fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
+        }
+        for task in self.accept_tasks.drain(..) {
+            let _ = task.await;
         }
         self.running = false;
     }
@@ -243,6 +264,27 @@ async fn bind_listener(addr: IpAddr, start_port: u16, auto_port: bool) -> Result
 /// Generic over the byte stream (`AsyncRead + AsyncWrite`) so the framing/crypto
 /// state machine is decoupled from the socket and can be unit-tested against an
 /// in-memory duplex. The accept loop only accepts, permits, and spawns this.
+/// Resolves when the connection's cancellation signal goes `true`; never
+/// resolves if there is no signal (or the sender was dropped). Cancel-safe: it's
+/// recreated each loop iteration and re-reads the current value on entry.
+async fn wait_cancel(cancel: &mut Option<watch::Receiver<bool>>) {
+    match cancel {
+        Some(rx) => {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            while rx.changed().await.is_ok() {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+            }
+            // Sender dropped without asking to close — fall back to never firing.
+            std::future::pending::<()>().await
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn process_connection<S>(mut stream: S, mut handler: Box<dyn ConnectionHandler>, remote: SocketAddr)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -250,6 +292,10 @@ where
     let mut buf = [0u8; 4096];
     let mut request = HttpRequest::new();
     let mut raw_buf = Vec::new(); // accumulates encrypted data
+    // A handler may expose a "please close" signal (e.g. RAOP force-disconnect /
+    // takeover); the read below selects on it so an idle connection is dropped
+    // promptly, not only after its next request.
+    let mut cancel = handler.cancellation();
 
     loop {
         // Handle complete requests
@@ -294,10 +340,18 @@ where
             }
         }
 
-        // Read from network
-        let n = match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        // Read from network — or bail immediately if asked to close.
+        let n = tokio::select! {
+            biased;
+            _ = wait_cancel(&mut cancel) => {
+                tracing::debug!(%remote, "connection closed by request");
+                let _ = stream.shutdown().await;
+                return;
+            }
+            r = stream.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            },
         };
 
         // Decrypt if encrypted, otherwise feed directly
@@ -353,7 +407,7 @@ fn spawn_accept_loop(
     callbacks: Arc<dyn HttpdCallbacks>,
     semaphore: Arc<Semaphore>,
     mut shutdown_rx: watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -386,7 +440,7 @@ fn spawn_accept_loop(
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

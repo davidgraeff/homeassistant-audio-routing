@@ -292,6 +292,8 @@ impl RaopServerBuilder {
             airplay_name,
             #[cfg(feature = "ap2")]
             active_audio: std::sync::Mutex::new(None),
+            session_owner: std::sync::Mutex::new(None),
+            connections: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
         });
@@ -341,6 +343,18 @@ impl RaopServer {
     /// Create a new server builder.
     pub fn builder() -> RaopServerBuilder {
         RaopServerBuilder::new()
+    }
+
+    /// Ask the connection from `addr` (a peer IP) to close, if one exists. Used
+    /// by an embedder to force-disconnect a specific sender. Returns once the
+    /// signal is sent; the connection tears down shortly after.
+    pub fn disconnect_client(&self, addr: &str) {
+        self.shared.disconnect_client(addr);
+    }
+
+    /// Peer IP of the client that currently holds the audio session, if any.
+    pub fn current_client(&self) -> Option<String> {
+        self.shared.session_owner.lock().ok().and_then(|g| g.as_ref().map(|s| s.addr.clone()))
     }
 
     /// Start the server: bind ports, register mDNS services, begin accepting connections.

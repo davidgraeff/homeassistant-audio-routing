@@ -83,5 +83,5 @@ pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 pub use raop::{AirPlayMode, MemoryPairingStore, PairingStore};
 pub use raop::{
     Ap1Codec, Ap1Encryption, AudioCodec, AudioFormat, AudioHandler, AudioSession, RaopServer, RaopServerBuilder,
-    RemoteCommand, RemoteControl, TrackMetadata,
+    RemoteCommand, RemoteControl, SessionDecision, SessionInfo, TrackMetadata,
 };

@@ -8,6 +8,7 @@ use crate::error::{CodecError, ShairplayError};
 use crate::proto::http::{HttpRequest, HttpResponse};
 use crate::proto::sdp::Sdp;
 use crate::raop::rtp::RaopRtp;
+use crate::raop::SessionDecision;
 
 #[cfg(feature = "ap2")]
 use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
@@ -335,6 +336,38 @@ pub(crate) fn handle_setup(
     let transport = request.header("Transport")?;
     tracing::debug!(transport, "AP1 SETUP");
 
+    // Surface the sender's friendly device name if it advertised one. iOS/macOS
+    // send `X-Apple-Client-Name` (e.g. "David's iPhone"); many senders (incl.
+    // PipeWire's RAOP) don't, so this is best-effort — absence just leaves the
+    // client identified by IP.
+    let addr = conn.remote_socket.ip().to_string();
+    let name = request.header("X-Apple-Client-Name");
+    if let Some(name) = name {
+        conn.shared.handler.on_client_named(&addr, name);
+    }
+
+    // Ask the embedder whether this sender may hold the session (ban / anti-
+    // takeover / priority policy lives there, not here). `current` is the
+    // incumbent, if any. On `Reject`, drop the connection before binding any RTP
+    // ports; on `Takeover`, disconnect the incumbent first; then claim the
+    // session (released when this connection drops — RaopConnectionHandler::drop).
+    let current = conn.shared.current_session_excluding(&addr);
+    match conn.shared.handler.authorize_session(&addr, name, current.as_ref()) {
+        SessionDecision::Reject => {
+            tracing::info!(%addr, "AP1 SETUP refused by authorize_session policy");
+            response.set_disconnect(true);
+            return None;
+        }
+        SessionDecision::Takeover => {
+            if let Some(cur) = &current {
+                tracing::info!(%addr, incumbent = %cur.addr, "AP1 SETUP takes over the session");
+                conn.shared.disconnect_client(&cur.addr);
+            }
+            conn.shared.claim_session(&addr, name);
+        }
+        SessionDecision::Allow => conn.shared.claim_session(&addr, name),
+    }
+
     // Check for DACP remote control headers
     if let (Some(dacp_id), Some(active_remote)) = (request.header("DACP-ID"), request.header("Active-Remote")) {
         let addr_bytes = crate::raop::rtp::remote_addr_bytes(&conn.remote_socket.ip().to_string());
@@ -492,6 +525,8 @@ mod tests {
             hwaddr: vec![0u8; 6],
             password: String::new(),
             handler,
+            session_owner: std::sync::Mutex::new(None),
+            connections: std::sync::Mutex::new(std::collections::HashMap::new()),
             output_sample_rate: None,
             output_max_channels: None,
         });
