@@ -11,17 +11,27 @@ PAUSE are not exposed for the same reason.
 
 from __future__ import annotations
 
+import logging
+
 import voluptuous as vol
+from homeassistant.components import media_source
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
+    async_process_play_media_url,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv, entity_platform, entity_registry as er
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_platform,
+    entity_registry as er,
+)
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -37,6 +47,8 @@ from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NON
 RAOP_NODE_PREFIX = "raop-out-"
 SENDSPIN_DEV_PREFIX = "sendspin-dev-"
 
+_LOGGER = logging.getLogger(__name__)
+
 
 def _display_name(node_name: str) -> str:
     """Strips the bridge daemon's node-name prefix and turns
@@ -45,6 +57,61 @@ def _display_name(node_name: str) -> str:
         if node_name.startswith(prefix):
             return node_name[len(prefix) :].replace("_", " ").title()
     return node_name
+
+
+def _esphome_hostname(node_name: str) -> str | None:
+    """The ESPHome node name (== the device's mDNS hostname with `-`→`_`) that a
+    sendspin output's node name is built from: `sendspin-dev-<hostname>` gives
+    `<hostname>`, e.g. `home_assistant_voice_093ca8`. `None` for non-sendspin
+    outputs (RAOP), which carry no such identity."""
+    if node_name.startswith(SENDSPIN_DEV_PREFIX):
+        return node_name[len(SENDSPIN_DEV_PREFIX) :]
+    return None
+
+
+def _find_ha_device(hass: HomeAssistant, node_name: str) -> dr.DeviceEntry | None:
+    """Correlate a sendspin output to the Home Assistant device that represents
+    the same physical speaker, so the media_player can adopt HA's name and area
+    instead of the cryptic daemon-side hostname.
+
+    The only identity the daemon transmits for a sendspin device is its mDNS
+    hostname (e.g. `home-assistant-voice-093ca8`) — the full MAC is not
+    advertised. But that *full hostname* string appears verbatim in the ESPHome
+    integration's entity ids on the real device (e.g. the firmware `update`
+    entity's unique_id `<mac>-update-home_assistant_voice_093ca8`), and that
+    device carries the speaker's genuine full-MAC connection. So we match on the
+    whole hostname (not a truncated MAC), resolve it to that device, and later
+    link via the device's real connections.
+
+    Returns the matched device, or `None` if there's no match — or, defensively,
+    if more than one distinct device matches (ambiguous → don't guess)."""
+    hostname = _esphome_hostname(node_name)
+    if not hostname:
+        return None
+
+    ent_reg = er.async_get(hass)
+    device_ids = {
+        entity.device_id
+        for entity in ent_reg.entities.values()
+        # Skip our own entities (ours embeds the hostname too) and anything not
+        # tied to a device; then require the full hostname as a substring of the
+        # ESPHome-assigned unique_id / entity_id.
+        if entity.platform != DOMAIN
+        and entity.device_id is not None
+        and (hostname in (entity.unique_id or "") or hostname in entity.entity_id)
+    }
+
+    if len(device_ids) != 1:
+        if len(device_ids) > 1:
+            _LOGGER.warning(
+                "sendspin output %s matched %d Home Assistant devices by hostname %r; "
+                "not linking (ambiguous)",
+                node_name,
+                len(device_ids),
+                hostname,
+            )
+        return None
+    return dr.async_get(hass).async_get(next(iter(device_ids)))
 
 
 def _output_node_names(coordinator: PipewireRouterCoordinator) -> list[str]:
@@ -68,7 +135,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         desired = set(_output_node_names(coordinator))
 
         new = [
-            PipewireRouterMediaPlayer(coordinator, entry, name)
+            PipewireRouterMediaPlayer(hass, coordinator, entry, name)
             for name in desired
             if name not in entities
         ]
@@ -128,18 +195,55 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
     )
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry, node_name: str) -> None:
+    def __init__(
+        self, hass: HomeAssistant, coordinator: PipewireRouterCoordinator, entry: ConfigEntry, node_name: str
+    ) -> None:
         super().__init__(coordinator)
         # Identity is the stable node *name*; the ephemeral node_id is
         # re-resolved from each snapshot (see `_current`) so this entity
         # keeps working across a module reload that changes the id.
         self.node_name = node_name
         self._attr_unique_id = f"{entry.entry_id}_{node_name}"
-        self._attr_name = _display_name(node_name)
+
+        # Correlate a sendspin output to its Home Assistant device (by mDNS
+        # hostname → the ESPHome device) once, at creation. When matched, the
+        # entity links to that device and takes HA's name + area; unmatched
+        # (RAOP, or an unknown device), it falls back to the daemon's derived
+        # display name with no device. Resolved here — the ESPHome device is
+        # registered at HA start, before this integration sets up — so a device
+        # that only appears later is picked up on the next reload.
+        self._ha_device = _find_ha_device(hass, node_name)
+        if self._ha_device is None:
+            self._attr_name = _display_name(node_name)
+        else:
+            # has_entity_name + a name → "<device name> <name>", e.g.
+            # "Home Assistant Voice Badezimmer Audio Routing". The suffix keeps
+            # this routing output distinct from the speaker's own built-in
+            # assist media_player ("<device name> Media Player") on the same
+            # device, while still leading with the HA device name.
+            self._attr_name = "Audio Routing"
 
     @property
     def _is_sendspin(self) -> bool:
         return self.node_name.startswith(SENDSPIN_DEV_PREFIX)
+
+    @property
+    def device_info(self) -> DeviceInfo | None:
+        """Link to the matched Home Assistant device by its genuine full-MAC
+        connection(s), so this media_player is grouped under the real speaker
+        and inherits its name + area. `None` when unmatched (kept standalone).
+        We reuse the device's existing connections (never reconstruct a MAC),
+        which is what merges this entity into that exact device."""
+        if self._ha_device is None:
+            return None
+        mac_connections = {
+            (conn_type, conn_value)
+            for conn_type, conn_value in self._ha_device.connections
+            if conn_type == dr.CONNECTION_NETWORK_MAC
+        }
+        if not mac_connections:
+            return None
+        return DeviceInfo(connections=mac_connections)
 
     def _current(self) -> ApiMediaPlayerState | None:
         """This output's entry in the polled /api/media_players feed (RAOP
@@ -309,15 +413,47 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         # comes from `extra.wyoming.text` instead. Everyone else
         # (`tts.speak`, existing automations) keeps calling this with a
         # plain rendered-clip URL exactly as before.
+        extra = kwargs.get("extra") or {}
+        # Deliberately at INFO so the "did HA ever route audio to us?" question
+        # is answerable from the normal log without turning on debug — this is
+        # the first thing to check when TTS/announce "does nothing".
+        _LOGGER.info(
+            "play_media on %s (node=%s): media_type=%s announce=%s media_id=%r extra=%r",
+            self.entity_id,
+            self.node_name,
+            media_type,
+            kwargs.get("announce"),
+            media_id,
+            extra,
+        )
         node_id = self._require_node_id()
-        wyoming = (kwargs.get("extra") or {}).get("wyoming")
-        if wyoming:
-            await self.coordinator.client.async_announce_wyoming(
-                node_id,
-                host=wyoming["host"],
-                text=wyoming["text"],
-                port=wyoming.get("port", 10200),
-                voice=wyoming.get("voice"),
-            )
-        else:
-            await self.coordinator.client.async_announce(node_id, media_id)
+        wyoming = extra.get("wyoming")
+        try:
+            if wyoming:
+                await self.coordinator.client.async_announce_wyoming(
+                    node_id,
+                    host=wyoming["host"],
+                    text=wyoming["text"],
+                    port=wyoming.get("port", 10200),
+                    voice=wyoming.get("voice"),
+                )
+            else:
+                # tts.speak / the media browser hand us a `media-source://` URI,
+                # not a URL — resolve it to a concrete one, then make it
+                # absolute (async_process_play_media_url) so the bridge daemon,
+                # which runs on a different host, can actually fetch it. A plain
+                # URL passes through both steps unchanged.
+                if media_source.is_media_source_id(media_id):
+                    resolved = await media_source.async_resolve_media(
+                        self.hass, media_id, self.entity_id
+                    )
+                    _LOGGER.debug("resolved media-source %r -> %r", media_id, resolved.url)
+                    media_id = resolved.url
+                media_id = async_process_play_media_url(self.hass, media_id)
+                _LOGGER.info("announcing %r into %s (node=%s)", media_id, self.entity_id, node_id)
+                await self.coordinator.client.async_announce(node_id, media_id)
+        except Exception as err:
+            # Surface the failure both to the caller (service error) and the log,
+            # so a broken announce is never silent.
+            _LOGGER.error("play_media on %s failed: %s", self.entity_id, err)
+            raise

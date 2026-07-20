@@ -13,8 +13,9 @@ from unittest.mock import AsyncMock, patch
 
 import aiohttp
 import pytest
+from homeassistant.components.media_source import PlayMedia
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pipewire_audio_router.api import (
@@ -96,6 +97,87 @@ async def test_entities_created_from_matrix_including_sendspin(hass):
     # state derived from routing (nothing linked -> idle).
     assert bath is not None and bath.state == "idle"
     assert float(bath.attributes["volume_level"]) == 0.5
+
+
+async def test_sendspin_device_adopts_matching_ha_device_name_and_area(hass):
+    """A sendspin output is correlated to the ESPHome device for the same
+    speaker by its mDNS hostname (which appears in that device's ESPHome entity
+    ids), then links via the device's real full-MAC connection so it inherits
+    HA's friendly name + area instead of the cryptic daemon hostname."""
+    dev_reg = dr.async_get(hass)
+    ent_reg = er.async_get(hass)
+
+    # Pre-existing ESPHome device + entity for the physical speaker, exactly as
+    # the ESPHome integration registers it: full-MAC connection, a user-set
+    # name, an area, and an `update` entity whose unique_id carries the hostname.
+    esphome_entry = MockConfigEntry(domain="esphome", data={})
+    esphome_entry.add_to_hass(hass)
+    device = dev_reg.async_get_or_create(
+        config_entry_id=esphome_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, "20:f8:3b:09:3c:a8")},
+        name="Home Assistant Voice 093ca8",
+    )
+    dev_reg.async_update_device(device.id, name_by_user="Home Assistant Voice Badezimmer")
+    area_reg = ar.async_get(hass)
+    area = area_reg.async_get_or_create("Badezimmer")
+    dev_reg.async_update_device(device.id, area_id=area.id)
+    ent_reg.async_get_or_create(
+        "update",
+        "esphome",
+        "20:F8:3B:09:3C:A8-update-home_assistant_voice_093ca8",
+        device_id=device.id,
+    )
+
+    entry = _make_entry(hass)
+    routing = RoutingMatrix(
+        sources=[],
+        outputs=[
+            RoutingNode(
+                node_id=None,
+                node_name="sendspin-dev-home_assistant_voice_093ca8",
+                display_name="Home Assistant Voice 093ca8",
+                configured=False,
+            )
+        ],
+        links=[],
+    )
+    with _patch_daemon([], routing):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    # The entity is registered against the ESPHome device (linked by MAC)...
+    entity_id = ent_reg.async_get_entity_id(
+        "media_player", DOMAIN, f"{entry.entry_id}_sendspin-dev-home_assistant_voice_093ca8"
+    )
+    assert entity_id is not None
+    reg_entry = ent_reg.async_get(entity_id)
+    assert reg_entry.device_id == device.id
+    # ...so its friendly name is HA's device name and it lives in the same area
+    # (inherited from the linked device, since the entity sets no area of its own).
+    state = hass.states.get(entity_id)
+    assert state is not None
+    # HA device name + the "Audio Routing" suffix (distinct from the speaker's
+    # own built-in "… Media Player" on the same device).
+    assert state.attributes["friendly_name"] == "Home Assistant Voice Badezimmer Audio Routing"
+    assert dev_reg.async_get(device.id).area_id == area.id
+
+
+async def test_sendspin_device_without_matching_ha_device_keeps_derived_name(hass):
+    """No matching HA device → fall back to the daemon-derived display name and
+    no device link (the previous behaviour), never a blank name."""
+    entry = _make_entry(hass)
+    routing = RoutingMatrix(
+        sources=[],
+        outputs=[RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False)],
+        links=[],
+    )
+    with _patch_daemon([], routing):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    reg_entry = er.async_get(hass).async_get("media_player.bath")
+    assert reg_entry is not None and reg_entry.device_id is None
+    assert hass.states.get("media_player.bath").attributes["friendly_name"] == "Bath"
 
 
 async def test_set_volume_calls_bridge_daemon_api(hass):
@@ -186,6 +268,45 @@ async def test_play_media_calls_announce_on_bridge_daemon(hass):
                 blocking=True,
             )
             mock_announce.assert_awaited_once_with(35, "http://example.local/tts.mp3")
+
+
+async def test_play_media_resolves_media_source_uri(hass):
+    """`tts.speak`/the media browser hand the entity a `media-source://` URI,
+    not a URL. It must be resolved (and made absolute) before it reaches the
+    daemon's `/announce` — otherwise TTS silently does nothing."""
+    entry = _make_entry(hass)
+    routing = _routing_matrix([], outputs=[RoutingNode(node_id=35, node_name="raop-out-pioneer", display_name="Pioneer")])
+    players = [MediaPlayerState(node_id=35, node_name="raop-out-pioneer", state="idle", volume=1.0)]
+    with _patch_daemon(players, routing):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        resolved = PlayMedia(url="/api/tts_proxy/abc123.mp3", mime_type="audio/mpeg")
+        with (
+            patch(f"{API}.async_announce", new=AsyncMock()) as mock_announce,
+            patch(
+                "custom_components.pipewire_audio_router.media_player.media_source.async_resolve_media",
+                new=AsyncMock(return_value=resolved),
+            ) as mock_resolve,
+        ):
+            await hass.services.async_call(
+                "media_player",
+                "play_media",
+                {
+                    "entity_id": "media_player.pioneer",
+                    "media_content_type": "music",
+                    "media_content_id": "media-source://tts/-/message=hi",
+                    "announce": True,
+                },
+                blocking=True,
+            )
+            mock_resolve.assert_awaited_once()
+            # Resolved to a relative HA URL → announced as an absolute one the
+            # bridge daemon (a separate host) can fetch.
+            (node_id, url), _ = mock_announce.await_args
+            assert node_id == 35
+            assert url.endswith("/api/tts_proxy/abc123.mp3")
+            assert url.startswith("http://")
 
 
 async def test_play_media_with_wyoming_extra_calls_announce_wyoming(hass):
