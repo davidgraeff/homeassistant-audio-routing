@@ -52,6 +52,25 @@ impl OutputsStore {
         self.persist()
     }
 
+    /// The stored config for a RAOP node name, if any.
+    pub fn get(&self, node_name: &str) -> Option<RaopOutputConfig> {
+        self.outputs.iter().find(|o| raop_node_name(&o.name) == node_name).cloned()
+    }
+
+    /// Replace an existing output (matched by node name) with `output` and
+    /// persist. Returns `true` if one was replaced, `false` if none matched.
+    pub fn update(&mut self, output: RaopOutputConfig) -> anyhow::Result<bool> {
+        let node_name = raop_node_name(&output.name);
+        match self.outputs.iter_mut().find(|o| raop_node_name(&o.name) == node_name) {
+            Some(slot) => {
+                *slot = output;
+                self.persist()?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Remove the output with the given node name and persist. Returns the
     /// removed config, or `None` if there was no such output.
     pub fn remove(&mut self, node_name: &str) -> anyhow::Result<Option<RaopOutputConfig>> {

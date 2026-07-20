@@ -4,16 +4,20 @@
   import Toasts from './components/Toasts.svelte';
   import RoutingTab from './components/RoutingTab.svelte';
   import OutputsTab from './components/OutputsTab.svelte';
+  import AlignTab from './components/AlignTab.svelte';
   import SourcesTab from './components/SourcesTab.svelte';
-  import AnnounceTab from './components/AnnounceTab.svelte';
+  import SettingsTab from './components/SettingsTab.svelte';
+  import DiagnosticsTab from './components/DiagnosticsTab.svelte';
 
-  type Tab = 'routing' | 'outputs' | 'sources' | 'announce';
+  type Tab = 'routing' | 'outputs' | 'align' | 'sources' | 'settings' | 'diagnostics';
   let tab = $state<Tab>('routing');
   const tabs: { id: Tab; label: string }[] = [
     { id: 'routing', label: 'Routing' },
     { id: 'outputs', label: 'Outputs' },
+    { id: 'align', label: 'Align' },
     { id: 'sources', label: 'Sources' },
-    { id: 'announce', label: 'Announce' },
+    { id: 'settings', label: 'Settings' },
+    { id: 'diagnostics', label: 'Diagnostics' },
   ];
 </script>
 
@@ -36,10 +40,14 @@
     <RoutingTab />
   {:else if tab === 'outputs'}
     <OutputsTab />
+  {:else if tab === 'align'}
+    <AlignTab />
   {:else if tab === 'sources'}
     <SourcesTab />
+  {:else if tab === 'settings'}
+    <SettingsTab />
   {:else}
-    <AnnounceTab />
+    <DiagnosticsTab />
   {/if}
 </main>
 

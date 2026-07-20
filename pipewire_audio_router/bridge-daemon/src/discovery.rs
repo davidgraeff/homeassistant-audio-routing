@@ -29,10 +29,67 @@ use crate::config::{slugify, RaopEncryption, RaopOutputConfig};
 use crate::locks::LockRecover;
 use crate::pw_thread::{PwCommand, PwCommandSender};
 use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME};
+use crate::sync_settings::SharedSyncSettings;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+
+/// The resolved connection details (ip/port/encryption) of RAOP receivers
+/// discovery currently has loaded, keyed by RAOP node name. Populated by the
+/// discovery thread and read by the API (list_outputs) so auto-discovered
+/// receivers show the same IP/Port/Encryption columns as manually-added ones —
+/// the info exists at resolve time, it just needs surfacing. A device is added
+/// when its module is loaded and removed when it's unloaded.
+pub type SharedDiscovered = Arc<Mutex<BTreeMap<String, RaopOutputConfig>>>;
+
+/// A receiver discovery loaded, tracked by mDNS fullname. Carries the latency it
+/// was loaded with (so an override change triggers a reload) and its resolved
+/// config (so the reload can rebuild the module args without a re-announce).
+#[derive(Clone)]
+struct LoadedReceiver {
+    node_name: String,
+    latency: Option<u16>,
+    output: RaopOutputConfig,
+}
+
+/// Load a discovered receiver's `raop-sink` module. `Ok(true)` on success,
+/// `Ok(false)` on a module-level error (logged), `Err(())` if the PipeWire
+/// thread is gone (caller should stop discovery).
+fn load_module(pw_cmd: &PwCommandSender, node_name: &str, args: String) -> Result<bool, ()> {
+    let (tx, rx) = oneshot::channel();
+    if pw_cmd
+        .send(PwCommand::Load { node_name: node_name.to_string(), module_name: RAOP_MODULE_NAME.to_string(), args, reply: tx })
+        .is_err()
+    {
+        tracing::error!("PipeWire thread unavailable; stopping discovery");
+        return Err(());
+    }
+    match rx.blocking_recv() {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(e)) => {
+            tracing::warn!("failed to load discovered '{node_name}': {e}");
+            Ok(false)
+        }
+        Err(_) => {
+            tracing::warn!("no reply loading discovered '{node_name}'");
+            Ok(false)
+        }
+    }
+}
+
+/// Unload a discovered receiver's module (idempotent). `Err(())` if the PipeWire
+/// thread is gone.
+fn unload_module(pw_cmd: &PwCommandSender, node_name: &str) -> Result<(), ()> {
+    let (tx, rx) = oneshot::channel();
+    if pw_cmd.send(PwCommand::Unload { node_name: node_name.to_string(), reply: tx }).is_err() {
+        tracing::error!("PipeWire thread unavailable; stopping discovery");
+        return Err(());
+    }
+    let _ = rx.blocking_recv();
+    Ok(())
+}
 
 const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
 
@@ -42,8 +99,8 @@ const RAOP_SERVICE_TYPE: &str = "_raop._tcp.local.";
 /// the receiver's last-known address (`probe_reachable`) and only unload when it
 /// is *also* unreachable, then re-probe at this same cadence while it stays
 /// mDNS-absent-but-reachable. This mirrors the sendspin liveness policy
-/// (connection/probe driven), which RAOP discovery previously lacked: a device
-/// that stops announcing over mDNS but still answers on the wire stays loaded.
+/// (connection/probe driven): a device that stops announcing over mDNS but
+/// still answers on the wire stays loaded.
 const RAOP_ABSENT_GRACE: Duration = Duration::from_secs(90);
 /// How often the discovery loop wakes (when idle) to expire pending unloads.
 const RAOP_ABSENT_TICK: Duration = Duration::from_secs(15);
@@ -131,13 +188,21 @@ fn probe_reachable(addr: std::net::SocketAddr) -> bool {
 /// Starts mDNS discovery and returns the daemon handle. The handle must be
 /// kept alive for discovery to keep running — dropping it stops the browse and
 /// ends the worker thread.
-pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources, mode: Mode) -> anyhow::Result<ServiceDaemon> {
+pub fn spawn(
+    pw_cmd: PwCommandSender,
+    store: SharedStore,
+    sources: SharedSources,
+    mode: Mode,
+    sync_settings: SharedSyncSettings,
+    discovered: SharedDiscovered,
+) -> anyhow::Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
     let receiver = daemon.browse(RAOP_SERVICE_TYPE)?;
     std::thread::Builder::new().name("mdns-discovery".into()).spawn(move || {
-        // mDNS fullname -> RAOP node name, for receivers WE loaded, so a
-        // later removal unloads exactly those (never store-managed ones).
-        let mut loaded: HashMap<String, String> = HashMap::new();
+        // mDNS fullname -> what WE loaded (node name + the latency + resolved
+        // config), so a later removal unloads exactly those (never store-managed
+        // ones) and an override change can reload with the new latency.
+        let mut loaded: HashMap<String, LoadedReceiver> = HashMap::new();
         // Fullnames we've already warned lack IPv4. mdns-sd re-emits
         // ServiceResolved on every announcement, so a peer that never
         // exposes an IPv4 A record would otherwise spam the log many times
@@ -215,8 +280,20 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                         tracing::debug!("discovered '{}' is store-managed ({node_name}); leaving it to the store", output.name);
                         continue;
                     }
-                    if loaded.contains_key(&fullname) {
-                        continue; // already auto-loaded
+                    // Desired per-output latency override (sync_settings.rs).
+                    let desired_latency = sync_settings.lock_recover().raop_latency(&node_name);
+                    match loaded.get(&fullname) {
+                        // Already loaded with the current latency — nothing to do.
+                        Some(l) if l.latency == desired_latency => continue,
+                        // Loaded, but the override changed → unload so we reload below.
+                        Some(_) => {
+                            tracing::info!("discovered '{node_name}': latency override changed to {desired_latency:?}; reloading");
+                            if unload_module(&pw_cmd, &node_name).is_err() {
+                                break;
+                            }
+                            loaded.remove(&fullname);
+                        }
+                        None => {}
                     }
 
                     if mode == Mode::DryRun {
@@ -231,30 +308,20 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                     }
 
                     tracing::info!(
-                        "auto-discovered RAOP receiver '{}' at {}:{} ({}); loading {node_name}",
+                        "auto-discovered RAOP receiver '{}' at {}:{} ({}, latency {desired_latency:?}); loading {node_name}",
                         output.name,
                         output.ip,
                         output.port,
                         output.encryption.as_pipewire_arg()
                     );
-                    let args = raop_module_args(&output);
-                    let (tx, rx) = oneshot::channel();
-                    let sent = pw_cmd.send(PwCommand::Load {
-                        node_name: node_name.clone(),
-                        module_name: RAOP_MODULE_NAME.to_string(),
-                        args,
-                        reply: tx,
-                    });
-                    if sent.is_err() {
-                        tracing::error!("PipeWire thread unavailable; stopping discovery");
-                        break;
-                    }
-                    match rx.blocking_recv() {
-                        Ok(Ok(())) => {
-                            loaded.insert(fullname, node_name);
+                    let args = raop_module_args(&output, desired_latency);
+                    match load_module(&pw_cmd, &node_name, args) {
+                        Ok(true) => {
+                            discovered.lock_recover().insert(node_name.clone(), output.clone());
+                            loaded.insert(fullname, LoadedReceiver { node_name, latency: desired_latency, output });
                         }
-                        Ok(Err(e)) => tracing::warn!("failed to load discovered '{node_name}': {e}"),
-                        Err(_) => tracing::warn!("no reply loading discovered '{node_name}'"),
+                        Ok(false) => {}
+                        Err(()) => break,
                     }
                 }
                 Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
@@ -282,7 +349,7 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                     .map(|(fullname, _)| fullname.clone())
                     .collect();
                 for fullname in due {
-                    let Some(node_name) = loaded.get(&fullname).cloned() else {
+                    let Some(node_name) = loaded.get(&fullname).map(|l| l.node_name.clone()) else {
                         pending_unload.remove(&fullname); // not ours (shouldn't happen)
                         continue;
                     };
@@ -304,6 +371,7 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                     held_by_probe.remove(&fullname);
                     last_addr.remove(&fullname);
                     loaded.remove(&fullname);
+                    discovered.lock_recover().remove(&node_name);
                     tracing::info!(
                         "RAOP receiver '{fullname}' absent > {}s and unreachable; unloading {node_name}",
                         RAOP_ABSENT_GRACE.as_secs()
@@ -314,6 +382,35 @@ pub fn spawn(pw_cmd: PwCommandSender, store: SharedStore, sources: SharedSources
                         break 'discovery;
                     }
                     let _ = rx.blocking_recv();
+                }
+            }
+
+            // Apply latency-override changes (e.g. from the API) to already-loaded
+            // discovered receivers within one tick, without waiting for the device
+            // to re-announce. Store-managed outputs are reloaded by the API itself.
+            if mode == Mode::Load {
+                let stale: Vec<String> = loaded
+                    .iter()
+                    .filter(|(_, l)| sync_settings.lock_recover().raop_latency(&l.node_name) != l.latency)
+                    .map(|(fullname, _)| fullname.clone())
+                    .collect();
+                for fullname in stale {
+                    let Some(l) = loaded.get(&fullname).cloned() else { continue };
+                    let desired = sync_settings.lock_recover().raop_latency(&l.node_name);
+                    tracing::info!("applying latency {desired:?} to discovered '{}' (reload)", l.node_name);
+                    if unload_module(&pw_cmd, &l.node_name).is_err() {
+                        break 'discovery;
+                    }
+                    let args = raop_module_args(&l.output, desired);
+                    match load_module(&pw_cmd, &l.node_name, args) {
+                        Ok(true) => {
+                            loaded.insert(fullname, LoadedReceiver { latency: desired, ..l });
+                        }
+                        Ok(false) => {
+                            loaded.remove(&fullname);
+                        }
+                        Err(()) => break 'discovery,
+                    }
                 }
             }
         }

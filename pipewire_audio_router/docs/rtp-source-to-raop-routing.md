@@ -30,7 +30,7 @@ node properties:
 | `bt-bridge-rtp` | `module-rtp-source` | `true` | **no** — it's a `SPA_IO_RateMatch` *follower* |
 | `raop-out-*` | `module-raop-sink` | `true` | **no** — network sink |
 | `airplay-in` | vendored shairplay source | *(unset)* | **yes** |
-| `sendspin-grp-*` | `support.null-audio-sink` | *(unset)*, `node.driver=true` | **yes** |
+| `sync-grp-*` (group anchor) | `support.null-audio-sink` | *(unset)*, `node.driver=true` | **yes** |
 
 `module-rtp-source` is implemented as an adaptive **RateMatch follower**: it
 receives RTP into a jitter buffer and resamples to whatever clock drives the
@@ -46,7 +46,7 @@ freeze too.
 Why the working cases work:
 - **→ sendspin**: the sendspin *group sink* is a `support.null-audio-sink` with
   `node.driver=true` — a real driver that anchors the cycle; the RTP source
-  follows it. (See `bridge-daemon/src/sendspin_group.rs`.)
+  follows it. (See `bridge-daemon/src/sync_group.rs`.)
 - **airplay-in → RAOP**: the shairplay source is driver-capable, so it anchors
   the cycle and the RAOP sink follows — exactly as a RAOP sink normally follows
   a playback stream.
@@ -66,15 +66,17 @@ is not driver-capable, full stop.
 
 ## Fix: insert a null-sink clock anchor ("option 1") — implemented
 
-Implemented in `bridge-daemon/src/rtp_raop_anchor.rs` (a stateless reconciler
-run from the same loop as `routing::reconcile`/`sendspin_group`). Option 2
+Implemented in `bridge-daemon/src/sync_group.rs`, which unifies this RTP→RAOP
+anchoring with sendspin multi-room grouping into one **sync group** model (it
+subsumes the former `rtp_raop_anchor.rs` and `sendspin_group.rs`). A stateless-
+per-tick reconciler runs from the same loop as `routing::reconcile`. Option 2
 (properties on the RTP source) was ruled out first — see above.
 
 Route a non-driver source to a RAOP output **through a real driver** — the same
-pattern `sendspin_group.rs` already uses:
+pattern sendspin grouping uses:
 
 ```
-bt-bridge-rtp ──▶ rtp-anchor  (support.null-audio-sink, node.driver = true)
+bt-bridge-rtp ──▶ sync-grp-<hash>  (support.null-audio-sink, node.driver = true)
                        │ monitor
                        ▼
                   raop-out-*  (follows the anchor's clock, like it follows airplay-in)
@@ -82,16 +84,17 @@ bt-bridge-rtp ──▶ rtp-anchor  (support.null-audio-sink, node.driver = true
 
 The null sink is a genuine driver: it clocks the cycle, the RTP source feeds it
 as a follower, and the RAOP sink is fed from the anchor's **monitor** and
-follows that clock. No more driverless component. A single shared anchor can
-fan out to several RAOP sinks (and can coexist with sendspin, which brings its
-own driver sink).
+follows that clock. No more driverless component. **One anchor per source-set**
+fans out to every output routed from those sources — several RAOP sinks and/or
+sendspin devices at once — so a mix of AirPlay and sendspin plays off one clock.
 
-Implementation sketch (daemon): when the routing intent links a **non-driver
-source** (currently only the RTP source) to a **RAOP** output, transparently
-insert/attach a shared `rtp-anchor` null sink instead of a direct port link, and
-reconcile it away when the last such route is removed — mirroring the
-group-lifecycle logic in `sendspin_group.rs`. Direct links stay the default for
-driver-capable sources (`airplay-in`), which already work.
+How the reconciler decides (see `routing::raop_uses_anchor`): a RAOP output is
+anchored when **either** any feeding source is non-driver (the RTP case here)
+**or** it shares its exact source-set with a sendspin device (so it joins that
+group). A lone RAOP output fed only by driver-capable sources stays a direct
+link — snappier, one fewer buffer. The group's presentation lead and per-member
+offsets are tunable (`sync_settings.rs`, `raop.latency.ms`); see the "Outputs →
+Group sync" UI.
 
 ## Latency impact
 

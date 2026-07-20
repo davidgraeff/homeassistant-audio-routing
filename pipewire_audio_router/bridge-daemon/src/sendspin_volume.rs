@@ -2,7 +2,7 @@
 //!
 //! Unlike AirPlay outputs — real PipeWire `raop-sink` nodes whose volume the
 //! matrix drives through `node_id` — sendspin devices are *virtual* outputs fed
-//! by a shared group sink (sendspin_group.rs), so there's no per-device
+//! by a shared group sink (sync_group.rs), so there's no per-device
 //! PipeWire volume to set. Sendspin instead carries volume in-band: the server
 //! sends a `server/command` player `Volume` message to a specific client
 //! (`ServerSender::send_player_command`).
@@ -32,10 +32,21 @@ pub struct SendspinControl {
     senders: HashMap<String, ServerSender>,
     /// Desired volume (0–100) per virtual device node name; absent = default.
     desired: HashMap<String, u8>,
+    /// Desired per-device *static delay* (ms), keyed by virtual device node
+    /// name; absent = no extra delay. Unlike volume this IS persisted (across
+    /// restarts) by sync_settings.rs and seeded back in via [`Self::seed_delays`]
+    /// — a calibrated offset is useless if it resets. It's the per-client half of
+    /// group sync: trim one speaker that's consistently early/late relative to
+    /// the rest of its group.
+    desired_delay: HashMap<String, u16>,
 }
 
 fn volume_cmd(volume: u8) -> PlayerCommand {
     PlayerCommand { command: PlayerCommandType::Volume, volume: Some(volume.min(100)), mute: None, static_delay_ms: None }
+}
+
+fn delay_cmd(ms: u16) -> PlayerCommand {
+    PlayerCommand { command: PlayerCommandType::SetStaticDelay, volume: None, mute: None, static_delay_ms: Some(ms.min(5000)) }
 }
 
 /// Construct an empty control wrapped for sharing.
@@ -45,7 +56,8 @@ pub fn shared() -> SharedSendspinControl {
 
 impl SendspinControl {
     /// Register a freshly-connected device (by its virtual node name) and
-    /// (re)apply its stored volume so a reconnect restores what the user set.
+    /// (re)apply its stored volume + static delay so a reconnect restores what
+    /// the user set.
     pub async fn register(&mut self, node_name: String, sender: ServerSender) {
         tracing::info!("sendspin device connected: {node_name}");
         if let Some(&vol) = self.desired.get(&node_name) {
@@ -53,7 +65,43 @@ impl SendspinControl {
                 tracing::warn!("failed to apply stored volume {vol} to '{node_name}': {e}");
             }
         }
+        if let Some(&ms) = self.desired_delay.get(&node_name) {
+            if let Err(e) = sender.send_player_command(delay_cmd(ms)).await {
+                tracing::warn!("failed to apply stored delay {ms}ms to '{node_name}': {e}");
+            }
+        }
         self.senders.insert(node_name, sender);
+    }
+
+    /// Seed desired per-device delays at startup from the persisted sync
+    /// settings (sync_settings.rs), so they re-apply as devices connect. Existing
+    /// live entries are left untouched (a startup-only merge).
+    pub fn seed_delays(&mut self, delays: HashMap<String, u16>) {
+        for (node_name, ms) in delays {
+            self.desired_delay.entry(node_name).or_insert(ms);
+        }
+    }
+
+    /// Set a device's desired static delay (ms) and push it to the device if
+    /// connected. `0` clears it. Returns true if it reached a live device.
+    pub async fn set_delay(&mut self, node_name: &str, ms: u16) -> bool {
+        if ms == 0 {
+            self.desired_delay.remove(node_name);
+        } else {
+            self.desired_delay.insert(node_name.to_string(), ms.min(5000));
+        }
+        if let Some(sender) = self.senders.get(node_name) {
+            match sender.send_player_command(delay_cmd(ms)).await {
+                Ok(()) => return true,
+                Err(e) => tracing::warn!("failed to set delay for '{node_name}': {e}"),
+            }
+        }
+        false
+    }
+
+    /// Snapshot of the desired per-device delays by node name (for the UI).
+    pub fn delays(&self) -> HashMap<String, u16> {
+        self.desired_delay.clone()
     }
 
     /// Drop a disconnected device (its desired volume is kept for reconnect).

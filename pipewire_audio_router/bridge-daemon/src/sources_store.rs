@@ -4,9 +4,9 @@
 //! on a fresh install, then the `/data` file is authoritative and everything is
 //! managed live via the API (api.rs).
 //!
-//! (Sendspin is no longer configured here: devices are auto-discovered
+//! (Sendspin is not configured here: devices are auto-discovered
 //! (sendspin_discovery.rs) and grouped from the routing intent
-//! (sendspin_group.rs), so there's nothing per-output to persist.)
+//! (sync_group.rs), so there's nothing per-output to persist.)
 
 use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
 use crate::rtp_source::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_SOURCE_ADDR};

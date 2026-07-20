@@ -9,11 +9,19 @@ import type {
   AddOutputRequest,
   AirplayClient,
   AirplaySourceInfo,
+  AlignGroup,
+  AlignState,
+  AppSettings,
+  AppSettingsUpdate,
+  Encryption,
   MediaPlayerInfo,
+  NodesResponse,
   OpResponse,
   OutputInfo,
   RoutingMatrix,
   RtpSourceInfo,
+  StatusInfo,
+  SyncSettingsInfo,
   VolumeResponse,
   WyomingAnnounce,
 } from './types';
@@ -83,6 +91,12 @@ export const api = {
   outputs: () => request<OutputInfo[]>('GET', 'api/outputs'),
   addOutput: (output: AddOutputRequest) => request<OpResponse>('POST', 'api/outputs', output),
   removeOutput: (nodeName: string) => request<OpResponse>('DELETE', `api/outputs/${nodeName}`),
+  /** Reconfigure a manually-added output's connection details (IP/port/encryption). */
+  configureOutput: (nodeName: string, cfg: { ip: string; port: number; encryption: Encryption }) =>
+    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}`, cfg),
+  /** Per-RAOP-output receiver latency in ms (`raop.latency.ms`); null resets to default. */
+  setOutputLatency: (nodeName: string, latencyMs: number | null) =>
+    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/latency`, { latency_ms: latencyMs }),
 
   // AirPlay-receive source (single)
   airplaySource: () => request<AirplaySourceInfo>('GET', 'api/source/airplay'),
@@ -106,6 +120,33 @@ export const api = {
   sendspinVolumes: () => request<Record<string, number>>('GET', 'api/sendspin/volumes'),
   setSendspinVolume: (nodeName: string, volume: number) =>
     request<OpResponse>('PUT', 'api/sendspin/volume', { node_name: nodeName, volume }),
+
+  // Sendspin per-device static delay (ms, 0-5000; 0 clears). Map node_name -> ms.
+  sendspinDelays: () => request<Record<string, number>>('GET', 'api/sendspin/delays'),
+  setSendspinDelay: (nodeName: string, delayMs: number) =>
+    request<OpResponse>('PUT', 'api/sendspin/delay', { node_name: nodeName, delay_ms: delayMs }),
+
+  // Group sync settings (daemon-wide presentation lead, ms).
+  syncSettings: () => request<SyncSettingsInfo>('GET', 'api/sync/settings'),
+  setGroupLead: (groupLeadMs: number) =>
+    request<OpResponse>('PUT', 'api/sync/settings', { group_lead_ms: groupLeadMs }),
+
+  // General app settings (announce duck default, discovery on/off, default RAOP
+  // latency). PUT is a partial update — send only the fields you're changing.
+  settings: () => request<AppSettings>('GET', 'api/settings'),
+  setSettings: (patch: AppSettingsUpdate) => request<OpResponse>('PUT', 'api/settings', patch),
+
+  // Diagnostics status snapshot + live PipeWire graph.
+  status: () => request<StatusInfo>('GET', 'api/status'),
+  nodes: () => request<NodesResponse>('GET', 'api/nodes'),
+
+  // Latency alignment (by-ear calibration of a sync group).
+  alignGroups: () => request<AlignGroup[]>('GET', 'api/align/groups'),
+  alignStatus: () => request<AlignState>('GET', 'api/align'),
+  alignStart: (sources: string[]) => request<AlignState>('POST', 'api/align/start', { sources }),
+  alignSelect: (reference: string, target: string) =>
+    request<AlignState>('POST', 'api/align/select', { reference, target }),
+  alignStop: () => request<AlignState>('DELETE', 'api/align'),
 
   // RTP source (single — Bluetooth bridge firmware target)
   rtpSource: () => request<RtpSourceInfo>('GET', 'api/source/rtp'),

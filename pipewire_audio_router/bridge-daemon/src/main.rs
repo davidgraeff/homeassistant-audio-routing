@@ -1,9 +1,11 @@
 mod airplay_clients;
 mod airplay_source;
 mod api;
+mod calibrate;
 mod config;
 mod decode;
 mod discovery;
+mod discovery_supervisor;
 mod locks;
 mod metering;
 mod outputs_store;
@@ -13,15 +15,16 @@ mod pw_thread;
 mod raop;
 mod routing;
 mod routing_store;
-mod rtp_raop_anchor;
 mod rtp_source;
 mod sendspin_capture;
 mod sendspin_discovery;
-mod sendspin_group;
 mod sendspin_liveness;
 mod sendspin_server;
 mod sendspin_volume;
+mod settings_store;
 mod sources_store;
+mod sync_group;
+mod sync_settings;
 mod volume;
 mod wav;
 mod wyoming;
@@ -113,7 +116,9 @@ fn addon_version() -> String {
 }
 
 fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &str) -> anyhow::Result<()> {
-    tracing::info!("PipeWire Audio Router add-on v{}", addon_version());
+    let started = std::time::Instant::now();
+    let version = addon_version();
+    tracing::info!("PipeWire Audio Router add-on v{version}");
 
     // No options.json seeding: both stores start empty on a fresh install and
     // are populated entirely at runtime via the API (and mDNS discovery).
@@ -138,6 +143,38 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     tracing::info!("{} persisted routing link(s) in {}", routing.links().count(), routing_path.display());
     let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
 
+    // Sync/latency tuning (group lead + per-device static delays), kept next to
+    // routing.json in /data. Derived from the routing path so there's no extra
+    // CLI flag to thread through.
+    let sync_settings_path = routing_path.with_file_name("sync-settings.json");
+    let sync_settings = sync_settings::SyncSettings::load(&sync_settings_path)?;
+    tracing::info!(
+        "sync settings: group lead {} ms, {} device delay(s) in {}",
+        sync_settings.group_lead_ms(),
+        sync_settings.sendspin_delays().len(),
+        sync_settings_path.display()
+    );
+    let sync_settings: sync_settings::SharedSyncSettings = std::sync::Arc::new(std::sync::Mutex::new(sync_settings));
+
+    // General app settings (announce duck default, discovery on/off, default
+    // RAOP latency), beside the other /data stores. On a fresh install the
+    // discovery flag is seeded from BRIDGE_DISCOVERY so an env-off is honored on
+    // first boot; after that the persisted value is authoritative.
+    let settings_path = routing_path.with_file_name("settings.json");
+    let settings_fresh = !settings_path.exists();
+    let mut settings = settings_store::SettingsStore::load(&settings_path)?;
+    if settings_fresh {
+        settings.set_discovery_enabled(discovery_mode().is_some())?;
+    }
+    tracing::info!(
+        "settings: duck default {:.2}, discovery {}, default RAOP latency {:?} in {}",
+        settings.default_duck(),
+        if settings.discovery_enabled() { "on" } else { "off" },
+        settings.default_raop_latency_ms(),
+        settings_path.display()
+    );
+    let settings: settings_store::SharedSettings = std::sync::Arc::new(std::sync::Mutex::new(settings));
+
     let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
     // Remembered AirPlay senders (Sources-tab connection list). Lives beside
@@ -150,50 +187,39 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     let sendspin_control = sendspin_volume::shared();
     let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // Resolved connection details of auto-discovered RAOP receivers, populated by
+    // the discovery thread so the API can show their IP/Port/Encryption too.
+    let discovered_raop: discovery::SharedDiscovered = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     let (pw_state, changes, pw_cmd) = pw_thread::spawn()?;
 
-    // mDNS auto-discovery of RAOP receivers (overrides-only: store-managed
-    // outputs win, everything else is picked up live). `BRIDGE_DISCOVERY`
-    // controls it: unset/`on` loads discovered receivers, `log` only reports
-    // what it finds (safe dry-run), `off` disables it. The daemon handle must
-    // stay alive for discovery to keep running, so it's held for the whole
-    // process via `_discovery` (serve never returns in practice).
-    let _discovery = match discovery_mode() {
-        Some(mode) => match discovery::spawn(pw_cmd.clone(), store.clone(), sources.clone(), mode) {
-            Ok(daemon) => {
-                tracing::info!("mDNS RAOP discovery started ({mode:?})");
-                Some(daemon)
-            }
-            Err(e) => {
-                tracing::warn!("mDNS discovery unavailable ({e}); continuing without it");
-                None
-            }
-        },
-        None => {
-            tracing::info!("mDNS RAOP discovery disabled (BRIDGE_DISCOVERY=off)");
-            None
-        }
-    };
-
-    // mDNS auto-discovery of sendspin devices (same BRIDGE_DISCOVERY gate).
-    // Only populates the shared registry — no per-device sink is loaded here;
-    // the grouping reconciler (sendspin_group.rs) builds the audio path from
-    // the routing intent. Handle held for the process lifetime.
-    let _sendspin_discovery = if discovery_mode().is_some() {
-        match sendspin_discovery::spawn(sendspin_devices.clone(), changes.clone()) {
-            Ok(daemon) => {
-                tracing::info!("mDNS sendspin device discovery started");
-                Some(daemon)
-            }
-            Err(e) => {
-                tracing::warn!("sendspin discovery unavailable ({e}); continuing without it");
-                None
-            }
+    // mDNS auto-discovery (RAOP receivers + sendspin devices), now runtime
+    // toggleable from the Settings page (discovery_supervisor.rs). RAOP
+    // discovery is overrides-only (store-managed outputs win); sendspin
+    // discovery only populates the shared registry — the grouping reconciler
+    // (sync_group.rs) builds the audio path from the routing intent. The mode
+    // (Load vs dry-run) still comes from `BRIDGE_DISCOVERY`; whether discovery
+    // runs comes from the persisted settings flag. The supervisor is held for
+    // the process lifetime (serve never returns in practice) so the daemons
+    // stay alive.
+    let discovery_mode = discovery_mode().unwrap_or(discovery::Mode::Load);
+    let discovery = discovery_supervisor::DiscoverySupervisor::new(
+        pw_cmd.clone(),
+        store.clone(),
+        sources.clone(),
+        discovery_mode,
+        sendspin_devices.clone(),
+        changes.clone(),
+        sync_settings.clone(),
+        discovered_raop.clone(),
+    );
+    if settings.lock_recover().discovery_enabled() {
+        if let Err(e) = discovery.start() {
+            tracing::warn!("mDNS discovery unavailable ({e}); continuing without it");
         }
     } else {
-        None
-    };
+        tracing::info!("mDNS discovery disabled (settings)");
+    }
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -203,7 +229,8 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         let outputs: Vec<config::RaopOutputConfig> = store.lock_recover().list().to_vec();
         for output in outputs {
             let node_name = raop::raop_node_name(&output.name);
-            let args = raop::raop_module_args(&output);
+            let latency = sync_settings.lock_recover().raop_latency(&node_name);
+            let args = raop::raop_module_args(&output, latency);
             let (tx, rx) = tokio::sync::oneshot::channel();
             let sent = pw_cmd.send(pw_thread::PwCommand::Load {
                 node_name: node_name.clone(),
@@ -234,29 +261,52 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         // Without this, an mDNS TTL flap would tear down live groups.
         sendspin_liveness::spawn(sendspin_devices.clone(), sendspin_control.clone(), changes.clone());
 
+        // Seed persisted per-device static delays so they re-apply when each
+        // device (re)connects, exactly like stored volumes (sendspin_volume.rs).
+        {
+            let delays = sync_settings.lock_recover().sendspin_delays();
+            if !delays.is_empty() {
+                sendspin_control.lock().await.seed_delays(delays.into_iter().collect());
+            }
+        }
+
         // Reconcile persisted routing intent onto the live graph, now and on
         // every registry/device change: a node that (re)appears — a reloaded
         // raop-sink, a rediscovered device — gets its saved links recreated
         // (routing::reconcile, additive only), and sendspin devices sharing a
-        // source are (re)formed into synchronized groups (sendspin_group).
+        // source are (re)formed into synchronized groups (sync_group).
+        //
+        // The reconciler is shared (SharedGroups) so the alignment API
+        // (calibrate.rs) can read the live group layout — anchor + members — to
+        // drive the latency-alignment wizard.
+        let groups: sync_group::SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(sync_group::GroupReconciler::new()));
+
+        // Latency-alignment session manager (calibrate.rs): reads the live group
+        // layout, plays a click into a group's anchor, and mutes non-audible
+        // members while the user tunes offsets by ear.
+        let align = calibrate::AlignManager::new(pw_state.clone(), sendspin_control.clone(), groups.clone());
         {
             let pw = pw_state.clone();
             let cmd = pw_cmd.clone();
             let routing = routing.clone();
             let devices = sendspin_devices.clone();
             let control = sendspin_control.clone();
-            let groups = std::sync::Arc::new(tokio::sync::Mutex::new(sendspin_group::GroupReconciler::new()));
+            let settings = sync_settings.clone();
+            let groups = groups.clone();
             let mut rx = changes.subscribe();
             tokio::spawn(async move {
+                // routing::reconcile first (direct links), then sync_group (which
+                // owns anchored RAOP + sendspin groups) — the group lead comes from
+                // the live sync settings so a change takes effect on the next tick.
+                let lead = sync_settings::group_lead_us(&settings);
                 routing::reconcile(&pw, &cmd, &routing).await;
-                rtp_raop_anchor::reconcile(&pw, &cmd, &routing).await;
-                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control).await;
+                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead).await;
                 // Loops until the change channel closes (RecvError::Closed ends the
                 // `while let`); a Lagged wakeup reconciles just like a normal one.
                 while let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+                    let lead = sync_settings::group_lead_us(&settings);
                     routing::reconcile(&pw, &cmd, &routing).await;
-                    rtp_raop_anchor::reconcile(&pw, &cmd, &routing).await;
-                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control).await;
+                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead).await;
                 }
             });
         }
@@ -274,6 +324,13 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             sendspin_devices,
             routing,
             sendspin_control,
+            sync_settings,
+            settings,
+            discovery,
+            discovered_raop,
+            align,
+            version,
+            started,
             static_dir.to_path_buf(),
         );
         let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -294,7 +351,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
 /// Starts the persisted sources: the native AirPlay receiver (airplay_source.rs)
 /// and the RTP source (a PipeWire module). (Sendspin devices aren't started
 /// here — they're auto-discovered and grouped from the routing intent; see
-/// sendspin_group.rs.)
+/// sync_group.rs.)
 async fn spawn_stored_sources(
     sources: &api::SharedSources,
     airplay: &api::SharedAirplay,

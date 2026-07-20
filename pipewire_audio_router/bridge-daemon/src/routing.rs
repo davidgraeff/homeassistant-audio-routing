@@ -1,4 +1,4 @@
-//! Manual routing UI backend (PLAN.md Section 8): a source×output matrix —
+//! Manual routing UI backend: a source×output matrix —
 //! REST endpoints to read the matrix and toggle links, plus a WebSocket
 //! that pushes a fresh matrix snapshot on every registry change instead of
 //! requiring the client to poll.
@@ -80,7 +80,7 @@ fn is_output_node(node_name: &str) -> bool {
     node_name.starts_with(RAOP_NODE_PREFIX) || node_name.starts_with(SENDSPIN_NODE_PREFIX)
 }
 
-fn output_display_name(node_name: &str) -> String {
+pub(crate) fn output_display_name(node_name: &str) -> String {
     for prefix in [RAOP_NODE_PREFIX, SENDSPIN_NODE_PREFIX, SENDSPIN_DEV_PREFIX] {
         if let Some(rest) = node_name.strip_prefix(prefix) {
             return rest.replace(['_', '-'], " ");
@@ -132,7 +132,7 @@ fn build_matrix(
     let configured: BTreeMap<String, String> = store.list().iter().map(|o| (raop_node_name(&o.name), o.name.clone())).collect();
 
     // Discovered sendspin devices are virtual outputs (present, auto, no live
-    // node id — audio reaches them via a group sink, sendspin_group.rs).
+    // node id — audio reaches them via a group sink, sync_group.rs).
 
     // Union of every output/source name to show: present ∪ configured ∪
     // discovered devices ∪ intent.
@@ -222,7 +222,7 @@ fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: 
 
 /// Like `matched_port_specs`, but takes the source side's **monitor** output
 /// ports (`monitor_FL`/`monitor_FR`) instead of its normal outputs. Used to
-/// wire a null-sink *anchor*'s monitor into a RAOP output (rtp_raop_anchor.rs):
+/// wire a null-sink *anchor*'s monitor into a RAOP output (sync_group.rs):
 /// a null sink's only outputs are its monitor ports, which the normal matcher
 /// deliberately excludes.
 fn matched_monitor_port_specs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<LinkSpec> {
@@ -277,10 +277,48 @@ pub(crate) fn is_raop_output(name: &str) -> bool {
 /// a `node.network` RateMatch *follower* that can't drive a graph cycle, and a
 /// RAOP sink can't either, so a direct link is a driverless cycle that stalls
 /// the whole component. Driver-capable sources (the AirPlay receive source)
-/// return false and link directly. See rtp_raop_anchor.rs and
+/// return false and link directly. See sync_group.rs and
 /// docs/rtp-source-to-raop-routing.md.
 pub(crate) fn source_needs_raop_anchor(name: &str) -> bool {
     name == RTP_SOURCE_NODE_NAME
+}
+
+/// The set of sources feeding `output` in the intent (unique, sorted). Shared
+/// with sync_group.rs, which keys sync groups by this source-set.
+pub(crate) fn source_set_of<'a>(intent: &'a [RoutingLink], output: &str) -> std::collections::BTreeSet<&'a str> {
+    intent.iter().filter(|l| l.output == output).map(|l| l.source.as_str()).collect()
+}
+
+/// Whether the RAOP output `raop` is routed through a shared **sync anchor**
+/// (sync_group.rs) rather than direct source→sink links. True when either:
+///
+/// - **any source feeding it is a non-driver source** (`source_needs_raop_anchor`)
+///   — a direct link would be a driverless, stalling cycle, so it must go through
+///   the anchor's null-sink clock; or
+/// - **it shares its exact source-set with a sendspin device** — then it joins
+///   that device's sync group so the two play in lockstep off one clock (the
+///   "RAOP joins a sendspin group" case).
+///
+/// This is the single rule both sides depend on: `reconcile` must NOT create
+/// direct links for these (sync_group owns them, feeding them from the anchor's
+/// monitor), and sync_group uses the same predicate to decide which RAOP outputs
+/// belong to an anchored group. It's purely structural (over the intent), so the
+/// decision is stable regardless of which endpoints are live right now.
+pub(crate) fn raop_uses_anchor(intent: &[RoutingLink], raop: &str) -> bool {
+    if !is_raop_output(raop) {
+        return false;
+    }
+    let my_sources = source_set_of(intent, raop);
+    if my_sources.is_empty() {
+        return false;
+    }
+    if my_sources.iter().any(|s| source_needs_raop_anchor(s)) {
+        return true;
+    }
+    // Shares its exact source-set with some sendspin device → same group.
+    let sendspin_devices: std::collections::BTreeSet<&str> =
+        intent.iter().map(|l| l.output.as_str()).filter(|o| o.starts_with(SENDSPIN_DEV_PREFIX)).collect();
+    sendspin_devices.into_iter().any(|dev| source_set_of(intent, dev) == my_sources)
 }
 
 /// Ensure the matched-channel PipeWire links from `source` to `output` exist,
@@ -307,7 +345,7 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
 
 /// Like `ensure_link_by_name`, but links `monitor`'s **monitor** output ports
 /// (a null sink's only outputs) into `output`'s inputs. Used to feed a RAOP
-/// output from the RTP→RAOP anchor's monitor (rtp_raop_anchor.rs). Idempotent.
+/// output from the RTP→RAOP anchor's monitor (sync_group.rs). Idempotent.
 pub async fn ensure_monitor_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, monitor: &str, output: &str) {
     let ids = {
         let st = pw.lock_recover();
@@ -325,6 +363,26 @@ pub async fn ensure_monitor_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSen
     let _ = reply_rx.await;
 }
 
+/// Destroy every live link from node `from` to node `to` (by stable node name).
+/// Idempotent — missing links are fine. Used by sync_group.rs to detach a RAOP
+/// output from a group's anchor monitor when it leaves the group but the group
+/// (and its anchor) lives on.
+pub async fn destroy_links_between(pw: &SharedState, pw_cmd: &PwCommandSender, from: &str, to: &str) {
+    let link_ids: Vec<u32> = {
+        let st = pw.lock_recover();
+        let Some((from_id, to_id)) = node_id_for(&st, from).zip(node_id_for(&st, to)) else { return };
+        st.links.values().filter(|l| l.output_node == from_id && l.input_node == to_id).map(|l| l.link_id).collect()
+    };
+    if link_ids.is_empty() {
+        return;
+    }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if pw_cmd.send(PwCommand::DestroyLinks { link_ids, reply: reply_tx }).is_err() {
+        return;
+    }
+    let _ = reply_rx.await;
+}
+
 /// Reapply persisted routing intent (routing_store.rs) to the live graph: for
 /// every stored `(source, output)` link whose *both* nodes are currently
 /// present, ensure the matched-channel PipeWire links exist. Idempotent —
@@ -334,11 +392,14 @@ pub async fn ensure_monitor_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSen
 /// user. Intent whose endpoint is absent is simply left pending until the node
 /// (re)appears and a later call links it.
 pub async fn reconcile(pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting) {
-    for link in routing_store::snapshot(routing) {
-        // RTP-source → RAOP routes go through a null-sink anchor
-        // (rtp_raop_anchor.rs), not a direct link — a direct link is a
-        // driverless cycle that stalls the graph. Skip them here.
-        if source_needs_raop_anchor(&link.source) && is_raop_output(&link.output) {
+    let intent = routing_store::snapshot(routing);
+    for link in &intent {
+        // Anchored RAOP routes are owned by sync_group.rs (fed from a shared
+        // null-sink anchor's monitor), never direct-linked here: a non-driver
+        // source direct-linked to RAOP is a driverless cycle that stalls the
+        // graph, and a RAOP output grouped with a sendspin device must share
+        // that group's clock. Skip both so we don't create a competing feed.
+        if raop_uses_anchor(&intent, &link.output) {
             continue;
         }
         let ids = {
@@ -388,11 +449,11 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
     // Nudge the reconcilers (routing/groups/anchor) so intent changes take
     // effect promptly, not only on the next PipeWire registry event.
     let _ = state.changes.send(());
-    // RTP-source → RAOP goes through the null-sink anchor (rtp_raop_anchor.rs),
-    // never a direct link (which stalls). The anchor reconciler, woken by the
-    // notification above, builds the path.
-    if source_needs_raop_anchor(&req.source) && is_raop_output(&req.output) {
-        return Json(LinkOpResponse { ok: true, message: "saved; routing via RTP→RAOP anchor".to_string() });
+    // Anchored RAOP routes are built by sync_group.rs (fed from a shared
+    // null-sink anchor), never a direct link. The reconcilers, woken by the
+    // notification above, build the path.
+    if is_raop_output(&req.output) && raop_uses_anchor(&routing_store::snapshot(&state.routing), &req.output) {
+        return Json(LinkOpResponse { ok: true, message: "saved; routing via sync anchor".to_string() });
     }
     // Apply live now if both ends are present; otherwise it stays pending.
     let ids = {
@@ -528,4 +589,51 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(), axum::Error> {
     let json = serde_json::to_string(matrix).unwrap_or_else(|_| "{}".to_string());
     socket.send(Message::Text(json)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(source: &str, output: &str) -> RoutingLink {
+        RoutingLink { source: source.to_string(), output: output.to_string() }
+    }
+
+    #[test]
+    fn lone_raop_from_driver_source_is_direct() {
+        let intent = vec![link(AIRPLAY_NODE_NAME, "raop-out-dusche")];
+        assert!(!raop_uses_anchor(&intent, "raop-out-dusche"));
+    }
+
+    #[test]
+    fn raop_from_non_driver_source_is_anchored() {
+        let intent = vec![link(RTP_SOURCE_NODE_NAME, "raop-out-dusche")];
+        assert!(raop_uses_anchor(&intent, "raop-out-dusche"));
+    }
+
+    #[test]
+    fn raop_sharing_source_set_with_sendspin_device_is_anchored() {
+        // Same source-set {airplay-in} feeds a sendspin device and a RAOP output
+        // → they group, so the RAOP output joins the sendspin group's anchor.
+        let intent = vec![link(AIRPLAY_NODE_NAME, "sendspin-dev-kitchen"), link(AIRPLAY_NODE_NAME, "raop-out-dusche")];
+        assert!(raop_uses_anchor(&intent, "raop-out-dusche"));
+    }
+
+    #[test]
+    fn raop_with_different_source_set_than_sendspin_is_not_anchored() {
+        // The sendspin device is fed by two sources; the RAOP output by one — the
+        // source-sets differ, so they are not the same group.
+        let intent = vec![
+            link(AIRPLAY_NODE_NAME, "sendspin-dev-kitchen"),
+            link("some-other-source", "sendspin-dev-kitchen"),
+            link(AIRPLAY_NODE_NAME, "raop-out-dusche"),
+        ];
+        assert!(!raop_uses_anchor(&intent, "raop-out-dusche"));
+    }
+
+    #[test]
+    fn non_raop_output_never_uses_anchor() {
+        let intent = vec![link(AIRPLAY_NODE_NAME, "sendspin-dev-kitchen")];
+        assert!(!raop_uses_anchor(&intent, "sendspin-dev-kitchen"));
+    }
 }

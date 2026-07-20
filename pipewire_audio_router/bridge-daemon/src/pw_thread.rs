@@ -121,8 +121,8 @@ pub struct RegistryState {
 
 impl RegistryState {
     /// Whether any link currently feeds into this node — the basis for a
-    /// media_player entity's playing/idle state (Section 6/9): an output
-    /// with an active incoming link is "playing," one with none is "idle."
+    /// media_player entity's playing/idle state: an output with an active
+    /// incoming link is "playing," one with none is "idle."
     pub fn node_has_incoming_link(&self, node_id: u32) -> bool {
         self.links.values().any(|l| l.input_node == node_id)
     }
@@ -131,8 +131,8 @@ impl RegistryState {
 pub type SharedState = Arc<Mutex<RegistryState>>;
 
 /// Fires (empty payload, just a ping) whenever the registry state changes —
-/// node/port/link added or removed. The routing UI's WebSocket (Section 8,
-/// routing.rs) subscribes to this to push live matrix updates instead of
+/// node/port/link added or removed. The routing UI's WebSocket (routing.rs)
+/// subscribes to this to push live matrix updates instead of
 /// the client having to poll. `send` is synchronous and callable from any
 /// thread (including this module's own dedicated PipeWire OS thread, which
 /// isn't running inside a tokio runtime) — no async plumbing needed to

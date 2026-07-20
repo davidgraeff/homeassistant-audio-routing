@@ -17,6 +17,8 @@ use pw::spa;
 use spa::pod::Pod;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 struct Wav {
@@ -214,6 +216,140 @@ pub fn play_wav_to_target(target_node_id: u32, wav_bytes: &[u8]) -> Result<(), S
     }
     if timed_out.get() {
         return Err("playback timed out before the sink drained".to_string());
+    }
+    Ok(())
+}
+
+/// Plays a 16-bit PCM WAV clip to `target_node_id` on a continuous loop until
+/// `stop` is set, blocking the calling thread until then. The clip's PCM is
+/// wrapped seamlessly (end → start), so a periodic pattern (the calibration
+/// click track) plays gaplessly. Intended for `tokio::task::spawn_blocking`.
+pub fn play_loop_to_target(target_node_id: u32, wav_bytes: &[u8], stop: Arc<AtomicBool>) -> Result<(), String> {
+    let wav = parse_wav(wav_bytes)?;
+    let stride = wav.channels as usize * 2; // 16-bit => 2 bytes/sample
+    if wav.pcm.len() < stride {
+        return Ok(()); // nothing to play
+    }
+
+    pw::init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
+    let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| format!("context: {e}"))?;
+    let core = context.connect_rc(None).map_err(|e| format!("connect to PipeWire: {e}"))?;
+
+    let stream = pw::stream::StreamBox::new(
+        &core,
+        "bridge-align",
+        pw::properties::properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Playback",
+            *pw::keys::MEDIA_ROLE => "Notification",
+            *pw::keys::NODE_NAME => "bridge-align",
+        },
+    )
+    .map_err(|e| format!("create stream: {e}"))?;
+
+    let pcm = Rc::new(wav.pcm);
+    let cursor = Rc::new(Cell::new(0usize));
+    let error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    let _listener = stream
+        .add_local_listener_with_user_data(())
+        .process({
+            let pcm = pcm.clone();
+            let cursor = cursor.clone();
+            move |stream, _| {
+                let Some(mut buffer) = stream.dequeue_buffer() else {
+                    return;
+                };
+                let datas = buffer.datas_mut();
+                let data = &mut datas[0];
+                let filled = if let Some(slice) = data.data() {
+                    let cap = (slice.len() / stride) * stride; // whole frames only
+                    let mut cur = cursor.get();
+                    let mut written = 0usize;
+                    while written < cap {
+                        if cur >= pcm.len() {
+                            cur = 0; // seamless wrap to the pattern start
+                        }
+                        let n = (cap - written).min(pcm.len() - cur);
+                        slice[written..written + n].copy_from_slice(&pcm[cur..cur + n]);
+                        written += n;
+                        cur += n;
+                    }
+                    cursor.set(cur);
+                    written
+                } else {
+                    0
+                };
+                let chunk = data.chunk_mut();
+                *chunk.offset_mut() = 0;
+                *chunk.stride_mut() = stride as _;
+                *chunk.size_mut() = filled as _;
+            }
+        })
+        .state_changed({
+            let error = error.clone();
+            let mainloop = mainloop.clone();
+            move |_stream, _, _old, new| {
+                if let pw::stream::StreamState::Error(e) = new {
+                    *error.borrow_mut() = Some(e);
+                    mainloop.quit();
+                }
+            }
+        })
+        .register()
+        .map_err(|e| format!("register stream listener: {e}"))?;
+
+    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
+    audio_info.set_rate(wav.rate);
+    audio_info.set_channels(wav.channels as u32);
+    if wav.channels == 2 {
+        let mut position = [0; spa::param::audio::MAX_CHANNELS];
+        position[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+        position[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+        audio_info.set_position(position);
+    }
+
+    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(pw::spa::pod::Object {
+            type_: pw::spa::sys::SPA_TYPE_OBJECT_Format,
+            id: pw::spa::sys::SPA_PARAM_EnumFormat,
+            properties: audio_info.into(),
+        }),
+    )
+    .map_err(|e| format!("serialize format pod: {e}"))?
+    .0
+    .into_inner();
+    let mut params = [Pod::from_bytes(&values).ok_or("invalid format pod")?];
+
+    stream
+        .connect(
+            spa::utils::Direction::Output,
+            Some(target_node_id),
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+            &mut params,
+        )
+        .map_err(|e| format!("connect stream to node {target_node_id}: {e}"))?;
+
+    // The loop is `!Send`, so `stop` can't call `quit()` from outside — poll it
+    // on an in-loop timer (250 ms) and quit when the session ends.
+    let timer = {
+        let ml = mainloop.clone();
+        let stop = stop.clone();
+        mainloop.loop_().add_timer(move |_| {
+            if stop.load(Ordering::Relaxed) {
+                ml.quit();
+            }
+        })
+    };
+    let _ = timer.update_timer(Some(Duration::from_millis(250)), Some(Duration::from_millis(250)));
+
+    mainloop.run();
+
+    if let Some(e) = error.borrow_mut().take() {
+        return Err(e);
     }
     Ok(())
 }

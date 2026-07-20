@@ -3,10 +3,9 @@
 //!
 //! These modules are loaded into the bridge daemon's *own* PipeWire context at
 //! runtime (see pw_module.rs / pw_thread.rs), one per configured output — not
-//! from a static `pipewire.conf.d` file written before PipeWire starts, which
-//! is what this module used to generate. See docs/decisions.md "Loading
-//! PipeWire modules at runtime" for why runtime loading is both possible and
-//! preferable (hot-reloadable outputs, no restart).
+//! from a static `pipewire.conf.d` file written before PipeWire starts. See
+//! docs/decisions.md "Loading PipeWire modules at runtime" for why runtime
+//! loading is both possible and preferable (hot-reloadable outputs, no restart).
 
 use crate::config::{slugify, RaopOutputConfig};
 use std::fmt::Write as _;
@@ -31,7 +30,7 @@ pub fn raop_node_name(output_name: &str) -> String {
 /// parses. `nofail` (a config-level module flag) has no analogue here — a
 /// failed load returns NULL and is reported by the caller, so one bad device
 /// still can't take anything else down.
-pub fn raop_module_args(output: &RaopOutputConfig) -> String {
+pub fn raop_module_args(output: &RaopOutputConfig, latency_ms: Option<u16>) -> String {
     let node_name = raop_node_name(&output.name);
     let mut a = String::new();
     a.push_str("{ ");
@@ -40,6 +39,11 @@ pub fn raop_module_args(output: &RaopOutputConfig) -> String {
     write!(a, "raop.name = \"{}\" ", output.name).unwrap();
     a.push_str("raop.transport = \"udp\" ");
     write!(a, "raop.encryption.type = \"{}\" ", output.encryption.as_pipewire_arg()).unwrap();
+    // Per-output presentation latency (group-sync knob) from sync_settings.rs.
+    // Omitted → module default (1500 ms).
+    if let Some(ms) = latency_ms {
+        write!(a, "raop.latency.ms = {ms} ").unwrap();
+    }
     a.push_str("audio.format = \"S16\" ");
     a.push_str("audio.rate = 44100 ");
     a.push_str("audio.channels = 2 ");
@@ -66,7 +70,7 @@ mod tests {
             port: 7000,
             encryption: RaopEncryption::AuthSetup,
         };
-        let args = raop_module_args(&output);
+        let args = raop_module_args(&output, None);
         // Braces so the module's pw_properties_new_string parses it as an object.
         assert!(args.starts_with("{ ") && args.ends_with('}'));
         assert!(args.contains("raop.ip = \"192.168.178.35\""));
@@ -75,6 +79,8 @@ mod tests {
         assert!(args.contains("raop.encryption.type = \"auth_setup\""));
         assert!(args.contains("audio.format = \"S16\""));
         assert!(args.contains("node.name = \"raop-out-pioneer_vsx_934\""));
+        // No explicit latency arg unless configured (module default applies).
+        assert!(!args.contains("raop.latency.ms"));
     }
 
     #[test]
@@ -85,8 +91,20 @@ mod tests {
             port: 5000,
             encryption: RaopEncryption::None,
         };
-        let args = raop_module_args(&output);
+        let args = raop_module_args(&output, None);
         assert!(args.contains("raop.encryption.type = \"none\""));
         assert!(args.contains("raop.port = 5000"));
+    }
+
+    #[test]
+    fn module_args_include_latency_when_set() {
+        let output = RaopOutputConfig {
+            name: "Dusche".to_string(),
+            ip: "192.168.178.165".to_string(),
+            port: 5000,
+            encryption: RaopEncryption::None,
+        };
+        let args = raop_module_args(&output, Some(400));
+        assert!(args.contains("raop.latency.ms = 400"));
     }
 }

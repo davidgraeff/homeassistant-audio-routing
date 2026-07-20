@@ -1,12 +1,7 @@
-//! Minimal Wyoming protocol TTS client used as an **additive alternative** to the v1 file+URL
-//! announce path (api.rs's `AnnounceRequest::url`):
-//! `POST /api/media_players/:node_id/announce` accepts either `url` (HA's
-//! existing `tts`-rendered-file contract, unchanged) or `wyoming`
-//! (synthesize directly against a local Piper instance, skipping the
-//! render-to-file-then-HTTP-fetch round trip for lower first-audible-word
-//! latency). Both paths converge on the same WAV file before the
-//! duck/play/restore logic in api.rs, which has no idea which path
-//! produced it.
+//! Minimal Wyoming protocol TTS client backing the `wyoming` announce source
+//! (api.rs's `AnnounceRequest`): synthesize directly against a local Piper
+//! instance, producing a WAV file that feeds the same duck/play/restore logic
+//! in api.rs as the `url` source, which has no idea which source produced it.
 //!
 //! Wyoming (<https://github.com/rhasspy/wyoming>) frames every message as
 //! one JSON object per line, optionally followed by exactly

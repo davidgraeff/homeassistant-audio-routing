@@ -54,14 +54,14 @@ pub const DEFAULT_RTP_LATENCY_MSEC: u32 = 200;
 pub const DEFAULT_RTP_SOURCE_ADDR: &str = "0.0.0.0";
 
 /// Default `sess.ignore-ssrc`. `true` (module analogue of "accept all senders")
-/// keeps every packet reaching the port regardless of its SSRC — the historical
-/// default, needed while the firmware picked a **random SSRC per boot** (see
-/// docs/decisions.md "Fix 3"). With a firmware that now sends a **stable**
-/// MAC-derived SSRC, set this `false` to have the receiver latch onto the first
-/// SSRC and reject every other sender — the "Only one client" mode that stops a
-/// stray/second sender from interleaving into (corrupting) the stream. Kept at
-/// `true` by default so existing installs with not-yet-reflashed bridges don't
-/// go silent on reboot. Stored per install (sources_store.rs), settable via API.
+/// keeps every packet reaching the port regardless of its SSRC — required for
+/// firmware that picks a **random SSRC per boot** (see docs/decisions.md
+/// "Fix 3"). With firmware that sends a **stable** MAC-derived SSRC, set this
+/// `false` to have the receiver latch onto the first SSRC and reject every
+/// other sender — the "Only one client" mode that stops a stray/second sender
+/// from interleaving into (corrupting) the stream. Defaults to `true` so
+/// installs with not-yet-reflashed bridges don't go silent on reboot. Stored
+/// per install (sources_store.rs), settable via API.
 pub const DEFAULT_RTP_IGNORE_SSRC: bool = true;
 
 /// The SPA-JSON `args` object for the rtp-source module, ready to pass as the

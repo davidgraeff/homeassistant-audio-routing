@@ -1,13 +1,6 @@
-//! Decodes announce audio fetched via URL (api.rs's `AnnounceRequest::url`,
-//! Section 5.6 v1) into WAV, using `symphonia` — a pure-Rust decoder with
-//! no system/C dependencies. Replaces an earlier `ffmpeg` subprocess call:
-//! measured via `docker history` plus an isolated `apt-get install -s
-//! ffmpeg` on a clean base, Ubuntu's `ffmpeg` package pulled a full
-//! GPU/video-transcoding dependency chain (mesa, LLVM, libx265, libplacebo,
-//! VA-API/OpenCL, X11 libs — none of it relevant to decoding a short
-//! spoken-word clip) accounting for roughly 250-300MB of the runtime
-//! image, entirely removable since this was the *only* thing using
-//! ffmpeg. See docs/decisions.md.
+//! Decodes announce audio fetched via URL (api.rs's `AnnounceRequest::url`)
+//! into WAV, using `symphonia`. See docs/decisions.md "Decoding announce
+//! audio: `symphonia`, not an `ffmpeg` subprocess".
 
 use crate::wav::build_wav;
 use std::fs::File;

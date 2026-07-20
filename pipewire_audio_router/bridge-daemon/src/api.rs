@@ -3,7 +3,7 @@
 
 use crate::airplay_source::AirplayHandle;
 use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
-use crate::config::{RaopOutputConfig, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
+use crate::config::{RaopEncryption, RaopOutputConfig, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
 use crate::outputs_store::OutputsStore;
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
@@ -15,6 +15,7 @@ use crate::rtp_source::{
     RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME,
 };
 use crate::sendspin_discovery::SharedSendspinDevices;
+use crate::settings_store::SharedSettings;
 use crate::sources_store::{RtpSourceConfig, SourcesStore};
 use axum::{
     extract::{FromRef, Path, Request, State},
@@ -42,7 +43,7 @@ pub type SharedSources = Arc<Mutex<SourcesStore>>;
 pub type SharedAirplay = Arc<tokio::sync::Mutex<Option<AirplayHandle>>>;
 
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
-/// change-notification channel (Section 8, routing.rs), the command sender for
+/// change-notification channel (routing.rs), the command sender for
 /// runtime module load/unload (pw_thread.rs), and the persistent outputs store.
 /// Existing handlers extract just the piece they need via `FromRef` — they
 /// don't need to know this type grew more fields.
@@ -71,6 +72,23 @@ pub struct AppState {
     /// name, reconciled onto the live graph so routing survives node reloads
     /// and device disappearance/reappearance.
     pub routing: SharedRouting,
+    /// Persistent sync/latency tuning (sync_settings.rs): the group presentation
+    /// lead + per-sendspin-device static delays.
+    pub sync_settings: crate::sync_settings::SharedSyncSettings,
+    /// General app settings (settings_store.rs): announce default duck, mDNS
+    /// discovery on/off, default RAOP latency for new outputs.
+    pub settings: SharedSettings,
+    /// Runtime mDNS on/off, driven by the discovery flag above.
+    pub discovery: crate::discovery_supervisor::DiscoverySupervisor,
+    /// Resolved connection details of auto-discovered RAOP receivers
+    /// (discovery.rs), so list_outputs can show their IP/Port/Encryption.
+    pub discovered: crate::discovery::SharedDiscovered,
+    /// Latency-alignment session manager (calibrate.rs) for the Align page.
+    pub align: crate::calibrate::AlignManager,
+    /// Add-on version string (main.rs `addon_version()`), for `/api/status`.
+    pub version: String,
+    /// Process start instant, for the `/api/status` uptime.
+    pub started: std::time::Instant,
 }
 
 impl FromRef<AppState> for SharedState {
@@ -102,6 +120,13 @@ pub fn router(
     sendspin_devices: SharedSendspinDevices,
     routing: SharedRouting,
     sendspin_control: crate::sendspin_volume::SharedSendspinControl,
+    sync_settings: crate::sync_settings::SharedSyncSettings,
+    settings: SharedSettings,
+    discovery: crate::discovery_supervisor::DiscoverySupervisor,
+    discovered: crate::discovery::SharedDiscovered,
+    align: crate::calibrate::AlignManager,
+    version: String,
+    started: std::time::Instant,
     static_dir: PathBuf,
 ) -> Router {
     let state = AppState {
@@ -117,13 +142,21 @@ pub fn router(
         sendspin_devices,
         routing,
         sendspin_control,
+        sync_settings,
+        settings,
+        discovery,
+        discovered,
+        align,
+        version,
+        started,
     };
     Router::new()
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))
         .route("/api/links", post(create_link))
         .route("/api/outputs", get(list_outputs).post(add_output))
-        .route("/api/outputs/:node_name", delete(remove_output))
+        .route("/api/outputs/:node_name", delete(remove_output).put(configure_output))
+        .route("/api/outputs/:node_name/latency", put(set_output_latency))
         .route("/api/source/airplay", get(get_airplay_source).put(set_airplay_source).delete(delete_airplay_source))
         .route("/api/source/airplay/clients", get(list_airplay_clients))
         .route("/api/source/airplay/clients/forget", post(forget_airplay_client))
@@ -134,6 +167,15 @@ pub fn router(
         .route("/api/source/rtp", get(get_rtp_source).put(set_rtp_source).delete(delete_rtp_source))
         .route("/api/sendspin/volumes", get(get_sendspin_volumes))
         .route("/api/sendspin/volume", put(set_sendspin_volume))
+        .route("/api/sendspin/delays", get(get_sendspin_delays))
+        .route("/api/sendspin/delay", put(set_sendspin_delay_handler))
+        .route("/api/sync/settings", get(get_sync_settings).put(set_sync_settings))
+        .route("/api/settings", get(get_settings).put(set_settings))
+        .route("/api/status", get(get_status))
+        .route("/api/align/groups", get(align_groups))
+        .route("/api/align", get(align_status).delete(align_stop))
+        .route("/api/align/start", post(align_start))
+        .route("/api/align/select", post(align_select))
         .route("/api/media_players", get(list_media_players))
         .route("/api/media_players/:node_id/volume", get(get_volume).post(set_volume))
         .route("/api/media_players/:node_id/announce", post(announce))
@@ -280,6 +322,9 @@ struct OutputInfo {
     ip: Option<String>,
     port: Option<u16>,
     encryption: Option<String>,
+    /// Per-output RAOP receiver latency in ms (`raop.latency.ms`); `None` = the
+    /// module default (1500 ms). Only meaningful for configured RAOP outputs.
+    latency_ms: Option<u16>,
 }
 
 /// Human name from a RAOP node name (`raop-out-living_room` -> `living room`).
@@ -307,24 +352,35 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
     // RAOP outputs referenced by saved routing intent (offline ones surface here).
     let intent_outputs: BTreeSet<String> =
         state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(RAOP_NODE_PREFIX)).collect();
+    // Resolved details of auto-discovered receivers (discovery.rs) — the source
+    // of IP/Port/Encryption for entries not in the store.
+    let discovered: BTreeMap<String, RaopOutputConfig> = state.discovered.lock_recover().clone();
 
-    // Union: present ∪ configured ∪ intent-referenced.
+    // Union: present ∪ configured ∪ discovered ∪ intent-referenced.
     let mut names: BTreeSet<String> = present.iter().cloned().collect();
     names.extend(configured.keys().cloned());
+    names.extend(discovered.keys().cloned());
     names.extend(intent_outputs);
+
+    // Per-output RAOP latency overrides (sync_settings.rs) — for configured AND
+    // discovered receivers alike, keyed by node name.
+    let raop_latencies = state.sync_settings.lock_recover().raop_latencies();
 
     let mut outputs: Vec<OutputInfo> = names
         .into_iter()
         .map(|node_name| {
-            let cfg = configured.get(&node_name);
+            // Prefer the manual store entry; fall back to discovery's resolved
+            // details so an auto-discovered receiver shows the same columns.
+            let cfg = configured.get(&node_name).or_else(|| discovered.get(&node_name));
             OutputInfo {
                 kind: "airplay",
                 present: present.contains(&node_name),
-                configured: cfg.is_some(),
+                configured: configured.contains_key(&node_name),
                 name: cfg.map(|c| c.name.clone()).unwrap_or_else(|| raop_display_name(&node_name)),
                 ip: cfg.map(|c| c.ip.clone()),
                 port: cfg.map(|c| c.port),
                 encryption: cfg.map(|c| c.encryption.as_pipewire_arg().to_string()),
+                latency_ms: raop_latencies.get(&node_name).copied(),
                 node_name,
             }
         })
@@ -350,6 +406,7 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             ip: None,
             port: None,
             encryption: None,
+            latency_ms: None,
             node_name,
         });
     }
@@ -368,7 +425,12 @@ async fn add_output(State(state): State<AppState>, Json(output): Json<RaopOutput
         return (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: format!("output '{}' already exists", output.name) }));
     }
 
-    let args = raop_module_args(&output);
+    // A new output inherits the global default latency (settings_store.rs) as its
+    // per-node override (sync_settings.rs); `None` keeps the module default. The
+    // per-output value is then tunable via PUT .../latency, uniform with sendspin.
+    let latency = state.settings.lock_recover().default_raop_latency_ms();
+
+    let args = raop_module_args(&output, latency);
     let (tx, rx) = oneshot::channel();
     if state
         .pw_cmd
@@ -383,7 +445,17 @@ async fn add_output(State(state): State<AppState>, Json(output): Json<RaopOutput
 
     match rx.await {
         Ok(Ok(())) => match state.store.lock_recover().add(output) {
-            Ok(()) => (StatusCode::CREATED, Json(OutputOpResponse { ok: true, message: format!("added output '{node_name}'") })),
+            Ok(()) => {
+                // Seed the per-node latency override so it shows in the UI and is
+                // reapplied on reload. Best-effort: a failure here doesn't undo the
+                // (already loaded + stored) output.
+                if latency.is_some() {
+                    if let Err(e) = state.sync_settings.lock_recover().set_raop_latency(&node_name, latency) {
+                        tracing::warn!("added '{node_name}' but failed to persist its latency: {e}");
+                    }
+                }
+                (StatusCode::CREATED, Json(OutputOpResponse { ok: true, message: format!("added output '{node_name}'") }))
+            }
             // Loaded but not persisted: works this session, wouldn't survive a
             // restart — report it rather than pretend clean success.
             Err(e) => (
@@ -443,6 +515,78 @@ async fn remove_output(State(state): State<AppState>, Path(node_name): Path<Stri
         tracing::warn!("removed output '{node_name}' but failed to drop its routing intent: {e}");
     }
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed output '{node_name}'") }))
+}
+
+#[derive(Deserialize)]
+struct ConfigureOutputRequest {
+    ip: String,
+    port: u16,
+    encryption: RaopEncryption,
+}
+
+/// Reconfigure a **manually-added** RAOP output's connection details (IP / port /
+/// encryption) and reload its module so the change takes effect. Auto-discovered
+/// receivers take these from mDNS and aren't editable here (→ 404). The display
+/// name is the output's identity (its node name keys routing/latency/etc.), so
+/// it isn't changed — remove and re-add to rename.
+async fn configure_output(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+    Json(req): Json<ConfigureOutputRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let Some(mut cfg) = state.store.lock_recover().get(&node_name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(OutputOpResponse {
+                ok: false,
+                message: format!("'{node_name}' is not a manually-added output (auto-discovered receivers take their settings from mDNS)"),
+            }),
+        );
+    };
+    cfg.ip = req.ip;
+    cfg.port = req.port;
+    cfg.encryption = req.encryption;
+
+    // Keep the output's current per-node latency override when rebuilding args.
+    let latency = state.sync_settings.lock_recover().raop_latency(&node_name);
+
+    // Reload the live module (unload + load) so the new details apply now.
+    let present = state.pw.lock_recover().nodes.values().any(|n| n.node_name == node_name);
+    if present {
+        let (tx, rx) = oneshot::channel();
+        if state.pw_cmd.send(PwCommand::Unload { node_name: node_name.clone(), reply: tx }).is_err() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+            );
+        }
+        let _ = rx.await;
+        let args = raop_module_args(&cfg, latency);
+        let (tx, rx) = oneshot::channel();
+        if state
+            .pw_cmd
+            .send(PwCommand::Load { node_name: node_name.clone(), module_name: RAOP_MODULE_NAME.to_string(), args, reply: tx })
+            .is_err()
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+            );
+        }
+        if let Ok(Err(e)) = rx.await {
+            return (StatusCode::BAD_GATEWAY, Json(OutputOpResponse { ok: false, message: format!("failed to reload with new settings: {e}") }));
+        }
+    }
+
+    if let Err(e) = state.store.lock_recover().update(cfg) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist settings: {e}") }),
+        );
+    }
+    // The reload minted a new node id; nudge the reconcilers to re-link/regroup.
+    let _ = state.changes.send(());
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("reconfigured '{node_name}'") }))
 }
 
 // ---- AirPlay-receive source -----------------------------------------------
@@ -924,7 +1068,316 @@ async fn set_sendspin_volume(
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
 
-/// One output the custom HA integration (Section 6/9) turns into a
+// ---- Sync tuning: group lead + per-device static delay -------------------
+//
+// The user-facing latency dials for group sync (sync_settings.rs). The group
+// lead is one daemon-wide value (raise it so the slowest member — e.g. a RAOP
+// receiver sharing a group's anchor — still plays in time; lower it for a
+// snappier start). The per-sendspin-device static delay trims one speaker that's
+// consistently early/late. RAOP's per-output counterpart is its `latency_ms`
+// (below), a module-load arg rather than a live push.
+
+#[derive(Serialize)]
+struct SyncSettingsInfo {
+    /// Group presentation lead in ms (sendspin `send_ahead`).
+    group_lead_ms: u32,
+}
+
+#[derive(Deserialize)]
+struct SetSyncSettingsRequest {
+    group_lead_ms: u32,
+}
+
+async fn get_sync_settings(State(state): State<AppState>) -> Json<SyncSettingsInfo> {
+    Json(SyncSettingsInfo { group_lead_ms: state.sync_settings.lock_recover().group_lead_ms() })
+}
+
+async fn set_sync_settings(
+    State(state): State<AppState>,
+    Json(req): Json<SetSyncSettingsRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if let Err(e) = state.sync_settings.lock_recover().set_group_lead_ms(req.group_lead_ms) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+    }
+    // Nudge the reconciler; it re-reads the lead each tick and restarts group
+    // servers so the new value takes effect promptly.
+    let _ = state.changes.send(());
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("group lead set to {} ms", req.group_lead_ms) }))
+}
+
+/// General app settings (settings_store.rs) — the Settings page's General
+/// section. Group lead lives on `/api/sync/settings` (it's sync-specific).
+#[derive(Serialize)]
+struct SettingsInfo {
+    default_duck: f32,
+    discovery_enabled: bool,
+    default_raop_latency_ms: Option<u16>,
+}
+
+/// Partial update: every field is optional so the UI can PATCH one knob at a
+/// time. `default_raop_latency_ms` distinguishes "not sent" (omitted) from
+/// "cleared" (JSON `null`) via a nested `Option<Option<..>>`.
+#[derive(Deserialize)]
+struct SetSettingsRequest {
+    #[serde(default)]
+    default_duck: Option<f32>,
+    #[serde(default)]
+    discovery_enabled: Option<bool>,
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    default_raop_latency_ms: Option<Option<u16>>,
+}
+
+/// serde helper: present-with-null → `Some(None)`, absent → `None`.
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(de)?))
+}
+
+fn settings_info(state: &AppState) -> SettingsInfo {
+    let s = state.settings.lock_recover();
+    SettingsInfo {
+        default_duck: s.default_duck(),
+        discovery_enabled: s.discovery_enabled(),
+        default_raop_latency_ms: s.default_raop_latency_ms(),
+    }
+}
+
+async fn get_settings(State(state): State<AppState>) -> Json<SettingsInfo> {
+    Json(settings_info(&state))
+}
+
+async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettingsRequest>) -> (StatusCode, Json<OutputOpResponse>) {
+    // Persist each provided field.
+    {
+        let mut s = state.settings.lock_recover();
+        if let Some(d) = req.default_duck {
+            if let Err(e) = s.set_default_duck(d) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            }
+        }
+        if let Some(ms) = req.default_raop_latency_ms {
+            if let Err(e) = s.set_default_raop_latency_ms(ms) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            }
+        }
+        if let Some(enabled) = req.discovery_enabled {
+            if let Err(e) = s.set_discovery_enabled(enabled) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            }
+        }
+    }
+    // Apply the discovery flag live (outside the settings lock). A spawn failure
+    // is reported but the flag stays persisted — it'll retry on next boot.
+    if let Some(enabled) = req.discovery_enabled {
+        if let Err(e) = state.discovery.set_enabled(enabled) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to apply discovery: {e}") }));
+        }
+    }
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "settings saved".to_string() }))
+}
+
+/// Diagnostics snapshot for the Diagnostics page's status header.
+#[derive(Serialize)]
+struct StatusInfo {
+    version: String,
+    uptime_secs: u64,
+    discovery_enabled: bool,
+    /// Live PipeWire graph node count (0 while the graph is empty/unconnected).
+    pipewire_nodes: usize,
+    /// Configured RAOP outputs in the store (excludes auto-discovered ones).
+    raop_outputs: usize,
+    /// mDNS-discovered sendspin devices currently tracked.
+    sendspin_devices: usize,
+    /// Persisted routing links (by stable name).
+    routes: usize,
+}
+
+async fn get_status(State(state): State<AppState>) -> Json<StatusInfo> {
+    let pipewire_nodes = state.pw.lock_recover().nodes.len();
+    let raop_outputs = state.store.lock_recover().list().len();
+    let sendspin_devices = state.sendspin_devices.lock_recover().len();
+    let routes = state.routing.lock_recover().links().count();
+    Json(StatusInfo {
+        version: state.version.clone(),
+        uptime_secs: state.started.elapsed().as_secs(),
+        discovery_enabled: state.discovery.is_running(),
+        pipewire_nodes,
+        raop_outputs,
+        sendspin_devices,
+        routes,
+    })
+}
+
+// ---- Latency alignment (calibrate.rs) -----------------------------------
+
+/// Alignable groups (a source-set with its present members), for the picker.
+async fn align_groups(State(state): State<AppState>) -> Json<Vec<crate::calibrate::AlignGroup>> {
+    Json(state.align.groups().await)
+}
+
+/// Current calibration state (active session or not).
+async fn align_status(State(state): State<AppState>) -> Json<crate::calibrate::AlignState> {
+    Json(state.align.status().await)
+}
+
+#[derive(Deserialize)]
+struct AlignStartRequest {
+    /// Source node names identifying the group to align (its stable identity).
+    sources: Vec<String>,
+}
+
+async fn align_start(
+    State(state): State<AppState>,
+    Json(req): Json<AlignStartRequest>,
+) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+    state
+        .align
+        .start(req.sources)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+}
+
+#[derive(Deserialize)]
+struct AlignSelectRequest {
+    /// Member kept audible as the fixed reference.
+    reference: String,
+    /// Member being tuned (audible alongside the reference).
+    target: String,
+}
+
+async fn align_select(
+    State(state): State<AppState>,
+    Json(req): Json<AlignSelectRequest>,
+) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+    state
+        .align
+        .select(req.reference, req.target)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+}
+
+/// Stop the session, restoring every member's volume.
+async fn align_stop(State(state): State<AppState>) -> Json<crate::calibrate::AlignState> {
+    Json(state.align.stop().await)
+}
+
+#[derive(Deserialize)]
+struct SetSendspinDelayRequest {
+    /// Virtual device node name, e.g. `sendspin-dev-voice_pe_kitchen`.
+    node_name: String,
+    /// Static delay in ms (0–5000); `0` clears it.
+    delay_ms: u16,
+}
+
+async fn get_sendspin_delays(State(state): State<AppState>) -> Json<std::collections::HashMap<String, u16>> {
+    Json(state.sendspin_control.lock().await.delays())
+}
+
+async fn set_sendspin_delay_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SetSendspinDelayRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    // Persist first (a calibrated offset must survive restarts), then push live.
+    if let Err(e) = state.sync_settings.lock_recover().set_sendspin_delay(&req.node_name, req.delay_ms) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist delay: {e}") }));
+    }
+    let reached = state.sendspin_control.lock().await.set_delay(&req.node_name, req.delay_ms).await;
+    let ms = req.delay_ms.min(5000);
+    let message = if reached {
+        format!("set '{}' static delay to {ms} ms", req.node_name)
+    } else {
+        format!("saved {ms} ms for '{}' (device not connected)", req.node_name)
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+}
+
+#[derive(Deserialize)]
+struct SetOutputLatencyRequest {
+    /// RAOP receiver latency in ms; `null`/omitted resets to the module default.
+    latency_ms: Option<u16>,
+}
+
+/// Set a RAOP output's `raop.latency.ms` (the per-output group-sync knob) — for
+/// **both** manually-added and auto-discovered receivers. The value is persisted
+/// per node name in sync_settings.rs; a **configured** output is reloaded here
+/// immediately, while a **discovered** one is reloaded by the discovery loop
+/// within a tick (it owns discovered receivers, so we must not reload behind its
+/// back). `latency_ms: null` clears the override (back to the module default).
+async fn set_output_latency(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+    Json(req): Json<SetOutputLatencyRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if !node_name.starts_with(RAOP_NODE_PREFIX) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not a RAOP output") }),
+        );
+    }
+
+    // Persist the per-node override first — the source of truth both the reload
+    // below and the discovery loop read from.
+    if let Err(e) = state.sync_settings.lock_recover().set_raop_latency(&node_name, req.latency_ms) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist latency: {e}") }),
+        );
+    }
+
+    let configured = state.store.lock_recover().get(&node_name);
+    let latency_label = match req.latency_ms {
+        Some(ms) => format!("{ms} ms"),
+        None => "default".to_string(),
+    };
+
+    // A configured (store-managed) output isn't owned by discovery, so reload it
+    // here for an immediate effect. A discovered output is left to discovery.
+    if let Some(cfg) = configured {
+        let present = state.pw.lock_recover().nodes.values().any(|n| n.node_name == node_name);
+        if present {
+            let (tx, rx) = oneshot::channel();
+            if state.pw_cmd.send(PwCommand::Unload { node_name: node_name.clone(), reply: tx }).is_err() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+                );
+            }
+            let _ = rx.await;
+            let args = raop_module_args(&cfg, req.latency_ms);
+            let (tx, rx) = oneshot::channel();
+            if state
+                .pw_cmd
+                .send(PwCommand::Load { node_name: node_name.clone(), module_name: RAOP_MODULE_NAME.to_string(), args, reply: tx })
+                .is_err()
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
+                );
+            }
+            if let Ok(Err(e)) = rx.await {
+                return (StatusCode::BAD_GATEWAY, Json(OutputOpResponse { ok: false, message: format!("failed to reload with new latency: {e}") }));
+            }
+        }
+        // The reload minted a new node id; nudge the reconcilers to re-link/regroup.
+        let _ = state.changes.send(());
+        return (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' latency to {latency_label}") }));
+    }
+
+    // Discovered / not currently configured: persisted; discovery applies it on
+    // its next tick (or when the device next announces).
+    (
+        StatusCode::OK,
+        Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' latency to {latency_label} (applies shortly)") }),
+    )
+}
+
+/// One output the custom HA integration turns into a
 /// `media_player` entity: derived from the live registry, not from the
 /// add-on's static config, so it only lists outputs PipeWire actually
 /// created (a misconfigured RAOP device that never loaded still won't
@@ -936,9 +1389,9 @@ struct MediaPlayerInfo {
     node_name: String,
     /// "playing" if any link currently feeds this node, "idle" otherwise
     /// (pw_thread.rs's `node_has_incoming_link`) — there is no richer
-    /// PipeWire-native concept of "paused" for a passive routing sink;
-    /// see PLAN.md Section 6 for why this entity's state model is
-    /// necessarily simpler than a real playback device's.
+    /// PipeWire-native concept of "paused" for a passive routing sink, so
+    /// this entity's state model is necessarily simpler than a real
+    /// playback device's.
     state: &'static str,
     /// Included inline (read natively from the node's Props param, volume.rs)
     /// rather than requiring the HA integration to make a second request
@@ -998,7 +1451,7 @@ async fn set_volume(Path(node_id): Path<u32>, Json(req): Json<SetVolumeRequest>)
     }
 }
 
-/// TTS/voice-response ducked announce stream (PLAN.md Section 5.6). Ducks
+/// TTS/voice-response ducked announce stream. Ducks
 /// every source currently linked into this sink by setting their **node**
 /// volume (not link volume — PipeWire Links have no Props/gain stage at
 /// all, only a Format param; disproven empirically in
@@ -1008,29 +1461,22 @@ async fn set_volume(Path(node_id): Path<u32>, Json(req): Json<SetVolumeRequest>)
 /// announce error can never leave music stuck at duck volume.
 ///
 /// The announce audio itself comes from exactly one of two mutually
-/// exclusive sources — **additive**, not a v1→v2 migration (Phase 3.5):
-/// - `url` (**v1**, unchanged): a rendered TTS clip fetched over HTTP
-///   (LAN-local, e.g. HA's own `tts` integration), decoded to WAV via
-///   `decode.rs` (pure-Rust `symphonia` — pw-cat/libsndfile can't decode
-///   compressed formats like mp3 itself, and shelling out to `ffmpeg` for
-///   this used to pull ~250-300MB of unrelated GPU/video-transcoding
-///   system dependencies into the runtime image for no benefit here).
-/// - `wyoming` (**v2**, new): synthesized directly against a local
-///   Wyoming TTS server (e.g. Piper, see wyoming.rs), skipping the
-///   render-to-file-then-HTTP-fetch round trip for lower first-audible-
-///   word latency. Whichever caller wants this picks it per call — HA's
-///   `tts.speak` keeps using `url` exactly as before; nothing is forced
-///   to switch.
+/// exclusive sources; the caller picks one per call:
+/// - `url`: a rendered TTS clip fetched over HTTP (LAN-local, e.g. HA's own
+///   `tts` integration), decoded to WAV via `decode.rs`.
+/// - `wyoming`: synthesized directly against a local Wyoming TTS server
+///   (e.g. Piper, see wyoming.rs), skipping the render-to-file-then-HTTP-
+///   fetch round trip for lower first-audible-word latency.
 #[derive(Deserialize)]
 struct AnnounceRequest {
     url: Option<String>,
     wyoming: Option<WyomingAnnounceRequest>,
     /// 0.0-1.0, the level surviving sources are ducked to while the
-    /// announce plays. Defaults to a level that keeps music audibly
-    /// present but subordinate, matching Section 5.6's "ducked, not
-    /// silenced" design.
-    #[serde(default = "default_duck_volume")]
-    duck_volume: f32,
+    /// announce plays. Omitted → the global default (settings_store.rs),
+    /// which keeps music audibly present but subordinate, matching Section
+    /// 5.6's "ducked, not silenced" design.
+    #[serde(default)]
+    duck_volume: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1044,10 +1490,6 @@ struct WyomingAnnounceRequest {
     voice: Option<String>,
 }
 
-fn default_duck_volume() -> f32 {
-    0.25
-}
-
 fn default_wyoming_port() -> u16 {
     10200
 }
@@ -1059,10 +1501,13 @@ struct AnnounceResponse {
 }
 
 async fn announce(
-    State(pw_state): State<SharedState>,
+    State(state): State<AppState>,
     Path(node_id): Path<u32>,
     Json(req): Json<AnnounceRequest>,
 ) -> (StatusCode, Json<AnnounceResponse>) {
+    let pw_state = &state.pw;
+    // Fall back to the configured global default when the caller omits a level.
+    let duck_volume = req.duck_volume.unwrap_or_else(|| state.settings.lock_recover().default_duck());
     let (target_name, source_node_ids): (String, Vec<u32>) = {
         let state = pw_state.lock_recover();
         match state.nodes.get(&node_id) {
@@ -1136,7 +1581,7 @@ async fn announce(
             }
         }
     } else if let Some(w) = wyoming_req {
-        // No ffmpeg decode step needed here — we build the WAV ourselves
+        // No decode step needed here — we build the WAV ourselves
         // from the exact PCM format Wyoming reports (wyoming.rs).
         match crate::wyoming::synthesize_to_wav(&w.host, w.port, &w.text, w.voice.as_deref()).await {
             Ok(wav_bytes) => {
@@ -1157,7 +1602,7 @@ async fn announce(
     for &src_id in &source_node_ids {
         if let Ok(Some(vol)) = crate::volume::get_volume(src_id).await {
             original_volumes.push((src_id, vol));
-            let _ = crate::volume::set_volume(src_id, req.duck_volume).await;
+            let _ = crate::volume::set_volume(src_id, duck_volume).await;
         }
     }
 

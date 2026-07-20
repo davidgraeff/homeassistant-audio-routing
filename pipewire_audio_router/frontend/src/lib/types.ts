@@ -45,6 +45,9 @@ export interface OutputInfo {
   ip: string | null;
   port: number | null;
   encryption: string | null;
+  /** Per-output RAOP receiver latency in ms (`raop.latency.ms`); null = module
+   * default (1500 ms). Only meaningful for configured RAOP outputs. */
+  latency_ms: number | null;
 }
 
 export interface AddOutputRequest {
@@ -52,6 +55,83 @@ export interface AddOutputRequest {
   ip: string;
   port?: number;
   encryption?: Encryption;
+  latency_ms?: number | null;
+}
+
+export interface SyncSettingsInfo {
+  /** Group presentation lead in ms (sendspin `send_ahead`). */
+  group_lead_ms: number;
+}
+
+/** General, daemon-wide app settings (settings_store.rs) — the Settings page. */
+export interface AppSettings {
+  /** Level surviving sources duck to for an announce that omits its own (0–1). */
+  default_duck: number;
+  /** Runtime mDNS discovery on/off. */
+  discovery_enabled: boolean;
+  /** Default RAOP receiver latency (ms) stamped on new outputs; null = module
+   * default (1500 ms). */
+  default_raop_latency_ms: number | null;
+}
+
+/** Partial settings update; omitted fields are left unchanged. For
+ * `default_raop_latency_ms`, `null` clears it (back to the module default). */
+export type AppSettingsUpdate = Partial<AppSettings>;
+
+/** Diagnostics status snapshot (`/api/status`). */
+export interface StatusInfo {
+  version: string;
+  uptime_secs: number;
+  /** Whether mDNS discovery is running right now. */
+  discovery_enabled: boolean;
+  /** Live PipeWire graph node count. */
+  pipewire_nodes: number;
+  /** Configured RAOP outputs in the store (excludes auto-discovered). */
+  raop_outputs: number;
+  /** mDNS-discovered sendspin devices currently tracked. */
+  sendspin_devices: number;
+  /** Persisted routing links. */
+  routes: number;
+}
+
+// ---- Latency alignment (calibrate.rs) -----------------------------------
+
+export type AlignMemberKind = 'sendspin' | 'raop';
+
+export interface AlignMember {
+  node_name: string;
+  kind: AlignMemberKind;
+  /** Live PipeWire node id (RAOP only); null for virtual sendspin devices. */
+  node_id: number | null;
+}
+
+/** An alignable sync group (a source-set with its present members). */
+export interface AlignGroup {
+  sources: string[];
+  members: AlignMember[];
+}
+
+/** Current calibration session state (`/api/align`). */
+export interface AlignState {
+  active: boolean;
+  sources: string[];
+  /** The fixed member everything is aligned against. */
+  reference: string | null;
+  /** The member currently being tuned (audible alongside the reference). */
+  target: string | null;
+  members: AlignMember[];
+}
+
+/** One live PipeWire node (`/api/nodes`). */
+export interface NodeInfo {
+  node_id: number;
+  node_name: string;
+  media_class: string | null;
+}
+
+export interface NodesResponse {
+  nodes: NodeInfo[];
+  ports: unknown[];
 }
 
 export interface AirplaySourceInfo {

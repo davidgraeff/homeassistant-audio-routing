@@ -131,8 +131,8 @@
     await refresh();
   }
 
-  async function saveAirplay(e: Event) {
-    e.preventDefault();
+  async function saveAirplay(e?: Event) {
+    e?.preventDefault();
     busy = true;
     const trimmed = airplayName.trim();
     const ok = await run(
@@ -159,8 +159,8 @@
     return { sourceAddr: '0.0.0.0', ignoreSsrc: true };
   }
 
-  async function saveRtp(e: Event) {
-    e.preventDefault();
+  async function saveRtp(e?: Event) {
+    e?.preventDefault();
     busy = true;
     const { sourceAddr, ignoreSsrc } = rtpModeToParams();
     const where = rtpMode === 'multicast' ? sourceAddr : rtpMode === 'single' ? 'single sender' : 'any sender';
@@ -178,68 +178,83 @@
 </script>
 
 <div class="card">
-  <h2>AirPlay-receive source</h2>
+  <div class="card-head">
+    <h2>AirPlay-receive source</h2>
+    {#if airplay.name}
+      <button class="toggle off" type="button" onclick={disableAirplay} disabled={busy}>Disable</button>
+    {:else}
+      <button class="toggle on" type="button" onclick={() => saveAirplay()} disabled={busy || !airplayName.trim()}>Enable</button>
+    {/if}
+  </div>
   <p class="card-sub">
-    A single AirPlay target that phones/PCs can cast into. Clear the name to disable it. Raise the
-    jitter buffer if playback stutters — it trades latency for smoother audio. Enable "auth-setup" only
-    if a sender refuses to connect unencrypted (it broadens compatibility but changes how PipeWire
-    senders negotiate).
+    A single AirPlay target that phones and PCs can cast into. Give it a service name and Save, then use
+    the button in the corner to turn it on or off. Encryption compatibility and takeover policy live under
+    Advanced.
   </p>
   <form onsubmit={saveAirplay}>
-    <div class="row">
-      <div class="grow field">
-        <label for="ap-name">Service name</label>
-        <input id="ap-name" type="text" bind:value={airplayName} placeholder="PipeWire Router" />
+    <div class="field">
+      <label for="ap-name">Service name</label>
+      <input id="ap-name" type="text" bind:value={airplayName} placeholder="PipeWire Router" />
+    </div>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <div class="row">
+        <div class="field">
+          <label for="ap-latency">Jitter buffer (ms)</label>
+          <input id="ap-latency" type="number" min="20" max="2000" step="10" bind:value={airplayLatency} placeholder="150" />
+          <span class="hint">Raise if playback stutters — trades latency for smoother audio.</span>
+        </div>
+        <div class="field grow">
+          <label class="check">
+            <input id="ap-auth" type="checkbox" bind:checked={airplayAuthSetup} />
+            Auth-setup
+          </label>
+          <span class="hint">Advertises the auth-setup encryption mode (et=0,4). Enable only if a sender refuses to connect unencrypted — it broadens compatibility but changes how PipeWire senders negotiate.</span>
+        </div>
+        <div class="field grow">
+          <label class="check">
+            <input id="ap-takeover" type="checkbox" bind:checked={airplayPreventTakeover} onchange={savePreventTakeover} />
+            Prevent takeover
+          </label>
+          <span class="hint">Refuse a new sender while one is already streaming (applied live, no restart).</span>
+        </div>
       </div>
-      <div class="field">
-        <label for="ap-latency">Jitter buffer (ms)</label>
-        <input id="ap-latency" type="number" min="20" max="2000" step="10" bind:value={airplayLatency} placeholder="150" />
-      </div>
-      <div class="field">
-        <label for="ap-auth" title="Advertise the auth-setup encryption mode (et=0,4)">Auth-setup</label>
-        <input id="ap-auth" type="checkbox" bind:checked={airplayAuthSetup} />
-      </div>
-      <div class="field">
-        <label for="ap-takeover" title="Refuse a new sender while one is already streaming (applied live, no restart)">
-          Prevent takeover
-        </label>
-        <input id="ap-takeover" type="checkbox" bind:checked={airplayPreventTakeover} onchange={savePreventTakeover} />
-      </div>
-      <div class="field"><button class="primary" type="submit" disabled={busy}>Save</button></div>
-      <div class="field">
-        <button class="ghost" type="button" onclick={disableAirplay} disabled={busy || !airplay.name}>Disable</button>
+    </details>
+
+    <div class="status-bar">
+      <p class="status">
+        Status:
+        {#if airplay.name}
+          <span class="badge {airplay.running ? 'on' : 'off'}">{airplay.running ? 'running' : 'stopped'}</span>
+          as <strong>{airplay.name}</strong>
+          {#if connectedClients.length}
+            — <span class="badge on">streaming</span>
+            from
+            <strong>{connectedClients.map(clientLabel).join(', ')}</strong>
+          {:else}
+            — <span class="badge off">no client</span>
+          {/if}
+        {:else}
+          <span class="badge off">disabled</span>
+        {/if}
+      </p>
+      <div class="status-actions">
+        <button class="ghost" type="button" onclick={() => { showManage = true; refreshClients(); }}>
+          Manage connections{#if clients.length}&nbsp;({clients.length}){/if}
+        </button>
+        <button class="primary" type="submit" disabled={busy}>Save</button>
       </div>
     </div>
   </form>
-  <div class="row" style="align-items:center; gap:0.75rem">
-    <p class="muted" style="font-size:0.85rem; margin:0; flex:1 1 auto">
-      Status:
-      {#if airplay.name}
-        <span class="badge {airplay.running ? 'on' : 'off'}">{airplay.running ? 'running' : 'stopped'}</span>
-        as <strong>{airplay.name}</strong>
-        {#if connectedClients.length}
-          — <span class="badge on">streaming</span>
-          from
-          <strong>{connectedClients.map(clientLabel).join(', ')}</strong>
-        {:else}
-          — <span class="badge off">no client</span>
-        {/if}
-      {:else}
-        <span class="badge off">disabled</span>
-      {/if}
-    </p>
-    <button class="ghost" type="button" onclick={() => { showManage = true; refreshClients(); }}>
-      Manage connections{#if clients.length}&nbsp;({clients.length}){/if}
-    </button>
-  </div>
 </div>
 
 {#if showManage}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="modal-backdrop" onclick={() => (showManage = false)}>
     <div class="modal-card card" onclick={(e) => e.stopPropagation()}>
-      <div class="row" style="align-items:center; justify-content:space-between">
-        <h2 style="margin:0">AirPlay connections</h2>
+      <div class="card-head">
+        <h2>AirPlay connections</h2>
         <button class="ghost" type="button" onclick={() => (showManage = false)}>Close</button>
       </div>
       <p class="card-sub">
@@ -313,26 +328,24 @@
 {/if}
 
 <div class="card">
-  <h2>Bluetooth bridge (RTP) source</h2>
+  <div class="card-head">
+    <h2>RTP-receive source</h2>
+    {#if rtp.enabled}
+      <button class="toggle off" type="button" onclick={disableRtp} disabled={busy}>Disable</button>
+    {:else}
+      <button class="toggle on" type="button" onclick={() => saveRtp()} disabled={busy}>Enable</button>
+    {/if}
+  </div>
   <p class="card-sub">
-    Receives the RTP audio stream from the ESP32 Bluetooth bridge firmware and exposes it as a routable
-    source. The listen port must match the port the firmware sends to. Raise the jitter buffer if a
-    weak-signal bridge stutters — it trades latency for dropout tolerance.
+    Receives an RTP/UDP audio stream and exposes it as a routable source. Feed it from the ESP32
+    Bluetooth bridge, a Raspberry Pi Bluetooth bridge, or any PipeWire installation running
+    <code>module-rtp-sink</code> — they all land on the same <code>bt-bridge-rtp</code> node, so the
+    add-on needs no change to accept either. The listen port must match the port the sender targets.
   </p>
   <form onsubmit={saveRtp}>
-    <div class="row">
-      <div class="field">
-        <label for="rtp-port">Listen port</label>
-        <input id="rtp-port" type="number" min="1" max="65535" bind:value={rtpPort} placeholder="46000" />
-      </div>
-      <div class="field">
-        <label for="rtp-latency">Jitter buffer (ms)</label>
-        <input id="rtp-latency" type="number" min="20" max="2000" step="10" bind:value={rtpLatency} placeholder="200" />
-      </div>
-      <div class="field"><button class="primary" type="submit" disabled={busy}>Enable</button></div>
-      <div class="field">
-        <button class="ghost" type="button" onclick={disableRtp} disabled={busy || !rtp.enabled}>Disable</button>
-      </div>
+    <div class="field">
+      <label for="rtp-port">Listen port</label>
+      <input id="rtp-port" type="number" min="1" max="65535" bind:value={rtpPort} placeholder="46000" />
     </div>
     <fieldset class="rtp-source">
       <legend>Source</legend>
@@ -364,26 +377,135 @@
         </div>
       {/if}
     </fieldset>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <div class="field">
+        <label for="rtp-latency">Jitter buffer (ms)</label>
+        <input id="rtp-latency" type="number" min="20" max="2000" step="10" bind:value={rtpLatency} placeholder="200" />
+        <span class="hint">Raise if a weak-signal bridge stutters — trades latency for dropout tolerance.</span>
+      </div>
+    </details>
+
+    <div class="status-bar">
+      <p class="status">
+        Status:
+        {#if rtp.enabled}
+          <span class="badge {rtp.loaded ? 'on' : 'off'}">{rtp.loaded ? 'loaded' : 'not loaded'}</span>
+          on <strong>:{rtp.port}</strong>, <strong>{rtp.latency_msec} ms</strong> buffer —
+          {#if rtp.source_addr !== '0.0.0.0'}
+            multicast <strong>{rtp.source_addr}</strong>
+          {:else if rtp.ignore_ssrc}
+            <strong>any sender</strong>
+          {:else}
+            <strong>single sender</strong>
+          {/if}
+        {:else}
+          <span class="badge off">disabled</span>
+        {/if}
+      </p>
+      <div class="status-actions">
+        <button class="primary" type="submit" disabled={busy}>Save</button>
+      </div>
+    </div>
   </form>
-  <p class="muted" style="font-size:0.85rem; margin:0">
-    Status:
-    {#if rtp.enabled}
-      <span class="badge {rtp.loaded ? 'on' : 'off'}">{rtp.loaded ? 'loaded' : 'not loaded'}</span>
-      on <strong>:{rtp.port}</strong>, <strong>{rtp.latency_msec} ms</strong> buffer —
-      {#if rtp.source_addr !== '0.0.0.0'}
-        multicast <strong>{rtp.source_addr}</strong>
-      {:else if rtp.ignore_ssrc}
-        <strong>any sender</strong>
-      {:else}
-        <strong>single sender</strong>
-      {/if}
-    {:else}
-      <span class="badge off">disabled</span>
-    {/if}
-  </p>
 </div>
 
 <style>
+  /* Card header: title on the left, the master enable/disable toggle top-right. */
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .card-head h2 {
+    margin: 0;
+  }
+
+  /* Master on/off toggle — green to enable, red to disable. */
+  button.toggle {
+    color: #fff;
+    border-color: transparent;
+    flex: 0 0 auto;
+  }
+  button.toggle.on {
+    background: var(--success-color);
+  }
+  button.toggle.off {
+    background: var(--error-color);
+  }
+
+  /* Collapsible advanced block, hidden by default. */
+  details.advanced {
+    margin-top: 12px;
+    border-top: 1px solid var(--divider-color);
+    padding-top: 12px;
+  }
+  details.advanced > summary {
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--secondary-text-color);
+    list-style: none;
+    user-select: none;
+  }
+  details.advanced > summary::-webkit-details-marker {
+    display: none;
+  }
+  details.advanced > summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 0.15s;
+  }
+  details.advanced[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  details.advanced > summary + * {
+    margin-top: 12px;
+  }
+  details.advanced .field {
+    margin-bottom: 0;
+  }
+  label.check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 0;
+  }
+  label.check input {
+    width: auto;
+  }
+  .hint {
+    display: block;
+    margin-top: 4px;
+    font-size: 0.78rem;
+    color: var(--secondary-text-color);
+  }
+
+  /* Bottom bar: live status on the left, Save (and Manage) on the right. */
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--divider-color);
+  }
+  .status-bar .status {
+    flex: 1 1 auto;
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--secondary-text-color);
+  }
+  .status-bar .status-actions {
+    display: flex;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+
   .modal-backdrop {
     position: fixed;
     inset: 0;
@@ -423,8 +545,8 @@
     width: 4rem;
   }
   fieldset.rtp-source {
-    margin: 0.75rem 0 0;
-    padding: 0.5rem 0.75rem 0.75rem;
+    margin: 12px 0 0;
+    padding: 8px 12px 12px;
     border: 1px solid var(--divider-color);
     border-radius: 6px;
   }

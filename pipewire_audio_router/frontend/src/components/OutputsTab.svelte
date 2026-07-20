@@ -13,16 +13,45 @@
   let port = $state<number | ''>('');
   let encryption = $state<Encryption>('auth_setup');
 
+  // Per-device sync tuning: static delays (sendspin) and per-output receiver
+  // latency (RAOP). The daemon-wide group lead lives on the Settings tab.
+  // Per-row editable sync value (ms): RAOP latency or sendspin static delay.
+  let edit = $state<Record<string, number | ''>>({});
+
   async function refresh() {
     loading = true;
     try {
-      outputs = await api.outputs();
+      const [outs, delays] = await Promise.all([
+        api.outputs(),
+        api.sendspinDelays().catch(() => ({}) as Record<string, number>),
+      ]);
+      outputs = outs;
+      // Seed the editable sync fields from current state.
+      const next: Record<string, number | ''> = {};
+      for (const o of outs) {
+        if (o.kind === 'sendspin') next[o.node_name] = delays[o.node_name] ?? 0;
+        else next[o.node_name] = o.latency_ms ?? '';
+      }
+      edit = next;
     } catch {
       outputs = [];
     }
     loading = false;
   }
   onMount(refresh);
+
+  // Apply the per-row sync value: RAOP → receiver latency, sendspin → static delay.
+  async function applySync(o: OutputInfo) {
+    const v = edit[o.node_name];
+    if (o.kind === 'sendspin') {
+      const ms = v === '' ? 0 : Number(v);
+      if (await run(() => api.setSendspinDelay(o.node_name, ms), `Set '${o.name}' delay to ${ms} ms`))
+        await refresh();
+    } else {
+      const ms = v === '' ? null : Number(v);
+      if (await run(() => api.setOutputLatency(o.node_name, ms), `Set '${o.name}' latency`)) await refresh();
+    }
+  }
 
   async function add(e: Event) {
     e.preventDefault();
@@ -53,6 +82,36 @@
       return;
     if (await run(() => api.removeOutput(o.node_name), `Removed '${o.name}'`)) await refresh();
   }
+
+  // Configure modal for a manually-added output (IP / port / encryption).
+  let configuring = $state<OutputInfo | null>(null);
+  let cfgIp = $state('');
+  let cfgPort = $state<number | ''>('');
+  let cfgEnc = $state<Encryption>('auth_setup');
+  let cfgBusy = $state(false);
+
+  function openConfigure(o: OutputInfo) {
+    configuring = o;
+    cfgIp = o.ip ?? '';
+    cfgPort = o.port ?? '';
+    cfgEnc = (o.encryption as Encryption) ?? 'auth_setup';
+  }
+
+  async function saveConfigure(e: Event) {
+    e.preventDefault();
+    if (!configuring || !cfgIp.trim() || cfgPort === '') return;
+    cfgBusy = true;
+    const target = configuring;
+    const ok = await run(
+      () => api.configureOutput(target.node_name, { ip: cfgIp.trim(), port: Number(cfgPort), encryption: cfgEnc }),
+      `Reconfigured '${target.name}'`,
+    );
+    cfgBusy = false;
+    if (ok) {
+      configuring = null;
+      await refresh();
+    }
+  }
 </script>
 
 <div class="card info">
@@ -62,7 +121,7 @@
     speakers) and <strong>Sendspin</strong> speakers — the open multi-room protocol used by ESPHome and
     Home Assistant Voice PE. Compatible devices on your network are discovered automatically and appear
     below and in the routing matrix; you don't need to configure anything. Route one source to several
-    Sendspin devices and they play in a synchronized group.
+    Sendspin devices — or a mix of Sendspin and AirPlay — and they play in one synchronized group.
   </p>
 </div>
 
@@ -85,7 +144,7 @@
     <div style="overflow-x:auto">
       <table>
         <thead>
-          <tr><th>Name</th><th>Type</th><th>IP</th><th>Port</th><th>Encryption</th><th>Status</th><th></th></tr>
+          <tr><th>Name</th><th>Type</th><th>IP</th><th>Port</th><th>Encryption</th><th>Sync offset</th><th>Status</th><th></th></tr>
         </thead>
         <tbody>
           {#each outputs as o (o.node_name)}
@@ -98,9 +157,40 @@
               <td>{#if o.ip}<code>{o.ip}</code>{:else}—{/if}</td>
               <td>{o.port ?? '—'}</td>
               <td>{o.encryption ?? '—'}</td>
+              <td>
+                {#if o.kind === 'sendspin'}
+                  <div class="sync-cell">
+                    <input
+                      type="number"
+                      min="0"
+                      max="5000"
+                      step="10"
+                      bind:value={edit[o.node_name]}
+                      title="Static delay in ms (0 = none)"
+                    />
+                    <button onclick={() => applySync(o)} title="Apply static delay">Set</button>
+                  </div>
+                {:else}
+                  <div class="sync-cell">
+                    <input
+                      type="number"
+                      min="0"
+                      max="5000"
+                      step="10"
+                      bind:value={edit[o.node_name]}
+                      placeholder="1500"
+                      title="RAOP receiver latency in ms (blank = module default 1500)"
+                    />
+                    <button onclick={() => applySync(o)} title="Apply latency (reloads the sink)">Set</button>
+                  </div>
+                {/if}
+              </td>
               <td><span class="badge {o.present ? 'on' : 'off'}">{o.present ? 'online' : 'offline'}</span></td>
-              <td style="text-align:right">
+              <td style="text-align:right; white-space:nowrap">
                 {#if o.kind === 'airplay'}
+                  {#if o.configured}
+                    <button class="ghost" onclick={() => openConfigure(o)}>Configure</button>
+                  {/if}
                   <button class="danger" onclick={() => remove(o)}>Remove</button>
                 {/if}
               </td>
@@ -148,6 +238,46 @@
   </form>
 </div>
 
+{#if configuring}
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => (configuring = null)}>
+    <div class="modal-card card" onclick={(e) => e.stopPropagation()}>
+      <div class="card-head">
+        <h2>Configure '{configuring.name}'</h2>
+        <button class="ghost" type="button" onclick={() => (configuring = null)}>Close</button>
+      </div>
+      <p class="card-sub">
+        Connection settings for this manually-added AirPlay receiver. Saving reloads its sink so the change
+        takes effect immediately. To rename it, remove and re-add it (the name is its identity).
+      </p>
+      <form onsubmit={saveConfigure}>
+        <div class="row">
+          <div class="grow field">
+            <label for="cfg-ip">IP address</label>
+            <input id="cfg-ip" type="text" bind:value={cfgIp} placeholder="192.168.1.50" required />
+          </div>
+          <div class="field" style="flex:0 0 100px">
+            <label for="cfg-port">Port</label>
+            <input id="cfg-port" type="number" min="1" max="65535" bind:value={cfgPort} placeholder="7000" required />
+          </div>
+          <div class="field" style="flex:0 0 150px">
+            <label for="cfg-enc">Encryption</label>
+            <select id="cfg-enc" bind:value={cfgEnc}>
+              <option value="auth_setup">auth_setup</option>
+              <option value="RSA">RSA</option>
+              <option value="none">none</option>
+            </select>
+          </div>
+        </div>
+        <div class="row" style="justify-content:flex-end">
+          <button type="button" class="ghost" onclick={() => (configuring = null)}>Cancel</button>
+          <button class="primary" type="submit" disabled={cfgBusy || !cfgIp.trim() || cfgPort === ''}>Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
 <style>
   tr.offline td {
     opacity: 0.55;
@@ -156,5 +286,35 @@
     background: color-mix(in srgb, var(--primary-color) 18%, transparent);
     color: var(--primary-color);
     margin-left: 6px;
+  }
+  .sync-cell {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .sync-cell input {
+    width: 74px;
+  }
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 6vh 1rem 1rem;
+    z-index: 50;
+  }
+  .modal-card {
+    width: min(560px, 100%);
+    max-height: 84vh;
+    overflow: auto;
+    margin: 0;
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
   }
 </style>
