@@ -135,28 +135,36 @@ see `bridge-daemon/src/rtp_source.rs`.
 
 ### `GET /api/source/rtp`
 ```json
-{ "enabled": true, "port": 46000, "latency_msec": 200, "source_addr": "0.0.0.0", "loaded": true }
+{ "enabled": true, "port": 46000, "latency_msec": 200, "source_addr": "0.0.0.0", "ignore_ssrc": true, "loaded": true }
 ```
 `enabled` is whether it's on in the store; `port` is the stored UDP port (or
 the `46000` default when disabled); `latency_msec` is the receiver jitter
 buffer (raise on a weak link to trade latency for fewer dropouts);
 `source_addr` is the bind address — `0.0.0.0` for a normal unicast target, or
-a multicast group so several receivers share one bridge stream; `loaded` is
+a multicast group so several receivers share one bridge stream; `ignore_ssrc`
+is `sess.ignore-ssrc` (`true` accepts any sender on the port; `false` latches
+onto the first SSRC and rejects the rest — the "only one client" corruption
+guard, safe now the firmware sends a stable MAC-derived SSRC); `loaded` is
 whether the `bt-bridge-rtp` node is present in the live graph right now.
 
 ### `PUT /api/source/rtp`
 ```json
-// Request  (all but the daemon replaces the whole config; omitted fields default)
-{ "port": 46000, "latency_msec": 200, "source_addr": "239.255.42.42" }
+// Request  (the daemon replaces the whole config; omitted fields default)
+{ "port": 46000, "latency_msec": 200, "source_addr": "239.255.42.42", "ignore_ssrc": true }
 // Response
-{ "ok": true, "message": "RTP source enabled on 239.255.42.42:46000 (200 ms jitter buffer)" }
+{ "ok": true, "message": "RTP source enabled on 239.255.42.42:46000 (200 ms jitter buffer, any sender)" }
 ```
 Enables the source (or changes it): persists the config, then reloads the
 module (unload-then-load, so a change is a clean reload). Saved *before* the
 module is reconciled — if the load fails the setting still persists and the
 response is `ok: false` with the reason (502). Set `source_addr` to a
 multicast group (and point the firmware's RTP host at the same group) to fan
-one bridge stream out to several PipeWire hosts.
+one bridge stream out to several PipeWire hosts. Set `ignore_ssrc` to `false`
+to reject every sender but the first one seen (`true`, the default, accepts
+any). The add-on's web UI folds these two knobs into one "Source" radio —
+*Accept all senders* (`0.0.0.0`, `ignore_ssrc` true), *Only one client*
+(`0.0.0.0`, `ignore_ssrc` false), *Multicast group* (the group, `ignore_ssrc`
+true).
 
 ### `DELETE /api/source/rtp`
 Disables the source — unloads the module (its node disappears live) and clears

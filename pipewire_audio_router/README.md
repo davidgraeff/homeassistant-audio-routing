@@ -13,7 +13,7 @@ built this way, see [../docs/decisions.md](../docs/decisions.md).
 
 ## Installing
 
-This directory is a real HA add-on (`config.yaml` + `Dockerfile`), and
+This directory is a HA add-on (`config.yaml` + `Dockerfile`), and
 the repo root's `repository.yaml` makes the whole repo installable as an
 add-on repository:
 
@@ -31,16 +31,14 @@ add-on repository:
 
 There are **no add-on options** to fill in. Everything user-facing is
 configured at runtime via the daemon's REST API / web UI and persisted
-under `/data`, so it survives restarts. (Earlier versions had static
-`options.json` fields that only *seeded* these on first run and were then
-ignored — user testing found that confusing, so they were removed.)
+under `/data`, so it survives restarts.
 
 - **RAOP (AirPlay) outputs** — AV receivers this add-on streams *out* to
   (e.g. Yamaha/Pioneer). Managed via `/api/outputs`, and auto-discovered
   over mDNS. `port` defaults to `7000` (RAOP's advertised RTSP port is
   often *not* 5000); `encryption` defaults to `auth_setup` — the only mode
   that worked against real hardware tested here (`none`/`RSA` are
-  fallbacks, for a real reason — see
+  fallbacks, for a reason — see
   [decisions.md](../docs/decisions.md#raop-quirks-found-only-by-testing-against-real-hardware)).
 - **AirPlay-receive source** — the name phones/PCs cast *in* to. A single
   source, managed via `/api/source/airplay` (empty name = disabled).
@@ -49,9 +47,13 @@ ignored — user testing found that confusing, so they were removed.)
   exposes it as a routable source (`bt-bridge-rtp`). A single source,
   managed via `/api/source/rtp` (set the listen port to match the
   firmware; disabled by default). Loaded as a native PipeWire module like
-  RAOP outputs — not a subprocess.
-- **Sendspin outputs** — ESPHome speakers that connect *in* to this add-on
-  (no IP needed). Managed via `/api/sendspin_outputs`.
+  RAOP outputs.
+- **Sendspin outputs** — ESPHome speaker devices (e.g. HA Voice PE) that
+  connect *in* to this add-on (no IP needed). Auto-discovered over mDNS and
+  surfaced as virtual routing outputs; you route to them through the routing
+  matrix and set per-device volume via `/api/sendspin/volume`. Devices fed by
+  the same set of sources are automatically formed into one synchronized
+  group.
 
 See [Managing outputs at runtime](#managing-outputs-at-runtime) below and
 the [full API reference](../docs/api-reference.md).
@@ -63,8 +65,7 @@ RAOP outputs are hot-reloadable: the daemon loads one
 context at runtime, so adding or removing one doesn't restart PipeWire or
 interrupt audio on the other outputs (see
 [decisions.md](../docs/decisions.md#loading-pipewire-modules-at-runtime)
-for how this works, and why the old "requires a restart" limitation was a
-misreading). The set is persisted to `/data/raop-outputs.json`.
+for how this works). The set is persisted to `/data/raop-outputs.json`.
 
 ```bash
 # list outputs (and whether each is loaded right now)
@@ -86,27 +87,33 @@ Full endpoint reference (status codes, failure modes):
 
 - **PipeWire + WirePlumber**: the actual audio graph, on the Ubuntu 26.04
   LTS base validated in `spikes/01`–`04` (see repo-root `spikes/`).
-- **Bridge daemon** (`bridge-daemon/`, Rust): generates the static RAOP
-  `pipewire.conf.d` config, observes the live PipeWire registry on a
-  dedicated thread, and serves the REST/WebSocket API on `:8099`. Full
-  endpoint reference: [../docs/api-reference.md](../docs/api-reference.md).
-- **`sendspin-adapter.py`**: one process per configured sendspin output,
-  embedding `aiosendspin` and capturing PipeWire audio via `pw-record` to
-  push over the Sendspin WebSocket protocol to the real ESPHome device.
-- **`shairport-sync`**: the AirPlay-receive source, if
-  `airplay_source_name` isn't empty. Needs a real D-Bus system bus +
-  `avahi-daemon`, both started by `rootfs/run.sh` — see
-  [decisions.md](../docs/decisions.md#shairport-sync-needs-a-real-d-bus-system-bus--avahi).
+- **Bridge daemon** (`bridge-daemon/`, Rust): observes the live PipeWire
+  registry on a dedicated thread, serves the REST/WebSocket API on `:8099`,
+  and hosts everything user-configurable — RAOP outputs, the AirPlay
+  source, and sendspin outputs — in-process. Full endpoint reference:
+  [../docs/api-reference.md](../docs/api-reference.md).
+  - **Sendspin outputs**: an embedded sendspin server role
+    (`sendspin_server.rs`, vendored `sendspin-rs`) creates each sink node,
+    captures its PCM (`sendspin_capture.rs`), and pushes it over the
+    Sendspin WebSocket protocol to the ESPHome device.
+  - **AirPlay-receive source**: an embedded pure-Rust RAOP server
+    (`airplay_source.rs`, vendored `shairplay`) feeds decoded PCM into a
+    PipeWire source node the daemon owns (node `airplay-in`).
+  - **RTP (Bluetooth bridge) source**: a native PipeWire module, same as
+    RAOP outputs.
 
-Startup order (`rootfs/run.sh`): D-Bus system + session buses →
-`pipewire` → `wireplumber` → `avahi-daemon` → `bridge-daemon serve`. The
-daemon then loads a `raop-sink` module per stored RAOP output and
-spawns/supervises the source/adapter processes (`shairport-sync`,
-`sendspin-adapter.py`) from its own persisted `/data` stores — all
-reconfigurable live via the API (`/api/outputs`, `/api/source/airplay`,
-`/api/sendspin_outputs`), no restart. If a top-level component dies, the
-whole container exits so HA's supervisor restarts everything rather than
-limping along with a dead piece.
+  mDNS discovery and advertising (RAOP, AirPlay, sendspin) all use the
+  pure-Rust `mdns-sd` crate — no avahi or system D-Bus daemon involved.
+
+Startup order (`rootfs/run.sh`): D-Bus session bus → `pipewire` →
+`wireplumber` → `bridge-daemon serve`. The daemon then loads a `raop-sink`
+module per stored RAOP output and brings up the AirPlay and RTP sources from
+its persisted config; sendspin devices are discovered and grouped
+dynamically as they appear. It's all in-process and reconfigurable live via
+the API (`/api/outputs`, `/api/source/airplay`, `/api/source/rtp`,
+`/api/sendspin/volume`), no restart. If a top-level component dies, the whole
+container exits so HA's supervisor restarts everything rather than limping
+along with a dead piece.
 
 ## Web UI
 

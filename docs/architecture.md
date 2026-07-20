@@ -33,9 +33,7 @@ PipeWire `rtp-source` would do).
    - Phones/PCs stream to it as an AirPlay receiver. This is a **native,
      in-process** RAOP receiver (a vendored+patched pure-Rust `shairplay`
      crate, `airplay_source.rs`) whose decoded PCM is pushed through a
-     small jitter buffer into a PipeWire source node (`airplay-in`) —
-     **not** a `shairport-sync` subprocess (which had no PipeWire backend
-     in the Ubuntu build, so its audio never reached the graph). See
+     small jitter buffer into a PipeWire source node (`airplay-in`). See
      [decisions.md](decisions.md#native-airplay-receive-source-vendored-shairplay-not-shairport-sync).
    - The Bluetooth bridge box (a real ESP32 acting as a classic-Bluetooth
      A2DP sink) RTP-encodes what it receives and sends it to the
@@ -74,11 +72,10 @@ PipeWire `rtp-source` would do).
    registry on a dedicated thread (PipeWire's core types aren't `Send`)
    and exposes that state — plus native mutation endpoints (links via
    `Core::create_object`/`Registry::destroy_global`, volume via the node's
-   `Props` param, announce playback via a `pw::stream`; no subprocesses) —
-   over a REST + WebSocket API. There are **no subprocesses left** — the
-   AirPlay receiver, the Sendspin servers, and the RTP source all run
-   natively in-process, so `run.sh` is just infrastructure + the daemon.
-   Full endpoint reference: [api-reference.md](api-reference.md).
+   `Props` param, announce playback via a `pw::stream`) — over a REST +
+   WebSocket API. The AirPlay receiver, the Sendspin servers, and the RTP
+   source all run natively in-process, so `run.sh` is just infrastructure +
+   the daemon. Full endpoint reference: [api-reference.md](api-reference.md).
 5. **Home Assistant** talks to that API through the `custom_components`
    integration, which creates one `media_player` entity per routing-matrix
    **output** — RAOP receivers *and* discovered sendspin devices alike. The
