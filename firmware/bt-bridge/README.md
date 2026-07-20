@@ -75,11 +75,12 @@ The rest of this section is only needed if you're feeding a **standalone
 PipeWire session** (e.g. testing on a dev machine, not the add-on). The
 receiving end needs `libpipewire-module-rtp-source` configured to match
 what this firmware actually sends: **native-endian `S16LE`**, not RFC
-3551's big-endian `L16` convention, and `sess.ignore-ssrc = true` (this
-firmware picks a new random SSRC every boot — see
-[decisions.md](../../docs/decisions.md#bluetooth-bridge-box-hardware-and-firmware-constraints)
-for why that setting matters, not just what it does). Example
-`pipewire.conf.d` snippet:
+3551's big-endian `L16` convention. `sess.ignore-ssrc` may be either — the
+firmware now sends a **stable SSRC** derived from its factory MAC (see
+[decisions.md](../../docs/decisions.md#bluetooth-bridge-box-hardware-and-firmware-constraints)),
+so `false` (accept only the first sender's SSRC — a corruption guard against
+a stray/second sender) survives reboots. `true` (accept any sender) is the
+safe default kept below. Example `pipewire.conf.d` snippet:
 
 ```
 context.modules = [

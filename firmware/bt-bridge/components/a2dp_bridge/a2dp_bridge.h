@@ -94,6 +94,9 @@ class A2DPBridge : public Component {
   text_sensor::TextSensor *track_artist_sensor_{nullptr};
 
   int rtp_socket_{-1};
+  // Stable across reboots: derived from the factory MAC in setup(), not
+  // randomised per boot, so the receiver's sess.ignore-ssrc=false mode keeps
+  // accepting this box after a restart. See setup() and docs/decisions.md.
   uint32_t rtp_ssrc_{0};
   uint16_t rtp_sequence_{0};
   uint32_t rtp_timestamp_{0};

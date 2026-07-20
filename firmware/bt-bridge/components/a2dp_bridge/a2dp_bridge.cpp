@@ -11,7 +11,7 @@
 #include <sys/socket.h>
 
 #include "esp_heap_caps.h"
-#include "esp_random.h"
+#include "esp_mac.h"
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -76,7 +76,20 @@ static void rtp_tx_task_trampoline(void *arg) { static_cast<A2DPBridge *>(arg)->
 
 void A2DPBridge::setup() {
   g_instance = this;
-  this->rtp_ssrc_ = esp_random();
+  // Derive a *stable* RTP SSRC from the factory MAC rather than a per-boot
+  // random value. module-rtp-source with sess.ignore-ssrc=false latches onto
+  // the first SSRC it sees and rejects every other one; a random-per-boot SSRC
+  // (the old esp_random() here) then went silent after each reboot, which is
+  // exactly why the receiver had to force sess.ignore-ssrc=true ("Fix 3" in
+  // docs/decisions.md). A MAC-derived SSRC is identical across reboots, so the
+  // receiver can now reject *foreign* senders (the corrupted-audio guard, its
+  // "Only one client" mode) while still accepting this box after a restart. We
+  // fold the lower four MAC bytes (the per-unit NIC portion, past Espressif's
+  // shared OUI) into the 32-bit SSRC. See firmware/bt-bridge/README.md.
+  uint8_t mac[6] = {0};
+  esp_efuse_mac_get_default(mac);
+  this->rtp_ssrc_ = (static_cast<uint32_t>(mac[2]) << 24) | (static_cast<uint32_t>(mac[3]) << 16) |
+                    (static_cast<uint32_t>(mac[4]) << 8) | static_cast<uint32_t>(mac[5]);
   this->setup_rtp_socket_();
   this->start_rtp_tx_task_();
   this->start_bt_stack_();
