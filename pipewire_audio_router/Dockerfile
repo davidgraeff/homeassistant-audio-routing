@@ -106,7 +106,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dbus-x11 \
         procps \
         bash \
-        avahi-daemon \
     && rm -rf /var/lib/apt/lists/* \
     # Man pages, translated message catalogs, and long-form package docs are
     # dead weight in a container that only ever talks over its own REST API
@@ -134,6 +133,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # cpal/alsa's DT_NEEDED entry once it sees nothing in the reachable code path
 # actually calls into it, since this daemon only uses sendspin-rs's server
 # role, never its client-side audio *output* module that cpal belongs to.
+#
+# No avahi-daemon (and no system D-Bus started in run.sh) either: it was only
+# ever there for the shairport-sync subprocess, which hard-required avahi + a
+# real system bus to start. The native AirPlay receiver replaced it, and all
+# mDNS discovery/advertising (RAOP outputs, AirPlay, sendspin) now goes through
+# the pure-Rust `mdns-sd` crate, which needs no daemon — see docs/decisions.md
+# "Native AirPlay-receive source".
 
 # Real-time scheduling without RTKit. The `pipewire` daemon, `wireplumber`, AND
 # every PipeWire *client* (client.conf — this includes the bridge daemon, which
