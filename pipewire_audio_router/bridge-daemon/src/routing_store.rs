@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 /// deterministic (BTreeSet) and dedup is free.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RoutingLink {
-    /// Source node name (e.g. `"shairport-sync"`, `"bt-bridge-rtp"`).
+    /// Source node name (e.g. `"airplay-in"`, `"bt-bridge-rtp"`).
     pub source: String,
     /// Output node name (e.g. `"raop-out-dusche"`, `"sendspin-dev-kitchen"`).
     pub output: String,

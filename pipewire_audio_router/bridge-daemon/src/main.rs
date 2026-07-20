@@ -1,3 +1,4 @@
+mod airplay_clients;
 mod airplay_source;
 mod api;
 mod config;
@@ -46,16 +47,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the long-lived daemon: connect to the already-running PipeWire
-    /// instance, load a `raop-sink` module for every stored RAOP output, start
-    /// every stored source/adapter process, and serve the REST API — all of
+    /// instance, load a `raop-sink` module for every stored RAOP output, bring
+    /// up the stored AirPlay and RTP sources, and serve the REST API — all of
     /// which can be reconfigured live (api.rs's `/api/outputs`,
-    /// `/api/source/airplay`, `/api/sendspin_outputs`).
+    /// `/api/source/airplay`, `/api/source/rtp`). Sendspin devices are
+    /// discovered and grouped dynamically, so there's nothing stored for them.
     Serve {
         /// Persistent, runtime-managed RAOP output store.
         #[arg(long, default_value = DEFAULT_STORE_PATH)]
         store: PathBuf,
-        /// Persistent, runtime-managed store for the supervised source/adapter
-        /// processes (AirPlay source, sendspin outputs).
+        /// Persistent, runtime-managed store for the AirPlay and RTP sources.
         #[arg(long, default_value = DEFAULT_SOURCES_PATH)]
         sources: PathBuf,
         /// Persistent routing intent (links by stable node name), reconciled
@@ -126,6 +127,10 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         sources.rtp_source().map(|c| c.port),
         sources_path.display()
     );
+    // Live anti-takeover flag, seeded from the store; the API toggles it without
+    // restarting the receiver (airplay_source's `authorize_session` reads it).
+    let airplay_prevent_takeover: airplay_source::SharedPreventTakeover =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(sources.airplay_prevent_takeover()));
     let sources = std::sync::Arc::new(std::sync::Mutex::new(sources));
 
     let routing = routing_store::RoutingStore::load(routing_path)?;
@@ -133,6 +138,13 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
 
     let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
+    // Remembered AirPlay senders (Sources-tab connection list). Lives beside
+    // sources.json in /data; loads with everyone marked disconnected.
+    let airplay_clients_path = sources_path.with_file_name("airplay_clients.json");
+    let airplay_clients = airplay_clients::AirplayClientRegistry::load(&airplay_clients_path)?;
+    tracing::info!("{} remembered AirPlay client(s) in {}", airplay_clients.list().len(), airplay_clients_path.display());
+    let airplay_clients = airplay_clients.shared();
     let meters = metering::MeterHub::new();
     let sendspin_control = sendspin_volume::shared();
     let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
@@ -214,7 +226,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         // Start every stored source/adapter process (AirPlay source via
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
         // — the rest still start and it can be re-enabled live.
-        spawn_stored_sources(&sources, &airplay, pw_cmd.clone()).await;
+        spawn_stored_sources(&sources, &airplay, &airplay_clients, &airplay_prevent_takeover, pw_cmd.clone()).await;
 
         // Own sendspin device online/offline (and eventual removal) from the
         // live connection state + an active TCP probe — mDNS only ever adds.
@@ -253,6 +265,8 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             store,
             sources,
             airplay.clone(),
+            airplay_clients,
+            airplay_prevent_takeover,
             meters,
             sendspin_devices,
             routing,
@@ -278,7 +292,13 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
 /// and the RTP source (a PipeWire module). (Sendspin devices aren't started
 /// here — they're auto-discovered and grouped from the routing intent; see
 /// sendspin_group.rs.)
-async fn spawn_stored_sources(sources: &api::SharedSources, airplay: &api::SharedAirplay, pw_cmd: pw_thread::PwCommandSender) {
+async fn spawn_stored_sources(
+    sources: &api::SharedSources,
+    airplay: &api::SharedAirplay,
+    airplay_clients: &airplay_clients::SharedAirplayClients,
+    airplay_prevent_takeover: &airplay_source::SharedPreventTakeover,
+    pw_cmd: pw_thread::PwCommandSender,
+) {
     // Snapshot the config and drop the (std) lock before awaiting anything.
     let (airplay_name, airplay_latency, airplay_auth_setup, rtp) = {
         let s = sources.lock_recover();
@@ -289,7 +309,7 @@ async fn spawn_stored_sources(sources: &api::SharedSources, airplay: &api::Share
     // — load it via the PipeWire thread like a RAOP sink, not the supervisor. A
     // failed load is logged, not fatal; it can be re-enabled live via the API.
     if let Some(rtp) = rtp {
-        let args = rtp_source::rtp_source_module_args(rtp.port, rtp.latency_msec, &rtp.source_addr);
+        let args = rtp_source::rtp_source_module_args(rtp.port, rtp.latency_msec, &rtp.source_addr, rtp.ignore_ssrc);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let sent = pw_cmd.send(pw_thread::PwCommand::Load {
             node_name: rtp_source::RTP_SOURCE_NODE_NAME.to_string(),
@@ -311,7 +331,9 @@ async fn spawn_stored_sources(sources: &api::SharedSources, airplay: &api::Share
     }
 
     if let Some(name) = airplay_name {
-        match airplay_source::start(name.clone(), airplay_latency, airplay_auth_setup).await {
+        match airplay_source::start(name.clone(), airplay_latency, airplay_auth_setup, airplay_clients.clone(), airplay_prevent_takeover.clone())
+            .await
+        {
             Ok(handle) => {
                 *airplay.lock().await = Some(handle);
                 tracing::info!("started AirPlay source '{name}'");

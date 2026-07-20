@@ -9,7 +9,7 @@
 //! (sendspin_group.rs), so there's nothing per-output to persist.)
 
 use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
-use crate::rtp_source::{DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_SOURCE_ADDR};
+use crate::rtp_source::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_SOURCE_ADDR};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -31,6 +31,14 @@ pub struct RtpSourceConfig {
     /// firmware stream across receivers. `serde(default)` for old config files.
     #[serde(default = "default_rtp_source_addr")]
     pub source_addr: String,
+    /// `sess.ignore-ssrc`. `true` (default) accepts packets from any sender on
+    /// the port; `false` latches onto the first SSRC and rejects the rest — the
+    /// "Only one client" mode that stops a stray/second sender from corrupting
+    /// the stream (needs a firmware with a stable SSRC). `serde(default)` keeps
+    /// old config files — and installs with not-yet-reflashed bridges — on the
+    /// safe `true`. See rtp_source.rs.
+    #[serde(default = "default_rtp_ignore_ssrc")]
+    pub ignore_ssrc: bool,
 }
 
 fn default_rtp_port() -> u16 {
@@ -43,6 +51,10 @@ fn default_rtp_latency_msec() -> u32 {
 
 fn default_rtp_source_addr() -> String {
     DEFAULT_RTP_SOURCE_ADDR.to_string()
+}
+
+fn default_rtp_ignore_ssrc() -> bool {
+    DEFAULT_RTP_IGNORE_SSRC
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +71,12 @@ struct SourcesConfig {
     /// PipeWire-safe unencrypted path). `serde(default)` = false for old files.
     #[serde(default)]
     airplay_auth_setup: bool,
+    /// When true, a new AirPlay sender is refused while another is already
+    /// streaming (anti-takeover); when false, the legacy last-wins behavior.
+    /// `serde(default)` via `default_true` so old config files (which predate
+    /// this) come up protected.
+    #[serde(default = "default_true")]
+    airplay_prevent_takeover: bool,
     /// RTP source (Bluetooth bridge firmware target); `None` = disabled.
     #[serde(default)]
     rtp_source: Option<RtpSourceConfig>,
@@ -66,6 +84,10 @@ struct SourcesConfig {
 
 fn default_airplay_latency_msec() -> u32 {
     DEFAULT_AIRPLAY_LATENCY_MSEC
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub struct SourcesStore {
@@ -93,6 +115,7 @@ impl SourcesStore {
                 airplay_source_name: None,
                 airplay_latency_msec: DEFAULT_AIRPLAY_LATENCY_MSEC,
                 airplay_auth_setup: false,
+                airplay_prevent_takeover: true,
                 rtp_source: None,
             };
             Ok(Self { path: path.to_path_buf(), config })
@@ -128,6 +151,17 @@ impl SourcesStore {
     /// Set the AirPlay auth-setup advertise flag and persist.
     pub fn set_airplay_auth_setup(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.config.airplay_auth_setup = enabled;
+        self.persist()
+    }
+
+    /// Whether new senders are refused while one is already streaming.
+    pub fn airplay_prevent_takeover(&self) -> bool {
+        self.config.airplay_prevent_takeover
+    }
+
+    /// Set the anti-takeover policy and persist.
+    pub fn set_airplay_prevent_takeover(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.config.airplay_prevent_takeover = enabled;
         self.persist()
     }
 
@@ -191,7 +225,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut store = SourcesStore::load(&path).unwrap();
         assert_eq!(store.rtp_source(), None); // disabled by default
-        store.set_rtp_source(Some(RtpSourceConfig { port: 46000, latency_msec: 200, source_addr: "0.0.0.0".to_string() })).unwrap();
+        store
+            .set_rtp_source(Some(RtpSourceConfig { port: 46000, latency_msec: 200, source_addr: "0.0.0.0".to_string(), ignore_ssrc: true }))
+            .unwrap();
         assert_eq!(store.rtp_source().map(|c| c.port), Some(46000));
         assert_eq!(store.rtp_source().map(|c| c.latency_msec), Some(200));
         // Persisted across a reload.

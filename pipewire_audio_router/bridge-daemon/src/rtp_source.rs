@@ -53,19 +53,30 @@ pub const DEFAULT_RTP_LATENCY_MSEC: u32 = 200;
 /// per install (sources_store.rs) and settable via the API.
 pub const DEFAULT_RTP_SOURCE_ADDR: &str = "0.0.0.0";
 
+/// Default `sess.ignore-ssrc`. `true` (module analogue of "accept all senders")
+/// keeps every packet reaching the port regardless of its SSRC — the historical
+/// default, needed while the firmware picked a **random SSRC per boot** (see
+/// docs/decisions.md "Fix 3"). With a firmware that now sends a **stable**
+/// MAC-derived SSRC, set this `false` to have the receiver latch onto the first
+/// SSRC and reject every other sender — the "Only one client" mode that stops a
+/// stray/second sender from interleaving into (corrupting) the stream. Kept at
+/// `true` by default so existing installs with not-yet-reflashed bridges don't
+/// go silent on reboot. Stored per install (sources_store.rs), settable via API.
+pub const DEFAULT_RTP_IGNORE_SSRC: bool = true;
+
 /// The SPA-JSON `args` object for the rtp-source module, ready to pass as the
 /// `args` string to `pw_context_load_module` (the braces-wrapped form the
 /// module's own `pw_properties_new_string(args)` parses). `stream.props` is a
 /// nested object so the received audio lands on a node with the right
 /// `media.class`/`node.name`. Only the listen port and jitter-buffer latency
 /// vary; see the module docs for why the format/rate/channels are fixed.
-pub fn rtp_source_module_args(port: u16, latency_msec: u32, source_addr: &str) -> String {
+pub fn rtp_source_module_args(port: u16, latency_msec: u32, source_addr: &str, ignore_ssrc: bool) -> String {
     let mut a = String::new();
     a.push_str("{ ");
     write!(a, "source.ip = \"{source_addr}\" ").unwrap();
     write!(a, "source.port = {port} ").unwrap();
     a.push_str("sess.media = \"audio\" ");
-    a.push_str("sess.ignore-ssrc = true ");
+    write!(a, "sess.ignore-ssrc = {ignore_ssrc} ").unwrap();
     write!(a, "sess.latency.msec = {latency_msec} ").unwrap();
     a.push_str("audio.format = \"S16LE\" ");
     a.push_str("audio.rate = 44100 ");
@@ -81,7 +92,7 @@ mod tests {
 
     #[test]
     fn module_args_carry_the_firmware_wire_format() {
-        let args = rtp_source_module_args(46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR);
+        let args = rtp_source_module_args(46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC);
         // Braces so the module's pw_properties_new_string parses it as an object.
         assert!(args.starts_with("{ ") && args.ends_with('}'));
         assert!(args.contains("source.ip = \"0.0.0.0\""));
@@ -101,19 +112,27 @@ mod tests {
 
     #[test]
     fn module_args_honor_a_custom_port() {
-        let args = rtp_source_module_args(47100, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR);
+        let args = rtp_source_module_args(47100, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC);
         assert!(args.contains("source.port = 47100"));
     }
 
     #[test]
     fn module_args_honor_a_custom_latency() {
-        let args = rtp_source_module_args(46000, 350, DEFAULT_RTP_SOURCE_ADDR);
+        let args = rtp_source_module_args(46000, 350, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC);
         assert!(args.contains("sess.latency.msec = 350"));
     }
 
     #[test]
     fn module_args_honor_a_multicast_source_address() {
-        let args = rtp_source_module_args(46000, DEFAULT_RTP_LATENCY_MSEC, "239.255.42.42");
+        let args = rtp_source_module_args(46000, DEFAULT_RTP_LATENCY_MSEC, "239.255.42.42", DEFAULT_RTP_IGNORE_SSRC);
         assert!(args.contains("source.ip = \"239.255.42.42\""));
+    }
+
+    #[test]
+    fn module_args_honor_ignore_ssrc_false() {
+        // "Only one client": the receiver latches onto the first SSRC and drops
+        // foreign senders. Requires a firmware with a stable (MAC-derived) SSRC.
+        let args = rtp_source_module_args(46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, false);
+        assert!(args.contains("sess.ignore-ssrc = false"));
     }
 }

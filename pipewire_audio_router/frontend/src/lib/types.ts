@@ -61,6 +61,27 @@ export interface AirplaySourceInfo {
   latency_msec: number;
   /** Advertise the auth-setup encryption mode so encryption-requiring senders can connect. */
   auth_setup: boolean;
+  /** Refuse a new sender while one is already streaming (anti-takeover). */
+  prevent_takeover: boolean;
+}
+
+export interface AirplayClient {
+  /** Stable identifier for forget calls: the name if known, else the IP. */
+  key: string;
+  /** Friendly device name once the sender advertised one; null if only seen by IP. */
+  name: string | null;
+  /** Most recent IP address this client connected from. */
+  addr: string;
+  /** Unix seconds this client was first ever seen. */
+  first_seen: number;
+  /** Unix seconds of the most recent connection. */
+  last_connected: number;
+  /** Streaming to the AirPlay source right now. */
+  connected: boolean;
+  /** Future sessions from this client are refused (enforced at RTSP SETUP). */
+  banned: boolean;
+  /** Takeover priority: a higher-priority sender bumps a lower-priority one. */
+  priority: number;
 }
 
 export interface RtpSourceInfo {
@@ -74,6 +95,9 @@ export interface RtpSourceInfo {
   /** `source.ip`: `0.0.0.0` = unicast, or a multicast group so several
    *  receivers can share one firmware stream. */
   source_addr: string;
+  /** `sess.ignore-ssrc`: `true` accepts any sender on the port, `false` locks
+   *  onto the first SSRC and rejects the rest ("Only one client"). */
+  ignore_ssrc: boolean;
   /** Whether the `bt-bridge-rtp` node is present in the live PipeWire graph. */
   loaded: boolean;
 }

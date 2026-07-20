@@ -12,11 +12,11 @@
 //!   integration.
 //! - **Sources** are any node with at least one **non-monitor** output-
 //!   direction port. Every sink in this project also exposes `monitor_*`
-//!   output ports (for `pw-record` taps) — excluding ports named with that
+//!   output ports (monitor/capture taps) — excluding ports named with that
 //!   prefix is what keeps a sink's own monitor tap from being
 //!   misclassified as a routable source. Real sources observed so far
-//!   (shairport-sync's AirPlay input, ad-hoc test nodes) all expose plain
-//!   `output_*`/`capture_*` ports, never `monitor_*`.
+//!   (the native AirPlay input `airplay-in`, ad-hoc test nodes) all expose
+//!   plain `output_*`/`capture_*` ports, never `monitor_*`.
 //!
 //! **Channel pairing**: linking a source to an output pairs ports by their
 //! name's final `_`-separated suffix (`output_FL` ~ `send_FL` ~

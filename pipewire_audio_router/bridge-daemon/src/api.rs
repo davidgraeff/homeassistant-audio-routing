@@ -11,14 +11,16 @@ use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME, RAOP_NODE_
 use crate::routing;
 use crate::routing_store::SharedRouting;
 use crate::rtp_source::{
-    rtp_source_module_args, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_SOURCE_ADDR, RTP_SOURCE_MODULE_NAME,
-    RTP_SOURCE_NODE_NAME,
+    rtp_source_module_args, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_SOURCE_ADDR,
+    RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME,
 };
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::sources_store::{RtpSourceConfig, SourcesStore};
 use axum::{
-    extract::{FromRef, Path, State},
-    http::StatusCode,
+    extract::{FromRef, Path, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -31,7 +33,7 @@ use tower_http::services::ServeDir;
 /// Runtime-managed set of RAOP outputs, shared between the CRUD handlers.
 pub type SharedStore = Arc<Mutex<OutputsStore>>;
 
-/// Runtime config for the daemon-supervised source/adapter processes.
+/// Runtime config for the AirPlay and RTP sources.
 pub type SharedSources = Arc<Mutex<SourcesStore>>;
 
 /// The running AirPlay-receive source (airplay_source.rs), if configured —
@@ -52,6 +54,12 @@ pub struct AppState {
     pub store: SharedStore,
     pub sources: SharedSources,
     pub airplay: SharedAirplay,
+    /// Remembered AirPlay senders (airplay_clients.rs) — the Sources-tab
+    /// connection list and the base for later priority/ban controls.
+    pub airplay_clients: crate::airplay_clients::SharedAirplayClients,
+    /// Live anti-takeover flag, shared with the running receiver's session gate
+    /// so the API can toggle it without a restart.
+    pub airplay_prevent_takeover: crate::airplay_source::SharedPreventTakeover,
     /// On-demand source peak meters (metering.rs); taps live only while a
     /// routing-matrix WS client is connected.
     pub meters: crate::metering::SharedMeters,
@@ -88,13 +96,28 @@ pub fn router(
     store: SharedStore,
     sources: SharedSources,
     airplay: SharedAirplay,
+    airplay_clients: crate::airplay_clients::SharedAirplayClients,
+    airplay_prevent_takeover: crate::airplay_source::SharedPreventTakeover,
     meters: crate::metering::SharedMeters,
     sendspin_devices: SharedSendspinDevices,
     routing: SharedRouting,
     sendspin_control: crate::sendspin_volume::SharedSendspinControl,
     static_dir: PathBuf,
 ) -> Router {
-    let state = AppState { pw: pw_state, changes, pw_cmd, store, sources, airplay, meters, sendspin_devices, routing, sendspin_control };
+    let state = AppState {
+        pw: pw_state,
+        changes,
+        pw_cmd,
+        store,
+        sources,
+        airplay,
+        airplay_clients,
+        airplay_prevent_takeover,
+        meters,
+        sendspin_devices,
+        routing,
+        sendspin_control,
+    };
     Router::new()
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))
@@ -102,6 +125,12 @@ pub fn router(
         .route("/api/outputs", get(list_outputs).post(add_output))
         .route("/api/outputs/:node_name", delete(remove_output))
         .route("/api/source/airplay", get(get_airplay_source).put(set_airplay_source).delete(delete_airplay_source))
+        .route("/api/source/airplay/clients", get(list_airplay_clients))
+        .route("/api/source/airplay/clients/forget", post(forget_airplay_client))
+        .route("/api/source/airplay/clients/ban", post(ban_airplay_client))
+        .route("/api/source/airplay/clients/priority", post(set_airplay_client_priority))
+        .route("/api/source/airplay/clients/disconnect", post(disconnect_airplay_client))
+        .route("/api/source/airplay/policy", put(set_airplay_policy))
         .route("/api/source/rtp", get(get_rtp_source).put(set_rtp_source).delete(delete_rtp_source))
         .route("/api/sendspin/volumes", get(get_sendspin_volumes))
         .route("/api/sendspin/volume", put(set_sendspin_volume))
@@ -117,11 +146,35 @@ pub fn router(
         // SPA (frontend/, served from `static_dir`). `ServeDir` returns
         // `index.html` for `/`.
         .fallback_service(ServeDir::new(static_dir))
+        // Cache policy for the static SPA: hashed assets are immutable and cached
+        // for a year; `index.html` (and any other entrypoint) is `no-cache` so a
+        // new deploy — whose index references freshly-hashed asset names — is
+        // always picked up instead of a stale index pinning old asset URLs.
+        .layer(middleware::from_fn(spa_cache_control))
         .with_state(state)
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Set `Cache-Control` on the static SPA served by `ServeDir`. Vite emits
+/// content-hashed asset filenames (`index-<hash>.js`), so those are safe to
+/// cache forever; `index.html` must never be cached, or a browser keeps serving
+/// an old index that points at asset URLs a new deploy no longer has. API and
+/// health responses are left untouched.
+async fn spa_cache_control(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut resp = next.run(req).await;
+    if !path.starts_with("/api") && path != "/health" {
+        let value = if path.starts_with("/assets/") {
+            HeaderValue::from_static("public, max-age=31536000, immutable")
+        } else {
+            HeaderValue::from_static("no-cache")
+        };
+        resp.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    resp
 }
 
 #[derive(Serialize)]
@@ -136,7 +189,7 @@ async fn list_nodes(State(pw_state): State<SharedState>) -> Json<NodesResponse> 
 }
 
 /// Links two ports by their exact PipeWire port names (e.g.
-/// `"alsa_playback.shairport-sync:output_FL"`), one call per channel — the
+/// `"airplay-in:output_FL"`), one call per channel — the
 /// caller (eventually the routing UI / HA integration, for now this
 /// project's own test scripts) is responsible for pairing FL/FR etc.
 ///
@@ -392,13 +445,14 @@ async fn remove_output(State(state): State<AppState>, Path(node_name): Path<Stri
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed output '{node_name}'") }))
 }
 
-// ---- Daemon-supervised source/adapter processes ---------------------------
+// ---- AirPlay-receive source -----------------------------------------------
 //
-// The AirPlay-receive source (shairport-sync) and sendspin outputs
-// (sendspin-adapter.py) are external processes, not PipeWire modules — the
-// daemon supervises them (supervisor.rs) from config persisted in the sources
-// store (sources_store.rs, seeded from options.json). Same "runtime, no
-// restart" model as /api/outputs, backed by child processes.
+// The AirPlay-receive source is an embedded, native RAOP receiver
+// (airplay_source.rs) — not a subprocess and not a PipeWire module. Its
+// enabled/disabled state and knobs are persisted in the sources store
+// (sources_store.rs), which starts empty on a fresh install (no options.json
+// seeding) and is then authoritative. Same "runtime, no restart" model as
+// /api/outputs, but backed by an in-process receiver rather than a module.
 
 #[derive(Serialize)]
 struct AirplaySourceInfo {
@@ -411,6 +465,9 @@ struct AirplaySourceInfo {
     /// Whether the auth-setup encryption mode is advertised (`et=0,4`), letting
     /// encryption-requiring senders connect (default off = unencrypted only).
     auth_setup: bool,
+    /// Whether a new sender is refused while one is already streaming
+    /// (anti-takeover). Toggled via `PUT /api/source/airplay/policy`.
+    prevent_takeover: bool,
 }
 
 #[derive(Deserialize)]
@@ -430,12 +487,17 @@ fn default_airplay_source_latency_msec() -> u32 {
 }
 
 async fn get_airplay_source(State(state): State<AppState>) -> Json<AirplaySourceInfo> {
-    let (name, latency_msec, auth_setup) = {
+    let (name, latency_msec, auth_setup, prevent_takeover) = {
         let s = state.sources.lock_recover();
-        (s.airplay_source_name().map(str::to_string), s.airplay_latency_msec(), s.airplay_auth_setup())
+        (
+            s.airplay_source_name().map(str::to_string),
+            s.airplay_latency_msec(),
+            s.airplay_auth_setup(),
+            s.airplay_prevent_takeover(),
+        )
     };
     let running = state.airplay.lock().await.is_some();
-    Json(AirplaySourceInfo { name, running, latency_msec, auth_setup })
+    Json(AirplaySourceInfo { name, running, latency_msec, auth_setup, prevent_takeover })
 }
 
 /// Stop the current AirPlay receiver (if any). Caller holds no locks.
@@ -467,7 +529,15 @@ async fn set_airplay_source(
     // Tear down any existing receiver, then (re)start for the new name.
     stop_airplay(&state).await;
     match stored {
-        Some(name) => match crate::airplay_source::start(name.clone(), latency, auth_setup).await {
+        Some(name) => match crate::airplay_source::start(
+            name.clone(),
+            latency,
+            auth_setup,
+            state.airplay_clients.clone(),
+            state.airplay_prevent_takeover.clone(),
+        )
+        .await
+        {
             Ok(handle) => {
                 *state.airplay.lock().await = Some(handle);
                 (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("AirPlay source set to '{name}'") }))
@@ -487,6 +557,169 @@ async fn delete_airplay_source(State(state): State<AppState>) -> (StatusCode, Js
     }
     stop_airplay(&state).await;
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() }))
+}
+
+/// One remembered AirPlay sender for the Sources tab. `key` (name if known,
+/// else IP) identifies it for a `forget` call. `connected` is live, so it's
+/// derived here rather than read from the persisted record (which omits it).
+#[derive(Serialize)]
+struct AirplayClientInfo {
+    key: String,
+    name: Option<String>,
+    addr: String,
+    first_seen: u64,
+    last_connected: u64,
+    connected: bool,
+    banned: bool,
+    priority: i32,
+}
+
+async fn list_airplay_clients(State(state): State<AppState>) -> Json<Vec<AirplayClientInfo>> {
+    let clients = state
+        .airplay_clients
+        .lock_recover()
+        .list()
+        .into_iter()
+        .map(|c| AirplayClientInfo {
+            key: c.key().to_string(),
+            name: c.name,
+            addr: c.addr,
+            first_seen: c.first_seen,
+            last_connected: c.last_connected,
+            connected: c.connected,
+            banned: c.banned,
+            priority: c.priority,
+        })
+        .collect();
+    Json(clients)
+}
+
+#[derive(Deserialize)]
+struct ForgetClientRequest {
+    key: String,
+}
+
+async fn forget_airplay_client(
+    State(state): State<AppState>,
+    Json(req): Json<ForgetClientRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let forgotten = state.airplay_clients.lock_recover().forget(&req.key);
+    if forgotten {
+        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("forgot AirPlay client '{}'", req.key) }))
+    } else {
+        // Not found, or still connected (a live client can't be forgotten).
+        (
+            StatusCode::CONFLICT,
+            Json(OutputOpResponse {
+                ok: false,
+                message: format!("could not forget '{}' (unknown or still connected)", req.key),
+            }),
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct BanClientRequest {
+    key: String,
+    banned: bool,
+}
+
+/// Ban/unban a remembered client. A ban is enforced at the next session start
+/// (`authorize_session`); it does not evict a client that's already streaming.
+async fn ban_airplay_client(
+    State(state): State<AppState>,
+    Json(req): Json<BanClientRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let ok = state.airplay_clients.lock_recover().set_banned(&req.key, req.banned);
+    if ok {
+        let verb = if req.banned { "banned" } else { "unbanned" };
+        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{verb} AirPlay client '{}'", req.key) }))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{}'", req.key) }),
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPriorityRequest {
+    key: String,
+    priority: i32,
+}
+
+/// Set a client's takeover priority. A connecting client with a strictly higher
+/// priority than the current one takes the session over (see `authorize_session`).
+async fn set_airplay_client_priority(
+    State(state): State<AppState>,
+    Json(req): Json<SetPriorityRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let ok = state.airplay_clients.lock_recover().set_priority(&req.key, req.priority);
+    if ok {
+        (
+            StatusCode::OK,
+            Json(OutputOpResponse { ok: true, message: format!("set priority {} for '{}'", req.priority, req.key) }),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{}'", req.key) }),
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct DisconnectClientRequest {
+    key: String,
+}
+
+/// Force-disconnect a currently-connected client by dropping its RTSP
+/// connection (the receiver stops its stream shortly after).
+async fn disconnect_airplay_client(
+    State(state): State<AppState>,
+    Json(req): Json<DisconnectClientRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    // Resolve the key to the live peer IP the RAOP server keys connections on.
+    let addr = state.airplay_clients.lock_recover().connected_addr(&req.key);
+    let Some(addr) = addr else {
+        return (
+            StatusCode::CONFLICT,
+            Json(OutputOpResponse { ok: false, message: format!("'{}' is not currently connected", req.key) }),
+        );
+    };
+    match &*state.airplay.lock().await {
+        Some(handle) => {
+            handle.disconnect_client(&addr);
+            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("disconnecting AirPlay client '{}'", req.key) }))
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(OutputOpResponse { ok: false, message: "AirPlay source is not running".to_string() }),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetAirplayPolicyRequest {
+    prevent_takeover: bool,
+}
+
+/// Toggle the anti-takeover policy. Updates the live flag the receiver's session
+/// gate reads (no restart, so the current stream is undisturbed) and persists it.
+async fn set_airplay_policy(
+    State(state): State<AppState>,
+    Json(req): Json<SetAirplayPolicyRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if let Err(e) = state.sources.lock_recover().set_airplay_prevent_takeover(req.prevent_takeover) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+    }
+    state.airplay_prevent_takeover.store(req.prevent_takeover, std::sync::atomic::Ordering::Relaxed);
+    let msg = if req.prevent_takeover {
+        "AirPlay: new senders refused while one is streaming"
+    } else {
+        "AirPlay: new senders may take over the current stream"
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg.to_string() }))
 }
 
 // ---- RTP source (Bluetooth bridge firmware target) ------------------------
@@ -510,6 +743,10 @@ struct RtpSourceInfo {
     /// `source.ip`: `0.0.0.0` = unicast, or a multicast group so several
     /// receivers can share one firmware stream. Stored value, or default.
     source_addr: String,
+    /// `sess.ignore-ssrc`: `true` accepts any sender on the port, `false` locks
+    /// onto the first SSRC and rejects the rest ("Only one client"). Stored
+    /// value, or default. Needs a stable-SSRC firmware to use `false`.
+    ignore_ssrc: bool,
     /// Whether the `bt-bridge-rtp` node is actually present in the live
     /// registry right now — the module analogue of the AirPlay source's
     /// `running`. Can lag briefly after enabling, or be `false` if libpipewire
@@ -529,6 +766,10 @@ struct SetRtpSourceRequest {
     /// clients omit it, so it defaults to unicast.
     #[serde(default = "default_rtp_source_addr")]
     source_addr: String,
+    /// `sess.ignore-ssrc`: `true` accept any sender, `false` lock onto the first
+    /// SSRC ("Only one client"). Older clients omit it, so it defaults to `true`.
+    #[serde(default = "default_rtp_source_ignore_ssrc")]
+    ignore_ssrc: bool,
 }
 
 fn default_rtp_source_port() -> u16 {
@@ -543,6 +784,10 @@ fn default_rtp_source_addr() -> String {
     DEFAULT_RTP_SOURCE_ADDR.to_string()
 }
 
+fn default_rtp_source_ignore_ssrc() -> bool {
+    DEFAULT_RTP_IGNORE_SSRC
+}
+
 /// Whether the RTP source node is present in the live registry right now.
 fn rtp_source_loaded(pw: &SharedState) -> bool {
     pw.lock_recover().nodes.values().any(|n| n.node_name == RTP_SOURCE_NODE_NAME)
@@ -552,14 +797,20 @@ fn rtp_source_loaded(pw: &SharedState) -> bool {
 /// first so a re-enable or a port change is a clean reload — `Load` errors if
 /// a module is already registered under the node name. Unload is idempotent, so
 /// its result is intentionally ignored.
-async fn reload_rtp_source(pw_cmd: &PwCommandSender, port: u16, latency_msec: u32, source_addr: &str) -> Result<(), String> {
+async fn reload_rtp_source(
+    pw_cmd: &PwCommandSender,
+    port: u16,
+    latency_msec: u32,
+    source_addr: &str,
+    ignore_ssrc: bool,
+) -> Result<(), String> {
     let (tx, rx) = oneshot::channel();
     if pw_cmd.send(PwCommand::Unload { node_name: RTP_SOURCE_NODE_NAME.to_string(), reply: tx }).is_err() {
         return Err("PipeWire thread is not running".to_string());
     }
     let _ = rx.await;
 
-    let args = rtp_source_module_args(port, latency_msec, source_addr);
+    let args = rtp_source_module_args(port, latency_msec, source_addr, ignore_ssrc);
     let (tx, rx) = oneshot::channel();
     if pw_cmd
         .send(PwCommand::Load {
@@ -585,7 +836,8 @@ async fn get_rtp_source(State(state): State<AppState>) -> Json<RtpSourceInfo> {
         enabled: cfg.is_some(),
         port: cfg.as_ref().map(|c| c.port).unwrap_or(DEFAULT_RTP_PORT),
         latency_msec: cfg.as_ref().map(|c| c.latency_msec).unwrap_or(DEFAULT_RTP_LATENCY_MSEC),
-        source_addr: cfg.map(|c| c.source_addr).unwrap_or_else(|| DEFAULT_RTP_SOURCE_ADDR.to_string()),
+        source_addr: cfg.as_ref().map(|c| c.source_addr.clone()).unwrap_or_else(|| DEFAULT_RTP_SOURCE_ADDR.to_string()),
+        ignore_ssrc: cfg.map(|c| c.ignore_ssrc).unwrap_or(DEFAULT_RTP_IGNORE_SSRC),
         loaded: rtp_source_loaded(&state.pw),
     })
 }
@@ -598,15 +850,22 @@ async fn set_rtp_source(State(state): State<AppState>, Json(req): Json<SetRtpSou
         port: req.port,
         latency_msec: req.latency_msec,
         source_addr: req.source_addr.clone(),
+        ignore_ssrc: req.ignore_ssrc,
     })) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
     }
-    match reload_rtp_source(&state.pw_cmd, req.port, req.latency_msec, &req.source_addr).await {
+    match reload_rtp_source(&state.pw_cmd, req.port, req.latency_msec, &req.source_addr, req.ignore_ssrc).await {
         Ok(()) => (
             StatusCode::OK,
             Json(OutputOpResponse {
                 ok: true,
-                message: format!("RTP source enabled on {}:{} ({} ms jitter buffer)", req.source_addr, req.port, req.latency_msec),
+                message: format!(
+                    "RTP source enabled on {}:{} ({} ms jitter buffer, {})",
+                    req.source_addr,
+                    req.port,
+                    req.latency_msec,
+                    if req.ignore_ssrc { "any sender" } else { "single sender" },
+                ),
             }),
         ),
         Err(e) => (

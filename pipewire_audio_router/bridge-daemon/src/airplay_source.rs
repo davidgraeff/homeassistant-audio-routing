@@ -14,15 +14,21 @@
 //! as a routable source — outputting silence when idle. A `mem`-cheap peak
 //! level is computed inline from the received PCM for the UI meter.
 
+use crate::airplay_clients::{self, SharedAirplayClients};
 use crate::locks::LockRecover;
 use pipewire as pw;
 use pw::spa;
-use shairplay::{Ap1Encryption, AudioFormat, AudioHandler, AudioSession, RaopServer};
+use shairplay::{Ap1Encryption, AudioFormat, AudioHandler, AudioSession, RaopServer, SessionDecision, SessionInfo};
 use spa::pod::Pod;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Shared anti-takeover flag (mirrors sources_store's `airplay_prevent_takeover`),
+/// read live by the RAOP `authorize_session` gate so the API can toggle the
+/// policy without restarting the receiver.
+pub type SharedPreventTakeover = Arc<AtomicBool>;
 
 /// Stable PipeWire node name for the AirPlay source — what the matrix/routing
 /// key on. (shairport-sync, by contrast, made an unpredictably-named node only
@@ -78,6 +84,14 @@ impl AirplayHandle {
         f32::from_bits(self.peak.load(Ordering::Relaxed))
     }
 
+    /// Force-disconnect the sender at `addr` (a peer IP), if connected. Used by
+    /// the API's manual force-disconnect.
+    pub fn disconnect_client(&self, addr: &str) {
+        if let Some(server) = &self.server {
+            server.disconnect_client(addr);
+        }
+    }
+
     /// Stop the RAOP server (unregister mDNS, close listeners) and the PipeWire
     /// producer. Consumes the handle.
     pub async fn stop(mut self) {
@@ -109,7 +123,17 @@ impl Drop for AirplayHandle {
 /// PipeWire's raop-discover selects the highest `et`, so enabling it switches
 /// PipeWire from unencrypted to auth_setup — a different (still-supported) path
 /// that broadens compatibility to non-Apple senders that demand encryption.
-pub async fn start(name: String, latency_msec: u32, auth_setup: bool) -> anyhow::Result<AirplayHandle> {
+pub async fn start(
+    name: String,
+    latency_msec: u32,
+    auth_setup: bool,
+    clients: SharedAirplayClients,
+    prevent_takeover: SharedPreventTakeover,
+) -> anyhow::Result<AirplayHandle> {
+    // Fresh receiver: nothing is streaming yet, so clear any stale live flags a
+    // prior handle might have left (a restart that skipped a disconnect).
+    clients.lock_recover().reset_connected();
+
     let target = samples_for_ms(latency_msec);
     // Bound growth well past the prebuffer target so a stalled consumer can't
     // grow the ring without limit; oldest samples are dropped past this.
@@ -120,7 +144,7 @@ pub async fn start(name: String, latency_msec: u32, auth_setup: bool) -> anyhow:
     let producer_stop = spawn_producer(ring.clone(), peak.clone(), target)
         .map_err(|e| anyhow::anyhow!("failed to start AirPlay PipeWire producer: {e}"))?;
 
-    let handler = Arc::new(Handler { ring, peak: peak.clone(), cap });
+    let handler = Arc::new(Handler { ring, peak: peak.clone(), cap, clients, prevent_takeover });
     let mut builder = RaopServer::builder().name(name.clone()).hwaddr(derive_hwaddr(&name)).port(AIRPLAY_PORT);
     if auth_setup {
         // Offer both — the sender picks. Leaving RSA out (et=1) is deliberate:
@@ -161,6 +185,11 @@ struct Handler {
     peak: Arc<AtomicU32>,
     /// Drop-oldest bound for the ring (see [`start`]).
     cap: usize,
+    /// Persistent registry of senders — updated on connect/name/disconnect for
+    /// the Sources-tab connection list (airplay_clients.rs).
+    clients: SharedAirplayClients,
+    /// Live anti-takeover policy, consulted in `authorize_session`.
+    prevent_takeover: SharedPreventTakeover,
 }
 
 impl AudioHandler for Handler {
@@ -181,11 +210,45 @@ impl AudioHandler for Handler {
         Box::new(Session { ring: self.ring.clone(), peak: self.peak.clone(), cap: self.cap, in_channels, resampler })
     }
 
+    fn authorize_session(&self, addr: &str, name: Option<&str>, current: Option<&SessionInfo>) -> SessionDecision {
+        let clients = self.clients.lock_recover();
+        if clients.is_banned(addr, name) {
+            tracing::info!("AirPlay: refusing banned client {addr} (name={name:?})");
+            return SessionDecision::Reject;
+        }
+        // Free receiver → admit.
+        let Some(cur) = current else {
+            return SessionDecision::Allow;
+        };
+        // Busy. A strictly higher priority wins outright (an explicit override of
+        // the anti-takeover policy); otherwise the toggle decides: protect the
+        // incumbent (Reject) or fall back to legacy last-wins (Takeover).
+        let mine = clients.priority_of(addr, name);
+        let theirs = clients.priority_of(&cur.addr, cur.name.as_deref());
+        if mine > theirs {
+            tracing::info!("AirPlay: {addr} (priority {mine}) takes over from {} (priority {theirs})", cur.addr);
+            SessionDecision::Takeover
+        } else if self.prevent_takeover.load(Ordering::Relaxed) {
+            tracing::info!(
+                "AirPlay: refusing {addr} — {} is streaming (prevent-takeover; priority {mine} <= {theirs})",
+                cur.addr
+            );
+            SessionDecision::Reject
+        } else {
+            SessionDecision::Takeover
+        }
+    }
     fn on_client_connected(&self, addr: &str) {
         tracing::info!("AirPlay client connected: {addr}");
+        airplay_clients::on_connected(&self.clients, addr);
+    }
+    fn on_client_named(&self, addr: &str, name: &str) {
+        tracing::info!("AirPlay client {addr} identified as '{name}'");
+        airplay_clients::on_named(&self.clients, addr, name);
     }
     fn on_client_disconnected(&self, addr: &str) {
         tracing::info!("AirPlay client disconnected: {addr}");
+        airplay_clients::on_disconnected(&self.clients, addr);
         // Clear any residual buffered audio so a new session starts clean.
         self.ring.lock_recover().clear();
     }

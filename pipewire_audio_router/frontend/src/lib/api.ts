@@ -7,6 +7,7 @@
 
 import type {
   AddOutputRequest,
+  AirplayClient,
   AirplaySourceInfo,
   MediaPlayerInfo,
   OpResponse,
@@ -88,6 +89,17 @@ export const api = {
   setAirplaySource: (name: string, latencyMsec: number, authSetup: boolean) =>
     request<OpResponse>('PUT', 'api/source/airplay', { name, latency_msec: latencyMsec, auth_setup: authSetup }),
   disableAirplaySource: () => request<OpResponse>('DELETE', 'api/source/airplay'),
+  airplayClients: () => request<AirplayClient[]>('GET', 'api/source/airplay/clients'),
+  forgetAirplayClient: (key: string) =>
+    request<OpResponse>('POST', 'api/source/airplay/clients/forget', { key }),
+  banAirplayClient: (key: string, banned: boolean) =>
+    request<OpResponse>('POST', 'api/source/airplay/clients/ban', { key, banned }),
+  setAirplayClientPriority: (key: string, priority: number) =>
+    request<OpResponse>('POST', 'api/source/airplay/clients/priority', { key, priority }),
+  disconnectAirplayClient: (key: string) =>
+    request<OpResponse>('POST', 'api/source/airplay/clients/disconnect', { key }),
+  setAirplayPolicy: (preventTakeover: boolean) =>
+    request<OpResponse>('PUT', 'api/source/airplay/policy', { prevent_takeover: preventTakeover }),
 
   // Sendspin per-device volume (virtual outputs; volume is carried in-band over
   // the sendspin protocol, not a PipeWire node volume). Map is node_name -> 0-100.
@@ -97,7 +109,12 @@ export const api = {
 
   // RTP source (single — Bluetooth bridge firmware target)
   rtpSource: () => request<RtpSourceInfo>('GET', 'api/source/rtp'),
-  setRtpSource: (port: number, latencyMsec: number, sourceAddr: string) =>
-    request<OpResponse>('PUT', 'api/source/rtp', { port, latency_msec: latencyMsec, source_addr: sourceAddr }),
+  setRtpSource: (port: number, latencyMsec: number, sourceAddr: string, ignoreSsrc: boolean) =>
+    request<OpResponse>('PUT', 'api/source/rtp', {
+      port,
+      latency_msec: latencyMsec,
+      source_addr: sourceAddr,
+      ignore_ssrc: ignoreSsrc,
+    }),
   disableRtpSource: () => request<OpResponse>('DELETE', 'api/source/rtp'),
 };
