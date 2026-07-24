@@ -16,6 +16,10 @@
   // Sync (moved here from the Outputs tab): daemon-wide presentation lead.
   let groupLeadMs = $state<number | ''>('');
   let syncBusy = $state(false);
+  // Whether sendspin delay changes apply to the running stream (future firmware)
+  // or need a stream restart (current ESPHome firmware).
+  let sendspinDelayLive = $state(false);
+  let delayModeBusy = $state(false);
 
   async function refresh() {
     loading = true;
@@ -24,6 +28,7 @@
       duck = s.default_duck;
       discovery = s.discovery_enabled;
       raopLatency = s.default_raop_latency_ms ?? '';
+      sendspinDelayLive = s.sendspin_delay_live;
       if (sync) groupLeadMs = sync.group_lead_ms;
     } catch {
       // leave defaults; a toast already surfaced the error via run() elsewhere
@@ -56,6 +61,15 @@
     syncBusy = true;
     await run(() => api.setGroupLead(Number(groupLeadMs)), `Group lead set to ${groupLeadMs} ms`);
     syncBusy = false;
+  }
+
+  async function toggleDelayLive() {
+    delayModeBusy = true;
+    const next = !sendspinDelayLive;
+    if (await run(() => api.setSettings({ sendspin_delay_live: next }), 'Setting saved')) {
+      sendspinDelayLive = next;
+    }
+    delayModeBusy = false;
   }
 </script>
 
@@ -116,5 +130,15 @@
         <button class="primary" onclick={saveGroupLead} disabled={syncBusy || groupLeadMs === ''}>Apply</button>
       </div>
     </div>
+
+    <label class="check" style="margin-top:12px">
+      <input type="checkbox" checked={sendspinDelayLive} disabled={delayModeBusy} onchange={toggleDelayLive} />
+      Sendspin speakers apply delay changes live
+    </label>
+    <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
+      Leave off for current ESPHome firmware, which only picks up a per-speaker delay at stream start — so changing one
+      briefly restarts the group's stream (like an AirPlay reload). Turn on only for firmware that applies
+      <code>SetStaticDelay</code> to the running stream, to avoid the restart.
+    </p>
   </div>
 {/if}

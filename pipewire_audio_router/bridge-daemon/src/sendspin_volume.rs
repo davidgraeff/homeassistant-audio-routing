@@ -49,6 +49,10 @@ fn delay_cmd(ms: u16) -> PlayerCommand {
     PlayerCommand { command: PlayerCommandType::SetStaticDelay, volume: None, mute: None, static_delay_ms: Some(ms.min(5000)) }
 }
 
+fn mute_cmd(muted: bool) -> PlayerCommand {
+    PlayerCommand { command: PlayerCommandType::Mute, volume: None, mute: Some(muted), static_delay_ms: None }
+}
+
 /// Construct an empty control wrapped for sharing.
 pub fn shared() -> SharedSendspinControl {
     Arc::new(Mutex::new(SendspinControl::default()))
@@ -126,6 +130,22 @@ impl SendspinControl {
     /// Snapshot of the desired volumes by node name (for the UI sliders).
     pub fn volumes(&self) -> HashMap<String, u8> {
         self.desired.clone()
+    }
+
+    /// Push a **transient** mute/unmute to a device if connected, using the
+    /// protocol's dedicated `Mute` command (not volume 0 — conforming devices
+    /// keep volume and mute independent, and some ignore a 0 volume). Does NOT
+    /// touch the stored desired volume, so unmuting restores the prior level.
+    /// Used by the alignment wizard to solo the reference + target speaker.
+    /// Returns true if it reached a live device.
+    pub async fn set_mute(&self, node_name: &str, muted: bool) -> bool {
+        if let Some(sender) = self.senders.get(node_name) {
+            match sender.send_player_command(mute_cmd(muted)).await {
+                Ok(()) => return true,
+                Err(e) => tracing::warn!("failed to set mute for '{node_name}': {e}"),
+            }
+        }
+        false
     }
 
     /// Whether a device currently has a live server connection — the

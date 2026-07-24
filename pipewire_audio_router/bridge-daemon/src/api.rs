@@ -85,6 +85,9 @@ pub struct AppState {
     pub discovered: crate::discovery::SharedDiscovered,
     /// Latency-alignment session manager (calibrate.rs) for the Align page.
     pub align: crate::calibrate::AlignManager,
+    /// Live sync-group layout (sync_group.rs) — used to restart a group's
+    /// sendspin stream when a static-delay change needs it to take effect.
+    pub groups: crate::sync_group::SharedGroups,
     /// Add-on version string (main.rs `addon_version()`), for `/api/status`.
     pub version: String,
     /// Process start instant, for the `/api/status` uptime.
@@ -125,6 +128,7 @@ pub fn router(
     discovery: crate::discovery_supervisor::DiscoverySupervisor,
     discovered: crate::discovery::SharedDiscovered,
     align: crate::calibrate::AlignManager,
+    groups: crate::sync_group::SharedGroups,
     version: String,
     started: std::time::Instant,
     static_dir: PathBuf,
@@ -147,6 +151,7 @@ pub fn router(
         discovery,
         discovered,
         align,
+        groups,
         version,
         started,
     };
@@ -176,6 +181,7 @@ pub fn router(
         .route("/api/align", get(align_status).delete(align_stop))
         .route("/api/align/start", post(align_start))
         .route("/api/align/select", post(align_select))
+        .route("/api/align/volume", post(align_volume))
         .route("/api/media_players", get(list_media_players))
         .route("/api/media_players/:node_id/volume", get(get_volume).post(set_volume))
         .route("/api/media_players/:node_id/announce", post(announce))
@@ -1112,6 +1118,7 @@ struct SettingsInfo {
     default_duck: f32,
     discovery_enabled: bool,
     default_raop_latency_ms: Option<u16>,
+    sendspin_delay_live: bool,
 }
 
 /// Partial update: every field is optional so the UI can PATCH one knob at a
@@ -1125,6 +1132,8 @@ struct SetSettingsRequest {
     discovery_enabled: Option<bool>,
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     default_raop_latency_ms: Option<Option<u16>>,
+    #[serde(default)]
+    sendspin_delay_live: Option<bool>,
 }
 
 /// serde helper: present-with-null → `Some(None)`, absent → `None`.
@@ -1142,6 +1151,7 @@ fn settings_info(state: &AppState) -> SettingsInfo {
         default_duck: s.default_duck(),
         discovery_enabled: s.discovery_enabled(),
         default_raop_latency_ms: s.default_raop_latency_ms(),
+        sendspin_delay_live: s.sendspin_delay_live(),
     }
 }
 
@@ -1165,6 +1175,11 @@ async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettings
         }
         if let Some(enabled) = req.discovery_enabled {
             if let Err(e) = s.set_discovery_enabled(enabled) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            }
+        }
+        if let Some(live) = req.sendspin_delay_live {
+            if let Err(e) = s.set_sendspin_delay_live(live) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
             }
         }
@@ -1261,6 +1276,24 @@ async fn align_select(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
 }
 
+#[derive(Deserialize)]
+struct AlignVolumeRequest {
+    /// Audible-member playback level, 0–100.
+    volume: u8,
+}
+
+async fn align_volume(
+    State(state): State<AppState>,
+    Json(req): Json<AlignVolumeRequest>,
+) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+    state
+        .align
+        .set_level(req.volume)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+}
+
 /// Stop the session, restoring every member's volume.
 async fn align_stop(State(state): State<AppState>) -> Json<crate::calibrate::AlignState> {
     Json(state.align.stop().await)
@@ -1288,10 +1321,27 @@ async fn set_sendspin_delay_handler(
     }
     let reached = state.sendspin_control.lock().await.set_delay(&req.node_name, req.delay_ms).await;
     let ms = req.delay_ms.min(5000);
-    let message = if reached {
-        format!("set '{}' static delay to {ms} ms", req.node_name)
-    } else {
+
+    // Current ESPHome firmware reads the static delay only at stream start, so a
+    // live push doesn't shift the running stream — restart the device's group
+    // stream (drop + recreate its sendspin server on the next reconcile) so it
+    // reconnects and re-applies the delay, like a RAOP sink reload. Skipped when
+    // `sendspin_delay_live` is on (firmware that honors a live SetStaticDelay).
+    let live = state.settings.lock_recover().sendspin_delay_live();
+    let mut restarted = false;
+    if !live {
+        restarted = state.groups.lock().await.force_server_restart(&req.node_name);
+        if restarted {
+            let _ = state.changes.send(());
+        }
+    }
+
+    let message = if !reached {
         format!("saved {ms} ms for '{}' (device not connected)", req.node_name)
+    } else if restarted {
+        format!("set '{}' static delay to {ms} ms (restarting stream to apply)", req.node_name)
+    } else {
+        format!("set '{}' static delay to {ms} ms", req.node_name)
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }

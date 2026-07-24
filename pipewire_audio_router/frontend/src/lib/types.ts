@@ -72,6 +72,10 @@ export interface AppSettings {
   /** Default RAOP receiver latency (ms) stamped on new outputs; null = module
    * default (1500 ms). */
   default_raop_latency_ms: number | null;
+  /** Whether sendspin devices apply a static-delay change to the running stream.
+   * Current ESPHome firmware does not, so a delay change restarts the group
+   * stream; enable for future firmware that honors a live SetStaticDelay. */
+  sendspin_delay_live: boolean;
 }
 
 /** Partial settings update; omitted fields are left unchanged. For
@@ -120,6 +124,8 @@ export interface AlignState {
   /** The member currently being tuned (audible alongside the reference). */
   target: string | null;
   members: AlignMember[];
+  /** Playback level (0–100) of the audible members. */
+  volume: number;
 }
 
 /** One live PipeWire node (`/api/nodes`). */

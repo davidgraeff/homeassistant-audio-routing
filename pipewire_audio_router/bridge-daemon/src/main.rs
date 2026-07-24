@@ -329,6 +329,7 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
             discovery,
             discovered_raop,
             align,
+            groups,
             version,
             started,
             static_dir.to_path_buf(),

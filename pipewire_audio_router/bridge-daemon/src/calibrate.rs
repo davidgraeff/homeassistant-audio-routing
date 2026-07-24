@@ -49,10 +49,11 @@ const FREQ_A: f64 = 3000.0;
 const FREQ_B: f64 = 1500.0;
 const CLICK_AMP: f64 = 0.5;
 
-/// Level (of full scale) audible members play at during calibration — the same
-/// for both compared members so the ear judges timing, not loudness.
-const AUDIBLE_SENDSPIN: u8 = 80;
-const AUDIBLE_RAOP: f32 = 0.8;
+/// Default level (0–100) audible members play at during calibration — the same
+/// for both compared members so the ear judges timing, not loudness. Kept
+/// modest (calibration clicks are loud and it's usually a hands-on, close-range
+/// task); the user can raise/lower it live from the Align page.
+const DEFAULT_CAL_VOLUME: u8 = 50;
 
 /// Safety net: never leave a group muted with a click looping if the UI
 /// vanishes. The session tears itself down after this if not stopped.
@@ -121,11 +122,13 @@ pub struct AlignState {
     /// The member currently being tuned (audible alongside the reference).
     pub target: Option<String>,
     pub members: Vec<AlignMember>,
+    /// Playback level (0–100) of the audible members.
+    pub volume: u8,
 }
 
 impl AlignState {
     fn inactive() -> Self {
-        Self { active: false, sources: Vec::new(), reference: None, target: None, members: Vec::new() }
+        Self { active: false, sources: Vec::new(), reference: None, target: None, members: Vec::new(), volume: DEFAULT_CAL_VOLUME }
     }
 }
 
@@ -134,6 +137,8 @@ struct Session {
     members: Vec<AlignMember>,
     reference: Option<String>,
     target: Option<String>,
+    /// Playback level (0–100) applied to the audible members.
+    volume: u8,
     /// Set to stop the looping player thread.
     stop: Arc<AtomicBool>,
     /// Volumes captured on start, restored on teardown.
@@ -149,6 +154,7 @@ impl Session {
             reference: self.reference.clone(),
             target: self.target.clone(),
             members: self.members.clone(),
+            volume: self.volume,
         }
     }
 
@@ -267,8 +273,17 @@ impl AlignManager {
 
         let reference = Some(members[0].node_name.clone());
         let target = Some(members[1].node_name.clone());
-        let session = Session { sources: group.sources, members, reference, target, stop: stop.clone(), saved_sendspin, saved_raop };
-        self.apply_audibility(&session).await;
+        let session = Session {
+            sources: group.sources,
+            members,
+            reference,
+            target,
+            volume: DEFAULT_CAL_VOLUME,
+            stop: stop.clone(),
+            saved_sendspin,
+            saved_raop,
+        };
+        self.apply_audibility(&session.members, session.reference.as_deref(), session.target.as_deref(), session.volume).await;
         let state = session.state();
         *guard = Some(session);
         drop(guard);
@@ -281,27 +296,31 @@ impl AlignManager {
 
     /// Set which two members are audible (reference vs. the target being tuned).
     pub async fn select(&self, reference: String, target: String) -> Result<AlignState, String> {
-        let mut guard = self.session.lock().await;
-        let session = guard.as_mut().ok_or("no alignment session is running")?;
-        if !session.is_member(&reference) || !session.is_member(&target) {
-            return Err("reference and target must both be members of the active group".to_string());
-        }
-        session.reference = Some(reference);
-        session.target = Some(target);
-        let state = session.state();
-        // Re-apply mutes against the new pair. Clone the fields needed so the
-        // lock isn't held across the await inside apply_audibility.
-        let snapshot = Session {
-            sources: session.sources.clone(),
-            members: session.members.clone(),
-            reference: session.reference.clone(),
-            target: session.target.clone(),
-            stop: session.stop.clone(),
-            saved_sendspin: HashMap::new(),
-            saved_raop: HashMap::new(),
+        let (members, reference, target, volume, state) = {
+            let mut guard = self.session.lock().await;
+            let session = guard.as_mut().ok_or("no alignment session is running")?;
+            if !session.is_member(&reference) || !session.is_member(&target) {
+                return Err("reference and target must both be members of the active group".to_string());
+            }
+            session.reference = Some(reference);
+            session.target = Some(target);
+            (session.members.clone(), session.reference.clone(), session.target.clone(), session.volume, session.state())
         };
-        drop(guard);
-        self.apply_audibility(&snapshot).await;
+        // Re-solo against the new pair (lock released — apply_audibility awaits).
+        self.apply_audibility(&members, reference.as_deref(), target.as_deref(), volume).await;
+        Ok(state)
+    }
+
+    /// Set the audible members' playback level (0–100) live.
+    pub async fn set_level(&self, volume: u8) -> Result<AlignState, String> {
+        let volume = volume.min(100);
+        let (members, reference, target, state) = {
+            let mut guard = self.session.lock().await;
+            let session = guard.as_mut().ok_or("no alignment session is running")?;
+            session.volume = volume;
+            (session.members.clone(), session.reference.clone(), session.target.clone(), session.state())
+        };
+        self.apply_audibility(&members, reference.as_deref(), target.as_deref(), volume).await;
         Ok(state)
     }
 
@@ -315,31 +334,48 @@ impl AlignManager {
         AlignState::inactive()
     }
 
-    /// Make the reference + target audible, everything else muted.
-    async fn apply_audibility(&self, session: &Session) {
-        for m in &session.members {
-            let audible = session.reference.as_deref() == Some(&m.node_name) || session.target.as_deref() == Some(&m.node_name);
-            match (m.kind, m.node_id) {
-                (MemberKind::Sendspin, _) => {
-                    let v = if audible { AUDIBLE_SENDSPIN } else { 0 };
-                    let _ = self.sendspin.lock().await.set_volume(&m.node_name, v).await;
+    /// Solo the reference + target at `volume`; mute everything else. Sendspin
+    /// uses the protocol Mute command (leaving the stored volume intact); RAOP
+    /// uses the sink node volume (0 to mute).
+    async fn apply_audibility(&self, members: &[AlignMember], reference: Option<&str>, target: Option<&str>, volume: u8) {
+        for m in members {
+            let audible = reference == Some(m.node_name.as_str()) || target == Some(m.node_name.as_str());
+            match m.kind {
+                MemberKind::Sendspin => {
+                    let mut c = self.sendspin.lock().await;
+                    c.set_mute(&m.node_name, !audible).await;
+                    if audible {
+                        c.set_volume(&m.node_name, volume).await;
+                    }
                 }
-                (MemberKind::Raop, Some(id)) => {
-                    let v = if audible { AUDIBLE_RAOP } else { 0.0 };
-                    let _ = crate::volume::set_volume(id, v).await;
+                MemberKind::Raop => {
+                    if let Some(id) = self.raop_node_id(m) {
+                        let v = if audible { f32::from(volume) / 100.0 } else { 0.0 };
+                        let _ = crate::volume::set_volume(id, v).await;
+                    }
                 }
-                (MemberKind::Raop, None) => {}
             }
         }
     }
 
-    /// Stop playback and restore saved volumes.
+    /// A RAOP member's live node id, re-resolving against the graph if it wasn't
+    /// known at session start (e.g. the sink was reloading).
+    fn raop_node_id(&self, m: &AlignMember) -> Option<u32> {
+        m.node_id.or_else(|| crate::routing::node_id_for(&self.pw.lock_recover(), &m.node_name))
+    }
+
+    /// Stop playback, unmute every sendspin member, and restore saved volumes.
     async fn teardown(&self, session: Session) {
         session.stop.store(true, Ordering::Relaxed);
         {
             let mut c = self.sendspin.lock().await;
+            for m in &session.members {
+                if m.kind == MemberKind::Sendspin {
+                    c.set_mute(&m.node_name, false).await;
+                }
+            }
             for (n, v) in &session.saved_sendspin {
-                let _ = c.set_volume(n, *v).await;
+                c.set_volume(n, *v).await;
             }
         }
         for (id, v) in &session.saved_raop {

@@ -11,6 +11,11 @@
   let busy = $state(false);
   // Current per-member offset in ms (sendspin static delay / RAOP latency).
   let offsets = $state<Record<string, number>>({});
+  // Audible-member playback level (0–100), mirrored to the daemon.
+  let level = $state(50);
+  // Whether sendspin firmware applies a delay change live (Settings). When
+  // false, a change restarts the group stream, so we don't stream during drag.
+  let sendspinDelayLive = $state(false);
 
   const active = $derived(session?.active ?? false);
 
@@ -44,10 +49,18 @@
   async function refresh() {
     loading = true;
     try {
-      const [st, gs] = await Promise.all([api.alignStatus(), api.alignGroups()]);
+      const [st, gs, settings] = await Promise.all([
+        api.alignStatus(),
+        api.alignGroups(),
+        api.settings().catch(() => null),
+      ]);
       session = st;
       groups = gs;
-      if (st.active) await seedOffsets();
+      if (settings) sendspinDelayLive = settings.sendspin_delay_live;
+      if (st.active) {
+        level = st.volume;
+        await seedOffsets();
+      }
     } catch {
       session = null;
       groups = [];
@@ -67,6 +80,7 @@
     busy = true;
     try {
       session = await api.alignStart(group.sources);
+      level = session.volume;
       await seedOffsets();
     } catch (e) {
       await run(() => Promise.reject(e));
@@ -74,10 +88,19 @@
     busy = false;
   }
 
+  async function setLevel(v: number) {
+    level = v;
+    try {
+      session = await api.alignVolume(v);
+    } catch (e) {
+      await run(() => Promise.reject(e));
+    }
+  }
+
   async function stop() {
     busy = true;
     if (await run(() => api.alignStop(), 'Alignment finished — volumes restored')) {
-      session = { active: false, sources: [], reference: null, target: null, members: [] };
+      session = { active: false, sources: [], reference: null, target: null, members: [], volume: level };
     }
     busy = false;
   }
@@ -114,6 +137,29 @@
     } catch (e) {
       await run(() => Promise.reject(e));
     }
+  }
+
+  // Live drag: sendspin delay is applied in-band and takes effect immediately,
+  // so push while dragging (throttled). RAOP latency reloads the sink, so it's
+  // only committed on release (onchange) — dragging just updates the readout.
+  let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+  let pending: { m: AlignMember; ms: number } | null = null;
+  function liveOffset(m: AlignMember, ms: number) {
+    offsets[m.node_name] = ms; // immediate readout
+    // Only stream while dragging when it actually takes effect live: sendspin
+    // firmware that honors it. Otherwise (sendspin needing a restart, or RAOP)
+    // we commit once on release.
+    if (m.kind !== 'sendspin' || !sendspinDelayLive) return;
+    pending = { m, ms };
+    if (throttleTimer) return;
+    throttleTimer = setTimeout(() => {
+      throttleTimer = null;
+      if (pending) {
+        const p = pending;
+        pending = null;
+        void applyOffset(p.m, p.ms);
+      }
+    }, 100);
   }
 
   const groupTitle = $derived((session?.sources ?? []).map(label).join(' + '));
@@ -168,6 +214,21 @@
       Because you can only add delay, make the physically latest speaker the reference.
     </p>
 
+    <div class="field level">
+      <label for="cal-vol">Playback volume: {level}%</label>
+      <input
+        id="cal-vol"
+        type="range"
+        min="0"
+        max="100"
+        step="5"
+        value={level}
+        oninput={(e) => (level = Number((e.currentTarget as HTMLInputElement).value))}
+        onchange={(e) => setLevel(Number((e.currentTarget as HTMLInputElement).value))}
+      />
+      <p class="muted" style="font-size:0.8rem; margin:4px 0 0">Applies to the reference and the speaker being tuned.</p>
+    </div>
+
     <table>
       <thead>
         <tr><th>Speaker</th><th>Role</th><th>Offset</th><th></th></tr>
@@ -196,6 +257,7 @@
                   step={m.kind === 'sendspin' ? 5 : 10}
                   value={offsets[m.node_name] ?? 0}
                   disabled={!isTarget}
+                  oninput={(e) => liveOffset(m, Number((e.currentTarget as HTMLInputElement).value))}
                   onchange={(e) => applyOffset(m, Number((e.currentTarget as HTMLInputElement).value))}
                 />
                 <span class="ms">{offsets[m.node_name] ?? 0} ms</span>
@@ -209,6 +271,8 @@
                 </div>
                 {#if m.kind === 'raop'}
                   <p class="muted warn">Each change reloads this AirPlay sink — expect a brief gap before the click returns.</p>
+                {:else if !sendspinDelayLive}
+                  <p class="muted warn">Each change restarts the group stream — expect a brief gap before the click returns.</p>
                 {/if}
               {/if}
             </td>
@@ -278,5 +342,8 @@
   .warn {
     font-size: 0.8rem;
     margin: 6px 0 0;
+  }
+  .level {
+    max-width: 360px;
   }
 </style>

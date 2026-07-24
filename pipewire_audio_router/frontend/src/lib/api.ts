@@ -146,6 +146,7 @@ export const api = {
   alignStart: (sources: string[]) => request<AlignState>('POST', 'api/align/start', { sources }),
   alignSelect: (reference: string, target: string) =>
     request<AlignState>('POST', 'api/align/select', { reference, target }),
+  alignVolume: (volume: number) => request<AlignState>('POST', 'api/align/volume', { volume }),
   alignStop: () => request<AlignState>('DELETE', 'api/align'),
 
   // RTP source (single — Bluetooth bridge firmware target)

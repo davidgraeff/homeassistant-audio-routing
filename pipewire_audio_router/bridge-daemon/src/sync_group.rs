@@ -125,6 +125,24 @@ pub struct GroupSnapshot {
 }
 
 impl GroupReconciler {
+    /// Force the sendspin server of the group containing `sendspin_node_name` to
+    /// restart on the next reconcile, by dropping its handle and clearing the
+    /// remembered dialed set (so the `sendspin_node_names != prev_devices` check
+    /// fires). The devices reconnect and re-apply their static delay on connect
+    /// — the only way current ESPHome firmware picks up a delay change (it reads
+    /// `SetStaticDelay` at stream start, not live). Returns true if a group was
+    /// found; the caller must nudge a reconcile (ChangeNotifier) afterwards.
+    pub fn force_server_restart(&mut self, sendspin_node_name: &str) -> bool {
+        for g in self.running.values_mut() {
+            if g.server_devices.iter().any(|d| d == sendspin_node_name) {
+                g.server = None;
+                g.server_devices.clear();
+                return true;
+            }
+        }
+        false
+    }
+
     /// Snapshot every running group (anchor + members) for the alignment API.
     pub fn snapshot(&self) -> Vec<GroupSnapshot> {
         self.running

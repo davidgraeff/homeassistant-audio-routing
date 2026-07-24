@@ -50,11 +50,18 @@ struct Settings {
     /// the PipeWire module default (1500 ms).
     #[serde(default)]
     default_raop_latency_ms: Option<u16>,
+    /// Whether sendspin devices apply a static-delay change to the *running*
+    /// stream. Current ESPHome firmware does NOT (it reads the delay only at
+    /// stream start), so by default a delay change restarts the group stream —
+    /// like a RAOP sink reload. Flip this on for future firmware that honors a
+    /// live `SetStaticDelay`, to skip the restart. `serde(default)` = false.
+    #[serde(default)]
+    sendspin_delay_live: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { default_duck: DEFAULT_DUCK, discovery_enabled: true, default_raop_latency_ms: None }
+        Self { default_duck: DEFAULT_DUCK, discovery_enabled: true, default_raop_latency_ms: None, sendspin_delay_live: false }
     }
 }
 
@@ -107,6 +114,16 @@ impl SettingsStore {
         self.persist()
     }
 
+    pub fn sendspin_delay_live(&self) -> bool {
+        self.settings.sendspin_delay_live
+    }
+
+    /// Set whether sendspin delay changes apply live (no stream restart).
+    pub fn set_sendspin_delay_live(&mut self, live: bool) -> anyhow::Result<()> {
+        self.settings.sendspin_delay_live = live;
+        self.persist()
+    }
+
     fn persist(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -136,6 +153,7 @@ mod tests {
         assert_eq!(store.default_duck(), DEFAULT_DUCK);
         assert!(store.discovery_enabled());
         assert_eq!(store.default_raop_latency_ms(), None);
+        assert!(!store.sendspin_delay_live());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -147,11 +165,13 @@ mod tests {
         store.set_default_duck(1.5).unwrap(); // clamps to 1.0
         store.set_discovery_enabled(false).unwrap();
         store.set_default_raop_latency_ms(Some(400)).unwrap();
+        store.set_sendspin_delay_live(true).unwrap();
 
         let reloaded = SettingsStore::load(&path).unwrap();
         assert_eq!(reloaded.default_duck(), 1.0);
         assert!(!reloaded.discovery_enabled());
         assert_eq!(reloaded.default_raop_latency_ms(), Some(400));
+        assert!(reloaded.sendspin_delay_live());
         let _ = std::fs::remove_file(&path);
     }
 }
