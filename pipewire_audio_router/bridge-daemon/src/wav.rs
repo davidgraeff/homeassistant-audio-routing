@@ -30,9 +30,38 @@ pub fn build_wav(pcm: &[u8], sample_rate: u32, bits_per_sample: u16, channels: u
     out
 }
 
+/// Read a PCM WAV produced by [`build_wav`] (canonical 44-byte header, data
+/// chunk last): returns `(sample_rate, channels, pcm_bytes)`. Returns `None` if
+/// it isn't the expected layout. Used to turn a synthesized/decoded WAV back
+/// into raw PCM for resampling (announce.rs).
+pub fn read_pcm16(wav: &[u8]) -> Option<(u32, u16, &[u8])> {
+    if wav.len() < 44 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" || &wav[12..16] != b"fmt " {
+        return None;
+    }
+    let channels = u16::from_le_bytes([wav[22], wav[23]]);
+    let sample_rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+    // build_wav writes the data chunk immediately after the 16-byte fmt chunk.
+    if &wav[36..40] != b"data" {
+        return None;
+    }
+    let data_len = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]) as usize;
+    let end = (44 + data_len).min(wav.len());
+    Some((sample_rate, channels, &wav[44..end]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_pcm16_round_trips_build_wav() {
+        let pcm = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let wav = build_wav(&pcm, 48000, 16, 2);
+        let (rate, ch, data) = read_pcm16(&wav).expect("parse");
+        assert_eq!(rate, 48000);
+        assert_eq!(ch, 2);
+        assert_eq!(data, pcm.as_slice());
+    }
 
     #[test]
     fn wav_header_matches_input_format() {

@@ -22,8 +22,9 @@
 
 use crate::locks::LockRecover;
 use sendspin::protocol::messages::StreamPlayerConfig;
-use sendspin::server::{Advertisement, ClientEvent, ClientManager, Group};
-use sendspin::{DefaultClock, ServerConnection, ServerListener};
+use sendspin::server::{Advertisement, ClientEvent, ClientManager, Group, SharedTimeline};
+use sendspin::{Clock, DefaultClock, ServerConnection, ServerListener};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -245,4 +246,212 @@ fn resolve_node_name(devices: &crate::sendspin_discovery::SharedSendspinDevices,
     }
     let label = fullname.split("._sendspin._tcp").next().unwrap_or(fullname);
     crate::sendspin_discovery::device_node_name(label)
+}
+
+/// Like [`start_server`], but instead of one `Group` fanning identical frames to
+/// all members, it gives **each device its own single-member `Group`**, and all
+/// those groups **share one [`SharedTimeline`]**. One capture (the single PCM
+/// source) drives them: each chunk is stamped **once** on the shared timeline and
+/// delivered to every group via `push_encoded`, so chunk-N carries an identical
+/// timestamp to every device — the O-B per-device-sender model (each device is
+/// independently addressable, e.g. for per-device duck/overlay, while staying
+/// sample-accurately coincident). This is spike S1's subject; see
+/// docs/spike-results-and-status.md.
+///
+/// Unlike a per-device *null-sink* (one sink per device — the S3 spike, which
+/// showed dropouts because the null-sink isn't a steady clock driver), here the
+/// senders are fed from one steady anchor monitor, which is the recommended shape
+/// for a synchronized music group.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_server_per_device(
+    server_name: &str,
+    display_name: &str,
+    port: u16,
+    sink_node_id: u32,
+    device_filter: std::collections::HashSet<String>,
+    send_ahead_us: i64,
+    control: crate::sendspin_volume::SharedSendspinControl,
+    devices: crate::sendspin_discovery::SharedSendspinDevices,
+) -> anyhow::Result<SendspinServerHandle> {
+    let node_name = server_name.to_string();
+
+    let (capture_handle, mut pcm_rx) = crate::sendspin_capture::spawn(sink_node_id)
+        .map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
+
+    // One clock shared by the timeline and the dial manager, so the timestamps
+    // stamped here are in the same domain as the `server/time` replies members
+    // trust. (On Linux even distinct DefaultClocks share CLOCK_MONOTONIC_RAW,
+    // but sharing the Arc is the portable guarantee.)
+    let clock: Arc<dyn Clock> = Arc::new(DefaultClock::default());
+
+    let listener = ServerListener::bind(("0.0.0.0", port), &node_name, display_name)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind sendspin server on port {port}: {e}"))?
+        .path(SENDSPIN_PATH);
+    let advertisement = Advertisement::new(&node_name, display_name, port, SENDSPIN_PATH)
+        .map_err(|e| anyhow::anyhow!("failed to advertise sendspin server '{node_name}': {e}"))?;
+
+    // The single shared timeline. Config is set once up front so every member
+    // gets `stream/start` when it joins and the timeline is never re-anchored
+    // mid-stream (a per-member re-anchor would desync the others).
+    let timeline = Arc::new(SharedTimeline::new(Arc::clone(&clock)).with_send_ahead_us(send_ahead_us));
+    timeline.set_config(StreamPlayerConfig {
+        codec: "pcm".to_string(),
+        sample_rate: crate::sendspin_capture::SAMPLE_RATE,
+        channels: crate::sendspin_capture::CHANNELS as u8,
+        bit_depth: 16,
+        codec_header: None,
+    });
+
+    // One single-member Group per device, all sharing `timeline`. Keyed by the
+    // opaque client_id; `client_to_node` maps that to the device's output node
+    // name so the capture loop can look up its overlay (announcement) state.
+    let groups: Arc<Mutex<HashMap<String, Group>>> = Arc::new(Mutex::new(HashMap::new()));
+    let client_to_node: Arc<std::sync::Mutex<HashMap<String, String>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    let accept_task = spawn_accept_loop_per_device(
+        listener,
+        Arc::clone(&groups),
+        Arc::clone(&client_to_node),
+        Arc::clone(&timeline),
+        control.clone(),
+    );
+
+    let (client_manager, mut events) = ClientManager::start_filtered(
+        node_name.clone(),
+        display_name.to_string(),
+        Arc::clone(&clock),
+        move |fullname| device_filter.contains(fullname),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to start sendspin client discovery for '{node_name}': {e}"))?;
+
+    let event_task = {
+        let groups = Arc::clone(&groups);
+        let client_to_node = Arc::clone(&client_to_node);
+        let timeline = Arc::clone(&timeline);
+        let control = control.clone();
+        let devices = devices.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match event {
+                    ClientEvent::Connected { client_id, fullname, sender, .. } => {
+                        let dev_node_name = resolve_node_name(&devices, &fullname);
+                        client_to_node.lock().unwrap().insert(client_id.clone(), dev_node_name.clone());
+                        control.lock().await.register(dev_node_name, sender.clone()).await;
+                        // Its own group on the shared timeline. add_member sends
+                        // stream/start (config is already set), no re-anchor.
+                        let group = Group::with_timeline(Arc::clone(&timeline));
+                        if let Err(e) = group.add_member(client_id.clone(), sender).await {
+                            tracing::warn!("failed to add per-device member: {e}");
+                        }
+                        groups.lock().await.insert(client_id, group);
+                    }
+                    ClientEvent::Message { .. } => {}
+                    ClientEvent::Disconnected { client_id } => {
+                        // Bind the removal to a statement so the (non-Send) std
+                        // MutexGuard drops before the await below.
+                        let removed = client_to_node.lock().unwrap().remove(&client_id);
+                        if let Some(dev_node_name) = removed {
+                            control.lock().await.unregister(&dev_node_name);
+                        }
+                        groups.lock().await.remove(&client_id);
+                    }
+                }
+            }
+        })
+    };
+
+    let capture_forward_task = {
+        let groups = Arc::clone(&groups);
+        let client_to_node = Arc::clone(&client_to_node);
+        let timeline = Arc::clone(&timeline);
+        tokio::spawn(async move {
+            let mixer = crate::overlay_mixer::OverlayMixer::global();
+            while let Some(pcm) = pcm_rx.recv().await {
+                // Stamp ONCE per chunk, then fan that identical ts to every
+                // device's group — the shared-timeline sync guarantee. A device
+                // with an active announcement overlay gets duck(music)+overlay
+                // instead of the plain chunk; its groupmates get plain music.
+                let ts = timeline.stamp(pcm.len());
+                let groups = groups.lock().await;
+                let c2n = client_to_node.lock().unwrap();
+                for (client_id, group) in groups.iter() {
+                    match c2n.get(client_id).and_then(|node| mixer.mix(node, &pcm)) {
+                        Some(frame) => group.push_encoded(ts, &frame),
+                        None => group.push_encoded(ts, &pcm),
+                    }
+                }
+                drop(c2n);
+                drop(groups);
+                // Finished overlays are drained by the AnnounceCoordinator's poll
+                // loop (main.rs), which drives scheduler.complete (next queued /
+                // un-duck) — not here.
+            }
+        })
+    };
+
+    Ok(SendspinServerHandle {
+        _advertisement: advertisement,
+        _client_manager: client_manager,
+        _capture: capture_handle,
+        accept_task,
+        event_task,
+        capture_forward_task,
+    })
+}
+
+/// Accept loop for the per-device topology: each inbound client gets its own
+/// single-member group on the shared timeline (mirrors `spawn_accept_loop`).
+fn spawn_accept_loop_per_device(
+    listener: ServerListener,
+    groups: Arc<Mutex<HashMap<String, Group>>>,
+    client_to_node: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    timeline: Arc<SharedTimeline>,
+    control: crate::sendspin_volume::SharedSendspinControl,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((conn, _addr)) => {
+                    let client_id = conn.client_id().to_string();
+                    let node_name = crate::sendspin_discovery::device_node_name(&conn.hello().name);
+                    let sender = conn.sender();
+                    control.lock().await.register(node_name.clone(), sender.clone()).await;
+                    client_to_node.lock().unwrap().insert(client_id.clone(), node_name.clone());
+                    let group = Group::with_timeline(Arc::clone(&timeline));
+                    if let Err(e) = group.add_member(client_id.clone(), sender).await {
+                        tracing::warn!("failed to add inbound per-device member: {e}");
+                    }
+                    groups.lock().await.insert(client_id.clone(), group);
+                    tokio::spawn(drain_messages_per_device(
+                        conn,
+                        client_id,
+                        node_name,
+                        Arc::clone(&groups),
+                        Arc::clone(&client_to_node),
+                        control.clone(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("sendspin accept error: {e}");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    })
+}
+
+async fn drain_messages_per_device(
+    mut conn: ServerConnection,
+    client_id: String,
+    node_name: String,
+    groups: Arc<Mutex<HashMap<String, Group>>>,
+    client_to_node: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    control: crate::sendspin_volume::SharedSendspinControl,
+) {
+    while conn.recv_message().await.is_some() {}
+    control.lock().await.unregister(&node_name);
+    client_to_node.lock().unwrap().remove(&client_id);
+    groups.lock().await.remove(&client_id);
 }

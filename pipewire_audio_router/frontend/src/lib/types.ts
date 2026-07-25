@@ -30,6 +30,24 @@ export interface RoutingMatrix {
   links: RoutingLink[];
 }
 
+/** A named music group (groups_store.rs): outputs that play the same stream in
+ * sync. Membership is exclusive (an output is in at most one music group). */
+export interface MusicGroup {
+  id: string;
+  name: string;
+  members: string[];
+}
+
+/** A named announcement group: reusable target outputs for announcements, with a
+ * priority and duck level. Overlaps music/other announcement groups freely. */
+export interface AnnouncementGroup {
+  id: string;
+  name: string;
+  targets: string[];
+  priority: number;
+  duck: number;
+}
+
 export type Encryption = 'none' | 'RSA' | 'auth_setup';
 
 export interface OutputInfo {
@@ -76,6 +94,15 @@ export interface AppSettings {
    * Current ESPHome firmware does not, so a delay change restarts the group
    * stream; enable for future firmware that honors a live SetStaticDelay. */
   sendspin_delay_live: boolean;
+  /** Whether the HA integration also exposes each individual output as its own
+   * media_player entity. Default off: the integration creates one entity per
+   * music group and per announcement group; this adds a per-output entity for
+   * directly addressing a single speaker regardless of its group. */
+  expose_outputs_as_media_players: boolean;
+  /** Experimental (O-B): run each sync group's sendspin devices as per-device
+   * senders sharing one timeline, instead of one shared Group. Sync-preserving;
+   * the foundation for per-device duck/overlay. */
+  per_device_sendspin_senders: boolean;
 }
 
 /** Partial settings update; omitted fields are left unchanged. For
@@ -203,11 +230,4 @@ export interface OpResponse {
 export interface VolumeResponse {
   volume: number | null;
   message: string | null;
-}
-
-export interface WyomingAnnounce {
-  host: string;
-  port?: number;
-  text: string;
-  voice?: string | null;
 }

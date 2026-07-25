@@ -2,20 +2,22 @@
   import { routing } from './lib/routing';
   import ThemeToggle from './components/ThemeToggle.svelte';
   import Toasts from './components/Toasts.svelte';
-  import RoutingTab from './components/RoutingTab.svelte';
   import OutputsTab from './components/OutputsTab.svelte';
+  import GroupsTab from './components/GroupsTab.svelte';
   import AlignTab from './components/AlignTab.svelte';
   import SourcesTab from './components/SourcesTab.svelte';
   import SettingsTab from './components/SettingsTab.svelte';
   import DiagnosticsTab from './components/DiagnosticsTab.svelte';
 
-  type Tab = 'routing' | 'outputs' | 'align' | 'sources' | 'settings' | 'diagnostics';
-  let tab = $state<Tab>('routing');
+  // Groups is the primary surface. The low-level routing matrix moved into
+  // Diagnostics (a connection-diagnosis tool, not a daily-use page).
+  type Tab = 'groups' | 'outputs' | 'sources' | 'align' | 'settings' | 'diagnostics';
+  let tab = $state<Tab>('groups');
   const tabs: { id: Tab; label: string }[] = [
-    { id: 'routing', label: 'Routing' },
+    { id: 'groups', label: 'Groups' },
     { id: 'outputs', label: 'Outputs' },
-    { id: 'align', label: 'Align' },
     { id: 'sources', label: 'Sources' },
+    { id: 'align', label: 'Align' },
     { id: 'settings', label: 'Settings' },
     { id: 'diagnostics', label: 'Diagnostics' },
   ];
@@ -36,14 +38,14 @@
 </nav>
 
 <main>
-  {#if tab === 'routing'}
-    <RoutingTab />
+  {#if tab === 'groups'}
+    <GroupsTab />
   {:else if tab === 'outputs'}
     <OutputsTab />
-  {:else if tab === 'align'}
-    <AlignTab />
   {:else if tab === 'sources'}
     <SourcesTab />
+  {:else if tab === 'align'}
+    <AlignTab />
   {:else if tab === 'settings'}
     <SettingsTab />
   {:else}

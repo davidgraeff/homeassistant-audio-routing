@@ -36,6 +36,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import PipewireRouterCoordinator
+from .api import AnnouncementGroup, MusicGroup
 from .api import MediaPlayerState as ApiMediaPlayerState
 from .api import RoutingMatrix, RoutingNode
 from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NONE
@@ -125,29 +126,46 @@ def _output_node_names(coordinator: PipewireRouterCoordinator) -> list[str]:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     coordinator: PipewireRouterCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    # One entity per routing-matrix output, keyed by the stable node *name*
-    # (a reloaded module returns a fresh node_id but the same name). Entities
-    # are added when an output appears and removed when it leaves the matrix.
-    entities: dict[str, PipewireRouterMediaPlayer] = {}
+    # Entities are created one per music group + one per announcement group, and
+    # (only when the daemon's `expose_outputs_as_media_players` toggle is on) one
+    # per output. Keyed by a namespaced string ("mg:<id>", "ag:<id>",
+    # "out:<node>") so the three kinds never collide, and each is added/removed as
+    # its group/output/toggle appears or leaves.
+    entities: dict[str, CoordinatorEntity] = {}
 
     @callback
     def _reconcile_entities() -> None:
-        desired = set(_output_node_names(coordinator))
+        desired: dict[str, CoordinatorEntity] = {}
+        for g in coordinator.music_groups:
+            key = f"mg:{g.id}"
+            if key not in entities:
+                desired[key] = MusicGroupMediaPlayer(coordinator, entry, g.id)
+        for g in coordinator.announcement_groups:
+            key = f"ag:{g.id}"
+            if key not in entities:
+                desired[key] = AnnouncementGroupMediaPlayer(coordinator, entry, g.id)
+        if coordinator.expose_outputs:
+            for name in _output_node_names(coordinator):
+                key = f"out:{name}"
+                if key not in entities:
+                    desired[key] = PipewireRouterMediaPlayer(hass, coordinator, entry, name)
 
-        new = [
-            PipewireRouterMediaPlayer(hass, coordinator, entry, name)
-            for name in desired
-            if name not in entities
-        ]
-        for ent in new:
-            entities[ent.node_name] = ent
+        new = list(desired.values())
+        for key, ent in desired.items():
+            entities[key] = ent
         if new:
             async_add_entities(new)
 
-        gone = [name for name in entities if name not in desired]
+        # Anything no longer backed by a group/output (or per-output turned off).
+        live_keys = (
+            {f"mg:{g.id}" for g in coordinator.music_groups}
+            | {f"ag:{g.id}" for g in coordinator.announcement_groups}
+            | ({f"out:{n}" for n in _output_node_names(coordinator)} if coordinator.expose_outputs else set())
+        )
+        gone = [key for key in entities if key not in live_keys]
         if gone:
             registry = er.async_get(hass)
-            removed = [entities.pop(name) for name in gone]
+            removed = [entities.pop(key) for key in gone]
 
             async def _remove() -> None:
                 for ent in removed:
@@ -203,7 +221,7 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         # re-resolved from each snapshot (see `_current`) so this entity
         # keeps working across a module reload that changes the id.
         self.node_name = node_name
-        self._attr_unique_id = f"{entry.entry_id}_{node_name}"
+        self._attr_unique_id = f"{entry.entry_id}_out_{node_name}"
 
         # Correlate a sendspin output to its Home Assistant device (by mDNS
         # hostname → the ESPHome device) once, at creation. When matched, the
@@ -456,4 +474,154 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
             # Surface the failure both to the caller (service error) and the log,
             # so a broken announce is never silent.
             _LOGGER.error("play_media on %s failed: %s", self.entity_id, err)
+            raise
+
+
+class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaPlayerEntity):
+    """A named music group as a media_player: pick the source the whole group
+    plays (`select_source`, routing all members together) and set a group master
+    volume (applied to every member). One entity per music group."""
+
+    _attr_supported_features = MediaPlayerEntityFeature.VOLUME_SET | MediaPlayerEntityFeature.SELECT_SOURCE
+    _attr_has_entity_name = False
+
+    def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry, group_id: str) -> None:
+        super().__init__(coordinator)
+        self._group_id = group_id
+        self._attr_unique_id = f"{entry.entry_id}_mg_{group_id}"
+
+    def _group(self) -> MusicGroup | None:
+        return next((g for g in self.coordinator.music_groups if g.id == self._group_id), None)
+
+    def _matrix(self) -> RoutingMatrix:
+        return self.coordinator.routing
+
+    @property
+    def available(self) -> bool:
+        return self._group() is not None
+
+    @property
+    def name(self) -> str | None:
+        g = self._group()
+        return g.name if g else None
+
+    @property
+    def source_list(self) -> list[str]:
+        return [SOURCE_NONE] + [s.display_name for s in self._matrix().sources]
+
+    def _member_sources(self) -> set[str]:
+        """Source node names currently linked to any member of this group."""
+        g = self._group()
+        if not g:
+            return set()
+        members = set(g.members)
+        return {src for src, out in self._matrix().links if out in members}
+
+    @property
+    def source(self) -> str | None:
+        srcs = self._member_sources()
+        names = [s.display_name for s in self._matrix().sources if s.node_name in srcs]
+        return names[0] if names else SOURCE_NONE
+
+    @property
+    def state(self) -> MediaPlayerState | None:
+        present_sources = {s.node_name for s in self._matrix().sources if s.present}
+        return MediaPlayerState.PLAYING if self._member_sources() & present_sources else MediaPlayerState.IDLE
+
+    @property
+    def volume_level(self) -> float | None:
+        """Group master = the mean of the members' individual volumes."""
+        g = self._group()
+        if not g or not g.members:
+            return None
+        levels: list[float] = []
+        for name in g.members:
+            if name.startswith(SENDSPIN_DEV_PREFIX):
+                levels.append(self.coordinator.sendspin_volumes.get(name, 100) / 100)
+            else:
+                current = next((p for p in self.coordinator.data if p.node_name == name), None)
+                if current is not None and current.volume is not None:
+                    levels.append(current.volume)
+        return sum(levels) / len(levels) if levels else None
+
+    def _resolve_source_name(self, source: str) -> str:
+        target = next((s for s in self._matrix().sources if s.display_name == source), None)
+        if target is None:
+            raise HomeAssistantError(f"unknown source '{source}' for {self.entity_id}")
+        return target.node_name
+
+    async def async_select_source(self, source: str) -> None:
+        if source == SOURCE_NONE:
+            await self.coordinator.client.async_unroute_music_group(self._group_id)
+        else:
+            await self.coordinator.client.async_route_music_group(self._group_id, self._resolve_source_name(source))
+        await self.coordinator.async_request_refresh()
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Apply the master volume to every member (in-band for sendspin, node
+        volume for RAOP)."""
+        g = self._group()
+        if not g:
+            return
+        for name in g.members:
+            if name.startswith(SENDSPIN_DEV_PREFIX):
+                await self.coordinator.client.async_set_sendspin_volume(name, round(volume * 100))
+            else:
+                current = next((p for p in self.coordinator.data if p.node_name == name), None)
+                if current is not None:
+                    await self.coordinator.client.async_set_volume(current.node_id, volume)
+        await self.coordinator.async_request_refresh()
+
+
+class AnnouncementGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaPlayerEntity):
+    """A named announcement group as a media_player: `play_media` / TTS fans a
+    ducked announcement to the group's targets (priority + duck come from the
+    group). One entity per announcement group. Not a music source."""
+
+    _attr_supported_features = MediaPlayerEntityFeature.PLAY_MEDIA | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
+    _attr_has_entity_name = False
+
+    def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry, group_id: str) -> None:
+        super().__init__(coordinator)
+        self._group_id = group_id
+        self._attr_unique_id = f"{entry.entry_id}_ag_{group_id}"
+
+    def _group(self) -> AnnouncementGroup | None:
+        return next((g for g in self.coordinator.announcement_groups if g.id == self._group_id), None)
+
+    @property
+    def available(self) -> bool:
+        return self._group() is not None
+
+    @property
+    def name(self) -> str | None:
+        g = self._group()
+        return g.name if g else None
+
+    @property
+    def state(self) -> MediaPlayerState | None:
+        # Announcements are transient overlays; there's no persistent play state.
+        return MediaPlayerState.IDLE
+
+    async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs) -> None:
+        extra = kwargs.get("extra") or {}
+        _LOGGER.info(
+            "play_media on announcement group %s: media_type=%s media_id=%r extra=%r",
+            self.entity_id,
+            media_type,
+            media_id,
+            extra,
+        )
+        wyoming = extra.get("wyoming")
+        try:
+            if wyoming:
+                await self.coordinator.client.async_announce_group(self._group_id, wyoming=wyoming)
+            else:
+                if media_source.is_media_source_id(media_id):
+                    resolved = await media_source.async_resolve_media(self.hass, media_id, self.entity_id)
+                    media_id = resolved.url
+                media_id = async_process_play_media_url(self.hass, media_id)
+                await self.coordinator.client.async_announce_group(self._group_id, url=media_id)
+        except Exception as err:
+            _LOGGER.error("announce to group %s failed: %s", self.entity_id, err)
             raise

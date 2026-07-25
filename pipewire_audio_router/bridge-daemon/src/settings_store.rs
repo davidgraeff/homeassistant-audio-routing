@@ -57,11 +57,24 @@ struct Settings {
     /// live `SetStaticDelay`, to skip the restart. `serde(default)` = false.
     #[serde(default)]
     sendspin_delay_live: bool,
+    /// Whether the HA integration should additionally expose every individual
+    /// output as its own `media_player` entity. By default the integration
+    /// creates one entity per music group and per announcement group; turning
+    /// this on adds a per-output entity for directly addressing a single
+    /// speaker regardless of its group. `serde(default)` = false.
+    #[serde(default)]
+    expose_outputs_as_media_players: bool,
+    /// **Experimental (O-B):** run each sync group's sendspin devices as
+    /// *per-device senders* sharing one timeline (sync_group + `start_server_per_device`)
+    /// instead of one shared `Group`. Sync-preserving (validated in spike S1); the
+    /// foundation for per-device duck/overlay. `serde(default)` = false.
+    #[serde(default)]
+    per_device_sendspin_senders: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { default_duck: DEFAULT_DUCK, discovery_enabled: true, default_raop_latency_ms: None, sendspin_delay_live: false }
+        Self { default_duck: DEFAULT_DUCK, discovery_enabled: true, default_raop_latency_ms: None, sendspin_delay_live: false, expose_outputs_as_media_players: false, per_device_sendspin_senders: false }
     }
 }
 
@@ -124,6 +137,26 @@ impl SettingsStore {
         self.persist()
     }
 
+    pub fn expose_outputs_as_media_players(&self) -> bool {
+        self.settings.expose_outputs_as_media_players
+    }
+
+    /// Set whether the HA integration also exposes a per-output media_player.
+    pub fn set_expose_outputs_as_media_players(&mut self, expose: bool) -> anyhow::Result<()> {
+        self.settings.expose_outputs_as_media_players = expose;
+        self.persist()
+    }
+
+    pub fn per_device_sendspin_senders(&self) -> bool {
+        self.settings.per_device_sendspin_senders
+    }
+
+    /// Set the experimental per-device-senders mode for sync groups.
+    pub fn set_per_device_sendspin_senders(&mut self, on: bool) -> anyhow::Result<()> {
+        self.settings.per_device_sendspin_senders = on;
+        self.persist()
+    }
+
     fn persist(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -136,6 +169,13 @@ impl SettingsStore {
 
 /// Shared handle used across the API and (for the discovery flag) startup.
 pub type SharedSettings = std::sync::Arc<std::sync::Mutex<SettingsStore>>;
+
+/// Read the experimental per-device-senders flag from the shared settings
+/// (poison-safe; defaults to false if the lock is poisoned). Mirrors
+/// `sync_settings::group_lead_us` so the reconcile task can read it each tick.
+pub fn per_device_senders(settings: &SharedSettings) -> bool {
+    settings.lock().map(|s| s.per_device_sendspin_senders()).unwrap_or(false)
+}
 
 #[cfg(test)]
 mod tests {
@@ -154,6 +194,8 @@ mod tests {
         assert!(store.discovery_enabled());
         assert_eq!(store.default_raop_latency_ms(), None);
         assert!(!store.sendspin_delay_live());
+        assert!(!store.expose_outputs_as_media_players());
+        assert!(!store.per_device_sendspin_senders());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -166,12 +208,16 @@ mod tests {
         store.set_discovery_enabled(false).unwrap();
         store.set_default_raop_latency_ms(Some(400)).unwrap();
         store.set_sendspin_delay_live(true).unwrap();
+        store.set_expose_outputs_as_media_players(true).unwrap();
+        store.set_per_device_sendspin_senders(true).unwrap();
 
         let reloaded = SettingsStore::load(&path).unwrap();
         assert_eq!(reloaded.default_duck(), 1.0);
         assert!(!reloaded.discovery_enabled());
         assert_eq!(reloaded.default_raop_latency_ms(), Some(400));
         assert!(reloaded.sendspin_delay_live());
+        assert!(reloaded.expose_outputs_as_media_players());
+        assert!(reloaded.per_device_sendspin_senders());
         let _ = std::fs::remove_file(&path);
     }
 }

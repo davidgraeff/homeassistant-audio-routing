@@ -20,6 +20,7 @@ mod discovery;
 mod group;
 mod listener;
 mod manager;
+mod timeline;
 
 pub use binary::encode_audio_frame;
 pub use connection::{ServerConnection, ServerConnectionGuard, ServerSender};
@@ -28,3 +29,4 @@ pub use discovery::{Advertisement, ClientBrowser, Discovered};
 pub use group::{Group, DEFAULT_SEND_AHEAD_US};
 pub use listener::ServerListener;
 pub use manager::{ClientEvent, ClientManager};
+pub use timeline::SharedTimeline;

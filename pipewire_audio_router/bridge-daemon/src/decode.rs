@@ -4,6 +4,7 @@
 
 use crate::wav::build_wav;
 use std::fs::File;
+use std::io::Cursor;
 use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -25,6 +26,38 @@ pub async fn decode_file_to_wav(path: &Path) -> anyhow::Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || decode_file_to_wav_blocking(&path)).await?
 }
 
+/// Decodes an in-memory clip (e.g. a `include_bytes!`-embedded diagnostic
+/// asset) into a 16-bit PCM WAV. Same standardization as [`decode_file_to_wav`],
+/// but sourced from a byte slice rather than a file. `ext` is a format hint
+/// (`"mp3"`, `"wav"`, …); symphonia still probes the real format from content.
+pub async fn decode_bytes_to_wav(bytes: &'static [u8], ext: &'static str) -> anyhow::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension(ext);
+        decode_stream_to_wav(mss, hint)
+    })
+    .await?
+}
+
+/// Decode the file at `path` straight to overlay-ready PCM: 48 kHz, stereo,
+/// S16LE (the capture/overlay format). Used by the per-device announce path
+/// (announce.rs) which mixes the clip into one device's stream.
+pub async fn decode_file_to_pcm_48k_stereo(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = File::open(&path)?;
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
+        let (pcm, rate, channels) = decode_stream_to_pcm(mss, hint)?;
+        Ok(crate::resample::to_48k_stereo_s16le(&pcm, rate, channels))
+    })
+    .await?
+}
+
 fn decode_file_to_wav_blocking(path: &Path) -> anyhow::Result<Vec<u8>> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -33,7 +66,19 @@ fn decode_file_to_wav_blocking(path: &Path) -> anyhow::Result<Vec<u8>> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
+    decode_stream_to_wav(mss, hint)
+}
 
+/// Shared decode core: probe the stream's format, decode its first audio track,
+/// and standardize to a 16-bit PCM WAV.
+fn decode_stream_to_wav(mss: MediaSourceStream, hint: Hint) -> anyhow::Result<Vec<u8>> {
+    let (pcm, sample_rate, channels) = decode_stream_to_pcm(mss, hint)?;
+    Ok(build_wav(&pcm, sample_rate, 16, channels))
+}
+
+/// Decode the first audio track to interleaved S16LE PCM, returning it with its
+/// native sample rate and channel count.
+fn decode_stream_to_pcm(mss: MediaSourceStream, hint: Hint) -> anyhow::Result<(Vec<u8>, u32, u16)> {
     let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())?;
     let mut format = probed.format;
 
@@ -71,10 +116,10 @@ fn decode_file_to_wav_blocking(path: &Path) -> anyhow::Result<Vec<u8>> {
     }
 
     if pcm.is_empty() {
-        anyhow::bail!("decoded zero audio samples from {}", path.display());
+        anyhow::bail!("decoded zero audio samples from the source clip");
     }
 
-    Ok(build_wav(&pcm, sample_rate, 16, channels))
+    Ok((pcm, sample_rate, channels))
 }
 
 /// Converts a decoded packet (whatever sample format the source codec
@@ -90,5 +135,23 @@ fn append_as_i16_le(decoded: AudioBufferRef, out: &mut Vec<u8>) {
     out.reserve(sample_buf.samples().len() * 2);
     for sample in sample_buf.samples() {
         out.extend_from_slice(&sample.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The committed diagnostic clip the `test-announcement` endpoint embeds
+    /// must decode to a non-empty 16-bit PCM WAV — this guards against the
+    /// asset being replaced with something symphonia can't read.
+    #[tokio::test]
+    async fn embedded_test_announcement_decodes() {
+        let mp3 = include_bytes!("../assets/test-announcement.mp3");
+        let wav = decode_bytes_to_wav(mp3, "mp3").await.expect("decode embedded test announcement");
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        // Non-trivial audio: well past the 44-byte header.
+        assert!(wav.len() > 10_000, "decoded WAV suspiciously small: {} bytes", wav.len());
     }
 }

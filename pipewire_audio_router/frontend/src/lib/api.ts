@@ -11,10 +11,12 @@ import type {
   AirplaySourceInfo,
   AlignGroup,
   AlignState,
+  AnnouncementGroup,
   AppSettings,
   AppSettingsUpdate,
   Encryption,
   MediaPlayerInfo,
+  MusicGroup,
   NodesResponse,
   OpResponse,
   OutputInfo,
@@ -23,7 +25,6 @@ import type {
   StatusInfo,
   SyncSettingsInfo,
   VolumeResponse,
-  WyomingAnnounce,
 } from './types';
 
 const BASE = new URL('.', document.baseURI);
@@ -78,14 +79,13 @@ export const api = {
   forgetEntity: (nodeName: string) =>
     request<OpResponse>('DELETE', `api/routing/entity/${encodeURIComponent(nodeName)}`),
 
-  // Media players (volume + announce)
+  // Media players (volume). Ducked TTS/announce playback is driven by the Home
+  // Assistant integration against the daemon's `/announce` endpoint, not the web
+  // UI — the Outputs tab's Play tone / Play announcement buttons are the UI's
+  // own (unducked) diagnostics (see `testTone`/`testAnnouncement`).
   mediaPlayers: () => request<MediaPlayerInfo[]>('GET', 'api/media_players'),
   setVolume: (nodeId: number, volume: number) =>
     request<VolumeResponse>('POST', `api/media_players/${nodeId}/volume`, { volume }),
-  announceUrl: (nodeId: number, url: string, duckVolume: number) =>
-    request<OpResponse>('POST', `api/media_players/${nodeId}/announce`, { url, duck_volume: duckVolume }),
-  announceWyoming: (nodeId: number, wyoming: WyomingAnnounce, duckVolume: number) =>
-    request<OpResponse>('POST', `api/media_players/${nodeId}/announce`, { wyoming, duck_volume: duckVolume }),
 
   // RAOP outputs (CRUD)
   outputs: () => request<OutputInfo[]>('GET', 'api/outputs'),
@@ -97,6 +97,13 @@ export const api = {
   /** Per-RAOP-output receiver latency in ms (`raop.latency.ms`); null resets to default. */
   setOutputLatency: (nodeName: string, latencyMs: number | null) =>
     request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/latency`, { latency_ms: latencyMs }),
+  /** Diagnostic: play the calibration click once into this output's sink.
+   * Blocks until the clip finishes; only a live sink (present RAOP) is a valid target. */
+  testTone: (nodeName: string) =>
+    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/test-tone`),
+  /** Diagnostic: play the committed TTS test-announcement clip into this output's sink. */
+  testAnnouncement: (nodeName: string) =>
+    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/test-announcement`),
 
   // AirPlay-receive source (single)
   airplaySource: () => request<AirplaySourceInfo>('GET', 'api/source/airplay'),
@@ -135,6 +142,24 @@ export const api = {
   // latency). PUT is a partial update — send only the fields you're changing.
   settings: () => request<AppSettings>('GET', 'api/settings'),
   setSettings: (patch: AppSettingsUpdate) => request<OpResponse>('PUT', 'api/settings', patch),
+
+  // Named music/announcement groups (groups_store.rs).
+  musicGroups: () => request<MusicGroup[]>('GET', 'api/groups/music'),
+  createMusicGroup: (name: string, members: string[]) =>
+    request<{ ok: boolean; group?: MusicGroup; message?: string }>('POST', 'api/groups/music', { name, members }),
+  updateMusicGroup: (id: string, patch: { name?: string; members?: string[] }) =>
+    request<{ ok: boolean; group?: MusicGroup; message?: string }>('PUT', `api/groups/music/${id}`, patch),
+  deleteMusicGroup: (id: string) => request<OpResponse>('DELETE', `api/groups/music/${id}`),
+  routeMusicGroup: (id: string, source: string) => request<OpResponse>('POST', `api/groups/music/${id}/route`, { source }),
+  unrouteMusicGroup: (id: string) => request<OpResponse>('DELETE', `api/groups/music/${id}/route`),
+  announcementGroups: () => request<AnnouncementGroup[]>('GET', 'api/groups/announcement'),
+  createAnnouncementGroup: (name: string, targets: string[], priority: number, duck: number) =>
+    request<{ ok: boolean; group?: AnnouncementGroup; message?: string }>('POST', 'api/groups/announcement', { name, targets, priority, duck }),
+  updateAnnouncementGroup: (id: string, patch: { name?: string; targets?: string[]; priority?: number; duck?: number }) =>
+    request<{ ok: boolean; group?: AnnouncementGroup; message?: string }>('PUT', `api/groups/announcement/${id}`, patch),
+  deleteAnnouncementGroup: (id: string) => request<OpResponse>('DELETE', `api/groups/announcement/${id}`),
+  announceToGroup: (announcementGroup: string) =>
+    request<{ ok: boolean; admission: string; message: string }>('POST', 'api/announce', { announcement_group: announcementGroup, test: true }),
 
   // Diagnostics status snapshot + live PipeWire graph.
   status: () => request<StatusInfo>('GET', 'api/status'),

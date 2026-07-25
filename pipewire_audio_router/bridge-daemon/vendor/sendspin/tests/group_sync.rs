@@ -69,7 +69,7 @@ async fn two_members_receive_identical_timestamped_audio() {
         .unwrap()
         .unwrap();
 
-    let mut group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
+    let group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
     group
         .add_member(conn_a.client_id().to_string(), conn_a.sender())
         .await
@@ -89,7 +89,7 @@ async fn two_members_receive_identical_timestamped_audio() {
             codec_header: None,
         })
         .await;
-    let sent_timestamp = group.push_audio(&[1, 2, 3, 4, 5, 6, 7, 8]).await;
+    let sent_timestamp = group.push_audio(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
     let mut read_a = peer_a.await.unwrap();
     let mut read_b = peer_b.await.unwrap();
@@ -140,7 +140,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
         .await
         .unwrap()
         .unwrap();
-    let mut group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
+    let group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
     group
         .add_member(conn_a.client_id().to_string(), conn_a.sender())
         .await
@@ -156,7 +156,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
         })
         .await;
     // Sent before the late joiner exists — it must never see this.
-    group.push_audio(&[0xAA; 8]).await;
+    group.push_audio(&[0xAA; 8]);
 
     let mut read_a = peer_a.await.unwrap();
     assert!(matches!(
@@ -212,7 +212,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
 
     // The next push reaches both members with the identical timestamp/bytes
     // — the late joiner is synchronized with the one that was already there.
-    let sent_timestamp = group.push_audio(&[0xBB; 8]).await;
+    let sent_timestamp = group.push_audio(&[0xBB; 8]);
 
     let frame_a = match read_a.next().await.expect("no second chunk for A").unwrap() {
         WsMessage::Binary(b) => b,
@@ -267,7 +267,7 @@ async fn a_dead_member_is_pruned_without_blocking_the_survivor() {
         .unwrap()
         .unwrap();
 
-    let mut group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
+    let group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
     group
         .add_member(conn_a.client_id().to_string(), conn_a.sender())
         .await
@@ -295,7 +295,7 @@ async fn a_dead_member_is_pruned_without_blocking_the_survivor() {
         .await;
 
     assert_eq!(
-        group.member_ids().collect::<Vec<_>>(),
+        group.member_ids(),
         vec!["member-b"],
         "member-a's failed send must have pruned it from the group"
     );
@@ -316,4 +316,101 @@ async fn a_dead_member_is_pruned_without_blocking_the_survivor() {
         }
         other => panic!("expected server/command, got {other:?}"),
     }
+}
+
+/// The O-B invariant (per-device senders on a shared timeline): two *separate*
+/// groups — each standing in for one independently-addressable device — that
+/// share a single `SharedTimeline` emit an identical timestamp for the same
+/// chunk when the caller stamps the timeline once and fans the result to each
+/// group via `push_encoded`. This is the property that lets per-device senders
+/// stay sample-accurately coincident while being ducked/overlaid/routed on
+/// their own. It also proves the two senders can carry *different* bytes at
+/// that one shared timestamp (the per-device overlay/duck primitive).
+#[tokio::test]
+async fn separate_groups_sharing_a_timeline_stamp_identically() {
+    use sendspin::server::SharedTimeline;
+    use std::sync::Arc;
+
+    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let url = format!("ws://{addr}");
+
+    let peer_a = tokio::spawn({
+        let url = url.clone();
+        async move { connect_peer(&url, "device-a").await }
+    });
+    let peer_b = tokio::spawn({
+        let url = url.clone();
+        async move { connect_peer(&url, "device-b").await }
+    });
+    let (conn_a, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let (conn_b, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // One timeline, two independent single-member groups (one per "device").
+    let timeline = Arc::new(SharedTimeline::new(Arc::new(sendspin::DefaultClock::default())));
+    let group_a = Group::with_timeline(Arc::clone(&timeline));
+    let group_b = Group::with_timeline(Arc::clone(&timeline));
+    group_a
+        .add_member(conn_a.client_id().to_string(), conn_a.sender())
+        .await
+        .unwrap();
+    group_b
+        .add_member(conn_b.client_id().to_string(), conn_b.sender())
+        .await
+        .unwrap();
+
+    let config = StreamPlayerConfig {
+        codec: "pcm".to_string(),
+        sample_rate: 48000,
+        channels: 2,
+        bit_depth: 16,
+        codec_header: None,
+    };
+    group_a.start_stream(config.clone()).await;
+    group_b.start_stream(config).await;
+
+    // Stamp ONCE for this chunk, then hand that single ts to each group. Device
+    // B gets a different payload (as an overlay/duck would produce) at the very
+    // same timestamp.
+    let bytes_a = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let bytes_b = [9u8, 9, 9, 9, 9, 9, 9, 9];
+    let shared_ts = timeline.stamp(bytes_a.len());
+    group_a.push_encoded(shared_ts, &bytes_a);
+    group_b.push_encoded(shared_ts, &bytes_b);
+
+    let mut read_a = peer_a.await.unwrap();
+    let mut read_b = peer_b.await.unwrap();
+
+    // Each device gets its stream/start (Text) first.
+    for read in [&mut read_a, &mut read_b] {
+        let msg = read.next().await.expect("no stream/start").unwrap();
+        assert!(matches!(msg, WsMessage::Text(_)));
+    }
+
+    let frame_a = match read_a.next().await.expect("no audio A").unwrap() {
+        WsMessage::Binary(b) => b,
+        other => panic!("expected binary, got {other:?}"),
+    };
+    let frame_b = match read_b.next().await.expect("no audio B").unwrap() {
+        WsMessage::Binary(b) => b,
+        other => panic!("expected binary, got {other:?}"),
+    };
+    let chunk_a = AudioChunk::from_bytes(&frame_a).unwrap();
+    let chunk_b = AudioChunk::from_bytes(&frame_b).unwrap();
+
+    // The whole point: identical timestamp across independent senders...
+    assert_eq!(chunk_a.timestamp, shared_ts);
+    assert_eq!(chunk_b.timestamp, shared_ts);
+    assert_eq!(chunk_a.timestamp, chunk_b.timestamp);
+    // ...while each carries its own (potentially ducked/overlaid) payload.
+    assert_eq!(&*chunk_a.data, &bytes_a[..]);
+    assert_eq!(&*chunk_b.data, &bytes_b[..]);
 }

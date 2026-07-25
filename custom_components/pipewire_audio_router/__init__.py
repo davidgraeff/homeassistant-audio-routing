@@ -20,7 +20,9 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
+    AnnouncementGroup,
     MediaPlayerState,
+    MusicGroup,
     PipewireRouterApiClient,
     PipewireRouterApiError,
     RoutingMatrix,
@@ -86,6 +88,13 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         # each poll. Sendspin devices are virtual (no PipeWire node volume), so
         # their media_player volume comes from here, not from `.data`.
         self.sendspin_volumes: dict[str, int] = {}
+        # Named music/announcement groups (groups_store.rs) + the per-output
+        # entity toggle, refreshed each poll. These drive which media_player
+        # entities exist: one per music group + one per announcement group, plus
+        # one per output when `expose_outputs` is on.
+        self.music_groups: list[MusicGroup] = []
+        self.announcement_groups: list[AnnouncementGroup] = []
+        self.expose_outputs: bool = False
 
     async def _async_update_data(self) -> list[MediaPlayerState]:
         try:
@@ -108,6 +117,14 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
             self.sendspin_volumes = await self.client.async_get_sendspin_volumes()
         except PipewireRouterApiError as err:
             _LOGGER.debug("sendspin volumes unavailable: %s", err)
+        # Groups + the per-output toggle drive entity creation; secondary, and an
+        # older daemon without these endpoints simply yields no groups.
+        try:
+            self.music_groups = await self.client.async_get_music_groups()
+            self.announcement_groups = await self.client.async_get_announcement_groups()
+            self.expose_outputs = (await self.client.async_get_settings()).expose_outputs_as_media_players
+        except PipewireRouterApiError as err:
+            _LOGGER.debug("groups/settings unavailable: %s", err)
         return players
 
     async def async_init_routing(self) -> None:
@@ -174,11 +191,17 @@ def _async_register_cleanup_service(hass: HomeAssistant) -> None:
         registry = er.async_get(hass)
         removed = 0
         for entry_id, coordinator in hass.data.get(DOMAIN, {}).items():
-            valid = {f"{entry_id}_{o.node_name}" for o in coordinator.routing.outputs}
+            # New scheme: one entity per music group + per announcement group,
+            # plus per output when the toggle is on. Namespaced unique_ids so the
+            # kinds never collide. Anything else (incl. pre-migration
+            # f"{entry_id}_{node_name}" per-output ids) is stale → removed.
+            valid = {f"{entry_id}_mg_{g.id}" for g in coordinator.music_groups}
+            valid |= {f"{entry_id}_ag_{g.id}" for g in coordinator.announcement_groups}
+            if coordinator.expose_outputs:
+                valid |= {f"{entry_id}_out_{o.node_name}" for o in coordinator.routing.outputs}
             for entity in er.async_entries_for_config_entry(registry, entry_id):
                 if entity.domain != "media_player":
                     continue
-                # unique_id is f"{entry_id}_{node_name}"; keep only current ones.
                 if entity.unique_id not in valid:
                     registry.async_remove(entity.entity_id)
                     removed += 1

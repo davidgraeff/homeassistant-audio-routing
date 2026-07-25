@@ -65,6 +65,33 @@ class RoutingMatrix:
     links: list[tuple[str, str]]
 
 
+@dataclass
+class MusicGroup:
+    """A named music group (groups_store.rs): exclusive set of member outputs."""
+
+    id: str
+    name: str
+    members: list[str]
+
+
+@dataclass
+class AnnouncementGroup:
+    """A named announcement group: target outputs + priority + duck level."""
+
+    id: str
+    name: str
+    targets: list[str]
+    priority: int
+    duck: float
+
+
+@dataclass
+class AppSettings:
+    """Subset of the daemon's `/api/settings` the integration needs."""
+
+    expose_outputs_as_media_players: bool
+
+
 def _parse_routing_matrix(data: dict) -> RoutingMatrix:
     """Parse the daemon's `RoutingMatrix` JSON (routing.rs). Shared by the
     REST fetch and the WebSocket push so both stay in lock-step."""
@@ -276,6 +303,92 @@ class PipewireRouterApiClient:
             raise PipewireRouterApiError(f"could not {op}: {err}") from err
         if not body.get("ok", False):
             raise PipewireRouterApiError(body.get("message") or f"{op} failed")
+
+    async def async_get_music_groups(self) -> list[MusicGroup]:
+        """Named music groups (`GET /api/groups/music`)."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/groups/music") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        return [
+            MusicGroup(id=str(g["id"]), name=str(g["name"]), members=[str(m) for m in g.get("members", [])])
+            for g in data
+        ]
+
+    async def async_get_announcement_groups(self) -> list[AnnouncementGroup]:
+        """Named announcement groups (`GET /api/groups/announcement`)."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/groups/announcement") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        return [
+            AnnouncementGroup(
+                id=str(g["id"]),
+                name=str(g["name"]),
+                targets=[str(t) for t in g.get("targets", [])],
+                priority=int(g.get("priority", 0)),
+                duck=float(g.get("duck", 0.25)),
+            )
+            for g in data
+        ]
+
+    async def async_get_settings(self) -> AppSettings:
+        """Daemon app settings (`GET /api/settings`) — the toggle for per-output entities."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/settings") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        return AppSettings(expose_outputs_as_media_players=bool(data.get("expose_outputs_as_media_players", False)))
+
+    async def async_route_music_group(self, group_id: str, source: str) -> None:
+        """Route a source to a whole music group (`POST /api/groups/music/{id}/route`)."""
+        try:
+            async with self._session.post(
+                f"{self._base_url}/api/groups/music/{group_id}/route",
+                json={"source": source},
+            ) as resp:
+                body = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not route group: {err}") from err
+        if not body.get("ok", False):
+            raise PipewireRouterApiError(body.get("message") or "route failed")
+
+    async def async_unroute_music_group(self, group_id: str) -> None:
+        """Un-route a whole music group (`DELETE /api/groups/music/{id}/route`)."""
+        try:
+            async with self._session.delete(f"{self._base_url}/api/groups/music/{group_id}/route") as resp:
+                body = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not un-route group: {err}") from err
+        if not body.get("ok", False):
+            raise PipewireRouterApiError(body.get("message") or "un-route failed")
+
+    async def async_announce_group(self, group_id: str, *, url: str | None = None, wyoming: dict | None = None) -> None:
+        """Announce to a named announcement group (`POST /api/announce`), which
+        resolves the group's targets/priority/duck. Returns once admitted
+        (playing/queued) — not after playback, unlike the node-based announce."""
+        payload: dict = {"announcement_group": group_id}
+        if url is not None:
+            payload["url"] = url
+        elif wyoming is not None:
+            payload["wyoming"] = wyoming
+        try:
+            async with self._session.post(
+                f"{self._base_url}/api/announce",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                body = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not announce to group: {err}") from err
+        if not body.get("ok", False):
+            raise PipewireRouterApiError(body.get("message") or body.get("reason") or "announce rejected")
 
     async def _async_announce(self, node_id: int, source: dict, duck_volume: float | None) -> None:
         """Shared POST for both announce sources — blocks for the duration

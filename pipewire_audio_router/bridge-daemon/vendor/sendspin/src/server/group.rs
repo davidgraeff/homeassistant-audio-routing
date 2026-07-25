@@ -5,19 +5,16 @@ use crate::error::Error;
 use crate::protocol::messages::{PlayerCommand, StreamPlayerConfig};
 use crate::server::binary::encode_audio_frame;
 use crate::server::connection::{AudioEnqueue, ServerSender};
+use crate::server::timeline::SharedTimeline;
 use crate::sync::raw_clock::Clock;
 use futures_util::future::join_all;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Bytes;
 
-/// How far ahead of "now" (in this group's clock domain) the audio timeline is
-/// anchored, by default. Must comfortably exceed a client's own startup
-/// buffering latency, or it'll receive chunks whose intended playback time has
-/// already passed. v1 uses one fixed lead time for the whole group rather than
-/// negotiating per-client (see [`Group::with_send_ahead_us`]); per-client lead
-/// negotiation is deferred along with per-client format negotiation.
-pub const DEFAULT_SEND_AHEAD_US: i64 = 250_000;
+// Re-exported here for source compatibility; the constant now lives with the
+// timeline it parameterizes.
+pub use crate::server::timeline::DEFAULT_SEND_AHEAD_US;
 
 /// A synchronized playback group.
 ///
@@ -30,74 +27,78 @@ pub const DEFAULT_SEND_AHEAD_US: i64 = 250_000;
 /// converged clock-sync play the same chunk at the same wall-clock instant
 /// without the server ever comparing their clocks to each other.
 ///
+/// The timestamp stream lives in a [`SharedTimeline`]. A group created with
+/// [`Group::new`] owns its own timeline (the classic single-group case: sync is
+/// automatic). Several groups created with [`Group::with_timeline`] over one
+/// `Arc<SharedTimeline>` share a single timeline — the building block for
+/// per-device senders that must stay phase-locked while being addressed
+/// independently (duck/overlay/route one member without the others). In that
+/// mode the caller stamps the timeline **once** per chunk
+/// ([`SharedTimeline::stamp`]) and delivers the result to each group via
+/// [`Group::push_encoded`], instead of calling [`Group::push_audio`] per group
+/// (which would advance the shared timeline once per group).
+///
 /// v1 scope: one shared PCM format for the whole group — no per-client
 /// transcoding, so a member that can't take the group's format is a v1
 /// limitation, not silently-wrong audio. No late-join catch-up (a client
 /// added mid-stream just gets `stream/start` and audio from that point
 /// forward) and no historical buffer replay.
 pub struct Group {
-    clock: Arc<dyn Clock>,
-    send_ahead_us: i64,
-    state: Mutex<State>,
-}
-
-/// Mutable group state behind a single lock, so `Group`'s methods take `&self`
-/// and a slow member can never block membership changes or another member.
-struct State {
-    members: HashMap<String, ServerSender>,
-    stream_config: Option<StreamPlayerConfig>,
-    /// Timestamp (this group's clock domain) to stamp on the next pushed chunk.
-    /// `None` until the first push after a start/clear (re)anchors the timeline.
-    next_ts_us: Option<i64>,
-    /// Carry for the sub-microsecond part of a chunk's duration (numerator over
-    /// the sample rate), so advancing the timeline doesn't accumulate drift.
-    residue: i64,
-}
-
-impl State {
-    fn reset_timeline(&mut self) {
-        self.next_ts_us = None;
-        self.residue = 0;
-    }
+    timeline: Arc<SharedTimeline>,
+    members: Mutex<HashMap<String, ServerSender>>,
 }
 
 impl Group {
-    /// Create an empty group using `clock` as the shared timestamp domain —
-    /// pass the same clock the [`crate::server::ServerListener`] that
-    /// accepted these connections was built with, so timestamps here are in
-    /// the same domain as the `server/time` replies members already trust.
+    /// Create an empty group that owns a fresh timeline in `clock`'s domain —
+    /// pass the same clock the [`crate::server::ServerListener`] that accepted
+    /// these connections was built with, so timestamps here are in the same
+    /// domain as the `server/time` replies members already trust.
     pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self::with_timeline(Arc::new(SharedTimeline::new(clock)))
+    }
+
+    /// Create an empty group that shares an existing [`SharedTimeline`] with
+    /// other groups/senders. All groups sharing one timeline emit identical
+    /// timestamps for the same chunk — see the type docs for the stamp-once
+    /// contract.
+    pub fn with_timeline(timeline: Arc<SharedTimeline>) -> Self {
         Self {
-            clock,
-            send_ahead_us: DEFAULT_SEND_AHEAD_US,
-            state: Mutex::new(State {
-                members: HashMap::new(),
-                stream_config: None,
-                next_ts_us: None,
-                residue: 0,
-            }),
+            timeline,
+            members: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Override the default send-ahead lead time.
-    pub fn with_send_ahead_us(mut self, send_ahead_us: i64) -> Self {
-        self.send_ahead_us = send_ahead_us;
-        self
+    /// Override the default send-ahead lead time. Only valid on a group that
+    /// owns its (as-yet-unshared) timeline, i.e. straight after [`Group::new`];
+    /// it rebuilds the timeline with the new lead.
+    pub fn with_send_ahead_us(self, send_ahead_us: i64) -> Self {
+        let clock = self.timeline.clock();
+        Self {
+            timeline: Arc::new(SharedTimeline::new(clock).with_send_ahead_us(send_ahead_us)),
+            members: self.members,
+        }
+    }
+
+    /// The timeline backing this group, so a caller can share it across
+    /// per-device senders (`Group::with_timeline(group.timeline())`) and stamp
+    /// it once per chunk.
+    pub fn timeline(&self) -> Arc<SharedTimeline> {
+        Arc::clone(&self.timeline)
     }
 
     /// Client IDs of every current member.
     pub fn member_ids(&self) -> Vec<String> {
-        self.state.lock().unwrap().members.keys().cloned().collect()
+        self.members.lock().unwrap().keys().cloned().collect()
     }
 
     /// Number of current members.
     pub fn len(&self) -> usize {
-        self.state.lock().unwrap().members.len()
+        self.members.lock().unwrap().len()
     }
 
     /// Whether the group has no members.
     pub fn is_empty(&self) -> bool {
-        self.state.lock().unwrap().members.is_empty()
+        self.members.lock().unwrap().is_empty()
     }
 
     /// Add a member. If a stream is already active for this group, starts
@@ -109,15 +110,10 @@ impl Group {
         client_id: impl Into<String>,
         sender: ServerSender,
     ) -> Result<(), Error> {
-        let config = self.state.lock().unwrap().stream_config.clone();
-        if let Some(cfg) = config {
+        if let Some(cfg) = self.timeline.config() {
             sender.send_stream_start(cfg).await?;
         }
-        self.state
-            .lock()
-            .unwrap()
-            .members
-            .insert(client_id.into(), sender);
+        self.members.lock().unwrap().insert(client_id.into(), sender);
         Ok(())
     }
 
@@ -125,17 +121,13 @@ impl Group {
     /// disconnecting it (e.g. via [`crate::server::ServerConnection::disconnect`]) —
     /// this only stops future broadcasts from reaching it.
     pub fn remove_member(&self, client_id: &str) -> Option<ServerSender> {
-        self.state.lock().unwrap().members.remove(client_id)
+        self.members.lock().unwrap().remove(client_id)
     }
 
     /// Start (or restart, e.g. after a format change) the shared stream for
     /// every current member, and re-anchor the audio timeline.
     pub async fn start_stream(&self, config: StreamPlayerConfig) {
-        {
-            let mut state = self.state.lock().unwrap();
-            state.stream_config = Some(config.clone());
-            state.reset_timeline();
-        }
+        self.timeline.set_config(config.clone());
         self.broadcast_control(|sender| {
             let config = config.clone();
             async move { sender.send_stream_start(config).await }
@@ -143,55 +135,31 @@ impl Group {
         .await;
     }
 
-    /// Push one PCM chunk to every member, stamped with a single shared
-    /// timestamp so every member schedules it at the same instant. Returns
-    /// that timestamp.
-    ///
-    /// The timestamp comes from an anchored timeline rather than
-    /// `now + lead` per call, so pushing faster or slower than real time
-    /// doesn't shift playback: the first push after a start/clear anchors at
-    /// `now + send_ahead_us`, and each push advances the timeline by the
-    /// chunk's own duration (derived from the stream format). If pushes fall
-    /// behind — the timeline would schedule a chunk too close to now — it
-    /// re-anchors forward. Enqueue is non-blocking, so one slow member never
-    /// delays the others; a member whose connection has died is pruned.
+    /// Push one PCM chunk to every member: stamp the timeline once, then fan
+    /// the identical frame out. Returns that timestamp. Use this for a group
+    /// that owns its timeline. When several groups share one timeline, stamp it
+    /// yourself once per chunk and call [`Group::push_encoded`] per group so the
+    /// timeline advances only once. Enqueue is non-blocking, so one slow member
+    /// never delays the others; a member whose connection has died is pruned.
     pub fn push_audio(&self, pcm: &[u8]) -> i64 {
-        let mut state = self.state.lock().unwrap();
-        let now = self.clock.now_micros();
+        let ts = self.timeline.stamp(pcm.len());
+        self.push_encoded(ts, pcm);
+        ts
+    }
 
-        // Anchor on the first push, or re-anchor if the timeline has fallen too
-        // close to (or behind) now — otherwise chunks would be scheduled in the
-        // past. Half the lead is the low-water mark, giving hysteresis so steady
-        // real-time pacing doesn't re-anchor every push.
-        let ts = match state.next_ts_us {
-            Some(t) if t >= now + self.send_ahead_us / 2 => t,
-            _ => now + self.send_ahead_us,
-        };
-
-        // Advance the timeline by this chunk's exact duration, carrying the
-        // fractional-microsecond remainder so it doesn't drift.
-        let advanced = match &state.stream_config {
-            Some(cfg) => {
-                let bytes_per_sample = (cfg.channels as usize) * (cfg.bit_depth as usize / 8);
-                if bytes_per_sample > 0 && cfg.sample_rate > 0 {
-                    let samples = (pcm.len() / bytes_per_sample) as i64;
-                    let total = samples * 1_000_000 + state.residue;
-                    let rate = cfg.sample_rate as i64;
-                    state.residue = total % rate;
-                    Some(ts + total / rate)
-                } else {
-                    Some(ts)
-                }
-            }
-            None => Some(ts),
-        };
-        state.next_ts_us = advanced;
-
+    /// Fan one PCM chunk out to every member at a caller-supplied timestamp,
+    /// **without** advancing the timeline. This is the shared-timeline path:
+    /// the caller stamps a shared [`SharedTimeline`] once and delivers that one
+    /// `ts` to each group/sender, so every member's chunk-N carries an
+    /// identical timestamp. (For a group that owns its timeline, prefer
+    /// [`Group::push_audio`], which stamps and fans in one call.)
+    pub fn push_encoded(&self, ts: i64, pcm: &[u8]) {
         // Encode once; fan the same frame out to every member as cheap refcount
         // clones. Prune members whose connection has died.
         let frame: Bytes = encode_audio_frame(ts, pcm).into();
+        let mut members = self.members.lock().unwrap();
         let mut dead = Vec::new();
-        for (id, sender) in state.members.iter() {
+        for (id, sender) in members.iter() {
             match sender.enqueue_audio(frame.clone()) {
                 Ok(AudioEnqueue::Sent) => {}
                 Ok(AudioEnqueue::Evicted) => {
@@ -202,9 +170,8 @@ impl Group {
         }
         for id in dead {
             log::warn!("dropping dead group member {id}");
-            state.members.remove(&id);
+            members.remove(&id);
         }
-        ts
     }
 
     /// Broadcast a player command (volume, mute, static delay) to every
@@ -219,11 +186,7 @@ impl Group {
 
     /// End the shared stream for every current member and reset the timeline.
     pub async fn end_stream(&self) {
-        {
-            let mut state = self.state.lock().unwrap();
-            state.stream_config = None;
-            state.reset_timeline();
-        }
+        self.timeline.clear_config();
         self.broadcast_control(|sender| async move { sender.send_stream_end().await })
             .await;
     }
@@ -237,9 +200,8 @@ impl Group {
         Fut: std::future::Future<Output = Result<(), Error>>,
     {
         let members: Vec<(String, ServerSender)> = {
-            let state = self.state.lock().unwrap();
-            state
-                .members
+            let members = self.members.lock().unwrap();
+            members
                 .iter()
                 .map(|(id, sender)| (id.clone(), sender.clone()))
                 .collect()
@@ -249,11 +211,11 @@ impl Group {
             async move { (id, fut.await) }
         }))
         .await;
-        let mut state = self.state.lock().unwrap();
+        let mut members = self.members.lock().unwrap();
         for (id, result) in results {
             if let Err(e) = result {
                 log::warn!("dropping group member {id}: {e}");
-                state.members.remove(&id);
+                members.remove(&id);
             }
         }
     }
@@ -270,5 +232,12 @@ mod tests {
         assert!(group.is_empty());
         assert_eq!(group.len(), 0);
         assert_eq!(group.member_ids().len(), 0);
+    }
+
+    #[test]
+    fn groups_can_share_one_timeline() {
+        let a = Group::new(Arc::new(DefaultClock::default()));
+        let b = Group::with_timeline(a.timeline());
+        assert!(Arc::ptr_eq(&a.timeline(), &b.timeline()));
     }
 }

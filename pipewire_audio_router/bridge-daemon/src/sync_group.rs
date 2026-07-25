@@ -96,6 +96,9 @@ struct RunningGroup {
     server: Option<SendspinServerHandle>,
     /// Snapshot of the sendspin device set the running server was started for.
     server_devices: Vec<String>,
+    /// Which sendspin topology the running server was started in (per-device
+    /// senders vs one shared Group). A change flips it → restart into the new mode.
+    per_device: bool,
     /// RAOP outputs currently monitor-linked to the anchor.
     raop_members: Vec<String>,
 }
@@ -242,6 +245,7 @@ impl GroupReconciler {
         devices: &SharedSendspinDevices,
         control: &crate::sendspin_volume::SharedSendspinControl,
         send_ahead_us: i64,
+        per_device_senders: bool,
     ) {
         let intent = routing_store::snapshot(routing);
         let devices_map = devices.lock_recover().clone();
@@ -301,6 +305,7 @@ impl GroupReconciler {
                         port,
                         server: None,
                         server_devices: Vec::new(),
+                        per_device: per_device_senders,
                         raop_members: Vec::new(),
                     },
                 );
@@ -308,9 +313,9 @@ impl GroupReconciler {
 
             // Snapshot what we need so no borrow of `self.running` is held across
             // an await (the async link/server calls below).
-            let (anchor_name, anchor_id, port, prev_devices, prev_raop) = {
+            let (anchor_name, anchor_id, port, prev_devices, prev_per_device, prev_raop) = {
                 let rg = self.running.get(key).expect("just inserted");
-                (rg.anchor_node_name.clone(), rg.anchor_node_id, rg.port, rg.server_devices.clone(), rg.raop_members.clone())
+                (rg.anchor_node_name.clone(), rg.anchor_node_id, rg.port, rg.server_devices.clone(), rg.per_device, rg.raop_members.clone())
             };
 
             // b. Wire each source into the anchor (idempotent).
@@ -318,36 +323,56 @@ impl GroupReconciler {
                 routing::ensure_link_by_name(pw, pw_cmd, source, &anchor_name).await;
             }
 
-            // c. (Re)start the sendspin server when the dialed-device set changes.
-            //    The dial filter is fixed at start, so a membership change means
-            //    drop-and-recreate — but only the server, not the anchor, so the
-            //    RAOP outputs fed from the same anchor never blip.
-            if d.sendspin_node_names != prev_devices {
+            // c. (Re)start the sendspin server when the dialed-device set changes,
+            //    OR when the per-device-senders mode flips. The dial filter and the
+            //    topology are fixed at start, so either change means drop-and-
+            //    recreate — but only the server, not the anchor, so the RAOP outputs
+            //    fed from the same anchor never blip.
+            if d.sendspin_node_names != prev_devices || per_device_senders != prev_per_device {
                 if let Some(rg) = self.running.get_mut(key) {
                     rg.server = None; // drop old server (stops its capture/dial)
                     rg.server_devices = Vec::new();
                 }
                 if !d.sendspin_node_names.is_empty() {
-                    match sendspin_server::start_server(
-                        &anchor_name,
-                        &group_display(d),
-                        port,
-                        anchor_id,
-                        Some(d.sendspin_fullnames.clone()),
-                        Some(send_ahead_us),
-                        control.clone(),
-                        devices.clone(),
-                    )
-                    .await
-                    {
+                    // Per-device senders (experimental, O-B) vs one shared Group.
+                    // Both attach to the same anchor + capture; only the topology
+                    // differs (see sendspin_server).
+                    let started = if per_device_senders {
+                        sendspin_server::start_server_per_device(
+                            &anchor_name,
+                            &group_display(d),
+                            port,
+                            anchor_id,
+                            d.sendspin_fullnames.clone(),
+                            send_ahead_us,
+                            control.clone(),
+                            devices.clone(),
+                        )
+                        .await
+                    } else {
+                        sendspin_server::start_server(
+                            &anchor_name,
+                            &group_display(d),
+                            port,
+                            anchor_id,
+                            Some(d.sendspin_fullnames.clone()),
+                            Some(send_ahead_us),
+                            control.clone(),
+                            devices.clone(),
+                        )
+                        .await
+                    };
+                    match started {
                         Ok(handle) => {
                             tracing::info!(
-                                "sync group '{anchor_name}': sendspin server on port {port} dialing {} device(s)",
-                                d.sendspin_node_names.len()
+                                "sync group '{anchor_name}': sendspin server on port {port} dialing {} device(s){}",
+                                d.sendspin_node_names.len(),
+                                if per_device_senders { " (per-device senders)" } else { "" }
                             );
                             if let Some(rg) = self.running.get_mut(key) {
                                 rg.server = Some(handle);
                                 rg.server_devices = d.sendspin_node_names.clone();
+                                rg.per_device = per_device_senders;
                             }
                         }
                         Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start sendspin server: {e}"),

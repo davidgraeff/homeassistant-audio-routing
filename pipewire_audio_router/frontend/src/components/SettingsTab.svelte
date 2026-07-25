@@ -21,6 +21,15 @@
   let sendspinDelayLive = $state(false);
   let delayModeBusy = $state(false);
 
+  // Whether the HA integration also exposes a per-output media_player (on top of
+  // the per-music-group and per-announcement-group entities it creates by default).
+  let exposeOutputs = $state(false);
+  let exposeBusy = $state(false);
+
+  // Experimental (O-B): per-device sendspin senders sharing one timeline.
+  let perDeviceSenders = $state(false);
+  let perDeviceBusy = $state(false);
+
   async function refresh() {
     loading = true;
     try {
@@ -29,6 +38,8 @@
       discovery = s.discovery_enabled;
       raopLatency = s.default_raop_latency_ms ?? '';
       sendspinDelayLive = s.sendspin_delay_live;
+      exposeOutputs = s.expose_outputs_as_media_players;
+      perDeviceSenders = s.per_device_sendspin_senders;
       if (sync) groupLeadMs = sync.group_lead_ms;
     } catch {
       // leave defaults; a toast already surfaced the error via run() elsewhere
@@ -70,6 +81,24 @@
       sendspinDelayLive = next;
     }
     delayModeBusy = false;
+  }
+
+  async function toggleExposeOutputs() {
+    exposeBusy = true;
+    const next = !exposeOutputs;
+    if (await run(() => api.setSettings({ expose_outputs_as_media_players: next }), 'Setting saved')) {
+      exposeOutputs = next;
+    }
+    exposeBusy = false;
+  }
+
+  async function togglePerDeviceSenders() {
+    perDeviceBusy = true;
+    const next = !perDeviceSenders;
+    if (await run(() => api.setSettings({ per_device_sendspin_senders: next }), 'Setting saved (groups will restart)')) {
+      perDeviceSenders = next;
+    }
+    perDeviceBusy = false;
   }
 </script>
 
@@ -139,6 +168,39 @@
       Leave off for current ESPHome firmware, which only picks up a per-speaker delay at stream start — so changing one
       briefly restarts the group's stream (like an AirPlay reload). Turn on only for firmware that applies
       <code>SetStaticDelay</code> to the running stream, to avoid the restart.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Home Assistant entities</h2>
+    <p class="card-sub">
+      The Home Assistant integration creates one <code>media_player</code> per <strong>music group</strong> and per
+      <strong>announcement group</strong>. Enable this to <strong>also</strong> expose every individual output as its own
+      <code>media_player</code>, for directly addressing a single speaker regardless of its group.
+    </p>
+    <label class="check">
+      <input type="checkbox" checked={exposeOutputs} disabled={exposeBusy} onchange={toggleExposeOutputs} />
+      Expose all outputs as individual media players
+    </label>
+    <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
+      Off by default. Changes take effect after the integration next reconciles its entities (within a few seconds, or on
+      the next Home Assistant restart).
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Experimental</h2>
+    <p class="card-sub">
+      Unfinished features under active development. Safe to leave off.
+    </p>
+    <label class="check">
+      <input type="checkbox" checked={perDeviceSenders} disabled={perDeviceBusy} onchange={togglePerDeviceSenders} />
+      Per-device sendspin senders (shared timeline)
+    </label>
+    <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
+      Runs each sync group's Sendspin speakers as independent per-device senders sharing one timeline, instead of one
+      shared stream — the groundwork for per-speaker announcement ducking. Sync-preserving (hardware-validated), but not
+      yet feature-complete. Toggling restarts affected groups' Sendspin servers (a brief reconnect).
     </p>
   </div>
 {/if}
