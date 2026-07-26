@@ -12,6 +12,10 @@ __pycache__/
 firmware/bt-bridge/.esphome/
 firmware/bt-bridge/secrets.yaml
 
+# Secrets: the key-bearing announce-asset generator (contains a GEMINI_API key).
+# The keyless generate.sh is tracked; regenerate assets locally with this one.
+pipewire_audio_router/bridge-daemon/assets/generate_with_key.sh
+
 # Editor/OS cruft
 .DS_Store
 *.swp
