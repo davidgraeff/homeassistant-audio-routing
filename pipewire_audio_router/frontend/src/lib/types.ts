@@ -15,6 +15,14 @@ export interface RoutingNode {
   /** Recent peak level 0.0–1.0 for the meter (sources, while the matrix is
    * open); 0 for outputs/unmetered. */
   peak: number;
+  /** Current volume 0.0–1.0 for outputs whose volume the daemon tracks
+   * out-of-band (sendspin devices) — pushed live over the routing WS so the
+   * slider syncs, including physical changes the device reports. Absent for
+   * sources. */
+  volume?: number | null;
+  /** Current mute state for outputs whose mute the daemon tracks out-of-band
+   * (sendspin devices), pushed live over the routing WS. Absent otherwise. */
+  muted?: boolean | null;
 }
 
 export interface RoutingLink {
@@ -53,8 +61,8 @@ export type Encryption = 'none' | 'RSA' | 'auth_setup';
 export interface OutputInfo {
   node_name: string;
   name: string;
-  /** 'airplay' (RAOP) or 'sendspin' — for the Type column. */
-  kind: 'airplay' | 'sendspin';
+  /** 'airplay2' (AirPlay 2) or 'sendspin' — for the Type column / badge. */
+  kind: 'airplay2' | 'sendspin';
   /** In the live graph now. */
   present: boolean;
   /** Manual store entry (`true`) vs mDNS auto-discovered (`false`). */
@@ -63,17 +71,49 @@ export interface OutputInfo {
   ip: string | null;
   port: number | null;
   encryption: string | null;
-  /** Per-output RAOP receiver latency in ms (`raop.latency.ms`); null = module
-   * default (1500 ms). Only meaningful for configured RAOP outputs. */
+  /** Per-output latency override in ms; null = the type's built-in default
+   * (1500 ms). For AirPlay 2 it's the render delay. Not meaningful for sendspin
+   * (uses a separate static-delay knob). */
   latency_ms: number | null;
-}
-
-export interface AddOutputRequest {
-  name: string;
-  ip: string;
-  port?: number;
-  encryption?: Encryption;
-  latency_ms?: number | null;
+  /** AirPlay 2 only: PTP-lock health. true = receiver is exchanging gPTP with our
+   * grandmaster; false = present but not exchanging gPTP; undefined = not an AP2
+   * output / PTP not started. NB: realtime playback does NOT require a lock (a lone
+   * receiver free-runs) — false is only alarming when `ptp_relevant` is true. */
+  ptp_locked?: boolean;
+  /** AirPlay 2 only: seconds since the last gPTP packet from the receiver (lock
+   * age); undefined if never seen / not AP2. Small = healthy. */
+  ptp_lock_age_s?: number;
+  /** AirPlay 2 only: receiver advertises PTP support (features bit 41). undefined
+   * if not AP2 / features unseen. A device that doesn't advertise PTP never locks. */
+  ptp_supported?: boolean;
+  /** AirPlay 2 only: a live PTP lock is actually relevant right now — i.e. the
+   * receiver is in a ≥2-member AP2 group where drift is audible. undefined/false
+   * ⇒ a lone realtime receiver, which plays fine unlocked. */
+  ptp_relevant?: boolean;
+  /** AirPlay 2 only: decoded capability flags from the `features` TXT (Diagnostics
+   * card). undefined if not AP2 / features unseen. */
+  ap2_features?: {
+    /** Canonical `0xLOWER,0xUPPER` bitmask string. */
+    raw: string;
+    /** bit 41 — PTP timing supported. */
+    ptp: boolean;
+    /** bit 40 — buffered-audio mode (PTP mandatory in that mode). */
+    buffered_audio: boolean;
+    /** bit 48 — HomeKit transient pairing (how we connect). */
+    transient_pairing: boolean;
+  };
+  /** AirPlay 2 only: wire sample-rate mode — 'auto' (negotiate 48 kHz, fall back
+   * to 44.1 kHz) or 'fixed_44100'. undefined for non-AP2 outputs. */
+  ap2_rate_mode?: 'auto' | 'fixed_44100';
+  /** AirPlay 2 only: the effective wire rate (Hz) the output will use (48000 or
+   * 44100), reflecting the mode + learned capability. undefined for non-AP2. */
+  ap2_rate?: number;
+  /** AirPlay 2 only: device-authoritative volume 0.0–1.0 — READ from the receiver
+   * (or last user-set), or undefined/null when UNKNOWN (receiver didn't report and
+   * the user hasn't set it). Show unknown honestly (blank / 0), never a fake 100%. */
+  ap2_volume?: number | null;
+  /** AirPlay 2 only: mute state. undefined for non-AP2. */
+  ap2_muted?: boolean | null;
 }
 
 export interface SyncSettingsInfo {
@@ -87,9 +127,6 @@ export interface AppSettings {
   default_duck: number;
   /** Runtime mDNS discovery on/off. */
   discovery_enabled: boolean;
-  /** Default RAOP receiver latency (ms) stamped on new outputs; null = module
-   * default (1500 ms). */
-  default_raop_latency_ms: number | null;
   /** Whether sendspin devices apply a static-delay change to the running stream.
    * Current ESPHome firmware does not, so a delay change restarts the group
    * stream; enable for future firmware that honors a live SetStaticDelay. */
@@ -99,15 +136,29 @@ export interface AppSettings {
    * music group and per announcement group; this adds a per-output entity for
    * directly addressing a single speaker regardless of its group. */
   expose_outputs_as_media_players: boolean;
-  /** Experimental (O-B): run each sync group's sendspin devices as per-device
-   * senders sharing one timeline, instead of one shared Group. Sync-preserving;
-   * the foundation for per-device duck/overlay. */
-  per_device_sendspin_senders: boolean;
 }
 
-/** Partial settings update; omitted fields are left unchanged. For
- * `default_raop_latency_ms`, `null` clears it (back to the module default). */
+/** Partial settings update; omitted fields are left unchanged. */
 export type AppSettingsUpdate = Partial<AppSettings>;
+
+/** Host capability / weak-system assessment (`host_assessment.rs`). */
+export type HostVerdict = 'adequate' | 'marginal' | 'underpowered';
+export interface HostAssessment {
+  /** Human-readable CPU model. */
+  cpu_model: string;
+  /** Number of logical CPUs. */
+  cores: number;
+  /** Target architecture, e.g. "aarch64", "x86_64". */
+  arch: string;
+  /** Total system RAM in MiB. */
+  mem_total_mb: number;
+  /** Whether the process can obtain realtime (SCHED_FIFO) scheduling. */
+  rt_available: boolean;
+  /** Coarse verdict for realtime multi-room audio. */
+  verdict: HostVerdict;
+  /** Short human-readable explanation of the verdict. */
+  note: string;
+}
 
 /** Diagnostics status snapshot (`/api/status`). */
 export interface StatusInfo {
@@ -117,22 +168,22 @@ export interface StatusInfo {
   discovery_enabled: boolean;
   /** Live PipeWire graph node count. */
   pipewire_nodes: number;
-  /** Configured RAOP outputs in the store (excludes auto-discovered). */
-  raop_outputs: number;
   /** mDNS-discovered sendspin devices currently tracked. */
   sendspin_devices: number;
   /** Persisted routing links. */
   routes: number;
+  /** Host capability / weak-system assessment. */
+  host: HostAssessment;
 }
 
 // ---- Latency alignment (calibrate.rs) -----------------------------------
 
-export type AlignMemberKind = 'sendspin' | 'raop';
+export type AlignMemberKind = 'sendspin' | 'airplay2';
 
 export interface AlignMember {
   node_name: string;
   kind: AlignMemberKind;
-  /** Live PipeWire node id (RAOP only); null for virtual sendspin devices. */
+  /** Live PipeWire node id; null for virtual sendspin/AirPlay 2 devices. */
   node_id: number | null;
 }
 
@@ -224,6 +275,32 @@ export interface MediaPlayerInfo {
 
 export interface OpResponse {
   ok: boolean;
+  message: string;
+}
+
+/** Per-device announcement (`POST /api/announce`, announce.rs): play a clip to a
+ * set of output node names with per-device duck/overlay. Backend-agnostic — it
+ * targets per-device senders (Sendspin today, AirPlay 2 later), not PipeWire
+ * sink nodes. Provide exactly one audio source (here: `test` or `tone`). */
+export interface AnnounceRequest {
+  /** Output node names to announce to (e.g. `sendspin-dev-…`). */
+  targets: string[];
+  /** Built-in TTS test-announcement clip. */
+  test?: boolean;
+  /** Built-in calibration tone (a quick speaker-alive/wiring check). */
+  tone?: boolean;
+  /** Level (0–1) music ducks to while the clip plays; omit for the daemon default. */
+  duck?: number;
+}
+
+export interface AnnounceResponse {
+  ok: boolean;
+  /** `"playing"` | `"queued"` | `"rejected"`. */
+  admission: string;
+  /** Queue position when `admission === "queued"`. */
+  position?: number;
+  /** Why it was rejected, when `admission === "rejected"`. */
+  reason?: string;
   message: string;
 }
 

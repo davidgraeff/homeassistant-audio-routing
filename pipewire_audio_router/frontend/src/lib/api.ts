@@ -6,15 +6,15 @@
 // `<base>/api/...` in both cases.
 
 import type {
-  AddOutputRequest,
   AirplayClient,
   AirplaySourceInfo,
   AlignGroup,
   AlignState,
+  AnnounceRequest,
+  AnnounceResponse,
   AnnouncementGroup,
   AppSettings,
   AppSettingsUpdate,
-  Encryption,
   MediaPlayerInfo,
   MusicGroup,
   NodesResponse,
@@ -87,23 +87,22 @@ export const api = {
   setVolume: (nodeId: number, volume: number) =>
     request<VolumeResponse>('POST', `api/media_players/${nodeId}/volume`, { volume }),
 
-  // RAOP outputs (CRUD)
+  // Outputs (read-only list — sendspin + AirPlay 2 are auto-discovered).
   outputs: () => request<OutputInfo[]>('GET', 'api/outputs'),
-  addOutput: (output: AddOutputRequest) => request<OpResponse>('POST', 'api/outputs', output),
-  removeOutput: (nodeName: string) => request<OpResponse>('DELETE', `api/outputs/${nodeName}`),
-  /** Reconfigure a manually-added output's connection details (IP/port/encryption). */
-  configureOutput: (nodeName: string, cfg: { ip: string; port: number; encryption: Encryption }) =>
-    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}`, cfg),
-  /** Per-RAOP-output receiver latency in ms (`raop.latency.ms`); null resets to default. */
+  /** Per-output render delay in ms (AirPlay 2); null resets to default. */
   setOutputLatency: (nodeName: string, latencyMs: number | null) =>
     request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/latency`, { latency_ms: latencyMs }),
-  /** Diagnostic: play the calibration click once into this output's sink.
-   * Blocks until the clip finishes; only a live sink (present RAOP) is a valid target. */
-  testTone: (nodeName: string) =>
-    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/test-tone`),
-  /** Diagnostic: play the committed TTS test-announcement clip into this output's sink. */
-  testAnnouncement: (nodeName: string) =>
-    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/test-announcement`),
+
+  // AirPlay-2 wire sample-rate mode: 'auto' (negotiate 48 kHz, fall back to
+  // 44.1 kHz) or 'fixed_44100'. Restarts that receiver's group at the new rate.
+  setAp2RateMode: (nodeName: string, mode: 'auto' | 'fixed_44100') =>
+    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/ap2-rate`, { mode }),
+
+  // Per-device announcement (announce.rs). Plays a clip (built-in test/tone,
+  // or url/wyoming) to a set of per-device-sender outputs with duck/overlay —
+  // the backend-agnostic path (Sendspin now, AirPlay 2 later), used by the
+  // Outputs tab's Play tone / Play announcement diagnostics.
+  announce: (req: AnnounceRequest) => request<AnnounceResponse>('POST', 'api/announce', req),
 
   // AirPlay-receive source (single)
   airplaySource: () => request<AirplaySourceInfo>('GET', 'api/source/airplay'),
@@ -127,6 +126,16 @@ export const api = {
   sendspinVolumes: () => request<Record<string, number>>('GET', 'api/sendspin/volumes'),
   setSendspinVolume: (nodeName: string, volume: number) =>
     request<OpResponse>('PUT', 'api/sendspin/volume', { node_name: nodeName, volume }),
+  setSendspinMute: (nodeName: string, muted: boolean) =>
+    request<OpResponse>('PUT', 'api/sendspin/mute', { node_name: nodeName, muted }),
+
+  // AirPlay-2 per-device volume/mute (virtual outputs; volume is an in-band RTSP
+  // SET_PARAMETER to the receiver). Volume is 0.0–1.0. No receiver→daemon
+  // feedback yet, so the matrix reflects the last-set level.
+  setAp2Volume: (nodeName: string, volume: number) =>
+    request<OpResponse>('PUT', 'api/ap2/volume', { node_name: nodeName, volume }),
+  setAp2Mute: (nodeName: string, muted: boolean) =>
+    request<OpResponse>('PUT', 'api/ap2/mute', { node_name: nodeName, muted }),
 
   // Sendspin per-device static delay (ms, 0-5000; 0 clears). Map node_name -> ms.
   sendspinDelays: () => request<Record<string, number>>('GET', 'api/sendspin/delays'),
@@ -138,8 +147,8 @@ export const api = {
   setGroupLead: (groupLeadMs: number) =>
     request<OpResponse>('PUT', 'api/sync/settings', { group_lead_ms: groupLeadMs }),
 
-  // General app settings (announce duck default, discovery on/off, default RAOP
-  // latency). PUT is a partial update — send only the fields you're changing.
+  // General app settings (announce duck default, discovery on/off). PUT is a
+  // partial update — send only the fields you're changing.
   settings: () => request<AppSettings>('GET', 'api/settings'),
   setSettings: (patch: AppSettingsUpdate) => request<OpResponse>('PUT', 'api/settings', patch),
 

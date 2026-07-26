@@ -232,6 +232,10 @@ th {
 .badge.off {
   color: var(--disabled-text-color);
 }
+.badge.warn {
+  color: var(--error-color, #db4437);
+  border-color: currentColor;
+}
 .row {
   display: flex;
   gap: 8px;

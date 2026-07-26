@@ -8,8 +8,6 @@
   // General settings (settings_store.rs).
   let duck = $state(0.25);
   let discovery = $state(true);
-  // Blank = module default (1500 ms) → sent as null.
-  let raopLatency = $state<number | ''>('');
   let generalBusy = $state(false);
   let discoveryBusy = $state(false);
 
@@ -26,20 +24,14 @@
   let exposeOutputs = $state(false);
   let exposeBusy = $state(false);
 
-  // Experimental (O-B): per-device sendspin senders sharing one timeline.
-  let perDeviceSenders = $state(false);
-  let perDeviceBusy = $state(false);
-
   async function refresh() {
     loading = true;
     try {
       const [s, sync] = await Promise.all([api.settings(), api.syncSettings().catch(() => null)]);
       duck = s.default_duck;
       discovery = s.discovery_enabled;
-      raopLatency = s.default_raop_latency_ms ?? '';
       sendspinDelayLive = s.sendspin_delay_live;
       exposeOutputs = s.expose_outputs_as_media_players;
-      perDeviceSenders = s.per_device_sendspin_senders;
       if (sync) groupLeadMs = sync.group_lead_ms;
     } catch {
       // leave defaults; a toast already surfaced the error via run() elsewhere
@@ -50,10 +42,7 @@
 
   async function saveGeneral() {
     generalBusy = true;
-    await run(
-      () => api.setSettings({ default_duck: duck, default_raop_latency_ms: raopLatency === '' ? null : Number(raopLatency) }),
-      'Settings saved',
-    );
+    await run(() => api.setSettings({ default_duck: duck }), 'Settings saved');
     generalBusy = false;
   }
 
@@ -92,14 +81,6 @@
     exposeBusy = false;
   }
 
-  async function togglePerDeviceSenders() {
-    perDeviceBusy = true;
-    const next = !perDeviceSenders;
-    if (await run(() => api.setSettings({ per_device_sendspin_senders: next }), 'Setting saved (groups will restart)')) {
-      perDeviceSenders = next;
-    }
-    perDeviceBusy = false;
-  }
 </script>
 
 {#if loading}
@@ -115,15 +96,6 @@
       <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
         How far playing sources are lowered during an announcement that doesn't request its own level. Home Assistant's
         announcements pass their own value, so this mainly affects the Diagnostics test tool.
-      </p>
-    </div>
-
-    <div class="field">
-      <label for="set-raop-latency">Default AirPlay latency for new outputs (ms)</label>
-      <input id="set-raop-latency" type="number" min="0" max="5000" step="10" bind:value={raopLatency} placeholder="1500 (module default)" />
-      <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
-        Stamped onto a newly-added AirPlay output that doesn't set its own latency. Leave blank to keep the receiver's
-        default (~1500 ms). Existing outputs are unaffected.
       </p>
     </div>
 
@@ -185,22 +157,6 @@
     <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
       Off by default. Changes take effect after the integration next reconciles its entities (within a few seconds, or on
       the next Home Assistant restart).
-    </p>
-  </div>
-
-  <div class="card">
-    <h2>Experimental</h2>
-    <p class="card-sub">
-      Unfinished features under active development. Safe to leave off.
-    </p>
-    <label class="check">
-      <input type="checkbox" checked={perDeviceSenders} disabled={perDeviceBusy} onchange={togglePerDeviceSenders} />
-      Per-device sendspin senders (shared timeline)
-    </label>
-    <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
-      Runs each sync group's Sendspin speakers as independent per-device senders sharing one timeline, instead of one
-      shared stream — the groundwork for per-speaker announcement ducking. Sync-preserving (hardware-validated), but not
-      yet feature-complete. Toggling restarts affected groups' Sendspin servers (a brief reconnect).
     </p>
   </div>
 {/if}

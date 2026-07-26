@@ -1,8 +1,21 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
+  import { routing } from '../lib/routing';
   import { run } from '../lib/toast';
   import type { AirplayClient, AirplaySourceInfo, RtpSourceInfo } from '../lib/types';
+
+  // Live input-level meters. The daemon meters present sources on-demand while
+  // the routing matrix is watched — subscribing to the `routing` store here
+  // opens that same WebSocket, so each snapshot carries these sources' current
+  // peak (0.0–1.0). Match by the daemon's stable source node names (see
+  // airplay_source.rs / rtp_source.rs). Same data the routing graph meter uses.
+  const AIRPLAY_NODE = 'airplay-in';
+  const RTP_NODE = 'bt-bridge-rtp';
+  const sources = $derived($routing.matrix.sources);
+  const airplayPeak = $derived(sources.find((s) => s.node_name === AIRPLAY_NODE)?.peak ?? 0);
+  const rtpPeak = $derived(sources.find((s) => s.node_name === RTP_NODE)?.peak ?? 0);
+  const pct = (peak: number) => Math.min(100, Math.round(peak * 100));
 
   let airplay = $state<AirplaySourceInfo>({
     name: null,
@@ -34,6 +47,47 @@
   let rtpMode = $state<RtpMode>('all');
   let rtpMulticastAddr = $state('239.255.42.42');
   let busy = $state(false);
+
+  // The three source modes, with the copy that used to live inline in the radio
+  // list. Now driven from data so the compact dropdown can render the name in
+  // the closed trigger and name+description in the open list, and the card can
+  // show the selected mode's description on its own line below the control.
+  const RTP_MODES: { value: RtpMode; label: string; desc: string }[] = [
+    {
+      value: 'all',
+      label: 'Accept all senders',
+      desc: 'Any device sending to this port is received. Packets from two senders may interleave and corrupt the audio.',
+    },
+    {
+      value: 'single',
+      label: 'Only one client',
+      desc: "Locks onto the first sender's stream and rejects all others — the corruption guard. Needs firmware with a stable SSRC (any recent bt-bridge build).",
+    },
+    {
+      value: 'multicast',
+      label: 'Multicast group',
+      desc: 'Join a group so several boxes share one stream. Set the same group on every receiver and point the firmware’s RTP host at it. IPv4 or IPv6.',
+    },
+  ];
+  const rtpModeInfo = $derived(RTP_MODES.find((m) => m.value === rtpMode) ?? RTP_MODES[0]);
+
+  // Custom dropdown (a native <select> can't show a description per option, and
+  // shows the same text open and closed). A button + popup listbox lets the
+  // closed trigger stay compact while the open list carries each mode's blurb.
+  let rtpMenuOpen = $state(false);
+  let rtpDropdownEl = $state<HTMLDivElement>();
+  function selectRtpMode(value: RtpMode) {
+    rtpMode = value;
+    rtpMenuOpen = false;
+  }
+  // Close when clicking away or pressing Escape. pointerdown fires before the
+  // trigger's click, but a click inside is contained, so it never self-closes.
+  function onDocPointerDown(e: PointerEvent) {
+    if (rtpMenuOpen && rtpDropdownEl && !rtpDropdownEl.contains(e.target as Node)) rtpMenuOpen = false;
+  }
+  function onDocKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') rtpMenuOpen = false;
+  }
 
   // A non-empty, non-0.0.0.0 source.ip means the receiver joined a multicast
   // group; otherwise ignore-ssrc distinguishes "accept all" from "single".
@@ -177,6 +231,8 @@
   }
 </script>
 
+<svelte:window onpointerdown={onDocPointerDown} onkeydown={onDocKeydown} />
+
 <div class="card">
   <div class="card-head">
     <h2>AirPlay-receive source</h2>
@@ -239,6 +295,11 @@
           <span class="badge off">disabled</span>
         {/if}
       </p>
+      {#if airplay.name}
+        <div class="meter" title="Input level {pct(airplayPeak)}%" aria-label="input level">
+          <div class="meter-fill" style="width:{pct(airplayPeak)}%"></div>
+        </div>
+      {/if}
       <div class="status-actions">
         <button class="ghost" type="button" onclick={() => { showManage = true; refreshClients(); }}>
           Manage connections{#if clients.length}&nbsp;({clients.length}){/if}
@@ -347,36 +408,47 @@
       <label for="rtp-port">Listen port</label>
       <input id="rtp-port" type="number" min="1" max="65535" bind:value={rtpPort} placeholder="46000" />
     </div>
-    <fieldset class="rtp-source">
-      <legend>Source</legend>
-      <label class="radio">
-        <input type="radio" name="rtp-mode" value="all" bind:group={rtpMode} />
-        <span>
-          <strong>Accept all senders</strong>
-          <span class="muted">Any device sending to this port is received. Packets from two senders may interleave and corrupt the audio.</span>
-        </span>
-      </label>
-      <label class="radio">
-        <input type="radio" name="rtp-mode" value="single" bind:group={rtpMode} />
-        <span>
-          <strong>Only one client</strong>
-          <span class="muted">Locks onto the first sender's stream and rejects all others — the corruption guard. Needs firmware with a stable SSRC (any recent bt-bridge build).</span>
-        </span>
-      </label>
-      <label class="radio">
-        <input type="radio" name="rtp-mode" value="multicast" bind:group={rtpMode} />
-        <span>
-          <strong>Multicast group</strong>
-          <span class="muted">Join a group so several boxes share one stream. Set the same group on every receiver and point the firmware's RTP host at it. IPv4 or IPv6.</span>
-        </span>
-      </label>
-      {#if rtpMode === 'multicast'}
-        <div class="field multicast-addr">
-          <label for="rtp-mcast">Group address</label>
-          <input id="rtp-mcast" type="text" bind:value={rtpMulticastAddr} placeholder="239.255.42.42" />
+    <div class="field">
+      <span class="group-label" id="rtp-source-label">Source</span>
+      <div class="rtp-source-row">
+        <div class="dropdown" bind:this={rtpDropdownEl}>
+          <button
+            type="button"
+            class="dd-trigger"
+            aria-haspopup="listbox"
+            aria-expanded={rtpMenuOpen}
+            aria-labelledby="rtp-source-label"
+            onclick={() => (rtpMenuOpen = !rtpMenuOpen)}
+          >
+            <span>{rtpModeInfo.label}</span>
+            <span class="caret" aria-hidden="true">▾</span>
+          </button>
+          {#if rtpMenuOpen}
+            <ul class="dd-menu" role="listbox" aria-labelledby="rtp-source-label">
+              {#each RTP_MODES as m (m.value)}
+                <li role="option" aria-selected={m.value === rtpMode}>
+                  <button type="button" class="dd-item" class:active={m.value === rtpMode} onclick={() => selectRtpMode(m.value)}>
+                    <strong>{m.label}</strong>
+                    <span class="muted">{m.desc}</span>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
         </div>
-      {/if}
-    </fieldset>
+        {#if rtpMode === 'multicast'}
+          <input
+            id="rtp-mcast"
+            class="mcast-input"
+            type="text"
+            bind:value={rtpMulticastAddr}
+            placeholder="239.255.42.42"
+            aria-label="Multicast group address"
+          />
+        {/if}
+      </div>
+      <span class="hint">{rtpModeInfo.desc}</span>
+    </div>
 
     <details class="advanced">
       <summary>Advanced</summary>
@@ -404,6 +476,11 @@
           <span class="badge off">disabled</span>
         {/if}
       </p>
+      {#if rtp.enabled}
+        <div class="meter" title="Input level {pct(rtpPeak)}%" aria-label="input level">
+          <div class="meter-fill" style="width:{pct(rtpPeak)}%"></div>
+        </div>
+      {/if}
       <div class="status-actions">
         <button class="primary" type="submit" disabled={busy}>Save</button>
       </div>
@@ -544,38 +621,98 @@
   input.prio {
     width: 4rem;
   }
-  fieldset.rtp-source {
-    margin: 12px 0 0;
-    padding: 8px 12px 12px;
+  /* Compact source picker: one line (dropdown + optional group address), the
+     selected mode's description on the line below (rendered as .hint). */
+  .rtp-source-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .dropdown {
+    position: relative;
+    flex: 0 0 auto;
+  }
+  .dd-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 12rem;
+    padding: 6px 10px;
+    background: var(--card-background-color, var(--ha-card-background, #fff));
     border: 1px solid var(--divider-color);
     border-radius: 6px;
-  }
-  fieldset.rtp-source legend {
-    padding: 0 0.35rem;
-    font-weight: 600;
-    color: var(--secondary-text-color);
-    font-size: 0.85rem;
-  }
-  fieldset.rtp-source label.radio {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    padding: 0.3rem 0;
+    color: inherit;
+    font: inherit;
     cursor: pointer;
+    text-align: left;
   }
-  fieldset.rtp-source label.radio input {
-    margin-top: 0.2rem;
+  .dd-trigger .caret {
+    color: var(--secondary-text-color);
+    font-size: 0.7rem;
   }
-  fieldset.rtp-source label.radio span {
+  .dd-menu {
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 4px);
+    left: 0;
+    min-width: 20rem;
+    max-width: min(28rem, 90vw);
+    margin: 0;
+    padding: 4px;
+    list-style: none;
+    background: var(--card-background-color, var(--ha-card-background, #fff));
+    border: 1px solid var(--divider-color);
+    border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  }
+  .dd-item {
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
+    width: 100%;
+    padding: 8px 10px;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
   }
-  fieldset.rtp-source .muted {
-    font-size: 0.82rem;
+  .dd-item:hover,
+  .dd-item:focus-visible {
+    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
   }
-  fieldset.rtp-source .multicast-addr {
-    margin: 0.4rem 0 0 1.6rem;
-    max-width: 22rem;
+  .dd-item.active {
+    background: color-mix(in srgb, var(--primary-color) 18%, transparent);
+  }
+  .dd-item strong {
+    font-weight: 600;
+  }
+  .dd-item .muted {
+    font-size: 0.8rem;
+    line-height: 1.35;
+  }
+  .mcast-input {
+    flex: 1 1 12rem;
+    max-width: 16rem;
+    margin: 0;
+  }
+
+  /* Live input-level meter — same look as the routing-graph meter. */
+  .meter {
+    flex: 1 1 100px;
+    max-width: 220px;
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--secondary-text-color) 20%, transparent);
+    overflow: hidden;
+  }
+  .meter-fill {
+    height: 100%;
+    background: var(--success-color, #2e7d32);
+    transition: width 120ms linear;
   }
 </style>

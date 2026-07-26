@@ -9,7 +9,7 @@
   let session = $state<AlignState | null>(null);
   let loading = $state(true);
   let busy = $state(false);
-  // Current per-member offset in ms (sendspin static delay / RAOP latency).
+  // Current per-member offset in ms (sendspin static delay / AirPlay 2 render delay).
   let offsets = $state<Record<string, number>>({});
   // Audible-member playback level (0–100), mirrored to the daemon.
   let level = $state(50);
@@ -140,15 +140,15 @@
   }
 
   // Live drag: sendspin delay is applied in-band and takes effect immediately,
-  // so push while dragging (throttled). RAOP latency reloads the sink, so it's
-  // only committed on release (onchange) — dragging just updates the readout.
+  // so push while dragging (throttled). AirPlay 2 render delay is committed on
+  // release (onchange) — dragging just updates the readout.
   let throttleTimer: ReturnType<typeof setTimeout> | null = null;
   let pending: { m: AlignMember; ms: number } | null = null;
   function liveOffset(m: AlignMember, ms: number) {
     offsets[m.node_name] = ms; // immediate readout
     // Only stream while dragging when it actually takes effect live: sendspin
-    // firmware that honors it. Otherwise (sendspin needing a restart, or RAOP)
-    // we commit once on release.
+    // firmware that honors it. Otherwise (sendspin needing a restart, or
+    // AirPlay 2) we commit once on release.
     if (m.kind !== 'sendspin' || !sendspinDelayLive) return;
     pending = { m, ms };
     if (throttleTimer) return;
@@ -240,7 +240,7 @@
           <tr class:audible={isRef || isTarget}>
             <td>
               {label(m.node_name)}
-              <span class="badge">{m.kind === 'sendspin' ? 'Sendspin' : 'AirPlay'}</span>
+              <span class="badge">{m.kind === 'sendspin' ? 'Sendspin' : 'AirPlay 2'}</span>
             </td>
             <td>
               <label class="role">
@@ -269,9 +269,7 @@
                   <button onclick={() => applyOffset(m, (offsets[m.node_name] ?? 0) + 1)}>+1</button>
                   <button onclick={() => applyOffset(m, (offsets[m.node_name] ?? 0) + 10)}>+10</button>
                 </div>
-                {#if m.kind === 'raop'}
-                  <p class="muted warn">Each change reloads this AirPlay sink — expect a brief gap before the click returns.</p>
-                {:else if !sendspinDelayLive}
+                {#if m.kind === 'sendspin' && !sendspinDelayLive}
                   <p class="muted warn">Each change restarts the group stream — expect a brief gap before the click returns.</p>
                 {/if}
               {/if}
