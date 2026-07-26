@@ -6,6 +6,7 @@ use crate::server::connection::{ServerConnection, ServerSender};
 use crate::server::dial::dial_client;
 use crate::server::discovery::{ClientBrowser, Discovered};
 use crate::sync::raw_clock::Clock;
+use mdns_sd::ServiceDaemon;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,13 +119,32 @@ impl ClientManager {
         clock: Arc<dyn Clock>,
         allow: impl Fn(&str) -> bool + Send + 'static,
     ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
+        Self::start_filtered_with_daemon(server_id, server_name, clock, allow, None)
+    }
+
+    /// Like [`Self::start_filtered`], but browses on a **caller-provided** mDNS
+    /// daemon (see [`ClientBrowser::with_daemon`]) instead of spawning its own —
+    /// so an embedder can share one interface-restricted daemon across all of
+    /// its mDNS instead of adding a `mDNS_daemon` thread (and, under
+    /// host-networking, its multicast amplification) per manager. Passing `None`
+    /// is exactly [`Self::start_filtered`].
+    pub fn start_filtered_with_daemon(
+        server_id: impl Into<String>,
+        server_name: impl Into<String>,
+        clock: Arc<dyn Clock>,
+        allow: impl Fn(&str) -> bool + Send + 'static,
+        daemon: Option<ServiceDaemon>,
+    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
         let server_id = server_id.into();
         let server_name = server_name.into();
         let (event_tx, event_rx) = unbounded_channel();
         let tasks: Arc<Mutex<HashMap<String, ManagedClient>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let browser = ClientBrowser::new()?;
+        let browser = match daemon {
+            Some(d) => ClientBrowser::with_daemon(d)?,
+            None => ClientBrowser::new()?,
+        };
         let tasks_for_browse = Arc::clone(&tasks);
         let browse_handle = tokio::spawn(async move {
             while let Some(event) = browser.next_event().await {
@@ -175,13 +195,19 @@ impl ClientManager {
                             }
                         }
                     }
-                    // The device's advertisement went away: stop supervising it
-                    // (gracefully, so a live connection emits Disconnected)
-                    // instead of redialing a gone device forever.
+                    // The device's mDNS advertisement went away. This is NOT proof
+                    // the device left: WiFi power-saving speakers (e.g. Home Assistant
+                    // Voice PE) routinely let their record lapse (TTL expiry) while
+                    // still online, then re-announce. Stopping supervision here meant a
+                    // brief mDNS flap permanently dropped the device — it never resumed
+                    // playing. So KEEP the supervisor: its dial loop already retries
+                    // with backoff (1s→5min), so it reconnects the moment the device is
+                    // reachable again, no dependency on a fresh mDNS announcement. A
+                    // genuinely-gone device is removed by the host's own liveness layer
+                    // (which restarts this manager without it) — not by an mDNS flap.
                     Discovered::Removed { fullname } => {
-                        if let Some(managed) = tasks_for_browse.lock().unwrap().remove(&fullname) {
-                            log::info!("[{fullname}] mDNS service removed, stopping supervision");
-                            let _ = managed.directive_tx.send(Directive::Stop);
+                        if tasks_for_browse.lock().unwrap().contains_key(&fullname) {
+                            log::info!("[{fullname}] mDNS service removed — keeping supervision (dial loop retries; likely a power-save/TTL flap)");
                         }
                     }
                 }

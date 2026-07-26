@@ -284,18 +284,38 @@ pub(crate) struct MdnsService {
     daemon: mdns_sd::ServiceDaemon,
     raop_fullname: Option<String>,
     airplay_fullname: Option<String>,
+    /// `true` when this struct created the daemon and must shut it down on drop;
+    /// `false` when the daemon was injected (see [`MdnsService::with_daemon`])
+    /// and its lifetime belongs to the caller — drop then only unregisters this
+    /// service's records.
+    owns_daemon: bool,
 }
 
 #[cfg(not(target_os = "macos"))]
 impl MdnsService {
-    /// Create a new mDNS service manager.
+    /// Create a new mDNS service manager on a freshly-created, private daemon
+    /// (shut down on drop).
     pub(crate) fn new() -> Result<Self, NetworkError> {
         let daemon = mdns_sd::ServiceDaemon::new().map_err(|e| NetworkError::Mdns(format!("{e}")))?;
-        Ok(Self {
+        Ok(Self::on_daemon(daemon, true))
+    }
+
+    /// Create a manager on a **caller-provided** daemon. The caller owns the
+    /// daemon's lifetime: dropping this `MdnsService` unregisters only its own
+    /// records and leaves the daemon running, so one daemon — optionally
+    /// interface-restricted — can back many advertisers with a single
+    /// `mDNS_daemon` thread. `ServiceDaemon` is cheaply cloneable; pass a clone.
+    pub(crate) fn with_daemon(daemon: mdns_sd::ServiceDaemon) -> Self {
+        Self::on_daemon(daemon, false)
+    }
+
+    fn on_daemon(daemon: mdns_sd::ServiceDaemon, owns_daemon: bool) -> Self {
+        Self {
             daemon,
             raop_fullname: None,
             airplay_fullname: None,
-        })
+            owns_daemon,
+        }
     }
 
     /// Register the _raop._tcp mDNS service.
@@ -357,9 +377,13 @@ impl MdnsService {
 #[cfg(not(target_os = "macos"))]
 impl Drop for MdnsService {
     fn drop(&mut self) {
+        // Always remove our own records; only shut the daemon down if we own it
+        // (an injected daemon is the caller's to shut down).
         self.unregister_raop();
         self.unregister_airplay();
-        let _ = self.daemon.shutdown();
+        if self.owns_daemon {
+            let _ = self.daemon.shutdown();
+        }
     }
 }
 

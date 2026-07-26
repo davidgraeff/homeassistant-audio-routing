@@ -130,6 +130,20 @@ impl RaopShared {
             }
         }
     }
+
+    /// Ask every live connection to close gracefully. Used on server shutdown
+    /// so each sender gets a clean FIN on its RTSP control socket — the only
+    /// "session is gone" signal a RAOP receiver can give (it can't originate an
+    /// RTSP TEARDOWN). Without this the sockets close only implicitly at process
+    /// exit, which races a fast restart that rebinds the port first and leaves
+    /// the sender streaming RTP into a session the new process never set up.
+    pub(crate) fn disconnect_all(&self) {
+        if let Ok(m) = self.connections.lock() {
+            for tx in m.values() {
+                let _ = tx.send(true);
+            }
+        }
+    }
 }
 
 impl HttpdCallbacks for RaopShared {

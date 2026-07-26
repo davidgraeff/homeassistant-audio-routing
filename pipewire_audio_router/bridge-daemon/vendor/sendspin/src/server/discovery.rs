@@ -18,23 +18,61 @@ const SERVER_SERVICE_TYPE: &str = "_sendspin-server._tcp.local.";
 /// and dialed by a server.
 const CLIENT_SERVICE_TYPE: &str = "_sendspin._tcp.local.";
 
-/// A live mDNS advertisement. Unregisters and shuts down its background
-/// daemon on drop — hold this alive for as long as the server should stay
-/// discoverable.
+/// A live mDNS advertisement. On drop it always unregisters its own service;
+/// whether it also shuts the underlying daemon down depends on how it was
+/// created (see [`Advertisement::new`] vs [`Advertisement::with_daemon`]). Hold
+/// this alive for as long as the server should stay discoverable.
 pub struct Advertisement {
     daemon: ServiceDaemon,
     fullname: String,
+    /// `true` when this struct created the daemon and must shut it down on
+    /// drop; `false` when the daemon was injected via
+    /// [`Advertisement::with_daemon`] and its lifetime is the caller's.
+    owns_daemon: bool,
 }
 
 impl Advertisement {
-    /// Advertise a running server. `server_id` should be the same stable
-    /// identifier passed to [`crate::server::ServerListener::bind`] — it
-    /// becomes both the mDNS instance name and the advertised hostname.
-    /// `path` is the HTTP path clients should connect to (the spec fixes
-    /// this to `/sendspin` for real deployments).
+    /// Advertise a running server on a freshly-created, private mDNS daemon
+    /// (shut down when this `Advertisement` drops). `server_id` should be the
+    /// same stable identifier passed to [`crate::server::ServerListener::bind`]
+    /// — it becomes both the mDNS instance name and the advertised hostname.
+    /// `path` is the HTTP path clients should connect to (the spec fixes this
+    /// to `/sendspin` for real deployments).
+    ///
+    /// Use [`Advertisement::with_daemon`] to share one daemon across many
+    /// advertisers instead of spawning a background `mDNS_daemon` thread each.
     pub fn new(server_id: &str, name: &str, port: u16, path: &str) -> Result<Self, Error> {
         let daemon = ServiceDaemon::new()
             .map_err(|e| Error::Connection(format!("mDNS daemon start failed: {e}")))?;
+        Self::register_on(daemon, true, server_id, name, port, path)
+    }
+
+    /// Advertise a running server on a **caller-provided** mDNS daemon. The
+    /// caller owns the daemon's lifetime: dropping this `Advertisement`
+    /// unregisters only *this* service and leaves the daemon running, so one
+    /// daemon — optionally restricted to a single interface via
+    /// [`ServiceDaemon::disable_interface`]/[`ServiceDaemon::enable_interface`]
+    /// — can back many advertisers (and/or a [`ClientBrowser`]) with a single
+    /// `mDNS_daemon` thread. `ServiceDaemon` is cheaply cloneable; pass a clone
+    /// and keep one for the caller to shut down.
+    pub fn with_daemon(
+        daemon: ServiceDaemon,
+        server_id: &str,
+        name: &str,
+        port: u16,
+        path: &str,
+    ) -> Result<Self, Error> {
+        Self::register_on(daemon, false, server_id, name, port, path)
+    }
+
+    fn register_on(
+        daemon: ServiceDaemon,
+        owns_daemon: bool,
+        server_id: &str,
+        name: &str,
+        port: u16,
+        path: &str,
+    ) -> Result<Self, Error> {
         let service = ServiceInfo::new(
             SERVER_SERVICE_TYPE,
             server_id,
@@ -49,17 +87,22 @@ impl Advertisement {
         daemon
             .register(service)
             .map_err(|e| Error::Connection(format!("mDNS register failed: {e}")))?;
-        Ok(Self { daemon, fullname })
+        Ok(Self { daemon, fullname, owns_daemon })
     }
 }
 
 impl Drop for Advertisement {
     fn drop(&mut self) {
+        // Always remove our own advertisement from mDNS.
         if let Err(e) = self.daemon.unregister(&self.fullname) {
             log::warn!("mDNS unregister failed: {e}");
         }
-        if let Err(e) = self.daemon.shutdown() {
-            log::warn!("mDNS daemon shutdown failed: {e}");
+        // Only tear the daemon down if we created it; an injected (shared)
+        // daemon is the caller's to shut down.
+        if self.owns_daemon {
+            if let Err(e) = self.daemon.shutdown() {
+                log::warn!("mDNS daemon shutdown failed: {e}");
+            }
         }
     }
 }
@@ -70,18 +113,37 @@ impl Drop for Advertisement {
 pub struct ClientBrowser {
     daemon: ServiceDaemon,
     receiver: Receiver<ServiceEvent>,
+    /// `true` when this struct created the daemon (shut down on drop); `false`
+    /// when injected via [`ClientBrowser::with_daemon`] (drop stops only this
+    /// browse, leaving the daemon for the caller/other users).
+    owns_daemon: bool,
 }
 
 impl ClientBrowser {
-    /// Start browsing. Keep this alive for as long as discovery should keep
-    /// running — dropping it shuts down its background daemon.
+    /// Start browsing on a freshly-created, private mDNS daemon. Keep this
+    /// alive for as long as discovery should keep running — dropping it shuts
+    /// the daemon down. See [`ClientBrowser::with_daemon`] to share a daemon.
     pub fn new() -> Result<Self, Error> {
         let daemon = ServiceDaemon::new()
             .map_err(|e| Error::Connection(format!("mDNS daemon start failed: {e}")))?;
+        Self::browse_on(daemon, true)
+    }
+
+    /// Start browsing on a **caller-provided** mDNS daemon. The caller owns the
+    /// daemon's lifetime: dropping this `ClientBrowser` stops only *this* browse
+    /// (via [`ServiceDaemon::stop_browse`]) and leaves the daemon running, so
+    /// one daemon — optionally interface-restricted — can back many browsers
+    /// and/or [`Advertisement`]s with a single `mDNS_daemon` thread.
+    /// `ServiceDaemon` is cheaply cloneable; pass a clone.
+    pub fn with_daemon(daemon: ServiceDaemon) -> Result<Self, Error> {
+        Self::browse_on(daemon, false)
+    }
+
+    fn browse_on(daemon: ServiceDaemon, owns_daemon: bool) -> Result<Self, Error> {
         let receiver = daemon
             .browse(CLIENT_SERVICE_TYPE)
             .map_err(|e| Error::Connection(format!("mDNS browse failed: {e}")))?;
-        Ok(Self { daemon, receiver })
+        Ok(Self { daemon, receiver, owns_daemon })
     }
 
     /// Wait for the next discovery event: a client resolving at a usable URL,
@@ -145,8 +207,13 @@ pub enum Discovered {
 
 impl Drop for ClientBrowser {
     fn drop(&mut self) {
-        if let Err(e) = self.daemon.shutdown() {
-            log::warn!("mDNS daemon shutdown failed: {e}");
+        if self.owns_daemon {
+            if let Err(e) = self.daemon.shutdown() {
+                log::warn!("mDNS daemon shutdown failed: {e}");
+            }
+        } else if let Err(e) = self.daemon.stop_browse(CLIENT_SERVICE_TYPE) {
+            // Shared daemon: stop just our browse, leave the daemon for others.
+            log::warn!("mDNS stop_browse failed: {e}");
         }
     }
 }

@@ -26,6 +26,11 @@ pub use binary::encode_audio_frame;
 pub use connection::{ServerConnection, ServerConnectionGuard, ServerSender};
 pub use dial::dial_client;
 pub use discovery::{Advertisement, ClientBrowser, Discovered};
+/// Re-export of the underlying mDNS daemon types so callers can build and
+/// configure one `ServiceDaemon` (e.g. restrict it to a single interface with
+/// [`IfKind`]) and share it across [`Advertisement`]/[`ClientBrowser`] via their
+/// `with_daemon` constructors, instead of each spawning its own daemon thread.
+pub use mdns_sd::{IfKind, ServiceDaemon};
 pub use group::{Group, DEFAULT_SEND_AHEAD_US};
 pub use listener::ServerListener;
 pub use manager::{ClientEvent, ClientManager};

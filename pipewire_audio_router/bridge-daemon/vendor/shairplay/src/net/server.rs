@@ -146,6 +146,12 @@ pub(crate) struct HttpServer {
     /// before it returns — otherwise a quick restart races the old listener and
     /// fails to rebind the port (drifting to +1 under `auto_port`).
     accept_tasks: Vec<JoinHandle<()>>,
+    /// In-flight per-connection tasks, so `stop()` can await their graceful
+    /// `stream.shutdown()` (FIN) rather than let them be aborted mid-write when
+    /// the runtime drops at process exit. Shared with the accept loops, which
+    /// push each new connection's handle (pruning finished ones) — see
+    /// [`spawn_accept_loop`].
+    conn_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
     port: u16,
     running: bool,
     bind_config: BindConfig,
@@ -159,6 +165,7 @@ impl HttpServer {
             max_connections,
             shutdown_tx: None,
             accept_tasks: Vec::new(),
+            conn_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             port: 0,
             running: false,
             bind_config: BindConfig::default(),
@@ -212,7 +219,13 @@ impl HttpServer {
             if let Ok(addr) = listener.local_addr() {
                 tracing::debug!(%addr, "Listener bound");
             }
-            self.accept_tasks.push(spawn_accept_loop(listener, callbacks.clone(), semaphore.clone(), shutdown_rx.clone()));
+            self.accept_tasks.push(spawn_accept_loop(
+                listener,
+                callbacks.clone(),
+                semaphore.clone(),
+                shutdown_rx.clone(),
+                self.conn_tasks.clone(),
+            ));
         }
 
         Ok(actual_port)
@@ -238,6 +251,24 @@ impl HttpServer {
         }
         for task in self.accept_tasks.drain(..) {
             let _ = task.await;
+        }
+        // Await in-flight connection tasks so a graceful close already asked for
+        // (via `disconnect_all` / `disconnect_client` before `stop`) actually
+        // puts its FIN on the wire before we return and drop the listener.
+        // Bounded by one overall budget: a wedged connection can't stall
+        // shutdown — on timeout the remaining handles are dropped (detached) and
+        // their sockets close when the process exits, as they did before.
+        let conn_tasks: Vec<JoinHandle<()>> = {
+            let mut g = self.conn_tasks.lock().unwrap_or_else(|e| e.into_inner());
+            g.drain(..).collect()
+        };
+        if !conn_tasks.is_empty() {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                for task in conn_tasks {
+                    let _ = task.await;
+                }
+            })
+            .await;
         }
         self.running = false;
     }
@@ -407,6 +438,7 @@ fn spawn_accept_loop(
     callbacks: Arc<dyn HttpdCallbacks>,
     semaphore: Arc<Semaphore>,
     mut shutdown_rx: watch::Receiver<bool>,
+    conn_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -426,7 +458,7 @@ fn spawn_accept_loop(
                         Err(_) => { tracing::warn!("Max connections reached"); continue; }
                     };
                     let cb = callbacks.clone();
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let _permit = permit;
                         let handler = match cb.conn_init(local, remote) {
                             Some(h) => h,
@@ -434,6 +466,13 @@ fn spawn_accept_loop(
                         };
                         process_connection(stream, handler, remote).await;
                     });
+                    // Track the handle so `stop()` can await this connection's
+                    // graceful close; prune finished ones so the list stays
+                    // bounded to live connections over the server's lifetime.
+                    if let Ok(mut tasks) = conn_tasks.lock() {
+                        tasks.retain(|t| !t.is_finished());
+                        tasks.push(handle);
+                    }
                 }
                 _ = shutdown_rx.changed() => {
                     break;
@@ -458,6 +497,72 @@ mod tests {
             resp.finish(None);
             resp
         }
+    }
+
+    /// Callbacks that hand each connection a cancellable handler and remember
+    /// its close-sender — a minimal stand-in for `RaopShared`'s connection
+    /// registry, so we can drive the server-wide graceful-close path.
+    #[derive(Default)]
+    struct CancelCallbacks {
+        senders: std::sync::Mutex<Vec<watch::Sender<bool>>>,
+    }
+    impl CancelCallbacks {
+        fn disconnect_all(&self) {
+            for tx in self.senders.lock().unwrap().iter() {
+                let _ = tx.send(true);
+            }
+        }
+    }
+    impl HttpdCallbacks for CancelCallbacks {
+        fn conn_init(self: Arc<Self>, _local: SocketAddr, _remote: SocketAddr) -> Option<Box<dyn ConnectionHandler>> {
+            let (tx, rx) = watch::channel(false);
+            self.senders.lock().unwrap().push(tx);
+            Some(Box::new(CancelHandler { cancel: Some(rx) }))
+        }
+    }
+    struct CancelHandler {
+        cancel: Option<watch::Receiver<bool>>,
+    }
+    impl ConnectionHandler for CancelHandler {
+        fn conn_request(&mut self, _req: &HttpRequest) -> HttpResponse {
+            let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+            resp.add_header("CSeq", "1");
+            resp.finish(None);
+            resp
+        }
+        fn cancellation(&mut self) -> Option<watch::Receiver<bool>> {
+            self.cancel.take()
+        }
+    }
+
+    /// `stop()` must gracefully close a *live* connection (the fix): a sender
+    /// mid-session should see a clean EOF once the server is told to disconnect
+    /// all and stop, not be left dangling until process exit. Regression guard
+    /// for the "sender keeps streaming into a dead session after a restart" bug.
+    #[tokio::test]
+    async fn stop_gracefully_closes_live_connections() {
+        let cbs = Arc::new(CancelCallbacks::default());
+        let mut server = HttpServer::new(cbs.clone(), 10);
+        server.set_bind_config(BindConfig::new().addrs(["127.0.0.1".parse().unwrap()]).port(0));
+        let port = server.start(0).await.unwrap();
+
+        // Establish a connection and round-trip one request so we know the
+        // per-connection task is spawned and registered before we stop.
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n").await.unwrap();
+        let mut tmp = [0u8; 1024];
+        assert!(client.read(&mut tmp).await.unwrap() > 0, "expected a response");
+
+        // Mirror RaopServer::stop(): signal every live connection, then stop.
+        cbs.disconnect_all();
+        // Bounded so a regression (stop not awaiting connections / not closing
+        // them) fails as a timeout instead of hanging the suite.
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.stop())
+            .await
+            .expect("stop() should return promptly after graceful close");
+
+        // The graceful `stream.shutdown()` reaches the client as EOF.
+        assert_eq!(client.read(&mut tmp).await.unwrap(), 0, "server should have closed the connection");
     }
 
     // The extracted `process_connection` seam lets the framing → dispatch → write

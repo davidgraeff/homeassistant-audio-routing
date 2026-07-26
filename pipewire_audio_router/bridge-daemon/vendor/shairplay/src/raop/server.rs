@@ -78,6 +78,12 @@ pub struct RaopServerBuilder {
     video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
     #[cfg(feature = "hls")]
     hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
+    /// Optional caller-provided mDNS daemon (Linux only). When set, the server
+    /// advertises its `_raop._tcp`/`_airplay._tcp` records on this shared daemon
+    /// instead of spawning its own — see [`crate::net::mdns`]'s `with_daemon`.
+    /// The caller owns the daemon's lifetime.
+    #[cfg(not(target_os = "macos"))]
+    mdns_daemon: Option<mdns_sd::ServiceDaemon>,
 }
 
 impl Default for RaopServerBuilder {
@@ -109,7 +115,19 @@ impl RaopServerBuilder {
             video_handler: None,
             #[cfg(feature = "hls")]
             hls_handler: None,
+            #[cfg(not(target_os = "macos"))]
+            mdns_daemon: None,
         }
+    }
+
+    /// Advertise on a **caller-provided**, shared mDNS daemon instead of a
+    /// private one (Linux only). Lets an embedder pin advertising to a single
+    /// interface and share one `mDNS_daemon` thread across multiple advertisers.
+    /// The daemon is cheaply cloneable; pass a clone and keep the daemon alive.
+    #[cfg(not(target_os = "macos"))]
+    pub fn mdns_daemon(mut self, daemon: mdns_sd::ServiceDaemon) -> Self {
+        self.mdns_daemon = Some(daemon);
+        self
     }
 
     /// Set the maximum number of concurrent connections. Default: 10.
@@ -315,6 +333,8 @@ impl RaopServerBuilder {
             raop_et,
             #[cfg(feature = "ap2")]
             mode: self.mode,
+            #[cfg(not(target_os = "macos"))]
+            mdns_daemon: self.mdns_daemon,
         })
     }
 }
@@ -337,6 +357,9 @@ pub struct RaopServer {
     raop_et: String,
     #[cfg(feature = "ap2")]
     mode: AirPlayMode,
+    /// Caller-provided shared mDNS daemon to advertise on, if any (Linux only).
+    #[cfg(not(target_os = "macos"))]
+    mdns_daemon: Option<mdns_sd::ServiceDaemon>,
 }
 
 impl RaopServer {
@@ -350,6 +373,16 @@ impl RaopServer {
     /// signal is sent; the connection tears down shortly after.
     pub fn disconnect_client(&self, addr: &str) {
         self.shared.disconnect_client(addr);
+    }
+
+    /// Ask every currently-connected sender to close gracefully. Fires each
+    /// live connection's close signal so it sends a clean FIN on its RTSP
+    /// control socket — the receiver-side "session is gone" signal (a RAOP
+    /// receiver cannot originate an RTSP TEARDOWN). Returns once the signals are
+    /// sent; [`stop`](Self::stop) calls this and then awaits the connections so
+    /// the FINs reach the wire before the port is released.
+    pub fn disconnect_all(&self) {
+        self.shared.disconnect_all();
     }
 
     /// Peer IP of the client that currently holds the audio session, if any.
@@ -373,6 +406,15 @@ impl RaopServer {
 
         if std::env::var("CI").is_err() {
             let info = self.service_info();
+            // Advertise on the caller's shared daemon when provided (so all mDNS
+            // registrations share one interface-restricted daemon thread),
+            // otherwise spawn a private one.
+            #[cfg(not(target_os = "macos"))]
+            let mut mdns = match self.mdns_daemon.clone() {
+                Some(daemon) => MdnsService::with_daemon(daemon),
+                None => MdnsService::new()?,
+            };
+            #[cfg(target_os = "macos")]
             let mut mdns = MdnsService::new()?;
             mdns.register_raop(&info)?;
             #[cfg(feature = "ap2")]
@@ -391,11 +433,18 @@ impl RaopServer {
     }
 
     /// Stop the server: unregister mDNS services and close all listeners.
+    ///
+    /// Live connections are closed gracefully first: `disconnect_all` signals
+    /// each to send a clean FIN, and `httpd.stop()` then awaits them (bounded)
+    /// so those FINs reach the wire before the listener drops. This is what lets
+    /// a sender learn the session is stale on a restart, instead of streaming
+    /// RTP into a session the new process never set up.
     pub async fn stop(&mut self) {
         if let Some(mut mdns) = self.mdns.take() {
             mdns.unregister_raop();
             mdns.unregister_airplay();
         }
+        self.shared.disconnect_all();
         self.httpd.stop().await;
     }
 
