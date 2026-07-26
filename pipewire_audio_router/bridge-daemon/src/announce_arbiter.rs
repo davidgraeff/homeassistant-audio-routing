@@ -27,7 +27,7 @@
 // The scheduler is pure and time is injected (`now_ms`) so it's deterministic in
 // tests; the daemon passes real milliseconds. Wiring the emitted [`Action`]s to
 // real per-output ducking + overlay is the audio path's job (sendspin: O-A/O-B;
-// RAOP: O-E), which lands after O-B.
+// AP2 does it in-process), which lands after O-B.
 
 #![allow(dead_code)] // wired into the audio path after O-B; unit-tested now.
 
@@ -37,7 +37,7 @@ use std::collections::{BTreeSet, HashMap};
 /// targets). The same id fans across every target output.
 pub type AnnouncementId = u64;
 
-/// An output's stable node name (e.g. `raop-out-dusche`, `sendspin-dev-…`).
+/// An output's stable node name (e.g. `ap2-dev-dusche`, `sendspin-dev-…`).
 pub type Output = String;
 
 /// What to do when the requested outputs are busy.

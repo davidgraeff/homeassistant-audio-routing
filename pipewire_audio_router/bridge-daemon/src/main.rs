@@ -1,18 +1,28 @@
 mod airplay_clients;
 mod airplay_source;
+mod announce;
+mod announce_arbiter;
+mod ap2_discovery;
+mod ap2_liveness;
+mod ap2_ptp;
+mod ap2_server;
+mod ap2_spike;
+mod ap2_volume;
 mod api;
 mod calibrate;
 mod config;
 mod decode;
-mod discovery;
 mod discovery_supervisor;
+mod groups_store;
+mod host_assessment;
 mod locks;
 mod metering;
-mod outputs_store;
+mod overlay_mixer;
+mod per_device_spike;
 mod player;
 mod pw_module;
 mod pw_thread;
-mod raop;
+mod resample;
 mod routing;
 mod routing_store;
 mod rtp_source;
@@ -21,6 +31,7 @@ mod sendspin_discovery;
 mod sendspin_liveness;
 mod sendspin_server;
 mod sendspin_volume;
+mod raop_migration;
 mod settings_store;
 mod sources_store;
 mod sync_group;
@@ -33,7 +44,6 @@ use crate::locks::LockRecover;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_STORE_PATH: &str = "/data/raop-outputs.json";
 const DEFAULT_SOURCES_PATH: &str = "/data/sources.json";
 const DEFAULT_ROUTING_PATH: &str = "/data/routing.json";
 // Not 8080: with host_network the daemon binds a real host port, and 8080 is a
@@ -51,15 +61,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the long-lived daemon: connect to the already-running PipeWire
-    /// instance, load a `raop-sink` module for every stored RAOP output, bring
-    /// up the stored AirPlay and RTP sources, and serve the REST API — all of
-    /// which can be reconfigured live (api.rs's `/api/outputs`,
-    /// `/api/source/airplay`, `/api/source/rtp`). Sendspin devices are
-    /// discovered and grouped dynamically, so there's nothing stored for them.
+    /// instance, bring up the stored AirPlay and RTP sources, and serve the REST
+    /// API — all of which can be reconfigured live (api.rs's
+    /// `/api/source/airplay`, `/api/source/rtp`). Sendspin devices and AirPlay-2
+    /// receivers are discovered and grouped dynamically, so there's nothing
+    /// stored for them.
     Serve {
-        /// Persistent, runtime-managed RAOP output store.
-        #[arg(long, default_value = DEFAULT_STORE_PATH)]
-        store: PathBuf,
         /// Persistent, runtime-managed store for the AirPlay and RTP sources.
         #[arg(long, default_value = DEFAULT_SOURCES_PATH)]
         sources: PathBuf,
@@ -78,27 +85,26 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "bridge_daemon=info,shairplay=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "bridge_daemon=info,shairplay=info,airplay_client=info,airplay_audio=info,libairptp=info".into()),
         )
         .init();
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { store, sources, routing, static_dir, listen } => serve(&store, &sources, &routing, &static_dir, &listen),
+        Command::Serve { sources, routing, static_dir, listen } => serve(&sources, &routing, &static_dir, &listen),
     }
 }
 
-/// Reads `BRIDGE_DISCOVERY`: unset or `on`/`1`/`true` → load discovered
-/// receivers, `log` → dry-run (report only), `off`/`0`/`false`/`no` → disabled
-/// (returns `None`).
-fn discovery_mode() -> Option<discovery::Mode> {
+/// Reads `BRIDGE_DISCOVERY` for the fresh-install seed of the persisted
+/// discovery flag: unset or `on`/`1`/`true`/`yes` → enabled, `off`/`0`/`false`/
+/// `no` → disabled. Anything else → enabled (with a warning).
+fn discovery_enabled_env() -> bool {
     match std::env::var("BRIDGE_DISCOVERY").ok().as_deref().map(str::trim) {
-        None | Some("") | Some("on") | Some("1") | Some("true") | Some("yes") => Some(discovery::Mode::Load),
-        Some("log") | Some("dry-run") | Some("dryrun") => Some(discovery::Mode::DryRun),
-        Some("off") | Some("0") | Some("false") | Some("no") => None,
+        Some("off") | Some("0") | Some("false") | Some("no") => false,
+        None | Some("") | Some("on") | Some("1") | Some("true") | Some("yes") => true,
         Some(other) => {
             tracing::warn!("unrecognized BRIDGE_DISCOVERY='{other}'; defaulting to enabled");
-            Some(discovery::Mode::Load)
+            true
         }
     }
 }
@@ -115,16 +121,20 @@ fn addon_version() -> String {
     }
 }
 
-fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &str) -> anyhow::Result<()> {
+fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &str) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let version = addon_version();
     tracing::info!("PipeWire Audio Router add-on v{version}");
 
-    // No options.json seeding: both stores start empty on a fresh install and
-    // are populated entirely at runtime via the API (and mDNS discovery).
-    let store = outputs_store::OutputsStore::load(store_path)?;
-    tracing::info!("{} RAOP output(s) in store {}", store.list().len(), store_path.display());
-    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    // One-time migration: drop-raop 2026-07. Rewrites any persisted
+    // `raop-out-<slug>` routing/group reference to `ap2-dev-<slug>` before the
+    // reconcilers read them, so a link saved under the old RAOP output path
+    // points at the AP2 output that replaced it (same slug). Idempotent (a boot
+    // that finds no `raop-out-*` does nothing), so it can be removed after the
+    // deployment has booted once. Stale per-output RAOP latency / settings keys
+    // are dropped automatically by serde (the fields no longer exist).
+    let groups_config_path = routing_path.with_file_name("groups.json");
+    raop_migration::migrate_raop_prefixes(routing_path, &groups_config_path);
 
     let sources = sources_store::SourcesStore::load(sources_path)?;
     tracing::info!(
@@ -156,24 +166,34 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     );
     let sync_settings: sync_settings::SharedSyncSettings = std::sync::Arc::new(std::sync::Mutex::new(sync_settings));
 
-    // General app settings (announce duck default, discovery on/off, default
-    // RAOP latency), beside the other /data stores. On a fresh install the
-    // discovery flag is seeded from BRIDGE_DISCOVERY so an env-off is honored on
-    // first boot; after that the persisted value is authoritative.
+    // General app settings (announce duck default, discovery on/off), beside the
+    // other /data stores. On a fresh install the discovery flag is seeded from
+    // BRIDGE_DISCOVERY so an env-off is honored on first boot; after that the
+    // persisted value is authoritative.
     let settings_path = routing_path.with_file_name("settings.json");
     let settings_fresh = !settings_path.exists();
     let mut settings = settings_store::SettingsStore::load(&settings_path)?;
     if settings_fresh {
-        settings.set_discovery_enabled(discovery_mode().is_some())?;
+        settings.set_discovery_enabled(discovery_enabled_env())?;
     }
     tracing::info!(
-        "settings: duck default {:.2}, discovery {}, default RAOP latency {:?} in {}",
+        "settings: duck default {:.2}, discovery {} in {}",
         settings.default_duck(),
         if settings.discovery_enabled() { "on" } else { "off" },
-        settings.default_raop_latency_ms(),
         settings_path.display()
     );
     let settings: settings_store::SharedSettings = std::sync::Arc::new(std::sync::Mutex::new(settings));
+
+    // Named music/announcement groups (groups_store.rs), beside the other /data
+    // stores. The MG/AG data model behind the two-tier grouping design.
+    let groups_config = groups_store::GroupsStore::load(&groups_config_path)?;
+    tracing::info!(
+        "{} music group(s), {} announcement group(s) in {}",
+        groups_config.music().len(),
+        groups_config.announcement().len(),
+        groups_config_path.display()
+    );
+    let groups_config: groups_store::SharedGroupsStore = std::sync::Arc::new(std::sync::Mutex::new(groups_config));
 
     let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
@@ -185,33 +205,28 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
     let airplay_clients = airplay_clients.shared();
     let meters = metering::MeterHub::new();
     let sendspin_control = sendspin_volume::shared();
+    let ap2_control = ap2_volume::shared();
     let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-    // Resolved connection details of auto-discovered RAOP receivers, populated by
-    // the discovery thread so the API can show their IP/Port/Encryption too.
-    let discovered_raop: discovery::SharedDiscovered = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // Discovered AirPlay-2 receivers (ap2_discovery.rs) + the host-global PTP
+    // grandmaster (ap2_ptp.rs) they register with. The RAOP-output replacement.
+    let ap2_devices: ap2_discovery::SharedAp2Devices =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let ap2_ptp = ap2_ptp::Ap2PtpService::new();
 
     let (pw_state, changes, pw_cmd) = pw_thread::spawn()?;
 
-    // mDNS auto-discovery (RAOP receivers + sendspin devices), now runtime
-    // toggleable from the Settings page (discovery_supervisor.rs). RAOP
-    // discovery is overrides-only (store-managed outputs win); sendspin
-    // discovery only populates the shared registry — the grouping reconciler
-    // (sync_group.rs) builds the audio path from the routing intent. The mode
-    // (Load vs dry-run) still comes from `BRIDGE_DISCOVERY`; whether discovery
-    // runs comes from the persisted settings flag. The supervisor is held for
-    // the process lifetime (serve never returns in practice) so the daemons
-    // stay alive.
-    let discovery_mode = discovery_mode().unwrap_or(discovery::Mode::Load);
+    // mDNS auto-discovery (sendspin devices + AirPlay-2 receivers), runtime
+    // toggleable from the Settings page (discovery_supervisor.rs). Discovery only
+    // populates the shared registries — the grouping reconciler (sync_group.rs)
+    // builds the audio path from the routing intent. Whether discovery runs comes
+    // from the persisted settings flag. The supervisor is held for the process
+    // lifetime (serve never returns in practice) so the daemons stay alive.
     let discovery = discovery_supervisor::DiscoverySupervisor::new(
-        pw_cmd.clone(),
-        store.clone(),
-        sources.clone(),
-        discovery_mode,
         sendspin_devices.clone(),
+        ap2_devices.clone(),
+        ap2_ptp.clone(),
         changes.clone(),
-        sync_settings.clone(),
-        discovered_raop.clone(),
     );
     if settings.lock_recover().discovery_enabled() {
         if let Err(e) = discovery.start() {
@@ -221,36 +236,22 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         tracing::info!("mDNS discovery disabled (settings)");
     }
 
-    let rt = tokio::runtime::Runtime::new()?;
+    // Modestly bound the tokio worker pool: this daemon does async I/O (HTTP/WS,
+    // discovery, control channels) but NO time-critical audio work — that lives on
+    // dedicated SCHED_FIFO threads (PipeWire data-loop, ap2/sendspin relays, the
+    // AP2 rt-sender, libairptp). `Runtime::new()` sizes workers to the logical-core
+    // count; 4 is ample for the I/O load and trims a couple of idle threads.
+    //
+    // Do NOT cap `max_blocking_threads`: tokio's blocking pool serves `tokio::fs`,
+    // and `ServeDir` (the whole web UI) reads files through it. A low cap
+    // (previously 4) throttled static-file serving — under a hard-reload storm the
+    // UI failed to load. The pool is on-demand and idles out, so leaving it at the
+    // default is not a persistent-thread cost.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
     rt.block_on(async {
-        // Load a module for every stored RAOP output before serving. The
-        // PipeWire thread processes these once its loop is running (and the
-        // context is connected), so awaiting each reply here is safe.
-        let outputs: Vec<config::RaopOutputConfig> = store.lock_recover().list().to_vec();
-        for output in outputs {
-            let node_name = raop::raop_node_name(&output.name);
-            let latency = sync_settings.lock_recover().raop_latency(&node_name);
-            let args = raop::raop_module_args(&output, latency);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let sent = pw_cmd.send(pw_thread::PwCommand::Load {
-                node_name: node_name.clone(),
-                module_name: raop::RAOP_MODULE_NAME.to_string(),
-                args,
-                reply: tx,
-            });
-            if sent.is_err() {
-                tracing::error!("PipeWire thread unavailable while loading '{node_name}'");
-                continue;
-            }
-            match rx.await {
-                Ok(Ok(())) => tracing::info!("loaded RAOP output '{node_name}'"),
-                // A bad device must not abort startup — the others still load,
-                // and it can be fixed/re-added live via the API.
-                Ok(Err(e)) => tracing::warn!("skipping RAOP output '{node_name}': {e}"),
-                Err(_) => tracing::warn!("no reply loading RAOP output '{node_name}'"),
-            }
-        }
-
         // Start every stored source/adapter process (AirPlay source via
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
         // — the rest still start and it can be re-enabled live.
@@ -260,6 +261,17 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         // live connection state + an active TCP probe — mDNS only ever adds.
         // Without this, an mDNS TTL flap would tear down live groups.
         sendspin_liveness::spawn(sendspin_devices.clone(), sendspin_control.clone(), changes.clone());
+        // Same contract for AP2 receivers: mDNS (ap2_discovery) only adds; this
+        // task TCP-probes each and demotes/removes a powered-off receiver so its
+        // sender is torn down (and its PTP peer released).
+        ap2_liveness::spawn(ap2_devices.clone(), ap2_ptp.clone(), changes.clone());
+
+        // Let device-reported sendspin volume changes (sendspin_server.rs) nudge
+        // the routing-matrix WebSocket, so the UI slider syncs live to a physical
+        // volume change without polling. AP2 volume/mute is UI-driven (no receiver
+        // feedback yet) but uses the same notifier so a set pushes immediately.
+        sendspin_control.lock().await.set_change_notifier(changes.clone());
+        ap2_control.lock().await.set_change_notifier(changes.clone());
 
         // Seed persisted per-device static delays so they re-apply when each
         // device (re)connects, exactly like stored volumes (sendspin_volume.rs).
@@ -284,52 +296,88 @@ fn serve(store_path: &Path, sources_path: &Path, routing_path: &Path, static_dir
         // Latency-alignment session manager (calibrate.rs): reads the live group
         // layout, plays a click into a group's anchor, and mutes non-audible
         // members while the user tunes offsets by ear.
-        let align = calibrate::AlignManager::new(pw_state.clone(), sendspin_control.clone(), groups.clone());
+        let align = calibrate::AlignManager::new(sendspin_control.clone(), ap2_control.clone(), groups.clone());
         {
             let pw = pw_state.clone();
             let cmd = pw_cmd.clone();
             let routing = routing.clone();
             let devices = sendspin_devices.clone();
             let control = sendspin_control.clone();
+            let ap2_devices = ap2_devices.clone();
+            let ap2_ptp = ap2_ptp.clone();
+            let ap2_control = ap2_control.clone();
             let settings = sync_settings.clone();
             let groups = groups.clone();
             let mut rx = changes.subscribe();
             tokio::spawn(async move {
-                // routing::reconcile first (direct links), then sync_group (which
-                // owns anchored RAOP + sendspin groups) — the group lead comes from
-                // the live sync settings so a change takes effect on the next tick.
+                // routing::reconcile first (direct links for any real-node output),
+                // then sync_group (which owns the sendspin + AP2 groups) — the group
+                // lead comes from the live sync settings so a change takes effect on
+                // the next tick.
                 let lead = sync_settings::group_lead_us(&settings);
                 routing::reconcile(&pw, &cmd, &routing).await;
-                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead).await;
+                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control).await;
                 // Loops until the change channel closes (RecvError::Closed ends the
                 // `while let`); a Lagged wakeup reconciles just like a normal one.
-                while let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+                use tokio::sync::broadcast::error::RecvError;
+                // Coalescing window: after a change wakes us, wait for a brief quiet
+                // period (draining any further changes) before reconciling, so a
+                // burst of routing/liveness changes produces ONE reconcile instead of
+                // back-to-back teardown+reconnect — the latter trips an AP2 receiver's
+                // transient "Pairing error M2" when a new session is opened before the
+                // prior one is released. 400 ms is imperceptible for routing yet
+                // absorbs a rapid click-storm or liveness flap.
+                const RECONCILE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+                while let Ok(()) | Err(RecvError::Lagged(_)) = rx.recv().await {
+                    // Drain the burst: keep resetting the quiet timer while changes
+                    // keep arriving; reconcile once it goes quiet. Exit if closed.
+                    loop {
+                        match tokio::time::timeout(RECONCILE_DEBOUNCE, rx.recv()).await {
+                            Ok(Ok(())) | Ok(Err(RecvError::Lagged(_))) => continue,
+                            Ok(Err(RecvError::Closed)) => return,
+                            Err(_elapsed) => break, // quiet window elapsed
+                        }
+                    }
                     let lead = sync_settings::group_lead_us(&settings);
                     routing::reconcile(&pw, &cmd, &routing).await;
-                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead).await;
+                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control).await;
                 }
             });
         }
+
+        // Announce coordinator tick: complete finished per-device overlays (start
+        // the next queued clip / end the duck) and expire stale queued
+        // announcements. Cheap no-op when nothing is announcing.
+        tokio::spawn(async move {
+            let coordinator = announce::AnnounceCoordinator::global();
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(150));
+            loop {
+                ticker.tick().await;
+                coordinator.poll();
+            }
+        });
 
         let app = api::router(
             pw_state,
             changes,
             pw_cmd,
-            store,
             sources,
             airplay.clone(),
             airplay_clients,
             airplay_prevent_takeover,
             meters,
             sendspin_devices,
+            ap2_devices,
+            ap2_ptp.clone(),
             routing,
             sendspin_control,
+            ap2_control,
             sync_settings,
             settings,
             discovery,
-            discovered_raop,
             align,
             groups,
+            groups_config,
             version,
             started,
             static_dir.to_path_buf(),

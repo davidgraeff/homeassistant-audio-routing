@@ -92,9 +92,23 @@ impl AirplayClientRegistry {
         let clients = if path.exists() {
             let raw =
                 std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading airplay clients {}: {e}", path.display()))?;
-            let file: ClientsFile =
-                serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing airplay clients {}: {e}", path.display()))?;
-            file.clients
+            // Tolerate an empty/truncated or corrupt file rather than crash-looping the
+            // whole daemon: this file is rewritten on every client connect/disconnect,
+            // so a restart interrupting a write can truncate it to 0 bytes (which made
+            // the daemon exit(1) on boot). An empty/corrupt registry just starts with no
+            // remembered clients — they re-populate on the next connect.
+            if raw.trim().is_empty() {
+                tracing::warn!("airplay clients {} is empty; starting with none", path.display());
+                Vec::new()
+            } else {
+                match serde_json::from_str::<ClientsFile>(&raw) {
+                    Ok(file) => file.clients,
+                    Err(e) => {
+                        tracing::warn!("airplay clients {} is corrupt ({e}); starting with none", path.display());
+                        Vec::new()
+                    }
+                }
+            }
         } else {
             Vec::new()
         };
@@ -262,8 +276,16 @@ impl AirplayClientRegistry {
         }
         match serde_json::to_string_pretty(&ClientsFile { clients: self.clients.clone() }) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
+                // Atomic write: write a temp file then rename over the target. rename()
+                // is atomic on the same filesystem, so a crash/restart mid-write can't
+                // leave the real file truncated to 0 bytes (which crash-looped the daemon
+                // on the next boot — this file is rewritten on every connect/disconnect).
+                let tmp = self.path.with_extension("json.tmp");
+                let res = std::fs::write(&tmp, json.as_bytes())
+                    .and_then(|_| std::fs::rename(&tmp, &self.path));
+                if let Err(e) = res {
                     tracing::warn!("failed to persist airplay clients {}: {e}", self.path.display());
+                    let _ = std::fs::remove_file(&tmp);
                 }
             }
             Err(e) => tracing::warn!("failed to serialize airplay clients: {e}"),

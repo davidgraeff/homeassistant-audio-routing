@@ -3,17 +3,16 @@
 //!
 //! Raw PipeWire links are tied to ephemeral node ids and (even with
 //! `object.linger`) don't survive a container restart or a node reload — so a
-//! device that disappears and comes back, or a `raop-sink` module that
-//! reloads, loses its routing. This store records the *desired* routing by
-//! stable name instead; the reconciler (routing.rs) applies it to the live
-//! graph whenever both endpoints are present, and reapplies automatically when
-//! an entity reappears. An intent link whose endpoint isn't currently in the
-//! graph is "offline" — retained here, shown grayed in the UI, and re-linked
-//! the moment the node returns.
+//! device that disappears and comes back loses its routing. This store records
+//! the *desired* routing by stable name instead; the reconciler (routing.rs)
+//! applies it to the live graph whenever both endpoints are present, and
+//! reapplies automatically when an entity reappears. An intent link whose
+//! endpoint isn't currently in the graph is "offline" — retained here, shown
+//! grayed in the UI, and re-linked the moment the node returns.
 //!
-//! Mirrors the other `/data` stores (outputs_store.rs, sources_store.rs): no
-//! `options.json` seeding, starts empty, the file is authoritative and created
-//! on first mutation.
+//! Mirrors the other `/data` stores (sources_store.rs): no `options.json`
+//! seeding, starts empty, the file is authoritative and created on first
+//! mutation.
 
 use crate::locks::LockRecover;
 use serde::{Deserialize, Serialize};
@@ -27,7 +26,7 @@ use std::sync::{Arc, Mutex};
 pub struct RoutingLink {
     /// Source node name (e.g. `"airplay-in"`, `"bt-bridge-rtp"`).
     pub source: String,
-    /// Output node name (e.g. `"raop-out-dusche"`, `"sendspin-dev-kitchen"`).
+    /// Output node name (e.g. `"ap2-dev-dusche"`, `"sendspin-dev-kitchen"`).
     pub output: String,
 }
 
@@ -135,9 +134,9 @@ mod tests {
         let path = temp_path("add");
         let _ = std::fs::remove_file(&path);
         let mut store = RoutingStore::load(&path).unwrap();
-        store.add("shairport-sync", "raop-out-dusche").unwrap();
-        store.add("shairport-sync", "raop-out-dusche").unwrap(); // dup, no-op
-        assert!(store.contains("shairport-sync", "raop-out-dusche"));
+        store.add("airplay-in", "ap2-dev-dusche").unwrap();
+        store.add("airplay-in", "ap2-dev-dusche").unwrap(); // dup, no-op
+        assert!(store.contains("airplay-in", "ap2-dev-dusche"));
         assert_eq!(RoutingStore::load(&path).unwrap().links().count(), 1);
         let _ = std::fs::remove_file(&path);
     }
@@ -147,13 +146,13 @@ mod tests {
         let path = temp_path("entity");
         let _ = std::fs::remove_file(&path);
         let mut store = RoutingStore::load(&path).unwrap();
-        store.add("shairport-sync", "raop-out-dusche").unwrap();
-        store.add("bt-bridge-rtp", "raop-out-dusche").unwrap();
-        store.add("shairport-sync", "raop-out-pioneer").unwrap();
-        store.remove_entity("raop-out-dusche").unwrap();
-        assert!(!store.contains("shairport-sync", "raop-out-dusche"));
-        assert!(!store.contains("bt-bridge-rtp", "raop-out-dusche"));
-        assert!(store.contains("shairport-sync", "raop-out-pioneer"));
+        store.add("airplay-in", "ap2-dev-dusche").unwrap();
+        store.add("bt-bridge-rtp", "ap2-dev-dusche").unwrap();
+        store.add("airplay-in", "ap2-dev-pioneer").unwrap();
+        store.remove_entity("ap2-dev-dusche").unwrap();
+        assert!(!store.contains("airplay-in", "ap2-dev-dusche"));
+        assert!(!store.contains("bt-bridge-rtp", "ap2-dev-dusche"));
+        assert!(store.contains("airplay-in", "ap2-dev-pioneer"));
         let _ = std::fs::remove_file(&path);
     }
 }

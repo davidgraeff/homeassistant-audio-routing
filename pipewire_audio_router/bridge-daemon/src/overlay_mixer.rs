@@ -38,6 +38,12 @@ pub struct OverlayMixer {
     /// Overlays that reached the end of their clip since the last drain, so the
     /// caller can tell the scheduler the announcement finished on that output.
     finished: Mutex<Vec<(String, u64)>>,
+    /// Per-output capture rate (Hz), published by the AP2 sender when it starts a
+    /// group. Overlay clips arrive at 48 kHz; `start` resamples each to the target
+    /// output's rate so `mix_into` (which adds sample-for-sample on the RT relay)
+    /// always sees music and overlay at the same rate. Absent ⇒ 48 kHz (sendspin,
+    /// and AP2 groups running at 48 kHz — the common case, no resampling).
+    output_rate: Mutex<HashMap<String, u32>>,
 }
 
 impl OverlayMixer {
@@ -47,12 +53,27 @@ impl OverlayMixer {
         M.get_or_init(OverlayMixer::default)
     }
 
-    /// Start (or replace) an overlay on `output`.
+    /// Start (or replace) an overlay on `output`. `pcm` is 48 kHz stereo S16LE; if
+    /// the output's capture runs at a different rate (a 44.1 kHz AP2 group), the
+    /// clip is resampled once here so it mixes sample-for-sample with the music.
     pub fn start(&self, output: &str, id: u64, pcm: Vec<u8>, duck: f32) {
+        let rate = self.output_rate.lock().unwrap().get(output).copied().unwrap_or(48_000);
+        let pcm = crate::resample::from_48k_stereo_to(&pcm, rate);
         self.slots.lock().unwrap().insert(
             output.to_string(),
             Overlay { id, pcm, cursor: 0, duck: duck.clamp(0.0, 1.0) },
         );
+    }
+
+    /// Publish an output's current capture rate (Hz) so `start` can rate-match its
+    /// overlay clips. Called by the AP2 sender when a group (re)starts.
+    pub fn set_output_rate(&self, output: &str, rate: u32) {
+        self.output_rate.lock().unwrap().insert(output.to_string(), rate);
+    }
+
+    /// Forget an output's rate (back to the 48 kHz default) — on AP2 teardown.
+    pub fn clear_output_rate(&self, output: &str) {
+        self.output_rate.lock().unwrap().remove(output);
     }
 
     /// Stop the overlay on `output` (if any); returns its id.
@@ -66,20 +87,25 @@ impl OverlayMixer {
         self.slots.lock().unwrap().contains_key(output)
     }
 
-    /// Mix one music chunk for `output`. If an overlay is active, returns
+    /// Mix one music chunk for `output` **into a caller-provided buffer** (reused
+    /// across chunks by the sendspin relay, so the per-chunk mix does no
+    /// allocation on the RT relay thread). If an overlay is active, writes
     /// `duck(music) + overlay` for the next `music.len()` bytes (padding the
-    /// final chunk with silence), advancing the overlay; when the clip is
-    /// exhausted the slot is removed and recorded in [`Self::take_finished`].
-    /// Returns `None` if no overlay is active (caller sends plain music).
-    pub fn mix(&self, output: &str, music: &[u8]) -> Option<Vec<u8>> {
+    /// final chunk with silence) into `out`, advances the overlay, and returns
+    /// `true`; when the clip is exhausted the slot is removed and recorded in
+    /// [`Self::take_finished`]. Returns `false` (leaving `out` untouched) if no
+    /// overlay is active — the caller sends plain music.
+    pub fn mix_into(&self, output: &str, music: &[u8], out: &mut Vec<u8>) -> bool {
         let mut slots = self.slots.lock().unwrap();
-        let ov = slots.get_mut(output)?;
+        let Some(ov) = slots.get_mut(output) else {
+            return false;
+        };
 
         // Overlay slice matching this music chunk, zero-padded if the clip ends.
         let remaining = &ov.pcm[ov.cursor.min(ov.pcm.len())..];
         let take = remaining.len().min(music.len());
         let overlay_chunk = &remaining[..take];
-        let mixed = mix_s16le(music, overlay_chunk, ov.duck);
+        mix_s16le_into(music, overlay_chunk, ov.duck, out);
         ov.cursor += take;
 
         let done = ov.cursor >= ov.pcm.len();
@@ -88,7 +114,15 @@ impl OverlayMixer {
             slots.remove(output);
             self.finished.lock().unwrap().push((output.to_string(), id));
         }
-        Some(mixed)
+        true
+    }
+
+    /// Allocating convenience wrapper over [`Self::mix_into`] — returns `None`
+    /// when no overlay is active. Used by tests; the hot path uses `mix_into`.
+    #[cfg(test)]
+    pub fn mix(&self, output: &str, music: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.mix_into(output, music, &mut out).then_some(out)
     }
 
     /// Drain the outputs whose overlay finished since the last call.
@@ -97,12 +131,15 @@ impl OverlayMixer {
     }
 }
 
-/// Mix a music chunk with an overlay chunk (both S16LE): `music*duck + overlay`,
-/// saturating to i16. `overlay` may be shorter than `music` (treated as trailing
-/// silence); output length matches `music`.
-fn mix_s16le(music: &[u8], overlay: &[u8], duck: f32) -> Vec<u8> {
+/// Mix a music chunk with an overlay chunk (both S16LE) into `out`:
+/// `music*duck + overlay`, saturating to i16. `overlay` may be shorter than
+/// `music` (treated as trailing silence); output length matches `music`. `out`
+/// is cleared first and reused, so a caller looping over chunks allocates at
+/// most once (capacity is retained).
+fn mix_s16le_into(music: &[u8], overlay: &[u8], duck: f32, out: &mut Vec<u8>) {
     let n = music.len() / 2;
-    let mut out = Vec::with_capacity(n * 2);
+    out.clear();
+    out.reserve(n * 2);
     for i in 0..n {
         let m = i16::from_le_bytes([music[2 * i], music[2 * i + 1]]) as f32;
         let o = if 2 * i + 1 < overlay.len() {
@@ -113,6 +150,13 @@ fn mix_s16le(music: &[u8], overlay: &[u8], duck: f32) -> Vec<u8> {
         let mixed = (m * duck + o).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         out.extend_from_slice(&mixed.to_le_bytes());
     }
+}
+
+/// Allocating convenience wrapper over [`mix_s16le_into`], used by tests.
+#[cfg(test)]
+fn mix_s16le(music: &[u8], overlay: &[u8], duck: f32) -> Vec<u8> {
+    let mut out = Vec::new();
+    mix_s16le_into(music, overlay, duck, &mut out);
     out
 }
 

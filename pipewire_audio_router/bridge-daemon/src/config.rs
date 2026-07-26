@@ -1,61 +1,9 @@
-//! Shared config *types* for RAOP outputs and the node-name conventions used
-//! across the daemon.
+//! Shared node-name conventions used across the daemon.
 //!
-//! There is no add-on `options.json` seeding anymore — every output and source
-//! is created at runtime via the REST API and persisted in the daemon's own
-//! stores (outputs_store.rs, sources_store.rs). These types are just the
-//! shapes those stores and the API handlers share.
-
-use serde::{Deserialize, Serialize};
-
-/// RAOP encryption type. Defaults to `AuthSetup` — confirmed in spike 2
-/// (spikes/02-raop-static-sink.md) as the only mode that actually works
-/// against real hardware (Pioneer VSX-934, Dusche); `None`/`Rsa` both get
-/// `403 Forbidden` on ANNOUNCE against those receivers. Auto-discovery derives
-/// it from the mDNS `et` field instead of defaulting (discovery.rs).
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RaopEncryption {
-    None,
-    #[serde(rename = "RSA")]
-    Rsa,
-    AuthSetup,
-}
-
-impl Default for RaopEncryption {
-    fn default() -> Self {
-        RaopEncryption::AuthSetup
-    }
-}
-
-impl RaopEncryption {
-    /// The literal string PipeWire's `raop.encryption.type` module arg expects.
-    pub fn as_pipewire_arg(&self) -> &'static str {
-        match self {
-            RaopEncryption::None => "none",
-            RaopEncryption::Rsa => "RSA",
-            RaopEncryption::AuthSetup => "auth_setup",
-        }
-    }
-}
-
-fn default_raop_port() -> u16 {
-    // Default for an API-added output that omits `port` — NOT a safe universal
-    // value (see spikes/02-raop-static-sink.md: real devices on this network
-    // use 7000, not the "traditional" 5000). Callers should set it per device;
-    // auto-discovery reads the real port from mDNS.
-    7000
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RaopOutputConfig {
-    pub name: String,
-    pub ip: String,
-    #[serde(default = "default_raop_port")]
-    pub port: u16,
-    #[serde(default)]
-    pub encryption: RaopEncryption,
-}
+//! There is no add-on `options.json` seeding — every source is created at
+//! runtime via the REST API and persisted in the daemon's own stores
+//! (sources_store.rs). These constants are the node-name prefixes those stores
+//! and the API handlers share.
 
 /// Node-name prefix for sendspin output sink nodes (shared with
 /// sources_store.rs and the output classification in api.rs/routing.rs).
@@ -64,15 +12,21 @@ pub const SENDSPIN_NODE_PREFIX: &str = "sendspin-out-";
 /// Node-name prefix for a discovered sendspin *device* — a virtual routing
 /// output (no PipeWire node of its own; audio reaches it via whatever group
 /// sink it's dialed into). This is what appears as a matrix column and on the
-/// Outputs tab, mirroring how RAOP receivers show up. See sendspin_discovery.rs.
+/// Outputs tab. See sendspin_discovery.rs.
 pub const SENDSPIN_DEV_PREFIX: &str = "sendspin-dev-";
+
+/// Node-name prefix for a discovered AirPlay-2 *receiver* — a virtual routing
+/// output (no PipeWire node of its own), mirroring `SENDSPIN_DEV_PREFIX`. The
+/// in-process AP2 sender (ap2_server.rs) streams RTP to it with libairptp PTP
+/// timing; discovery (ap2_discovery.rs) registers it as a PTP peer. This is the
+/// only AirPlay output path (the AirPlay-1/RAOP output path was removed).
+pub const AP2_DEV_PREFIX: &str = "ap2-dev-";
 
 /// Node-name prefix for a **sync anchor** sink — one real `support.null-audio-sink`
 /// per set of co-routed outputs, created by sync_group.rs. It is the shared
-/// clock/timeline for a group: the sendspin server captures from it and every
-/// RAOP output in the group is fed from its monitor, so sendspin devices and
-/// RAOP receivers play the same audio off one clock. Like the sendspin group
-/// sink, it's internal plumbing — NOT matched by the matrix's output
+/// clock/timeline for a group: the sendspin server captures from it, so every
+/// device in the group plays the same audio off one clock. Like the sendspin
+/// group sink, it's internal plumbing — NOT matched by the matrix's output
 /// classification, so it never appears as its own column.
 pub const SYNC_GRP_PREFIX: &str = "sync-grp-";
 
@@ -86,13 +40,6 @@ pub fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn raop_output_applies_port_and_encryption_defaults() {
-        let output: RaopOutputConfig = serde_json::from_str(r#"{ "name": "Dusche", "ip": "192.168.178.165" }"#).unwrap();
-        assert_eq!(output.port, 7000);
-        assert_eq!(output.encryption, RaopEncryption::AuthSetup);
-    }
 
     #[test]
     fn slugify_collapses_punctuation_and_spaces() {

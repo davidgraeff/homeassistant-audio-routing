@@ -21,19 +21,45 @@
 //! a device keep" continues to do so unchanged.
 
 use crate::locks::LockRecover;
-use sendspin::protocol::messages::StreamPlayerConfig;
+use sendspin::protocol::messages::{Message, StreamPlayerConfig};
 use sendspin::server::{Advertisement, ClientEvent, ClientManager, Group, SharedTimeline};
 use sendspin::{Clock, DefaultClock, ServerConnection, ServerListener};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Fixed by the spec for real deployments (matches sendspin-rs's own
 /// convention and this daemon's other sendspin-adjacent code).
 const SENDSPIN_PATH: &str = "/sendspin";
+
+/// Best-effort real-time scheduling for the capture→wire relay thread.
+///
+/// The relay must never queue behind the daemon's general-purpose async work
+/// (HTTP API, mDNS, discovery, other groups) — that starvation is the primary
+/// sendspin stutter cause (RC1 in docs/audio-jitter-analysis.md). Running the
+/// relay on its own dedicated OS thread already takes it off the shared tokio
+/// runtime; this additionally elevates it to `SCHED_FIFO` so it preempts the
+/// normal-priority worker pool the instant a captured chunk is ready. Priority
+/// 40 sits below the AP2 sender's 50 and PipeWire's own RT threads. Without
+/// `CAP_SYS_NICE` (e.g. a dev box) it logs and continues at normal priority —
+/// exactly like the AP2 sender's `set_realtime_priority`.
+#[cfg(target_os = "linux")]
+fn set_relay_realtime_priority() {
+    // SAFETY: sched_setscheduler on the current thread (pid 0) with a valid
+    // sched_param; no aliasing, no ownership transfer.
+    unsafe {
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = 40;
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+            tracing::info!("sendspin relay: real-time priority set (SCHED_FIFO, priority 40)");
+        } else {
+            tracing::debug!("sendspin relay: could not set RT priority (need CAP_SYS_NICE); running at normal priority");
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn set_relay_realtime_priority() {}
 
 /// Everything one running sendspin server owns. Dropping it tears down every
 /// task/thread/background resource it started — the in-process equivalent of
@@ -50,190 +76,55 @@ pub struct SendspinServerHandle {
     _capture: crate::sendspin_capture::CaptureHandle,
     accept_task: JoinHandle<()>,
     event_task: JoinHandle<()>,
-    capture_forward_task: JoinHandle<()>,
+    /// The capture→wire relay runs on its own dedicated (RT-scheduled) OS
+    /// thread, not a tokio task — see `set_relay_realtime_priority`. It stops
+    /// when `_capture`'s Drop closes the PCM channel (its `blocking_recv`
+    /// returns `None`), so it needs no explicit abort; the handle is held only
+    /// to keep it named. Dropping it detaches — the thread exits on its own.
+    _relay_thread: std::thread::JoinHandle<()>,
 }
 
 impl Drop for SendspinServerHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
         self.event_task.abort();
-        self.capture_forward_task.abort();
-        // _capture's own Drop stops the capture thread; _client_manager's own
-        // Drop stops discovery/reconnect loops; _advertisement's own Drop
-        // unregisters the mDNS advertisement. The sink node is the shared anchor
-        // owned by sync_group.rs — not destroyed here.
+        // `_capture`'s own Drop stops the capture thread, which drops the PCM
+        // sender and closes the relay's channel → the relay thread exits.
+        // `_client_manager`'s Drop stops discovery/reconnect; `_advertisement`'s
+        // Drop unregisters mDNS. The sink node is the shared anchor owned by
+        // sync_group.rs — not destroyed here.
     }
 }
 
-/// Start a native sendspin server bound to `port`, capturing from the already-
-/// existing sink node `sink_node_id` (the shared sync anchor created by
-/// sync_group.rs) and running the embedded server (accept inbound + discover/dial
-/// devices) pushing captured audio to one shared `Group`. `server_name` is the
-/// server's own identity/advertisement label.
-///
-/// `device_filter`, when `Some`, restricts dialing to devices whose mDNS
-/// fullname is in the set — this is what makes a *group*: one anchor + one
-/// synchronized `Group` dialing exactly its member devices. `None` dials every
-/// discovered device (the manual-output behavior).
-///
-/// `send_ahead_us`, when `Some`, overrides the group's presentation lead — how
-/// far ahead of "now" audio is scheduled (raise it to let slower members, e.g. a
-/// RAOP receiver sharing this anchor, play the same instant; see
-/// [`sendspin::server::Group::with_send_ahead_us`]). `None` uses the protocol
-/// default.
-// Each parameter is a distinct shared handle the server needs; a struct wrapper
-// wouldn't clarify the one call site (sync_group.rs).
-#[allow(clippy::too_many_arguments)]
-pub async fn start_server(
-    server_name: &str,
-    display_name: &str,
-    port: u16,
-    sink_node_id: u32,
-    device_filter: Option<std::collections::HashSet<String>>,
-    send_ahead_us: Option<i64>,
-    control: crate::sendspin_volume::SharedSendspinControl,
-    devices: crate::sendspin_discovery::SharedSendspinDevices,
-) -> anyhow::Result<SendspinServerHandle> {
-    let node_name = server_name.to_string();
-
-    let (capture_handle, mut pcm_rx) = crate::sendspin_capture::spawn(sink_node_id)
-        .map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
-
-    let listener = ServerListener::bind(("0.0.0.0", port), &node_name, display_name)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind sendspin server on port {port}: {e}"))?
-        .path(SENDSPIN_PATH);
-    let advertisement = Advertisement::new(&node_name, display_name, port, SENDSPIN_PATH)
-        .map_err(|e| anyhow::anyhow!("failed to advertise sendspin server '{node_name}': {e}"))?;
-
-    let base_group = Group::new(Arc::new(DefaultClock::default()));
-    let group = Arc::new(Mutex::new(match send_ahead_us {
-        Some(us) => base_group.with_send_ahead_us(us),
-        None => base_group,
-    }));
-
-    let accept_task = spawn_accept_loop(listener, Arc::clone(&group), control.clone());
-
-    let (client_manager, mut events) =
-        ClientManager::start_filtered(node_name.clone(), display_name.to_string(), Arc::new(DefaultClock::default()), move |fullname| {
-            device_filter.as_ref().is_none_or(|set| set.contains(fullname))
-        })
-        .map_err(|e| anyhow::anyhow!("failed to start sendspin client discovery for '{node_name}': {e}"))?;
-    let event_task = {
-        let group = Arc::clone(&group);
-        let control = control.clone();
-        let devices = devices.clone();
-        // The group keys members by client_id (an opaque MAC), but volume
-        // control keys by the virtual device node name; remember the mapping so
-        // a Disconnected (which only carries client_id) can unregister volume.
-        let mut client_to_node: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                match event {
-                    ClientEvent::Connected { client_id, fullname, sender, .. } => {
-                        // Resolve the discovered device's node name from the
-                        // dialed mDNS fullname (client_id is a MAC and won't
-                        // match). Register for volume control (applies any
-                        // stored per-device volume), then add to the sync group.
-                        let node_name = resolve_node_name(&devices, &fullname);
-                        client_to_node.insert(client_id.clone(), node_name.clone());
-                        control.lock().await.register(node_name, sender.clone()).await;
-                        if let Err(e) = group.lock().await.add_member(client_id, sender).await {
-                            tracing::warn!("failed to add sendspin group member: {e}");
-                        }
-                    }
-                    // client/state, client/command from the device — no
-                    // server-side reaction needed (we push volume, not poll it).
-                    ClientEvent::Message { .. } => {}
-                    ClientEvent::Disconnected { client_id } => {
-                        if let Some(node_name) = client_to_node.remove(&client_id) {
-                            control.lock().await.unregister(&node_name);
-                        }
-                        group.lock().await.remove_member(&client_id);
-                    }
-                }
-            }
-        })
-    };
-
-    let capture_forward_task = {
-        let group = Arc::clone(&group);
-        let stream_started = AtomicBool::new(false);
-        tokio::spawn(async move {
-            while let Some(pcm) = pcm_rx.recv().await {
-                let group = group.lock().await;
-                if !stream_started.swap(true, Ordering::Relaxed) {
-                    group
-                        .start_stream(StreamPlayerConfig {
-                            codec: "pcm".to_string(),
-                            sample_rate: crate::sendspin_capture::SAMPLE_RATE,
-                            channels: crate::sendspin_capture::CHANNELS as u8,
-                            bit_depth: 16,
-                            codec_header: None,
-                        })
-                        .await;
-                }
-                group.push_audio(&pcm);
-            }
-        })
-    };
-
-    Ok(SendspinServerHandle {
-        _advertisement: advertisement,
-        _client_manager: client_manager,
-        _capture: capture_handle,
-        accept_task,
-        event_task,
-        capture_forward_task,
-    })
+/// A device-reported (volume, muted) carried by an inbound client message, if
+/// any. Devices report their own level/mute in a `client/state` player update —
+/// the device→server half of volume/mute sync (a user turning the physical knob
+/// or muting). Either field may be `None` (only some fields present); a non-state
+/// message yields `None` for the whole thing.
+fn reported_player_state(message: &Message) -> Option<(Option<u8>, Option<bool>)> {
+    match message {
+        Message::ClientState(state) => state.player.as_ref().map(|p| (p.volume, p.muted)),
+        _ => None,
+    }
 }
 
-/// Accept clients that dial in to us (some real Sendspin clients do; see
-/// sendspin-rs's `ServerListener` docs).
-fn spawn_accept_loop(
-    listener: ServerListener,
-    group: Arc<Mutex<Group>>,
-    control: crate::sendspin_volume::SharedSendspinControl,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((conn, _addr)) => {
-                    let client_id = conn.client_id().to_string();
-                    // Inbound dial-ins carry no mDNS fullname; derive the node
-                    // name from the client's self-reported hello name instead.
-                    let node_name = crate::sendspin_discovery::device_node_name(&conn.hello().name);
-                    let sender = conn.sender();
-                    control.lock().await.register(node_name.clone(), sender.clone()).await;
-                    if let Err(e) = group.lock().await.add_member(client_id.clone(), sender).await {
-                        tracing::warn!("failed to add inbound sendspin group member: {e}");
-                    }
-                    tokio::spawn(drain_messages(conn, client_id, node_name, Arc::clone(&group), control.clone()));
-                }
-                Err(e) => {
-                    tracing::warn!("sendspin accept error: {e}");
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
-    })
-}
-
-/// `ServerConnection::recv_message` must be polled for the connection to make
-/// progress at all (it also drives the underlying message loop) — this just
-/// keeps that going, then drops the client from the group + volume control when
-/// the connection ends (the dial path gets this from `ClientEvent`; inbound
-/// connections have no such event, so we clean up here).
-async fn drain_messages(
-    mut conn: ServerConnection,
-    client_id: String,
-    node_name: String,
-    group: Arc<Mutex<Group>>,
-    control: crate::sendspin_volume::SharedSendspinControl,
+/// Apply a device-reported player state to the shared control (device→UI sync).
+async fn apply_reported_state(
+    control: &crate::sendspin_volume::SharedSendspinControl,
+    node_name: &str,
+    volume: Option<u8>,
+    muted: Option<bool>,
 ) {
-    while conn.recv_message().await.is_some() {}
-    control.lock().await.unregister(&node_name);
-    group.lock().await.remove_member(&client_id);
+    if volume.is_none() && muted.is_none() {
+        return;
+    }
+    let mut c = control.lock().await;
+    if let Some(v) = volume {
+        c.note_reported_volume(node_name, v);
+    }
+    if let Some(m) = muted {
+        c.note_reported_mute(node_name, m);
+    }
 }
 
 /// Map a dialed mDNS fullname to the discovered device's virtual node name.
@@ -246,6 +137,16 @@ fn resolve_node_name(devices: &crate::sendspin_discovery::SharedSendspinDevices,
     }
     let label = fullname.split("._sendspin._tcp").next().unwrap_or(fullname);
     crate::sendspin_discovery::device_node_name(label)
+}
+
+/// Advertise a sendspin server on the process-wide shared, LAN-restricted mDNS
+/// daemon ([`crate::discovery_supervisor::shared_advertise_daemon`]), falling
+/// back to a private per-advertisement daemon if that's unavailable.
+fn advertise(node_name: &str, display_name: &str, port: u16) -> Result<Advertisement, sendspin::error::Error> {
+    match crate::discovery_supervisor::shared_advertise_daemon() {
+        Some(daemon) => Advertisement::with_daemon(daemon, node_name, display_name, port, SENDSPIN_PATH),
+        None => Advertisement::new(node_name, display_name, port, SENDSPIN_PATH),
+    }
 }
 
 /// Like [`start_server`], but instead of one `Group` fanning identical frames to
@@ -288,7 +189,7 @@ pub async fn start_server_per_device(
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind sendspin server on port {port}: {e}"))?
         .path(SENDSPIN_PATH);
-    let advertisement = Advertisement::new(&node_name, display_name, port, SENDSPIN_PATH)
+    let advertisement = advertise(&node_name, display_name, port)
         .map_err(|e| anyhow::anyhow!("failed to advertise sendspin server '{node_name}': {e}"))?;
 
     // The single shared timeline. Config is set once up front so every member
@@ -318,11 +219,16 @@ pub async fn start_server_per_device(
         control.clone(),
     );
 
-    let (client_manager, mut events) = ClientManager::start_filtered(
+    // Browse for dial-in clients on the shared, LAN-restricted mDNS daemon so
+    // the client discovery doesn't spin its own all-interfaces daemon (which,
+    // under host-networking, re-storms the multicast across the Docker veths
+    // when a discovered device's address doesn't resolve).
+    let (client_manager, mut events) = ClientManager::start_filtered_with_daemon(
         node_name.clone(),
         display_name.to_string(),
         Arc::clone(&clock),
         move |fullname| device_filter.contains(fullname),
+        crate::discovery_supervisor::shared_advertise_daemon(),
     )
     .map_err(|e| anyhow::anyhow!("failed to start sendspin client discovery for '{node_name}': {e}"))?;
 
@@ -337,58 +243,100 @@ pub async fn start_server_per_device(
                 match event {
                     ClientEvent::Connected { client_id, fullname, sender, .. } => {
                         let dev_node_name = resolve_node_name(&devices, &fullname);
+                        tracing::info!("sendspin per-device: '{dev_node_name}' connected (client {client_id}) — (re)adding to its group");
                         client_to_node.lock().unwrap().insert(client_id.clone(), dev_node_name.clone());
                         control.lock().await.register(dev_node_name, sender.clone()).await;
                         // Its own group on the shared timeline. add_member sends
-                        // stream/start (config is already set), no re-anchor.
+                        // stream/start (config is already set), no re-anchor. Replacing
+                        // any prior group for this client_id (a reconnect) drops the
+                        // stale one so the fresh sender starts receiving audio.
                         let group = Group::with_timeline(Arc::clone(&timeline));
                         if let Err(e) = group.add_member(client_id.clone(), sender).await {
                             tracing::warn!("failed to add per-device member: {e}");
                         }
-                        groups.lock().await.insert(client_id, group);
+                        groups.lock_recover().insert(client_id, group);
                     }
-                    ClientEvent::Message { .. } => {}
+                    ClientEvent::Message { client_id, message } => {
+                        // Device→UI volume/mute sync: a device reporting its own
+                        // (physically-changed) level/mute updates the stored state
+                        // so the UI reflects it. Resolve client_id→node first, then
+                        // drop the std guard before the async control lock.
+                        if let Some((volume, muted)) = reported_player_state(&message) {
+                            let dev_node = client_to_node.lock().unwrap().get(&client_id).cloned();
+                            if let Some(dev_node) = dev_node {
+                                apply_reported_state(&control, &dev_node, volume, muted).await;
+                            }
+                        }
+                    }
                     ClientEvent::Disconnected { client_id } => {
                         // Bind the removal to a statement so the (non-Send) std
                         // MutexGuard drops before the await below.
                         let removed = client_to_node.lock().unwrap().remove(&client_id);
-                        if let Some(dev_node_name) = removed {
-                            control.lock().await.unregister(&dev_node_name);
+                        if let Some(ref dev_node_name) = removed {
+                            tracing::info!("sendspin per-device: '{dev_node_name}' disconnected (client {client_id}) — awaiting ClientManager re-dial");
+                            control.lock().await.unregister(dev_node_name);
+                        } else {
+                            tracing::info!("sendspin per-device: client {client_id} disconnected (unmapped)");
                         }
-                        groups.lock().await.remove(&client_id);
+                        groups.lock_recover().remove(&client_id);
                     }
                 }
             }
         })
     };
 
-    let capture_forward_task = {
+    // The capture→wire relay: stamp each captured chunk once on the shared
+    // timeline and fan it out to every device's group. This is the timing-
+    // critical path — it runs on a DEDICATED, RT-scheduled OS thread rather
+    // than a tokio task so that general-purpose async work can never preempt it
+    // (RC1). Everything it calls is synchronous and non-blocking:
+    // `timeline.stamp`, the (std-`Mutex`) `groups`/`client_to_node` locks, the
+    // overlay `mix`, and `Group::push_encoded` (which enqueues to each member's
+    // writer task without awaiting). `blocking_recv` drains the capture channel
+    // and returns `None` when capture stops, ending the thread.
+    let relay_thread = {
         let groups = Arc::clone(&groups);
         let client_to_node = Arc::clone(&client_to_node);
         let timeline = Arc::clone(&timeline);
-        tokio::spawn(async move {
-            let mixer = crate::overlay_mixer::OverlayMixer::global();
-            while let Some(pcm) = pcm_rx.recv().await {
-                // Stamp ONCE per chunk, then fan that identical ts to every
-                // device's group — the shared-timeline sync guarantee. A device
-                // with an active announcement overlay gets duck(music)+overlay
-                // instead of the plain chunk; its groupmates get plain music.
-                let ts = timeline.stamp(pcm.len());
-                let groups = groups.lock().await;
-                let c2n = client_to_node.lock().unwrap();
-                for (client_id, group) in groups.iter() {
-                    match c2n.get(client_id).and_then(|node| mixer.mix(node, &pcm)) {
-                        Some(frame) => group.push_encoded(ts, &frame),
-                        None => group.push_encoded(ts, &pcm),
+        std::thread::Builder::new()
+            .name("sendspin-relay".into())
+            .spawn(move || {
+                set_relay_realtime_priority();
+                let mixer = crate::overlay_mixer::OverlayMixer::global();
+                // Reused across chunks AND across devices within a chunk so the
+                // per-device overlay mix allocates at most once (only relevant
+                // while an announcement is overlaying; the plain-music path never
+                // touches it). push_encoded copies into its own wire frame
+                // synchronously, so one buffer is safe to reuse for every device.
+                let mut mix_buf: Vec<u8> = Vec::new();
+                while let Some(pcm) = pcm_rx.blocking_recv() {
+                    // Stamp ONCE per chunk, then fan that identical ts to every
+                    // device's group — the shared-timeline sync guarantee. A
+                    // device with an active announcement overlay gets
+                    // duck(music)+overlay instead of the plain chunk; its
+                    // groupmates get plain music. The two locks are held only
+                    // for this brief synchronous fan-out (M5): no encode/mix
+                    // work happens before the locks are taken, and the guards
+                    // drop at the end of each iteration.
+                    let ts = timeline.stamp(pcm.len());
+                    let groups = groups.lock_recover();
+                    let c2n = client_to_node.lock().unwrap();
+                    for (client_id, group) in groups.iter() {
+                        let overlaid = c2n
+                            .get(client_id)
+                            .is_some_and(|node| mixer.mix_into(node, &pcm, &mut mix_buf));
+                        if overlaid {
+                            group.push_encoded(ts, &mix_buf);
+                        } else {
+                            group.push_encoded(ts, &pcm);
+                        }
                     }
+                    // Finished overlays are drained by the AnnounceCoordinator's
+                    // poll loop (main.rs), not here.
                 }
-                drop(c2n);
-                drop(groups);
-                // Finished overlays are drained by the AnnounceCoordinator's poll
-                // loop (main.rs), which drives scheduler.complete (next queued /
-                // un-duck) — not here.
-            }
-        })
+                tracing::debug!("sendspin relay thread exiting");
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn sendspin relay thread for '{node_name}': {e}"))?
     };
 
     Ok(SendspinServerHandle {
@@ -397,7 +345,7 @@ pub async fn start_server_per_device(
         _capture: capture_handle,
         accept_task,
         event_task,
-        capture_forward_task,
+        _relay_thread: relay_thread,
     })
 }
 
@@ -406,7 +354,7 @@ pub async fn start_server_per_device(
 fn spawn_accept_loop_per_device(
     listener: ServerListener,
     groups: Arc<Mutex<HashMap<String, Group>>>,
-    client_to_node: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    client_to_node: Arc<Mutex<HashMap<String, String>>>,
     timeline: Arc<SharedTimeline>,
     control: crate::sendspin_volume::SharedSendspinControl,
 ) -> JoinHandle<()> {
@@ -423,7 +371,7 @@ fn spawn_accept_loop_per_device(
                     if let Err(e) = group.add_member(client_id.clone(), sender).await {
                         tracing::warn!("failed to add inbound per-device member: {e}");
                     }
-                    groups.lock().await.insert(client_id.clone(), group);
+                    groups.lock_recover().insert(client_id.clone(), group);
                     tokio::spawn(drain_messages_per_device(
                         conn,
                         client_id,
@@ -447,11 +395,17 @@ async fn drain_messages_per_device(
     client_id: String,
     node_name: String,
     groups: Arc<Mutex<HashMap<String, Group>>>,
-    client_to_node: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    client_to_node: Arc<Mutex<HashMap<String, String>>>,
     control: crate::sendspin_volume::SharedSendspinControl,
 ) {
-    while conn.recv_message().await.is_some() {}
+    while let Some(message) = conn.recv_message().await {
+        // Device→UI volume/mute sync (same as the dial-out path): reflect a
+        // physically-changed volume/mute the device reports back into the UI.
+        if let Some((volume, muted)) = reported_player_state(&message) {
+            apply_reported_state(&control, &node_name, volume, muted).await;
+        }
+    }
     control.lock().await.unregister(&node_name);
     client_to_node.lock().unwrap().remove(&client_id);
-    groups.lock().await.remove(&client_id);
+    groups.lock_recover().remove(&client_id);
 }

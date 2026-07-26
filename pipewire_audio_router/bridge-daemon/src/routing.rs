@@ -26,13 +26,10 @@
 
 use crate::airplay_source::AIRPLAY_NODE_NAME;
 use crate::api::AppState;
-use crate::config::{SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
+use crate::config::{AP2_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
-use crate::outputs_store::OutputsStore;
 use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
-use crate::raop::{raop_node_name, RAOP_NODE_PREFIX};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
-use crate::rtp_source::RTP_SOURCE_NODE_NAME;
 use crate::sendspin_discovery::SendspinDevice;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
@@ -63,6 +60,18 @@ pub struct RoutingNode {
     /// Recent peak level (0.0–1.0) for the UI meter. Sources only (metered
     /// on-demand while the matrix is watched); `0.0` for outputs and unmetered.
     peak: f32,
+    /// Current volume (0.0–1.0) for outputs whose volume the daemon tracks
+    /// out-of-band. Presently sendspin devices only — their in-band volume
+    /// (sendspin_volume.rs) is pushed here so the UI slider syncs live over this
+    /// WebSocket (including a physical volume change the device reports). `None`
+    /// for sources/offline entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<f32>,
+    /// Current mute state for outputs whose mute the daemon tracks out-of-band
+    /// (sendspin + AP2) — pushed live over this WebSocket like `volume`. `None`
+    /// for sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    muted: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -77,11 +86,11 @@ pub struct RoutingMatrix {
 }
 
 fn is_output_node(node_name: &str) -> bool {
-    node_name.starts_with(RAOP_NODE_PREFIX) || node_name.starts_with(SENDSPIN_NODE_PREFIX)
+    node_name.starts_with(SENDSPIN_NODE_PREFIX)
 }
 
 pub(crate) fn output_display_name(node_name: &str) -> String {
-    for prefix in [RAOP_NODE_PREFIX, SENDSPIN_NODE_PREFIX, SENDSPIN_DEV_PREFIX] {
+    for prefix in [SENDSPIN_NODE_PREFIX, SENDSPIN_DEV_PREFIX, AP2_DEV_PREFIX] {
         if let Some(rest) = node_name.strip_prefix(prefix) {
             return rest.replace(['_', '-'], " ");
         }
@@ -102,11 +111,15 @@ fn channel_suffix(port_name: &str) -> &str {
 /// carry `configured` (store entry vs mDNS auto-discovered) for the badge.
 fn build_matrix(
     reg: &RegistryState,
-    store: &OutputsStore,
     devices: &BTreeMap<String, SendspinDevice>,
+    ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
     airplay_display: Option<&str>,
     meters: &crate::metering::MeterHub,
     intent: &[RoutingLink],
+    sendspin_volumes: &std::collections::HashMap<String, u8>,
+    sendspin_mutes: &std::collections::HashMap<String, bool>,
+    ap2_volumes: &std::collections::HashMap<String, f32>,
+    ap2_mutes: &std::collections::HashMap<String, bool>,
 ) -> RoutingMatrix {
     use std::collections::BTreeSet;
 
@@ -128,17 +141,14 @@ fn build_matrix(
         }
     }
 
-    // Configured RAOP outputs: node_name -> friendly display name.
-    let configured: BTreeMap<String, String> = store.list().iter().map(|o| (raop_node_name(&o.name), o.name.clone())).collect();
+    // Every output is now virtual + auto-discovered (sendspin + AP2 devices) —
+    // audio reaches them via a group sink (sync_group.rs), not a live node here.
 
-    // Discovered sendspin devices are virtual outputs (present, auto, no live
-    // node id — audio reaches them via a group sink, sync_group.rs).
-
-    // Union of every output/source name to show: present ∪ configured ∪
-    // discovered devices ∪ intent.
+    // Union of every output/source name to show: present ∪ discovered devices ∪
+    // intent.
     let mut output_names: BTreeSet<String> = present_outputs.keys().cloned().collect();
-    output_names.extend(configured.keys().cloned());
     output_names.extend(devices.keys().cloned());
+    output_names.extend(ap2_devices.keys().cloned());
     output_names.extend(intent.iter().map(|l| l.output.clone()));
 
     let mut source_names: BTreeSet<String> = present_sources.keys().cloned().collect();
@@ -149,21 +159,41 @@ fn build_matrix(
         .map(|name| {
             let node_id = present_outputs.get(&name).copied();
             let device = devices.get(&name);
-            let display_name = configured
-                .get(&name)
-                .cloned()
-                .or_else(|| device.map(|d| d.display_name.clone()))
+            let ap2 = ap2_devices.get(&name);
+            let display_name = device
+                .map(|d| d.display_name.clone())
+                .or_else(|| ap2.map(|d| d.display_name.clone()))
                 .unwrap_or_else(|| output_display_name(&name));
             RoutingNode {
-                // Present if live in the graph, or a discovered sendspin device
+                // Present if live in the graph, or a discovered sendspin/AP2 device
                 // the liveness task still deems online. An offline device stays
                 // listed (grayed) until liveness removes it — an mDNS blip no
                 // longer makes it vanish.
-                present: node_id.is_some() || device.is_some_and(|d| d.present),
+                present: node_id.is_some() || device.is_some_and(|d| d.present) || ap2.is_some_and(|d| d.present),
                 node_id,
-                // Devices and offline entries are never manually configured.
-                configured: configured.contains_key(&name),
+                // Every output is now auto-discovered (sendspin + AP2); nothing is
+                // manually configured anymore (the RAOP store is gone).
+                configured: false,
                 display_name,
+                // Virtual outputs (sendspin + AP2) carry their in-band volume/mute
+                // here so the UI syncs live over the routing WS.
+                volume: if name.starts_with(SENDSPIN_DEV_PREFIX) {
+                    Some(sendspin_volumes.get(&name).map_or(1.0, |v| *v as f32 / 100.0))
+                } else if name.starts_with(AP2_DEV_PREFIX) {
+                    // AP2 volume is device-authoritative: `None` (unknown) when we
+                    // haven't read it from the receiver and the user hasn't set it —
+                    // the UI then shows no level rather than a fabricated 100 %.
+                    ap2_volumes.get(&name).copied()
+                } else {
+                    None
+                },
+                muted: if name.starts_with(SENDSPIN_DEV_PREFIX) {
+                    Some(sendspin_mutes.get(&name).copied().unwrap_or(false))
+                } else if name.starts_with(AP2_DEV_PREFIX) {
+                    Some(ap2_mutes.get(&name).copied().unwrap_or(false))
+                } else {
+                    None
+                },
                 node_name: name,
                 peak: 0.0, // outputs aren't metered
             }
@@ -181,7 +211,7 @@ fn build_matrix(
                 _ => name.clone(),
             };
             let peak = meters.peak(&name);
-            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name, peak }
+            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name, peak, volume: None, muted: None }
         })
         .collect();
 
@@ -194,16 +224,27 @@ fn build_matrix(
     RoutingMatrix { sources, outputs, links }
 }
 
-/// Snapshot the matrix from shared state (locks registry + outputs store +
-/// routing intent). Lock order is fixed here — routing first (released before
-/// the others), then registry, then store — to stay deadlock-free.
-fn build_snapshot(state: &AppState) -> RoutingMatrix {
+/// Snapshot the matrix from shared state (locks registry + routing intent).
+/// Lock order is fixed here — routing first (released before the others), then
+/// registry — to stay deadlock-free.
+async fn build_snapshot(state: &AppState) -> RoutingMatrix {
+    // Snapshot the sendspin volumes up front, before any sync (std::sync::Mutex)
+    // locks are taken — the control is an async mutex and its guard must not be
+    // held across the sync section below (and never across an await).
+    let (sendspin_volumes, sendspin_mutes) = {
+        let c = state.sendspin_control.lock().await;
+        (c.volumes(), c.mutes())
+    };
+    let (ap2_volumes, ap2_mutes) = {
+        let c = state.ap2_control.lock().await;
+        (c.volumes(), c.mutes())
+    };
     let intent = routing_store::snapshot(&state.routing);
     let devices = state.sendspin_devices.lock_recover().clone();
+    let ap2_devices = state.ap2_devices.lock_recover().clone();
     let airplay = state.sources.lock_recover().airplay_source_name().map(str::to_string);
     let reg = state.pw.lock_recover();
-    let store = state.store.lock_recover();
-    build_matrix(&reg, &store, &devices, airplay.as_deref(), &state.meters, &intent)
+    build_matrix(&reg, &devices, &ap2_devices, airplay.as_deref(), &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes)
 }
 
 /// Present source nodes as `(node_name, node_id)` — the set the meter hub taps
@@ -218,15 +259,6 @@ fn present_source_meters(matrix: &RoutingMatrix) -> Vec<(String, u32)> {
 /// if either node doesn't exist or no channel suffixes match on both sides.
 fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<LinkSpec> {
     matched_port_specs_impl(state, source_node_id, output_node_id, false)
-}
-
-/// Like `matched_port_specs`, but takes the source side's **monitor** output
-/// ports (`monitor_FL`/`monitor_FR`) instead of its normal outputs. Used to
-/// wire a null-sink *anchor*'s monitor into a RAOP output (sync_group.rs):
-/// a null sink's only outputs are its monitor ports, which the normal matcher
-/// deliberately excludes.
-fn matched_monitor_port_specs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<LinkSpec> {
-    matched_port_specs_impl(state, source_node_id, output_node_id, true)
 }
 
 /// `want_monitor` selects which of the source node's output ports to match:
@@ -267,58 +299,10 @@ pub(crate) fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32>
     state.nodes.values().filter(|n| n.node_name == node_name).map(|n| n.node_id).max()
 }
 
-/// Whether `name` is a RAOP output node (`raop-out-*`).
-pub(crate) fn is_raop_output(name: &str) -> bool {
-    name.starts_with(RAOP_NODE_PREFIX)
-}
-
-/// Whether a source must be routed to RAOP outputs through a null-sink anchor
-/// rather than linked directly. True for the RTP source: `module-rtp-source` is
-/// a `node.network` RateMatch *follower* that can't drive a graph cycle, and a
-/// RAOP sink can't either, so a direct link is a driverless cycle that stalls
-/// the whole component. Driver-capable sources (the AirPlay receive source)
-/// return false and link directly. See sync_group.rs and
-/// docs/rtp-source-to-raop-routing.md.
-pub(crate) fn source_needs_raop_anchor(name: &str) -> bool {
-    name == RTP_SOURCE_NODE_NAME
-}
-
 /// The set of sources feeding `output` in the intent (unique, sorted). Shared
 /// with sync_group.rs, which keys sync groups by this source-set.
 pub(crate) fn source_set_of<'a>(intent: &'a [RoutingLink], output: &str) -> std::collections::BTreeSet<&'a str> {
     intent.iter().filter(|l| l.output == output).map(|l| l.source.as_str()).collect()
-}
-
-/// Whether the RAOP output `raop` is routed through a shared **sync anchor**
-/// (sync_group.rs) rather than direct source→sink links. True when either:
-///
-/// - **any source feeding it is a non-driver source** (`source_needs_raop_anchor`)
-///   — a direct link would be a driverless, stalling cycle, so it must go through
-///   the anchor's null-sink clock; or
-/// - **it shares its exact source-set with a sendspin device** — then it joins
-///   that device's sync group so the two play in lockstep off one clock (the
-///   "RAOP joins a sendspin group" case).
-///
-/// This is the single rule both sides depend on: `reconcile` must NOT create
-/// direct links for these (sync_group owns them, feeding them from the anchor's
-/// monitor), and sync_group uses the same predicate to decide which RAOP outputs
-/// belong to an anchored group. It's purely structural (over the intent), so the
-/// decision is stable regardless of which endpoints are live right now.
-pub(crate) fn raop_uses_anchor(intent: &[RoutingLink], raop: &str) -> bool {
-    if !is_raop_output(raop) {
-        return false;
-    }
-    let my_sources = source_set_of(intent, raop);
-    if my_sources.is_empty() {
-        return false;
-    }
-    if my_sources.iter().any(|s| source_needs_raop_anchor(s)) {
-        return true;
-    }
-    // Shares its exact source-set with some sendspin device → same group.
-    let sendspin_devices: std::collections::BTreeSet<&str> =
-        intent.iter().map(|l| l.output.as_str()).filter(|o| o.starts_with(SENDSPIN_DEV_PREFIX)).collect();
-    sendspin_devices.into_iter().any(|dev| source_set_of(intent, dev) == my_sources)
 }
 
 /// Ensure the matched-channel PipeWire links from `source` to `output` exist,
@@ -343,46 +327,6 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
     let _ = reply_rx.await;
 }
 
-/// Like `ensure_link_by_name`, but links `monitor`'s **monitor** output ports
-/// (a null sink's only outputs) into `output`'s inputs. Used to feed a RAOP
-/// output from the RTP→RAOP anchor's monitor (sync_group.rs). Idempotent.
-pub async fn ensure_monitor_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, monitor: &str, output: &str) {
-    let ids = {
-        let st = pw.lock_recover();
-        node_id_for(&st, monitor).zip(node_id_for(&st, output))
-    };
-    let Some((monitor_id, output_id)) = ids else { return };
-    let specs = matched_monitor_port_specs(pw, monitor_id, output_id);
-    if specs.is_empty() {
-        return;
-    }
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
-        return;
-    }
-    let _ = reply_rx.await;
-}
-
-/// Destroy every live link from node `from` to node `to` (by stable node name).
-/// Idempotent — missing links are fine. Used by sync_group.rs to detach a RAOP
-/// output from a group's anchor monitor when it leaves the group but the group
-/// (and its anchor) lives on.
-pub async fn destroy_links_between(pw: &SharedState, pw_cmd: &PwCommandSender, from: &str, to: &str) {
-    let link_ids: Vec<u32> = {
-        let st = pw.lock_recover();
-        let Some((from_id, to_id)) = node_id_for(&st, from).zip(node_id_for(&st, to)) else { return };
-        st.links.values().filter(|l| l.output_node == from_id && l.input_node == to_id).map(|l| l.link_id).collect()
-    };
-    if link_ids.is_empty() {
-        return;
-    }
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if pw_cmd.send(PwCommand::DestroyLinks { link_ids, reply: reply_tx }).is_err() {
-        return;
-    }
-    let _ = reply_rx.await;
-}
-
 /// Reapply persisted routing intent (routing_store.rs) to the live graph: for
 /// every stored `(source, output)` link whose *both* nodes are currently
 /// present, ensure the matched-channel PipeWire links exist. Idempotent —
@@ -391,17 +335,16 @@ pub async fn destroy_links_between(pw: &SharedState, pw_cmd: &PwCommandSender, f
 /// unlink (which also drops the intent) stays gone and this can't fight the
 /// user. Intent whose endpoint is absent is simply left pending until the node
 /// (re)appears and a later call links it.
+///
+/// After the RAOP output path was removed, every routable output is *virtual*
+/// (sendspin/AP2 devices with no live PipeWire node), so `node_id_for(output)`
+/// returns `None` and this loop no-ops for them — their audio path is built by
+/// sync_group.rs from a group anchor, not by a direct link here. The loop is
+/// kept (rather than deleted) so a future real-node output would still be
+/// direct-linked, and it stays a cheap no-op for the current output kinds.
 pub async fn reconcile(pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting) {
     let intent = routing_store::snapshot(routing);
     for link in &intent {
-        // Anchored RAOP routes are owned by sync_group.rs (fed from a shared
-        // null-sink anchor's monitor), never direct-linked here: a non-driver
-        // source direct-linked to RAOP is a driverless cycle that stalls the
-        // graph, and a RAOP output grouped with a sendspin device must share
-        // that group's clock. Skip both so we don't create a competing feed.
-        if raop_uses_anchor(&intent, &link.output) {
-            continue;
-        }
         let ids = {
             let st = pw.lock_recover();
             node_id_for(&st, &link.source).zip(node_id_for(&st, &link.output))
@@ -437,10 +380,14 @@ pub struct LinkOpResponse {
 }
 
 pub async fn get_routing(State(state): State<AppState>) -> Json<RoutingMatrix> {
-    Json(build_snapshot(&state))
+    Json(build_snapshot(&state).await)
 }
 
 pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
+    // Human-initiated (routing-graph / API) — logged distinctly so a person's
+    // actions can be told apart from stack-driven churn (reconcile, discovery,
+    // source cycling) when reading logs. Grep `USER ACTION`.
+    tracing::info!("USER ACTION: link '{}' → '{}' (routing graph)", req.source, req.output);
     // Persist the desired route first; it's the source of truth and reconcile()
     // (re)applies it whenever both endpoints are present.
     if let Err(e) = state.routing.lock_recover().add(&req.source, &req.output) {
@@ -449,19 +396,16 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
     // Nudge the reconcilers (routing/groups/anchor) so intent changes take
     // effect promptly, not only on the next PipeWire registry event.
     let _ = state.changes.send(());
-    // Anchored RAOP routes are built by sync_group.rs (fed from a shared
-    // null-sink anchor), never a direct link. The reconcilers, woken by the
-    // notification above, build the path.
-    if is_raop_output(&req.output) && raop_uses_anchor(&routing_store::snapshot(&state.routing), &req.output) {
-        return Json(LinkOpResponse { ok: true, message: "saved; routing via sync anchor".to_string() });
-    }
-    // Apply live now if both ends are present; otherwise it stays pending.
+    // Every output is now virtual (sendspin/AP2): its audio path is built by
+    // sync_group.rs from a group anchor, not a direct link here. If the output
+    // has no live PipeWire node (the normal case), there's nothing to link now —
+    // the reconcilers woken above build the path.
     let ids = {
         let st = state.pw.lock_recover();
         node_id_for(&st, &req.source).zip(node_id_for(&st, &req.output))
     };
     let Some((source_id, output_id)) = ids else {
-        return Json(LinkOpResponse { ok: true, message: "saved; will apply when both endpoints are present".to_string() });
+        return Json(LinkOpResponse { ok: true, message: "saved; routing via sync group".to_string() });
     };
     let specs = matched_port_specs(&state.pw, source_id, output_id);
     if specs.is_empty() {
@@ -479,6 +423,9 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
 }
 
 pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
+    // Human-initiated (routing-graph "remove link") — logged distinctly (grep
+    // `USER ACTION`) so it's not confused with stack-driven teardown.
+    tracing::info!("USER ACTION: unlink '{}' → '{}' (routing graph)", req.source, req.output);
     // Drop the intent first so reconcile() won't re-create what we remove.
     // Works for offline pairs too — this is purely by name.
     if let Err(e) = state.routing.lock_recover().remove(&req.source, &req.output) {
@@ -522,6 +469,7 @@ pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairReque
 /// to touch. After this the entity drops out of the matrix (no references
 /// left); if it's a real device it'll reappear on its own, unrouted.
 pub async fn forget_entity(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<LinkOpResponse> {
+    tracing::info!("USER ACTION: forget entity '{}' (routing graph)", node_name);
     match state.routing.lock_recover().remove_entity(&node_name) {
         Ok(()) => Json(LinkOpResponse { ok: true, message: format!("forgot routing for '{node_name}'") }),
         Err(e) => Json(LinkOpResponse { ok: false, message: format!("failed to forget '{node_name}': {e}") }),
@@ -546,7 +494,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let matrix = build_snapshot(&state);
+    let matrix = build_snapshot(&state).await;
     state.meters.reconcile_sources(&present_source_meters(&matrix));
     if send_matrix(&mut socket, &matrix).await.is_err() {
         state.meters.unwatch();
@@ -558,7 +506,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 match changed {
                     // On any graph change, rebuild + re-tap the current sources.
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let matrix = build_snapshot(&state);
+                        let matrix = build_snapshot(&state).await;
                         state.meters.reconcile_sources(&present_source_meters(&matrix));
                         if send_matrix(&mut socket, &matrix).await.is_err() {
                             break;
@@ -569,7 +517,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             }
             // Live peak refresh (levels move without graph changes).
             _ = tick.tick() => {
-                let matrix = build_snapshot(&state);
+                let matrix = build_snapshot(&state).await;
                 if send_matrix(&mut socket, &matrix).await.is_err() {
                     break;
                 }
@@ -588,7 +536,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
 async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(), axum::Error> {
     let json = serde_json::to_string(matrix).unwrap_or_else(|_| "{}".to_string());
-    socket.send(Message::Text(json)).await
+    socket.send(Message::Text(json.into())).await
 }
 
 #[cfg(test)]
@@ -600,40 +548,15 @@ mod tests {
     }
 
     #[test]
-    fn lone_raop_from_driver_source_is_direct() {
-        let intent = vec![link(AIRPLAY_NODE_NAME, "raop-out-dusche")];
-        assert!(!raop_uses_anchor(&intent, "raop-out-dusche"));
-    }
-
-    #[test]
-    fn raop_from_non_driver_source_is_anchored() {
-        let intent = vec![link(RTP_SOURCE_NODE_NAME, "raop-out-dusche")];
-        assert!(raop_uses_anchor(&intent, "raop-out-dusche"));
-    }
-
-    #[test]
-    fn raop_sharing_source_set_with_sendspin_device_is_anchored() {
-        // Same source-set {airplay-in} feeds a sendspin device and a RAOP output
-        // → they group, so the RAOP output joins the sendspin group's anchor.
-        let intent = vec![link(AIRPLAY_NODE_NAME, "sendspin-dev-kitchen"), link(AIRPLAY_NODE_NAME, "raop-out-dusche")];
-        assert!(raop_uses_anchor(&intent, "raop-out-dusche"));
-    }
-
-    #[test]
-    fn raop_with_different_source_set_than_sendspin_is_not_anchored() {
-        // The sendspin device is fed by two sources; the RAOP output by one — the
-        // source-sets differ, so they are not the same group.
+    fn source_set_of_collects_unique_sorted_sources() {
         let intent = vec![
             link(AIRPLAY_NODE_NAME, "sendspin-dev-kitchen"),
-            link("some-other-source", "sendspin-dev-kitchen"),
-            link(AIRPLAY_NODE_NAME, "raop-out-dusche"),
+            link("other-source", "sendspin-dev-kitchen"),
+            link(AIRPLAY_NODE_NAME, "ap2-dev-dusche"),
         ];
-        assert!(!raop_uses_anchor(&intent, "raop-out-dusche"));
-    }
-
-    #[test]
-    fn non_raop_output_never_uses_anchor() {
-        let intent = vec![link(AIRPLAY_NODE_NAME, "sendspin-dev-kitchen")];
-        assert!(!raop_uses_anchor(&intent, "sendspin-dev-kitchen"));
+        let kitchen = source_set_of(&intent, "sendspin-dev-kitchen");
+        assert!(kitchen.contains(AIRPLAY_NODE_NAME) && kitchen.contains("other-source") && kitchen.len() == 2);
+        let dusche = source_set_of(&intent, "ap2-dev-dusche");
+        assert_eq!(dusche.len(), 1);
     }
 }

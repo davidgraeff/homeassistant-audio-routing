@@ -6,16 +6,16 @@ edition = "2021"
 [dependencies]
 pipewire = "0.10"
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Serve the built Svelte frontend (frontend/dist) as static files.
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs"] }
 # Pure-Rust decode for announce clips (decode.rs) — replaces an ffmpeg
 # subprocess that pulled ~250-300MB of unrelated GPU/video-transcoding
 # system dependencies into the runtime image for what was only ever
@@ -23,22 +23,31 @@ tower-http = { version = "0.6", features = ["fs"] }
 # container (mp3, aac, ogg/vorbis, flac, wav, ...); the size cost is a bit
 # more compiled Rust in our own ~8MB binary, not a system dependency
 # tree, so there's no real reason to hand-pick a narrower feature set.
-symphonia = { version = "0.5", features = ["all"] }
+symphonia = { version = "0.6", features = ["all"] }
 # Pure-Rust mDNS/DNS-SD for auto-discovering RAOP (AirPlay) receivers on the
 # LAN (_raop._tcp) — no avahi/system daemon dependency, so it works the same
 # in the add-on container as on a dev box (needs multicast reachability, i.e.
 # host networking in the container).
-mdns-sd = "0.13"
+mdns-sd = "0.20"
+# SCHED_FIFO for the sendspin capture→wire relay thread (sendspin_server.rs), so
+# it can't be starved by general-purpose async work — the primary sendspin
+# stutter cause (RC1, docs/audio-jitter-analysis.md). Already in the build tree
+# via the vendored crates.
+libc = "0.2"
+# Lock-free SPSC ring for the AirPlay ingest jitter buffer (airplay_source.rs):
+# the RT process callback (now RT_PROCESS, on the graph data-loop) must pop
+# without ever blocking on the decode thread — the old Mutex<VecDeque> could
+# stall the graph cycle → airplay-in xruns → stutter on every output (RC1/RC2,
+# confirmed live via pw-top). Real-time-audio-focused SPSC ring.
+rtrb = "0.3"
 # Embedded Sendspin server role (replaces the sendspin-adapter.py subprocess
 # wrapping aiosendspin[server], removing ~212MB of av/numpy/pillow from the
 # runtime image and the last continuous shellout, pw-record, from the audio
 # path — see docs/decisions.md). Pinned to a commit, not a branch: this is
 # our own fork's server-role-prototype branch, not yet merged upstream (only
 # the client/receiver role exists there); a branch reference could move out
-# from under a build. Depends transitively on mdns-sd 0.20, distinct from
-# this crate's own 0.13 (used by discovery.rs for RAOP) — left to resolve as
-# two separate versions rather than risking discovery.rs's working RAOP
-# lookup code to unify them.
+# from under a build. Depends transitively on mdns-sd 0.20, now unified with
+# this crate's own mdns-sd 0.20 (used by discovery.rs for RAOP).
 sendspin = { git = "https://github.com/davidgraeff/sendspin-rs.git", rev = "1594c06cf6ace1bee95dde6f2beb088669ca56d6" }
 
 # Native AirPlay (RAOP) receiver — a pure-Rust, clean-room AP1+AP2 server that
@@ -49,6 +58,16 @@ sendspin = { git = "https://github.com/davidgraeff/sendspin-rs.git", rev = "1594
 # Vendored (path) so we can instrument the RTSP handshake — see vendor/shairplay.
 shairplay = { path = "vendor/shairplay" }
 
+# Vendored AirPlay-2 SENDER (lmcgartland/airplay2-rs, GPL-2.0), patched: its own
+# libairptp is stripped (the daemon owns the single host-global gPTP grandmaster
+# in ap2_ptp.rs and injects the clock id via Connection::set_ptp_clock_id). Used
+# by ap2_server.rs to stream captured PCM to AirPlay-2 receivers — the RAOP-output
+# replacement. See vendor/airplay2-sender/Cargo.toml for what was dropped/patched.
+airplay-client = { path = "vendor/airplay2-sender/crates/airplay-client" }
+# Core types (Device/Features/StreamConfig/TimingProtocol/PtpMode) the sender's
+# Connection needs but airplay-client doesn't re-export. Same vendored workspace.
+airplay-core = { path = "vendor/airplay2-sender/crates/airplay-core" }
+
 # Override the sendspin git dep with a vendored copy patched to expose the
 # dialed mDNS fullname on ClientEvent::Connected (upstream only forwards the
 # client_id, which for ESPHome devices is an opaque MAC that doesn't match the
@@ -56,3 +75,8 @@ shairplay = { path = "vendor/shairplay" }
 # device for per-device volume). Upstream this and drop the patch later.
 [patch."https://github.com/davidgraeff/sendspin-rs.git"]
 sendspin = { path = "vendor/sendspin" }
+
+# Compiles the vendored libairptp C (vendor/libairptp/) — OwnTone's MIT
+# AirPlay-2 gPTP grandmaster — into the daemon for the AP2 sender's PTP.
+[build-dependencies]
+cc = "1"

@@ -20,9 +20,8 @@ use pipewire as pw;
 use pw::spa;
 use shairplay::{Ap1Encryption, AudioFormat, AudioHandler, AudioSession, RaopServer, SessionDecision, SessionInfo};
 use spa::pod::Pod;
-use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Shared anti-takeover flag (mirrors sources_store's `airplay_prevent_takeover`),
@@ -55,9 +54,27 @@ const CHANNELS: usize = 2;
 /// dropouts.
 pub const DEFAULT_AIRPLAY_LATENCY_MSEC: u32 = 150;
 
-/// Shared interleaved-f32 ring buffer between shairplay's audio thread (push)
-/// and the PipeWire producer callback (pop).
-type Ring = Arc<Mutex<VecDeque<f32>>>;
+/// After a mid-stream ring underrun, re-arm the jitter buffer to this much audio
+/// before draining again — a small hysteresis guard, **not** the full cold-start
+/// prebuffer (`DEFAULT_AIRPLAY_LATENCY_MSEC`). A transient late/lost packet then
+/// costs ~one quantum plus this guard instead of a full ~150 ms of silence
+/// re-injected at the source and fanned to every output of the group (RC2 in
+/// docs/audio-jitter-analysis.md), while still avoiding a per-quantum underrun
+/// train. (Chronic underfeed from producer↔graph clock drift — RC3 — needs an
+/// adaptive resampler; this only bounds *transient* gaps.)
+const AIRPLAY_REARM_MSEC: u32 = 40;
+
+/// Producer half of the lock-free SPSC jitter-buffer ring (interleaved f32),
+/// shared behind a `Mutex` only to serialize the *producer* side across sessions
+/// (a session teardown + a new session can briefly overlap). The `Mutex` is
+/// **never** touched by the consumer: the PipeWire RT process callback owns the
+/// `rtrb::Consumer` and pops lock-free, so a graph cycle can never block on the
+/// decode thread (the old `Mutex<VecDeque>` could → `airplay-in` xruns → stutter).
+type RingProducer = Arc<Mutex<rtrb::Producer<f32>>>;
+
+/// Cumulative count of ingest-ring samples dropped on overflow (consumer/graph
+/// stalled). Overflow should be ~never in steady state; logged, throttled.
+static RING_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
 /// Interleaved-f32 samples for `msec` of audio at the producer's rate/channels.
 fn samples_for_ms(msec: u32) -> usize {
@@ -130,22 +147,40 @@ pub async fn start(
     clients: SharedAirplayClients,
     prevent_takeover: SharedPreventTakeover,
 ) -> anyhow::Result<AirplayHandle> {
+    // STACK lifecycle marker: a full AirPlay-receiver (re)start. If this appears in
+    // the logs WITHOUT a preceding `USER ACTION: set AirPlay source`, the receiver
+    // is being restarted by the stack (a bug) rather than by a human — that's the
+    // signal distinguishing the two for the `airplay-in` cycling investigation.
+    tracing::info!("STACK: airplay_source::start — (re)starting AirPlay receiver 'airplay-in' (name={name:?})");
     // Fresh receiver: nothing is streaming yet, so clear any stale live flags a
     // prior handle might have left (a restart that skipped a disconnect).
     clients.lock_recover().reset_connected();
 
     let target = samples_for_ms(latency_msec);
-    // Bound growth well past the prebuffer target so a stalled consumer can't
-    // grow the ring without limit; oldest samples are dropped past this.
+    // Bound the ring well past the prebuffer target so a stalled consumer can't
+    // grow it without limit; the ring is fixed-capacity (rtrb) — pushes past it
+    // are dropped.
     let cap = (target * 4).max(samples_for_ms(1000));
-    let ring: Ring = Arc::new(Mutex::new(VecDeque::with_capacity(cap)));
+    let (producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
+    let ring_prod: RingProducer = Arc::new(Mutex::new(producer));
+    // Set by the decode side on session-end / FLUSH; the RT consumer drains the
+    // ring and re-arms a cold prebuffer on its next cycle (see run_producer).
+    let flush = Arc::new(AtomicBool::new(false));
     let peak = Arc::new(AtomicU32::new(0));
 
-    let producer_stop = spawn_producer(ring.clone(), peak.clone(), target)
+    let producer_stop = spawn_producer(consumer, peak.clone(), target, flush.clone())
         .map_err(|e| anyhow::anyhow!("failed to start AirPlay PipeWire producer: {e}"))?;
 
-    let handler = Arc::new(Handler { ring, peak: peak.clone(), cap, clients, prevent_takeover });
+    let handler = Arc::new(Handler { ring_prod, flush, peak: peak.clone(), clients, prevent_takeover });
     let mut builder = RaopServer::builder().name(name.clone()).hwaddr(derive_hwaddr(&name)).port(AIRPLAY_PORT);
+    // Advertise on the process-wide shared, LAN-restricted mDNS daemon so the
+    // receiver's `_raop._tcp`/`_airplay._tcp` records share one interface-pinned
+    // daemon thread with everything else — avoids the host-network multicast
+    // amplification across Docker veths. Falls back to shairplay's own daemon if
+    // the shared one is unavailable.
+    if let Some(daemon) = crate::discovery_supervisor::shared_advertise_daemon() {
+        builder = builder.mdns_daemon(daemon);
+    }
     if auth_setup {
         // Offer both — the sender picks. Leaving RSA out (et=1) is deliberate:
         // PipeWire's RSA path is broken (see decisions.md). Codecs stay at the
@@ -181,10 +216,10 @@ fn derive_hwaddr(name: &str) -> [u8; 6] {
 }
 
 struct Handler {
-    ring: Ring,
+    ring_prod: RingProducer,
+    /// Session-end / FLUSH signal to the RT consumer (drain + re-arm).
+    flush: Arc<AtomicBool>,
     peak: Arc<AtomicU32>,
-    /// Drop-oldest bound for the ring (see [`start`]).
-    cap: usize,
     /// Persistent registry of senders — updated on connect/name/disconnect for
     /// the Sources-tab connection list (airplay_clients.rs).
     clients: SharedAirplayClients,
@@ -207,7 +242,7 @@ impl AudioHandler for Handler {
         } else {
             tracing::info!("AirPlay stream started ({in_rate}Hz/{in_channels}ch)");
         }
-        Box::new(Session { ring: self.ring.clone(), peak: self.peak.clone(), cap: self.cap, in_channels, resampler })
+        Box::new(Session { ring_prod: self.ring_prod.clone(), flush: self.flush.clone(), peak: self.peak.clone(), in_channels, resampler, frames: Vec::new(), scratch: Vec::new() })
     }
 
     fn authorize_session(&self, addr: &str, name: Option<&str>, current: Option<&SessionInfo>) -> SessionDecision {
@@ -249,67 +284,111 @@ impl AudioHandler for Handler {
     fn on_client_disconnected(&self, addr: &str) {
         tracing::info!("AirPlay client disconnected: {addr}");
         airplay_clients::on_disconnected(&self.clients, addr);
-        // Clear any residual buffered audio so a new session starts clean.
-        self.ring.lock_recover().clear();
+        // Signal the RT consumer to drop any residual buffered audio so a new
+        // session starts clean (it drains + re-arms a cold prebuffer).
+        self.flush.store(true, Ordering::Relaxed);
     }
 }
 
 struct Session {
-    ring: Ring,
+    ring_prod: RingProducer,
+    /// Session-end / FLUSH signal to the RT consumer (drain + re-arm).
+    flush: Arc<AtomicBool>,
     peak: Arc<AtomicU32>,
-    cap: usize,
     /// Channels the sender negotiated (adapted to CHANNELS before the ring).
     in_channels: usize,
     /// `Some` when the session rate differs from RATE (streaming resample);
     /// `None` = same rate, no resampling.
     resampler: Option<Resampler>,
+    /// Scratch buffers for the off-rate/mix path, reused across calls (the fast
+    /// path pushes `samples` directly and never touches these): `frames` holds
+    /// the channel-adapted stereo frames, `scratch` the interleaved output.
+    frames: Vec<[f32; 2]>,
+    scratch: Vec<f32>,
+}
+
+impl Session {
+    /// Push interleaved f32 samples into the SPSC ring. Locks only the producer
+    /// side (never the RT consumer); on overflow (a stalled consumer) the excess
+    /// is dropped rather than growing memory — logged, throttled.
+    fn push(&self, samples: &[f32]) {
+        let mut prod = self.ring_prod.lock_recover();
+        let mut pushed = 0usize;
+        for &s in samples {
+            if prod.push(s).is_err() {
+                break; // ring full — drop the remainder this chunk
+            }
+            pushed += 1;
+        }
+        let dropped = samples.len() - pushed;
+        if dropped > 0 {
+            let total = RING_OVERFLOW.fetch_add(dropped as u64, Ordering::Relaxed) + dropped as u64;
+            // ~every 0.5 s of dropped audio, so a persistent stall is visible
+            // without per-chunk spam.
+            if total % (RATE as u64 * CHANNELS as u64 / 2) < dropped as u64 {
+                tracing::debug!("AirPlay ingest ring overflow: dropped {dropped} samples (total {total})");
+            }
+        }
+    }
 }
 
 impl AudioSession for Session {
     fn audio_process(&mut self, samples: &[f32]) {
         // Inline peak for the meter (cheap; this is the received signal).
         let chunk_peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        // Rise instantly, so transients show; the producer side decays it.
+        // Rise instantly, so transients show; the consumer side decays it.
         let cur = f32::from_bits(self.peak.load(Ordering::Relaxed));
         self.peak.store(chunk_peak.max(cur).to_bits(), Ordering::Relaxed);
 
-        let mut ring = self.ring.lock_recover();
         if self.resampler.is_none() && self.in_channels == CHANNELS {
             // Fast path: already RATE/CHANNELS — push through unchanged.
-            ring.extend(samples.iter().copied());
+            self.push(samples);
         } else {
-            let frames = to_stereo_frames(samples, self.in_channels);
+            // Off-rate / non-stereo path: reuse `frames` + `scratch` (disjoint
+            // fields, so the resampler can borrow `frames` while filling
+            // `scratch`); no per-chunk allocation.
+            to_stereo_frames_into(samples, self.in_channels, &mut self.frames);
+            self.scratch.clear();
             match &mut self.resampler {
-                Some(rs) => rs.process(&frames, &mut ring),
+                Some(rs) => rs.process(&self.frames, &mut self.scratch),
                 None => {
-                    for f in &frames {
-                        ring.push_back(f[0]);
-                        ring.push_back(f[1]);
+                    for f in &self.frames {
+                        self.scratch.push(f[0]);
+                        self.scratch.push(f[1]);
                     }
                 }
             }
-        }
-        // Bound latency: drop oldest beyond the cap.
-        while ring.len() > self.cap {
-            ring.pop_front();
+            self.push(&self.scratch);
         }
     }
 
     fn audio_flush(&mut self) {
-        self.ring.lock_recover().clear();
+        // Tell the RT consumer to drop buffered-but-unplayed audio (RAOP FLUSH).
+        self.flush.store(true, Ordering::Relaxed);
         if let Some(rs) = &mut self.resampler {
             rs.reset();
         }
     }
 }
 
-/// Interleaved input samples (`in_channels`-wide) → stereo frames. Mono is
-/// duplicated to both channels; >2 channels take the first two (front L/R).
-fn to_stereo_frames(samples: &[f32], in_channels: usize) -> Vec<[f32; 2]> {
+/// Interleaved input samples (`in_channels`-wide) → stereo frames, appended to
+/// `out` (cleared first). Mono is duplicated to both channels; >2 channels take
+/// the first two (front L/R). Writes into a caller-owned buffer so the off-rate
+/// ingest path reuses it instead of allocating a `Vec` per chunk.
+fn to_stereo_frames_into(samples: &[f32], in_channels: usize, out: &mut Vec<[f32; 2]>) {
+    out.clear();
     match in_channels {
-        1 => samples.iter().map(|&s| [s, s]).collect(),
-        ch => samples.chunks_exact(ch).map(|f| [f[0], f[1]]).collect(),
+        1 => out.extend(samples.iter().map(|&s| [s, s])),
+        ch => out.extend(samples.chunks_exact(ch).map(|f| [f[0], f[1]])),
     }
+}
+
+/// Allocating convenience wrapper over [`to_stereo_frames_into`], used by tests.
+#[cfg(test)]
+fn to_stereo_frames(samples: &[f32], in_channels: usize) -> Vec<[f32; 2]> {
+    let mut out = Vec::new();
+    to_stereo_frames_into(samples, in_channels, &mut out);
+    out
 }
 
 /// Streaming linear-interpolation resampler, stereo, from a source rate to
@@ -339,7 +418,7 @@ impl Resampler {
     }
 
     /// Resample `input` stereo frames into `out` as interleaved f32 at RATE.
-    fn process(&mut self, input: &[[f32; 2]], out: &mut VecDeque<f32>) {
+    fn process(&mut self, input: &[[f32; 2]], out: &mut Vec<f32>) {
         if input.is_empty() {
             return;
         }
@@ -366,8 +445,8 @@ impl Resampler {
                 let frac = (pos - i as f64) as f32;
                 let a = get(i);
                 let b = get(i + 1);
-                out.push_back(a[0] + (b[0] - a[0]) * frac);
-                out.push_back(a[1] + (b[1] - a[1]) * frac);
+                out.push(a[0] + (b[0] - a[0]) * frac);
+                out.push(a[1] + (b[1] - a[1]) * frac);
                 pos += self.ratio;
             }
             // Carry the leftover, now measured from the new `prev`.
@@ -381,12 +460,12 @@ impl Resampler {
 /// Spawn the PipeWire producer on a dedicated thread (mirrors
 /// sendspin_capture's thread+channel+mainloop shape). Returns a stop sender.
 /// `target` is the jitter-buffer prebuffer, in interleaved-f32 samples.
-fn spawn_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize) -> Result<pw::channel::Sender<ProducerCmd>, String> {
+fn spawn_producer(consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, flush: Arc<AtomicBool>) -> Result<pw::channel::Sender<ProducerCmd>, String> {
     let (cmd_tx, cmd_rx) = pw::channel::channel::<ProducerCmd>();
     std::thread::Builder::new()
         .name("airplay-producer".into())
         .spawn(move || {
-            if let Err(e) = run_producer(ring, peak, target, cmd_rx) {
+            if let Err(e) = run_producer(consumer, peak, target, cmd_rx, flush) {
                 tracing::error!("AirPlay PipeWire producer exited with error: {e}");
             }
         })
@@ -394,7 +473,35 @@ fn spawn_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize) -> Result<pw:
     Ok(cmd_tx)
 }
 
-fn run_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::channel::Receiver<ProducerCmd>) -> Result<(), String> {
+/// Elevate the AirPlay producer thread to `SCHED_FIFO` so its control path
+/// preempts the normal-priority worker pool (notably the busy mDNS
+/// `ServiceDaemon` threads) under host CPU contention. As with the sendspin
+/// capture thread, the steady-state PCM fill runs in the `RT_PROCESS` callback
+/// on PipeWire's data-loop (already FIFO 83); this thread mostly sleeps in the
+/// mainloop poll, so elevating it protects prompt stream (re)connect / flush /
+/// stop handling (flaky-connection resilience) and can never spin-lock a core.
+/// Priority 45 mirrors the sendspin capture thread — above the relays (40),
+/// below the AP2 sender (50) and PipeWire's data-loop (83). Best-effort:
+/// without `CAP_SYS_NICE` it logs and continues at normal priority.
+#[cfg(target_os = "linux")]
+fn set_producer_realtime_priority() {
+    // SAFETY: sched_setscheduler on the current thread (pid 0) with a valid,
+    // zero-initialised sched_param; no aliasing, no ownership transfer.
+    unsafe {
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = 45;
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+            tracing::info!("AirPlay producer: real-time priority set (SCHED_FIFO, priority 45)");
+        } else {
+            tracing::debug!("AirPlay producer: could not set RT priority (need CAP_SYS_NICE); running at normal priority");
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn set_producer_realtime_priority() {}
+
+fn run_producer(consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::channel::Receiver<ProducerCmd>, flush: Arc<AtomicBool>) -> Result<(), String> {
+    set_producer_realtime_priority();
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| format!("context: {e}"))?;
@@ -413,17 +520,25 @@ fn run_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::cha
 
     let stride = CHANNELS * std::mem::size_of::<f32>(); // bytes per frame
     let error: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
-    // Jitter-buffer state: start in prebuffer mode (draining = false). Fill with
-    // silence until the ring holds `target` samples, then drain; on any underrun
-    // fall back to prebuffering so a brief gap doesn't turn into ongoing stutter.
-    let draining = std::rc::Rc::new(std::cell::Cell::new(false));
+    // The prebuffer arm threshold: the full `target` at cold start, dropping to
+    // the small `rearm_target` after the first mid-stream underrun so recovery
+    // stays near-realtime (M4 / RC2). Clamped so a very low configured latency
+    // never makes the re-arm guard *larger* than the cold-start prebuffer.
+    let rearm_target = samples_for_ms(AIRPLAY_REARM_MSEC).min(target).max(1);
 
     let _listener = stream
         .add_local_listener_with_user_data(())
+        // The process callback runs RT (RT_PROCESS, on the graph data-loop). It
+        // owns the SPSC consumer and its jitter-buffer state exclusively (no Rc
+        // shared with this thread — that would be a data race once RT_PROCESS
+        // moves the callback off this mainloop thread); `flush`/`peak` are shared
+        // only via atomics. It must never block: `pop` is lock-free.
         .process({
-            let ring = ring.clone();
             let peak = peak.clone();
-            let draining = draining.clone();
+            // Owned, mutated across invocations (FnMut). Start in prebuffer mode.
+            let mut consumer = consumer;
+            let mut draining = false;
+            let mut arm_target = target;
             move |stream, _| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
@@ -432,32 +547,42 @@ fn run_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::cha
                 let Some(data) = datas.first_mut() else {
                     return;
                 };
+                // Session ended / FLUSH: drop stale buffered audio and re-arm the
+                // full cold-start prebuffer for the next session.
+                if flush.swap(false, Ordering::Relaxed) {
+                    while consumer.pop().is_ok() {}
+                    draining = false;
+                    arm_target = target;
+                }
                 let filled = if let Some(slice) = data.data() {
                     let cap_frames = slice.len() / stride;
                     let want = cap_frames * CHANNELS; // f32 samples wanted
+                    // Leave prebuffer once we've accumulated the current arm
+                    // threshold (full `target` cold, small `rearm_target` after
+                    // a prior underrun).
+                    if !draining && consumer.slots() >= arm_target {
+                        draining = true;
+                    }
                     let mut got = 0usize;
-                    {
-                        let mut ring = ring.lock_recover();
-                        // Leave prebuffer once we've accumulated the target.
-                        if !draining.get() && ring.len() >= target {
-                            draining.set(true);
+                    if draining {
+                        // Bulk-read up to a full quantum in one lock-free chunk
+                        // (two slices when the ring wraps).
+                        let n = consumer.slots().min(want);
+                        if let Ok(chunk) = consumer.read_chunk(n) {
+                            let (s0, s1) = chunk.as_slices();
+                            for &s in s0.iter().chain(s1.iter()) {
+                                slice[got * 4..got * 4 + 4].copy_from_slice(&s.to_le_bytes());
+                                got += 1;
+                            }
+                            chunk.commit_all();
                         }
-                        if draining.get() {
-                            while got < want {
-                                match ring.pop_front() {
-                                    Some(s) => {
-                                        let b = s.to_le_bytes();
-                                        slice[got * 4..got * 4 + 4].copy_from_slice(&b);
-                                        got += 1;
-                                    }
-                                    None => break, // underrun
-                                }
-                            }
-                            // Underran mid-quantum: re-prebuffer before draining
-                            // again so we don't dribble out repeated micro-gaps.
-                            if got < want {
-                                draining.set(false);
-                            }
+                        // Underran mid-quantum: re-prebuffer before draining again
+                        // so we don't dribble out repeated micro-gaps — but only to
+                        // the small `rearm_target` guard, not the full cold-start
+                        // prebuffer, so recovery stays near-realtime (M4 / RC2).
+                        if got < want {
+                            draining = false;
+                            arm_target = rearm_target;
                         }
                     }
                     // Zero-pad the rest of the quantum (prebuffering or underrun)
@@ -516,10 +641,18 @@ fn run_producer(ring: Ring, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::cha
 
     // Direction::Output = a producer (source in the graph). No AUTOCONNECT: we
     // don't want it wired to the default sink — the routing reconciler links it
-    // where the user routes it. No RT_PROCESS since the process callback takes
-    // a mutex (avoid RT priority inversion).
+    // where the user routes it. RT_PROCESS: run the process callback on the
+    // graph's RT data-loop so it's never preempted by general-purpose async work
+    // (the non-RT producer was the live stutter cause — airplay-in xruns). Safe
+    // now that the jitter buffer is a lock-free SPSC ring (no mutex in the
+    // callback), so there's no RT priority inversion.
     stream
-        .connect(spa::utils::Direction::Output, None, pw::stream::StreamFlags::MAP_BUFFERS, &mut params)
+        .connect(
+            spa::utils::Direction::Output,
+            None,
+            pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+            &mut params,
+        )
         .map_err(|e| format!("connect producer stream: {e}"))?;
 
     let mainloop_for_cmd = mainloop.clone();
@@ -556,7 +689,7 @@ mod tests {
         // 48000 → 44100: expect ~44100/48000 output frames, streamed in chunks,
         // and continuous across chunk boundaries (no per-chunk reset).
         let mut rs = Resampler::new(48_000);
-        let mut out = VecDeque::new();
+        let mut out = Vec::new();
         // One second of input as 100 chunks of 480 stereo frames = 48000 frames.
         let chunk: Vec<[f32; 2]> = (0..480).map(|i| [i as f32, 0.0]).collect();
         let _ = chunk; // shape only; use a ramp below for continuity
@@ -587,7 +720,7 @@ mod tests {
         // 22050 → 44100 (2×): a monotonically increasing ramp must stay
         // non-decreasing through linear interpolation.
         let mut rs = Resampler::new(22_050);
-        let mut out = VecDeque::new();
+        let mut out = Vec::new();
         let block: Vec<[f32; 2]> = (0..100).map(|i| [i as f32, i as f32]).collect();
         rs.process(&block, &mut out);
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();

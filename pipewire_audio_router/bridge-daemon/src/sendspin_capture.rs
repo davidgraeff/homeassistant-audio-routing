@@ -12,21 +12,74 @@
 //! Runs on its own dedicated OS thread (matching pw_thread.rs's own
 //! `std::thread::Builder::spawn`, not `tokio::task::spawn_blocking` — this is
 //! long-lived, not one bounded task) and forwards each captured buffer's bytes
-//! through a `tokio::sync::mpsc::UnboundedSender` (safe to call from any thread,
-//! no runtime needed) to whatever async code wants the PCM (sendspin_server.rs).
+//! through a **bounded** `tokio::sync::mpsc` channel (non-blocking `try_send`,
+//! drop-on-full, safe to call from any thread, no runtime needed) to whatever
+//! consumer wants the PCM (sendspin_server.rs / ap2_server.rs). Buffers are
+//! drawn from a small pool ([`PooledBuf`]) and recycled, so the RT capture
+//! callback does no heap allocation in steady state, and the bounded channel
+//! caps memory/latency if a consumer ever falls behind.
 
 use pipewire as pw;
 use pw::spa;
 use spa::pod::Pod;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tokio::sync::mpsc::UnboundedSender;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 /// Fixed to match what this daemon has always produced for sendspin (adapter.py's
 /// SAMPLE_RATE/CHANNELS/BIT_DEPTH constants) — not derived from the sink node,
 /// since `support.null-audio-sink` doesn't itself constrain callers to one rate.
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
+
+/// Bounded depth of the capture → consumer PCM channel. Bounded (not unbounded)
+/// so a stalled/too-slow consumer can never grow memory or latency without
+/// limit: past this depth the RT callback drops the chunk (realtime-correct —
+/// prefer a glitch over unbounded backlog) rather than blocking or queueing
+/// forever. 32 = exactly one tokio mpsc block (no linked-list growth), ~0.68 s
+/// worst-case backlog that only ever fills during an abnormal consumer stall;
+/// steady-state occupancy is ~0-1.
+const CAPTURE_CHANNEL_CAP: usize = 32;
+
+/// Bounded depth of the buffer-pool free-list. A handful of spare buffers is
+/// plenty in steady state; returns past this are freed (the pool re-allocates if
+/// ever needed), so total pooled memory is bounded.
+const CAPTURE_POOL_CAP: usize = 8;
+
+/// Cumulative count of captured chunks dropped because the PCM channel was full
+/// (the consumer couldn't keep up). Logged, throttled.
+static CAPTURE_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// A captured PCM chunk backed by a **pooled** `Vec<u8>`. The capture callback
+/// runs on PipeWire's RT graph data-loop (`RT_PROCESS`); allocating a fresh
+/// `Vec` there every quantum risks stalling on the allocator arena. Instead the
+/// callback fills a buffer taken from a free-list and hands out this wrapper;
+/// on drop the buffer is returned to the free-list for reuse, so steady-state
+/// capture does no heap allocation on the RT thread.
+///
+/// Derefs to `[u8]`, so consumers use it exactly like the old `Vec<u8>` did
+/// (`&chunk`, `chunk.len()`, `chunk.chunks_exact(2)`, …) via deref coercion.
+pub struct PooledBuf {
+    buf: Vec<u8>,
+    ret: Sender<Vec<u8>>,
+}
+
+impl std::ops::Deref for PooledBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl Drop for PooledBuf {
+    fn drop(&mut self) {
+        // Return the buffer to the pool (keeps its capacity for reuse). Bounded
+        // + non-blocking: if the pool is already full (or the capture is gone),
+        // the buffer is simply freed.
+        let _ = self.ret.try_send(std::mem::take(&mut self.buf));
+    }
+}
 
 enum CaptureCmd {
     Stop,
@@ -59,14 +112,22 @@ impl Drop for CaptureHandle {
 /// see `STREAM_CAPTURE_SINK` below) on a dedicated thread. Returns immediately;
 /// captured chunks arrive on the returned receiver as they're delivered by
 /// PipeWire's own graph clock — nothing here paces or buffers them further.
-pub fn spawn(target_node_id: u32) -> Result<(CaptureHandle, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>), String> {
-    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::unbounded_channel();
+pub fn spawn(target_node_id: u32) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
+    spawn_with_rate(target_node_id, SAMPLE_RATE)
+}
+
+/// Like [`spawn`], but requests capture at `rate` Hz. PipeWire resamples in-graph
+/// (on its own RT thread) between the monitor's native rate and `rate`, so a
+/// consumer that needs a specific rate (e.g. the AP2 sender's 44100) can avoid
+/// resampling on its own hot path. Chunks are S16LE / `CHANNELS` at `rate`.
+pub fn spawn_with_rate(target_node_id: u32, rate: u32) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
+    let (pcm_tx, pcm_rx) = mpsc::channel(CAPTURE_CHANNEL_CAP);
     let (cmd_tx, cmd_rx) = pw::channel::channel::<CaptureCmd>();
 
     std::thread::Builder::new()
         .name("sendspin-capture".into())
         .spawn(move || {
-            if let Err(e) = run(target_node_id, pcm_tx, cmd_rx) {
+            if let Err(e) = run(target_node_id, rate, pcm_tx, cmd_rx) {
                 tracing::error!("sendspin capture thread for node {target_node_id} exited with error: {e}");
             }
         })
@@ -75,7 +136,36 @@ pub fn spawn(target_node_id: u32) -> Result<(CaptureHandle, tokio::sync::mpsc::U
     Ok((CaptureHandle { cmd_tx: Some(cmd_tx) }, pcm_rx))
 }
 
-fn run(target_node_id: u32, pcm_tx: UnboundedSender<Vec<u8>>, cmd_rx: pw::channel::Receiver<CaptureCmd>) -> Result<(), String> {
+/// Elevate the capture thread to `SCHED_FIFO` so it preempts the normal-priority
+/// worker pool (notably the busy mDNS `ServiceDaemon` threads) under host CPU
+/// contention. The steady-state PCM copy runs in the `RT_PROCESS` callback on
+/// PipeWire's own data-loop (already FIFO 83), so this thread mostly sleeps in
+/// `epoll_wait`; the elevation matters for the *control* path — prompt stream
+/// (re)connect, format renegotiation and stop handling — which otherwise stalls
+/// for seconds when the box is saturated (a cause of flaky connections). It
+/// blocks in the mainloop's poll when idle, so FIFO here can never spin-lock a
+/// core. Priority 45 sits above the relays (40) and below the AP2 sender (50)
+/// and PipeWire's data-loop (83). Without `CAP_SYS_NICE` it logs and continues
+/// at normal priority — exactly like the relay's `set_relay_realtime_priority`.
+#[cfg(target_os = "linux")]
+fn set_capture_realtime_priority() {
+    // SAFETY: sched_setscheduler on the current thread (pid 0) with a valid,
+    // zero-initialised sched_param; no aliasing, no ownership transfer.
+    unsafe {
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = 45;
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+            tracing::info!("sendspin capture: real-time priority set (SCHED_FIFO, priority 45)");
+        } else {
+            tracing::debug!("sendspin capture: could not set RT priority (need CAP_SYS_NICE); running at normal priority");
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn set_capture_realtime_priority() {}
+
+fn run(target_node_id: u32, rate: u32, pcm_tx: Sender<PooledBuf>, cmd_rx: pw::channel::Receiver<CaptureCmd>) -> Result<(), String> {
+    set_capture_realtime_priority();
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| format!("context: {e}"))?;
@@ -99,10 +189,19 @@ fn run(target_node_id: u32, pcm_tx: UnboundedSender<Vec<u8>>, cmd_rx: pw::channe
 
     let error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
+    // Buffer pool free-list (bounded): the RT process callback pulls a recycled
+    // `Vec` to fill (no allocation once warm), and each `PooledBuf` returns its
+    // buffer here on drop. Bounded so pooled memory can't grow without limit;
+    // returns past the cap are freed. tokio mpsc try_recv/try_send are
+    // non-blocking, so neither the RT callback nor a consumer's drop blocks.
+    let (free_tx, free_rx) = mpsc::channel::<Vec<u8>>(CAPTURE_POOL_CAP);
+
     let _listener = stream
         .add_local_listener_with_user_data(())
         .process({
             let pcm_tx = pcm_tx.clone();
+            let free_tx = free_tx;
+            let mut free_rx = free_rx;
             move |stream, _| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
@@ -116,12 +215,27 @@ fn run(target_node_id: u32, pcm_tx: UnboundedSender<Vec<u8>>, cmd_rx: pw::channe
                 if let Some(slice) = data.data() {
                     let end = (offset + size).min(slice.len());
                     if end > offset {
-                        // Send failing just means the receiving end (the
-                        // sendspin server task for this output) is gone —
-                        // nothing to do here but drop the chunk; the app
-                        // side is responsible for calling CaptureHandle::stop
-                        // once it no longer wants audio.
-                        let _ = pcm_tx.send(slice[offset..end].to_vec());
+                        // Reuse a pooled buffer (retains its capacity → no
+                        // RT-thread allocation in steady state); allocate only
+                        // until the pool warms up.
+                        let mut buf = free_rx.try_recv().unwrap_or_default();
+                        buf.clear();
+                        buf.extend_from_slice(&slice[offset..end]);
+                        // Non-blocking send: on `Full` the consumer is behind, so
+                        // drop this chunk (a glitch beats unbounded backlog) — the
+                        // returned PooledBuf frees its buffer back to the pool via
+                        // Drop. On `Closed` the consumer is gone (the app calls
+                        // CaptureHandle::stop when done). Either way, never block
+                        // the RT thread.
+                        if let Err(e) = pcm_tx.try_send(PooledBuf { buf, ret: free_tx.clone() }) {
+                            if matches!(e, mpsc::error::TrySendError::Full(_)) {
+                                let n = CAPTURE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                                // ~every 0.5 s of dropped audio at a ~21 ms quantum.
+                                if n % 24 == 0 {
+                                    tracing::debug!("sendspin capture (node {target_node_id}): consumer behind, dropped {n} chunks total");
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -142,7 +256,7 @@ fn run(target_node_id: u32, pcm_tx: UnboundedSender<Vec<u8>>, cmd_rx: pw::channe
     // Format: S16LE at the fixed rate/channels every sendspin output uses.
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
-    audio_info.set_rate(SAMPLE_RATE);
+    audio_info.set_rate(rate);
     audio_info.set_channels(CHANNELS as u32);
     let mut position = [0; spa::param::audio::MAX_CHANNELS];
     position[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;

@@ -1,7 +1,6 @@
-//! Routing-driven **sync grouping** reconciler — unifies sendspin multi-room
-//! grouping and RTP→RAOP anchoring into one model, so sendspin speakers and
-//! RAOP/AirPlay receivers routed from the same sources play the same audio off
-//! one clock.
+//! Routing-driven **sync grouping** reconciler — sendspin multi-room grouping
+//! and per-device AirPlay-2 senders in one model, so speakers routed from the
+//! same sources play the same audio off one clock.
 //!
 //! ## The model
 //!
@@ -11,40 +10,30 @@
 //! which is the group's shared clock/timeline:
 //!
 //! - the group's sources are linked **into** the anchor;
-//! - a filtered sendspin server (sendspin_server::start_server) captures **from**
-//!   the anchor and dials exactly the group's sendspin devices, pushing one
-//!   timestamped stream so they sync (see sendspin's `Group`);
-//! - every RAOP output in the group is fed from the anchor's **monitor**, so it
-//!   follows the same clock (a RAOP sink is a `node.network` follower and can't
-//!   drive a cycle — the anchor is also what lets a non-driver source like the
-//!   RTP bridge reach RAOP at all; a direct link would stall the graph).
+//! - a filtered sendspin server (sendspin_server) captures **from** the anchor
+//!   and dials exactly the group's sendspin devices, pushing one timestamped
+//!   stream so they sync (see sendspin's `Group`);
+//! - the group's AP2 receivers are driven by in-process senders (ap2_server.rs)
+//!   that capture from the same anchor and stream realtime ALAC with libairptp
+//!   PTP timing, so they share the same timeline.
 //!
-//! Because the anchor is one stable node per source-set, sendspin devices and
-//! RAOP outputs can come and go — and the sendspin server can be restarted when
-//! its dialed set changes — without disturbing the anchor or the other members
-//! fed from it.
-//!
-//! ## What is *not* anchored
-//!
-//! A lone RAOP output fed only by driver-capable sources (e.g. the AirPlay
-//! receive source), with no sendspin groupmate, is left as a **direct** link by
-//! routing::reconcile — snappier, one fewer buffer. `routing::raop_uses_anchor`
-//! is the single predicate deciding this, shared so the two reconcilers never
-//! both feed the same RAOP output.
+//! Because the anchor is one stable node per source-set, devices can come and
+//! go — and the sendspin server / AP2 senders can be restarted when their
+//! dialed set changes — without disturbing the anchor or the other members fed
+//! from it.
 //!
 //! ## Reconcile
 //!
-//! Stateful (owns the running anchors/servers) and serialized in the single
-//! reconciler task (main.rs). On each change it diffs desired groups (from
-//! intent + live devices/outputs) against running ones: tears down groups that
-//! are gone (dropping the server, destroying the anchor — its links go with it),
-//! creates new anchors, restarts a group's sendspin server when its dialed-device
-//! set changes, and adds/removes RAOP monitor links as outputs join/leave.
+//! Stateful (owns the running anchors/servers/AP2 senders) and serialized in the
+//! single reconciler task (main.rs). On each change it diffs desired groups (from
+//! intent + live devices) against running ones: tears down groups that are gone
+//! (dropping the server + AP2 senders, destroying the anchor — its links go with
+//! it), creates new anchors, and restarts a group's sendspin server / AP2 senders
+//! when their dialed set (or the AP2 wire rate) changes.
 
 use crate::config::SYNC_GRP_PREFIX;
 use crate::locks::LockRecover;
 use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
-use crate::raop::RAOP_NODE_PREFIX;
 use crate::routing::{self, node_id_for};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
 use crate::sendspin_discovery::{SendspinDevice, SharedSendspinDevices};
@@ -71,8 +60,17 @@ struct DesiredGroup {
     sendspin_node_names: Vec<String>,
     /// PRESENT sendspin device mDNS fullnames — the server's dial filter.
     sendspin_fullnames: HashSet<String>,
-    /// PRESENT RAOP output node names in this group (sorted) — monitor-linked.
-    raop_node_names: Vec<String>,
+    /// PRESENT AP2 receivers in this group: (output node_name, resolved IP,
+    /// per-output render delay override in ms — `None` = sender default), sorted
+    /// by node_name. Identity for "did the receiver set *or its delay* change?"
+    /// — a delay edit thus triggers the same drop-and-restart as a membership
+    /// change, reconnecting the RTSP session with the new render buffer.
+    ap2_members: Vec<(String, std::net::IpAddr, Option<u16>)>,
+    /// Negotiated wire/capture rate for this group's AP2 senders (Hz): 48000 iff
+    /// every AP2 member's effective rate is 48000, else 44100. Part of the AP2
+    /// restart identity, so a rate change (e.g. a 48 kHz downgrade or a UI mode
+    /// switch) restarts the senders + re-spawns the capture at the new rate.
+    ap2_rate: u32,
 }
 
 impl DesiredGroup {
@@ -81,7 +79,8 @@ impl DesiredGroup {
             sources: sources.iter().map(|s| s.to_string()).collect(),
             sendspin_node_names: Vec::new(),
             sendspin_fullnames: HashSet::new(),
-            raop_node_names: Vec::new(),
+            ap2_members: Vec::new(),
+            ap2_rate: 48_000,
         }
     }
 }
@@ -96,18 +95,46 @@ struct RunningGroup {
     server: Option<SendspinServerHandle>,
     /// Snapshot of the sendspin device set the running server was started for.
     server_devices: Vec<String>,
-    /// Which sendspin topology the running server was started in (per-device
-    /// senders vs one shared Group). A change flips it → restart into the new mode.
-    per_device: bool,
-    /// RAOP outputs currently monitor-linked to the anchor.
-    raop_members: Vec<String>,
+    /// Live AP2 senders (ap2_server.rs) for this group; drop = TEARDOWN each
+    /// receiver session. `None` when the group has no present AP2 receivers.
+    ap2_sender: Option<crate::ap2_server::Ap2ServerHandle>,
+    /// AP2 receiver node names the running senders were started for — the restart
+    /// identity. NOTE: render delay is deliberately NOT part of this: a delay change
+    /// is applied LIVE (ap2_control → SetRenderDelay), never by a reconnect (that
+    /// churn could silence a flaky receiver). Only membership/rate changes restart.
+    ap2_members: Vec<String>,
+    /// The AP2 capture/wire rate (Hz) the running senders were started at — part
+    /// of the restart identity alongside `ap2_members`.
+    ap2_rate: u32,
+}
+
+/// A standalone per-device sender for an *ungrouped* (idle) sendspin device,
+/// kept alive in per-device mode so the device is always reachable — e.g. for an
+/// announcement to an idle speaker — without a cold start. It owns its own silent
+/// `null-audio-sink` (nothing routed in → its monitor is silence), captured and
+/// streamed to the one device; the overlay mixer replaces that silence with a
+/// ducked announcement when one is targeted at it. Superseded by the device's
+/// group sender the moment it's routed into a group.
+struct IdleSender {
+    sink_node_name: String,
+    sink_node_id: u32,
+    port: u16,
+    _server: SendspinServerHandle,
 }
 
 #[derive(Default)]
 pub struct GroupReconciler {
     /// Keyed by the group's source-set (sorted sources joined by `KEY_SEP`).
     running: HashMap<String, RunningGroup>,
+    /// Standalone senders for ungrouped devices (per-device mode only), keyed by
+    /// device node name.
+    idle_senders: HashMap<String, IdleSender>,
 }
+
+/// Distinctive sink-name prefix for an idle device's private sink. Deliberately
+/// not `sendspin-dev-`/`ap2-dev-`/`sync-grp-` so routing never treats it as an
+/// output or anchor.
+const IDLE_SINK_PREFIX: &str = "idle-dev-";
 
 /// Shared handle so the alignment API (calibrate.rs) can read the live group
 /// layout the reconcile task owns.
@@ -123,8 +150,9 @@ pub struct GroupSnapshot {
     pub anchor_node_id: u32,
     /// Present sendspin device node names in the group.
     pub sendspin_members: Vec<String>,
-    /// Present RAOP output node names in the group.
-    pub raop_members: Vec<String>,
+    /// Present AP2 receiver node names in the group (alignable by muting +
+    /// tuning each one's live render delay).
+    pub ap2_members: Vec<String>,
 }
 
 impl GroupReconciler {
@@ -154,7 +182,7 @@ impl GroupReconciler {
                 sources: key.split(KEY_SEP).map(str::to_string).collect(),
                 anchor_node_id: g.anchor_node_id,
                 sendspin_members: g.server_devices.clone(),
-                raop_members: g.raop_members.clone(),
+                ap2_members: g.ap2_members.clone(),
             })
             .collect()
     }
@@ -173,17 +201,17 @@ fn source_key(sources: &BTreeSet<&str>) -> String {
     sources.iter().copied().collect::<Vec<_>>().join(&KEY_SEP.to_string())
 }
 
-/// Compute the groups the current intent + live devices/outputs call for.
+/// Compute the groups the current intent + live devices call for.
 ///
 /// A group is materialized (gets an anchor) as soon as it has a live consumer
-/// that needs one: a present sendspin device, or a present RAOP output that
-/// `routing::raop_uses_anchor` puts on the anchor. Members are grouped by their
-/// exact source-set, so a sendspin device and a RAOP output fed from the same
-/// sources land in one group and share its clock.
+/// that needs one: a present sendspin device or a present AP2 receiver. Members
+/// are grouped by their exact source-set, so a sendspin device and an AP2
+/// receiver fed from the same sources land in one group and share its clock.
 fn compute_desired(
     intent: &[RoutingLink],
     devices: &BTreeMap<String, SendspinDevice>,
-    present_raop: &BTreeSet<String>,
+    ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
+    ap2_latencies: &BTreeMap<String, u16>,
 ) -> BTreeMap<String, DesiredGroup> {
     let mut groups: BTreeMap<String, DesiredGroup> = BTreeMap::new();
 
@@ -198,24 +226,21 @@ fn compute_desired(
         g.sendspin_fullnames.insert(dev.fullname.clone());
     }
 
-    // Present RAOP outputs that use the anchor → members of their group.
-    let raop_outputs: BTreeSet<&str> =
-        intent.iter().map(|l| l.output.as_str()).filter(|o| o.starts_with(RAOP_NODE_PREFIX)).collect();
-    for raop in raop_outputs {
-        if !present_raop.contains(raop) || !routing::raop_uses_anchor(intent, raop) {
-            continue;
-        }
-        let sources = routing::source_set_of(intent, raop);
+    // Present AP2 receivers (with a resolved address) → members of their group.
+    // Mirrors the sendspin loop; the audio path is built in reconcile step (e).
+    for (dev_node, dev) in ap2_devices {
+        let Some(addr) = dev.addr else { continue };
+        let sources = routing::source_set_of(intent, dev_node);
         if sources.is_empty() {
             continue;
         }
         let g = groups.entry(source_key(&sources)).or_insert_with(|| DesiredGroup::new(&sources));
-        g.raop_node_names.push(raop.to_string());
+        g.ap2_members.push((dev_node.clone(), addr.ip(), ap2_latencies.get(dev_node).copied()));
     }
 
     for g in groups.values_mut() {
         g.sendspin_node_names.sort();
-        g.raop_node_names.sort();
+        g.ap2_members.sort();
     }
     groups
 }
@@ -225,9 +250,13 @@ impl GroupReconciler {
         Self::default()
     }
 
-    /// Lowest free port at/above the base not used by a running group.
-    fn alloc_port(&self) -> u16 {
-        let used: HashSet<u16> = self.running.values().map(|g| g.port).collect();
+    /// Lowest free port at/above the base not used by a running group or idle
+    /// sender. `extra` lets a caller reserve ports it's about to assign in the
+    /// same reconcile pass (before they land in `running`/`idle_senders`).
+    fn alloc_port(&self, extra: &HashSet<u16>) -> u16 {
+        let mut used: HashSet<u16> = self.running.values().map(|g| g.port).collect();
+        used.extend(self.idle_senders.values().map(|s| s.port));
+        used.extend(extra.iter().copied());
         let mut port = GROUP_BASE_PORT;
         while used.contains(&port) {
             port += 1;
@@ -245,15 +274,29 @@ impl GroupReconciler {
         devices: &SharedSendspinDevices,
         control: &crate::sendspin_volume::SharedSendspinControl,
         send_ahead_us: i64,
-        per_device_senders: bool,
+        ap2_devices: &crate::ap2_discovery::SharedAp2Devices,
+        ap2_ptp: &crate::ap2_ptp::SharedAp2Ptp,
+        sync_settings: &crate::sync_settings::SharedSyncSettings,
+        ap2_control: &crate::ap2_volume::SharedAp2Control,
     ) {
         let intent = routing_store::snapshot(routing);
         let devices_map = devices.lock_recover().clone();
-        let present_raop: BTreeSet<String> = {
-            let st = pw.lock_recover();
-            st.nodes.values().filter(|n| n.node_name.starts_with(RAOP_NODE_PREFIX)).map(|n| n.node_name.clone()).collect()
-        };
-        let desired = compute_desired(&intent, &devices_map, &present_raop);
+        let ap2_map = ap2_devices.lock_recover().clone();
+        let ap2_latencies = sync_settings.lock_recover().ap2_latencies();
+        let mut desired = compute_desired(&intent, &devices_map, &ap2_map, &ap2_latencies);
+
+        // Resolve each group's AP2 capture/wire rate from the per-output rate mode
+        // + learned capability cache (48000 iff every member's effective rate is
+        // 48000, else 44100). Done here (not in compute_desired) so the rate logic
+        // stays with the settings store.
+        {
+            let ss = sync_settings.lock_recover();
+            for d in desired.values_mut() {
+                if !d.ap2_members.is_empty() {
+                    d.ap2_rate = ss.ap2_group_rate(d.ap2_members.iter().map(|(n, _, _)| n.as_str()));
+                }
+            }
+        }
 
         // 1. Tear down groups no longer desired (server first, then the anchor —
         //    destroying the anchor node takes its source/monitor links with it).
@@ -261,14 +304,35 @@ impl GroupReconciler {
         for key in stale {
             if let Some(rg) = self.running.remove(&key) {
                 tracing::info!(
-                    "tearing down sync group {} ({} sendspin, {} raop)",
+                    "tearing down sync group {} ({} sendspin, {} ap2)",
                     rg.anchor_node_name,
                     rg.server_devices.len(),
-                    rg.raop_members.len()
+                    rg.ap2_members.len()
                 );
                 drop(rg.server);
+                drop(rg.ap2_sender); // signals AP2 senders to TEARDOWN their receivers
                 let (tx, rx) = oneshot::channel();
                 if pw_cmd.send(PwCommand::DestroySinkNode { node_id: rg.anchor_node_id, reply: tx }).is_ok() {
+                    let _ = rx.await;
+                }
+            }
+        }
+
+        // 1b. Idle-sender teardown. Every discovered device that isn't in a group
+        //     keeps a standalone sender (so it's always reachable — e.g.
+        //     announcements to an idle speaker). Drop the sender of any device that
+        //     is now grouped or gone, BEFORE the group servers below dial, so a
+        //     newly-grouped device isn't dialed by both its idle sender and its
+        //     group at once.
+        let grouped: HashSet<String> = desired.values().flat_map(|d| d.sendspin_node_names.iter().cloned()).collect();
+        let want_idle: HashSet<String> = devices_map.keys().filter(|d| !grouped.contains(*d)).cloned().collect();
+        let drop_idle: Vec<String> = self.idle_senders.keys().filter(|d| !want_idle.contains(*d)).cloned().collect();
+        for dev in drop_idle {
+            if let Some(s) = self.idle_senders.remove(&dev) {
+                tracing::info!("idle sender '{}' torn down (device grouped or gone)", s.sink_node_name);
+                drop(s._server);
+                let (tx, rx) = oneshot::channel();
+                if pw_cmd.send(PwCommand::DestroySinkNode { node_id: s.sink_node_id, reply: tx }).is_ok() {
                     let _ = rx.await;
                 }
             }
@@ -295,7 +359,7 @@ impl GroupReconciler {
                     tracing::warn!("sync anchor '{anchor_node_name}' did not appear in the graph in time");
                     continue; // a later reconcile retries once it shows up
                 };
-                let port = self.alloc_port();
+                let port = self.alloc_port(&HashSet::new());
                 tracing::info!("created sync anchor '{anchor_node_name}' (id {anchor_node_id}) for source(s) {:?}", d.sources);
                 self.running.insert(
                     key.clone(),
@@ -305,17 +369,18 @@ impl GroupReconciler {
                         port,
                         server: None,
                         server_devices: Vec::new(),
-                        per_device: per_device_senders,
-                        raop_members: Vec::new(),
+                        ap2_sender: None,
+                        ap2_members: Vec::new(),
+                        ap2_rate: 48_000,
                     },
                 );
             }
 
             // Snapshot what we need so no borrow of `self.running` is held across
             // an await (the async link/server calls below).
-            let (anchor_name, anchor_id, port, prev_devices, prev_per_device, prev_raop) = {
+            let (anchor_name, anchor_id, port, prev_devices, prev_ap2, prev_ap2_rate) = {
                 let rg = self.running.get(key).expect("just inserted");
-                (rg.anchor_node_name.clone(), rg.anchor_node_id, rg.port, rg.server_devices.clone(), rg.per_device, rg.raop_members.clone())
+                (rg.anchor_node_name.clone(), rg.anchor_node_id, rg.port, rg.server_devices.clone(), rg.ap2_members.clone(), rg.ap2_rate)
             };
 
             // b. Wire each source into the anchor (idempotent).
@@ -323,56 +388,39 @@ impl GroupReconciler {
                 routing::ensure_link_by_name(pw, pw_cmd, source, &anchor_name).await;
             }
 
-            // c. (Re)start the sendspin server when the dialed-device set changes,
-            //    OR when the per-device-senders mode flips. The dial filter and the
-            //    topology are fixed at start, so either change means drop-and-
-            //    recreate — but only the server, not the anchor, so the RAOP outputs
-            //    fed from the same anchor never blip.
-            if d.sendspin_node_names != prev_devices || per_device_senders != prev_per_device {
+            // c. (Re)start the group's sendspin server when its dialed-device set
+            //    changes. Each device is its own single-member sender sharing one
+            //    timeline off the anchor capture, so a device can be ducked/overlaid
+            //    independently while staying in sync (see sendspin_server). The dial
+            //    filter is fixed at start, so a membership change means drop-and-
+            //    recreate — the server only, not the anchor, so RAOP outputs fed
+            //    from the same anchor never blip.
+            if d.sendspin_node_names != prev_devices {
                 if let Some(rg) = self.running.get_mut(key) {
                     rg.server = None; // drop old server (stops its capture/dial)
                     rg.server_devices = Vec::new();
                 }
                 if !d.sendspin_node_names.is_empty() {
-                    // Per-device senders (experimental, O-B) vs one shared Group.
-                    // Both attach to the same anchor + capture; only the topology
-                    // differs (see sendspin_server).
-                    let started = if per_device_senders {
-                        sendspin_server::start_server_per_device(
-                            &anchor_name,
-                            &group_display(d),
-                            port,
-                            anchor_id,
-                            d.sendspin_fullnames.clone(),
-                            send_ahead_us,
-                            control.clone(),
-                            devices.clone(),
-                        )
-                        .await
-                    } else {
-                        sendspin_server::start_server(
-                            &anchor_name,
-                            &group_display(d),
-                            port,
-                            anchor_id,
-                            Some(d.sendspin_fullnames.clone()),
-                            Some(send_ahead_us),
-                            control.clone(),
-                            devices.clone(),
-                        )
-                        .await
-                    };
-                    match started {
+                    match sendspin_server::start_server_per_device(
+                        &anchor_name,
+                        &group_display(d),
+                        port,
+                        anchor_id,
+                        d.sendspin_fullnames.clone(),
+                        send_ahead_us,
+                        control.clone(),
+                        devices.clone(),
+                    )
+                    .await
+                    {
                         Ok(handle) => {
                             tracing::info!(
-                                "sync group '{anchor_name}': sendspin server on port {port} dialing {} device(s){}",
-                                d.sendspin_node_names.len(),
-                                if per_device_senders { " (per-device senders)" } else { "" }
+                                "sync group '{anchor_name}': per-device senders on port {port} dialing {} device(s)",
+                                d.sendspin_node_names.len()
                             );
                             if let Some(rg) = self.running.get_mut(key) {
                                 rg.server = Some(handle);
                                 rg.server_devices = d.sendspin_node_names.clone();
-                                rg.per_device = per_device_senders;
                             }
                         }
                         Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start sendspin server: {e}"),
@@ -380,22 +428,98 @@ impl GroupReconciler {
                 }
             }
 
-            // d. RAOP monitor links: attach newly-joined outputs, detach departed
-            //    ones (idempotent both ways).
-            for raop in &d.raop_node_names {
-                if !prev_raop.contains(raop) {
-                    tracing::info!("sync group '{anchor_name}': attaching RAOP output '{raop}'");
+            // d. (Re)start AP2 senders when the receiver set changes. Like sendspin,
+            //    each per-device Connection is fixed at start, so a change means
+            //    drop-and-recreate — only the senders, never the shared anchor.
+            // Identity is the receiver SET + the negotiated group rate — a
+            // membership change or a rate change (UI mode switch / cached 48→44.1
+            // downgrade) restarts the senders. Render delay is intentionally NOT in
+            // the identity: it's retuned live (ap2_control → SetRenderDelay), so a
+            // delay edit never reconnects (that churn could silence a flaky receiver).
+            let ap2_identity: Vec<String> =
+                d.ap2_members.iter().map(|(n, _, _)| n.clone()).collect();
+            if ap2_identity != prev_ap2 || d.ap2_rate != prev_ap2_rate {
+                if let Some(rg) = self.running.get_mut(key) {
+                    rg.ap2_sender = None; // drop → TEARDOWN old receiver sessions
+                    rg.ap2_members = Vec::new();
                 }
-                routing::ensure_monitor_link_by_name(pw, pw_cmd, &anchor_name, raop).await;
-            }
-            for raop in &prev_raop {
-                if !d.raop_node_names.contains(raop) {
-                    tracing::info!("sync group '{anchor_name}': detaching RAOP output '{raop}'");
-                    routing::destroy_links_between(pw, pw_cmd, &anchor_name, raop).await;
+                if !d.ap2_members.is_empty() {
+                    // Receivers are already PTP peers of the host-global grandmaster
+                    // (registered at discovery); ensure it's up and get its clock id.
+                    match ap2_ptp.ensure_started() {
+                        Ok(clock_id) => match crate::ap2_server::start(d.ap2_members.clone(), anchor_id, clock_id, ap2_control.clone(), d.ap2_rate, sync_settings.clone()) {
+                            Ok(handle) => {
+                                tracing::info!(
+                                    "sync group '{anchor_name}': AP2 senders streaming to {} receiver(s) @ {} Hz",
+                                    d.ap2_members.len(), d.ap2_rate
+                                );
+                                if let Some(rg) = self.running.get_mut(key) {
+                                    rg.ap2_sender = Some(handle);
+                                    rg.ap2_members = ap2_identity;
+                                    rg.ap2_rate = d.ap2_rate;
+                                }
+                            }
+                            Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start AP2 senders: {e}"),
+                        },
+                        Err(e) => tracing::warn!("sync group '{anchor_name}': AP2 PTP grandmaster unavailable: {e}"),
+                    }
                 }
             }
-            if let Some(rg) = self.running.get_mut(key) {
-                rg.raop_members = d.raop_node_names.clone();
+        }
+
+        // 3. Idle-sender creation (per-device mode): stand up a standalone sender
+        //    for every ungrouped device that doesn't have one, so it's always
+        //    reachable. Its own silent sink → it streams silence until the overlay
+        //    mixer injects an announcement, then falls back to silence.
+        for dev in &want_idle {
+            if self.idle_senders.contains_key(dev) {
+                continue;
+            }
+            let Some(fullname) = devices_map.get(dev).map(|d| d.fullname.clone()) else {
+                continue;
+            };
+            let suffix = dev.strip_prefix(crate::config::SENDSPIN_DEV_PREFIX).unwrap_or(dev);
+            let sink_node_name = format!("{IDLE_SINK_PREFIX}{suffix}");
+            let (tx, rx) = oneshot::channel();
+            if pw_cmd.send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx }).is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(Ok(())) => {}
+                _ => {
+                    tracing::warn!("idle sender: failed to create sink '{sink_node_name}'");
+                    continue;
+                }
+            }
+            let Some(sink_node_id) = wait_for_node(pw, &sink_node_name).await else {
+                tracing::warn!("idle sender: sink '{sink_node_name}' did not appear");
+                continue;
+            };
+            let port = self.alloc_port(&HashSet::new());
+            let filter = std::collections::HashSet::from([fullname]);
+            match sendspin_server::start_server_per_device(
+                &sink_node_name,
+                &format!("idle: {}", routing::output_display_name(dev)),
+                port,
+                sink_node_id,
+                filter,
+                send_ahead_us,
+                control.clone(),
+                devices.clone(),
+            )
+            .await
+            {
+                Ok(server) => {
+                    tracing::info!("idle sender for '{dev}' up on port {port} (silence until announced)");
+                    self.idle_senders.insert(dev.clone(), IdleSender { sink_node_name, sink_node_id, port, _server: server });
+                }
+                Err(e) => {
+                    tracing::warn!("idle sender for '{dev}': failed to start: {e}");
+                    let (t, r) = oneshot::channel();
+                    if pw_cmd.send(PwCommand::DestroySinkNode { node_id: sink_node_id, reply: t }).is_ok() {
+                        let _ = r.await;
+                    }
+                }
             }
         }
     }
@@ -403,12 +527,7 @@ impl GroupReconciler {
 
 /// A short human label for a group's embedded server / logs.
 fn group_display(d: &DesiredGroup) -> String {
-    let names: Vec<String> = d
-        .sendspin_node_names
-        .iter()
-        .chain(d.raop_node_names.iter())
-        .map(|n| routing::output_display_name(n))
-        .collect();
+    let names: Vec<String> = d.sendspin_node_names.iter().map(|n| routing::output_display_name(n)).collect();
     format!("group: {}", names.join(", "))
 }
 

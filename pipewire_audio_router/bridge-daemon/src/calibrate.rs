@@ -13,24 +13,20 @@
 //! be ambiguous once a member's delay approaches the click spacing — you can't
 //! tell which click you're lining up. The A/B alternation disambiguates: a
 //! target that has slipped a whole click lands its A on the reference's B, which
-//! is audibly wrong, so offsets up to ~2 s (covering RAOP's ~1.5 s max) are
-//! unmistakable.
+//! is audibly wrong, so offsets up to ~2 s are unmistakable.
 //!
 //! ## Why it's server-owned
 //!
-//! The session mutes the non-audible members (per-device sendspin volume / RAOP
-//! node volume) and runs a looping player into the group's sync anchor. If that
-//! lived in the browser, a closed tab would leave speakers muted and a click
-//! looping forever. So the daemon owns it: it snapshots volumes on start,
-//! restores them on stop, and arms a safety timeout that tears the session down
-//! if the UI goes away.
+//! The session mutes the non-audible members (per-device sendspin volume) and
+//! runs a looping player into the group's sync anchor. If that lived in the
+//! browser, a closed tab would leave speakers muted and a click looping forever.
+//! So the daemon owns it: it snapshots volumes on start, restores them on stop,
+//! and arms a safety timeout that tears the session down if the UI goes away.
 //!
-//! Adjusting a member's offset reuses the existing knobs (sendspin static delay
-//! — live; RAOP `raop.latency.ms` — reloads the sink, a brief gap), so this
-//! module only owns playback + muting, not the persisted offsets.
+//! Adjusting a member's offset reuses the existing knobs (sendspin static
+//! delay), so this module only owns playback + muting, not the persisted offsets.
 
-use crate::locks::LockRecover;
-use crate::pw_thread::SharedState;
+use crate::ap2_volume::SharedAp2Control;
 use crate::sendspin_volume::SharedSendspinControl;
 use crate::sync_group::SharedGroups;
 use serde::Serialize;
@@ -94,14 +90,16 @@ fn click_sample(i: usize, n: usize, freq: f64) -> f64 {
 #[serde(rename_all = "snake_case")]
 pub enum MemberKind {
     Sendspin,
-    Raop,
+    Airplay2,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AlignMember {
     pub node_name: String,
     pub kind: MemberKind,
-    /// Live PipeWire node id (RAOP members only) — for muting; `None` sendspin.
+    /// Unused for the current member kinds (sendspin + AP2 are both virtual and
+    /// muted in-band, not by PipeWire node id). Always `None`; kept for the API
+    /// shape.
     pub node_id: Option<u32>,
 }
 
@@ -143,7 +141,6 @@ struct Session {
     stop: Arc<AtomicBool>,
     /// Volumes captured on start, restored on teardown.
     saved_sendspin: HashMap<String, u8>,
-    saved_raop: HashMap<u32, f32>,
 }
 
 impl Session {
@@ -168,8 +165,8 @@ impl Session {
 #[derive(Clone)]
 pub struct AlignManager {
     session: Arc<tokio::sync::Mutex<Option<Session>>>,
-    pw: SharedState,
     sendspin: SharedSendspinControl,
+    ap2: SharedAp2Control,
     groups: SharedGroups,
     click: Arc<Vec<u8>>,
 }
@@ -183,23 +180,21 @@ fn same_set(a: &[String], b: &[String]) -> bool {
 }
 
 impl AlignManager {
-    pub fn new(pw: SharedState, sendspin: SharedSendspinControl, groups: SharedGroups) -> Self {
-        Self { session: Arc::new(tokio::sync::Mutex::new(None)), pw, sendspin, groups, click: Arc::new(click_wav()) }
+    pub fn new(sendspin: SharedSendspinControl, ap2: SharedAp2Control, groups: SharedGroups) -> Self {
+        Self { session: Arc::new(tokio::sync::Mutex::new(None)), sendspin, ap2, groups, click: Arc::new(click_wav()) }
     }
 
     /// Build member lists for every running group (the picker's source of truth).
     pub async fn groups(&self) -> Vec<AlignGroup> {
         let snap = self.groups.lock().await.snapshot();
-        let pw = self.pw.lock_recover();
         snap.into_iter()
             .map(|g| {
                 let mut members = Vec::new();
                 for n in g.sendspin_members {
                     members.push(AlignMember { node_name: n, kind: MemberKind::Sendspin, node_id: None });
                 }
-                for n in g.raop_members {
-                    let node_id = crate::routing::node_id_for(&pw, &n);
-                    members.push(AlignMember { node_name: n, kind: MemberKind::Raop, node_id });
+                for n in g.ap2_members {
+                    members.push(AlignMember { node_name: n, kind: MemberKind::Airplay2, node_id: None });
                 }
                 AlignGroup { sources: g.sources, members }
             })
@@ -230,11 +225,8 @@ impl AlignManager {
         for n in &group.sendspin_members {
             members.push(AlignMember { node_name: n.clone(), kind: MemberKind::Sendspin, node_id: None });
         }
-        {
-            let pw = self.pw.lock_recover();
-            for n in &group.raop_members {
-                members.push(AlignMember { node_name: n.clone(), kind: MemberKind::Raop, node_id: crate::routing::node_id_for(&pw, n) });
-            }
+        for n in &group.ap2_members {
+            members.push(AlignMember { node_name: n.clone(), kind: MemberKind::Airplay2, node_id: None });
         }
         if members.len() < 2 {
             return Err("a group needs at least two present members to align".to_string());
@@ -247,14 +239,6 @@ impl AlignManager {
             for m in &members {
                 if m.kind == MemberKind::Sendspin {
                     saved_sendspin.insert(m.node_name.clone(), vols.get(&m.node_name).copied().unwrap_or(100));
-                }
-            }
-        }
-        let mut saved_raop = HashMap::new();
-        for m in &members {
-            if let (MemberKind::Raop, Some(id)) = (m.kind, m.node_id) {
-                if let Ok(Some(v)) = crate::volume::get_volume(id).await {
-                    saved_raop.insert(id, v);
                 }
             }
         }
@@ -281,7 +265,6 @@ impl AlignManager {
             volume: DEFAULT_CAL_VOLUME,
             stop: stop.clone(),
             saved_sendspin,
-            saved_raop,
         };
         self.apply_audibility(&session.members, session.reference.as_deref(), session.target.as_deref(), session.volume).await;
         let state = session.state();
@@ -334,9 +317,11 @@ impl AlignManager {
         AlignState::inactive()
     }
 
-    /// Solo the reference + target at `volume`; mute everything else. Sendspin
-    /// uses the protocol Mute command (leaving the stored volume intact); RAOP
-    /// uses the sink node volume (0 to mute).
+    /// Solo the reference + target; mute everything else. Both member kinds mute
+    /// in-band, leaving the stored/device volume intact so unmute restores it:
+    /// sendspin via the protocol Mute (+ a calibration playback level), AP2 via
+    /// the device-authoritative mute (`ap2_control`; we deliberately do NOT
+    /// impose a volume on AP2 — its level stays device-authoritative).
     async fn apply_audibility(&self, members: &[AlignMember], reference: Option<&str>, target: Option<&str>, volume: u8) {
         for m in members {
             let audible = reference == Some(m.node_name.as_str()) || target == Some(m.node_name.as_str());
@@ -348,23 +333,16 @@ impl AlignManager {
                         c.set_volume(&m.node_name, volume).await;
                     }
                 }
-                MemberKind::Raop => {
-                    if let Some(id) = self.raop_node_id(m) {
-                        let v = if audible { f32::from(volume) / 100.0 } else { 0.0 };
-                        let _ = crate::volume::set_volume(id, v).await;
-                    }
+                MemberKind::Airplay2 => {
+                    self.ap2.lock().await.set_muted(&m.node_name, !audible).await;
                 }
             }
         }
     }
 
-    /// A RAOP member's live node id, re-resolving against the graph if it wasn't
-    /// known at session start (e.g. the sink was reloading).
-    fn raop_node_id(&self, m: &AlignMember) -> Option<u32> {
-        m.node_id.or_else(|| crate::routing::node_id_for(&self.pw.lock_recover(), &m.node_name))
-    }
-
-    /// Stop playback, unmute every sendspin member, and restore saved volumes.
+    /// Stop playback, unmute every member, and restore saved sendspin volumes.
+    /// (AP2 needs no volume restore — unmuting via `ap2_control` returns each
+    /// receiver to its device-authoritative level.)
     async fn teardown(&self, session: Session) {
         session.stop.store(true, Ordering::Relaxed);
         {
@@ -378,8 +356,13 @@ impl AlignManager {
                 c.set_volume(n, *v).await;
             }
         }
-        for (id, v) in &session.saved_raop {
-            let _ = crate::volume::set_volume(*id, *v).await;
+        {
+            let mut c = self.ap2.lock().await;
+            for m in &session.members {
+                if m.kind == MemberKind::Airplay2 {
+                    c.set_muted(&m.node_name, false).await;
+                }
+            }
         }
     }
 

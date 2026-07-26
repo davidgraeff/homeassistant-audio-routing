@@ -16,13 +16,11 @@
 //!   (`PlayerCommandType::SetStaticDelay`), for trimming an individual speaker
 //!   that's consistently early/late relative to the rest of its group. Applied
 //!   in-band by the sendspin server on (re)connect (sendspin_volume.rs).
-//! - **`raop_latency`** — the RAOP counterpart of `sendspin_delays`: a per-output
-//!   `raop.latency.ms` in ms, keyed by RAOP node name. It's a module-load
-//!   argument (not a live push), so it's applied when the `raop-sink` is loaded —
-//!   for **both** manually-added and mDNS-discovered receivers, keyed by the same
-//!   stable node name so a device's calibration survives it going offline and
-//!   being rediscovered. RAOP's own default is a hefty 1500 ms; lower it toward a
-//!   group's other members for a snappier start.
+//! - **`ap2_latency`** — the AirPlay-2 per-output render delay in ms (the PT=87
+//!   anchor shift; ap2_server.rs), keyed by AP2 node name. It's retuned LIVE on
+//!   the running stream (ap2_control → SetRenderDelay), and used as the initial
+//!   delay on the next (membership/rate) reconnect. `None` = the sender's
+//!   built-in default (1500 ms).
 //!
 //! Mirrors the other `/data` stores: no `options.json` seeding, the file is
 //! authoritative and created on first mutation; a missing file means defaults.
@@ -48,14 +46,48 @@ struct SyncConfig {
     /// Per-sendspin-device static delay (ms), keyed by virtual device node name.
     #[serde(default)]
     sendspin_delays: BTreeMap<String, u16>,
-    /// Per-RAOP-output `raop.latency.ms` (ms), keyed by RAOP node name.
+    /// Per-AP2-output render delay (ms), keyed by AP2 node name.
     #[serde(default)]
-    raop_latency: BTreeMap<String, u16>,
+    ap2_latency: BTreeMap<String, u16>,
+    /// Per-AP2-output wire sample-rate MODE (user choice), keyed by AP2 node name.
+    /// Absent ⇒ `Auto`. `Auto` negotiates 48 kHz and falls back to 44.1 kHz;
+    /// `Fixed44100` forces the AirPlay-standard 44.1 kHz (for receivers that
+    /// misbehave at 48 kHz).
+    #[serde(default)]
+    ap2_rate_mode: BTreeMap<String, Ap2RateMode>,
+    /// Per-AP2-device LEARNED capability cache (Hz), keyed by AP2 node name: the
+    /// last successfully-negotiated rate, or 44100 if a 48 kHz SETUP was rejected.
+    /// Absent ⇒ untested (Auto optimistically tries 48 kHz). Persisted so we don't
+    /// re-probe a known-44.1k-only receiver on every connect.
+    #[serde(default)]
+    ap2_rate_cap: BTreeMap<String, u32>,
+}
+
+/// Per-AP2-output sample-rate mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ap2RateMode {
+    /// Negotiate 48 kHz, fall back to 44.1 kHz on rejection (default).
+    Auto,
+    /// Force 44.1 kHz (AirPlay standard).
+    Fixed44100,
+}
+
+impl Default for Ap2RateMode {
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self { group_lead_ms: DEFAULT_GROUP_LEAD_MS, sendspin_delays: BTreeMap::new(), raop_latency: BTreeMap::new() }
+        Self {
+            group_lead_ms: DEFAULT_GROUP_LEAD_MS,
+            sendspin_delays: BTreeMap::new(),
+            ap2_latency: BTreeMap::new(),
+            ap2_rate_mode: BTreeMap::new(),
+            ap2_rate_cap: BTreeMap::new(),
+        }
     }
 }
 
@@ -107,28 +139,81 @@ impl SyncSettings {
         self.persist()
     }
 
-    /// The configured `raop.latency.ms` for a RAOP node, if any (`None` = the
-    /// module default).
-    pub fn raop_latency(&self, node_name: &str) -> Option<u16> {
-        self.config.raop_latency.get(node_name).copied()
+    /// The configured render delay (ms) for an AP2 node, if any (`None` = the
+    /// sender's built-in default).
+    pub fn ap2_latency(&self, node_name: &str) -> Option<u16> {
+        self.config.ap2_latency.get(node_name).copied()
     }
 
-    /// Desired per-output RAOP latencies (ms) by node name.
-    pub fn raop_latencies(&self) -> BTreeMap<String, u16> {
-        self.config.raop_latency.clone()
+    /// Desired per-output AP2 render delays (ms) by node name.
+    pub fn ap2_latencies(&self) -> BTreeMap<String, u16> {
+        self.config.ap2_latency.clone()
     }
 
-    /// Set (or clear, when `ms` is `None`) a RAOP output's latency and persist.
-    pub fn set_raop_latency(&mut self, node_name: &str, ms: Option<u16>) -> anyhow::Result<()> {
+    /// Set (or clear, when `ms` is `None`) an AP2 output's render delay and persist.
+    pub fn set_ap2_latency(&mut self, node_name: &str, ms: Option<u16>) -> anyhow::Result<()> {
         match ms {
             None => {
-                self.config.raop_latency.remove(node_name);
+                self.config.ap2_latency.remove(node_name);
             }
             Some(ms) => {
-                self.config.raop_latency.insert(node_name.to_string(), ms);
+                self.config.ap2_latency.insert(node_name.to_string(), ms);
             }
         }
         self.persist()
+    }
+
+    // ---- AP2 sample rate (mode + learned cache) --------------------------
+
+    /// The user-chosen rate mode for an AP2 output (default [`Ap2RateMode::Auto`]).
+    pub fn ap2_rate_mode(&self, node_name: &str) -> Ap2RateMode {
+        self.config.ap2_rate_mode.get(node_name).copied().unwrap_or_default()
+    }
+
+    /// All explicitly-set AP2 rate modes (for the UI/outputs listing).
+    pub fn ap2_rate_modes(&self) -> BTreeMap<String, Ap2RateMode> {
+        self.config.ap2_rate_mode.clone()
+    }
+
+    /// Set an AP2 output's rate mode and persist. Setting `Auto` also clears any
+    /// learned cap so the next connect re-probes 48 kHz.
+    pub fn set_ap2_rate_mode(&mut self, node_name: &str, mode: Ap2RateMode) -> anyhow::Result<()> {
+        self.config.ap2_rate_mode.insert(node_name.to_string(), mode);
+        if mode == Ap2RateMode::Auto {
+            self.config.ap2_rate_cap.remove(node_name);
+        }
+        self.persist()
+    }
+
+    /// Record the outcome of a rate negotiation (48000 = 48 kHz worked, 44100 =
+    /// 48 kHz was rejected) so we don't re-probe. Persisted. No-op if unchanged.
+    pub fn set_ap2_rate_cap(&mut self, node_name: &str, rate: u32) -> anyhow::Result<()> {
+        if self.config.ap2_rate_cap.get(node_name) == Some(&rate) {
+            return Ok(());
+        }
+        self.config.ap2_rate_cap.insert(node_name.to_string(), rate);
+        self.persist()
+    }
+
+    /// The effective wire rate for one AP2 output: `Fixed44100` ⇒ 44100; `Auto` ⇒
+    /// the learned cap (44100 if a prior 48 kHz SETUP was rejected), else 48000
+    /// (optimistic — untested Auto devices try 48 kHz first).
+    pub fn ap2_effective_rate(&self, node_name: &str) -> u32 {
+        match self.ap2_rate_mode(node_name) {
+            Ap2RateMode::Fixed44100 => 44_100,
+            Ap2RateMode::Auto => self.config.ap2_rate_cap.get(node_name).copied().unwrap_or(48_000),
+        }
+    }
+
+    /// The capture/wire rate for a whole AP2 group: 48000 iff EVERY member's
+    /// effective rate is 48000, else 44100 (one capture serves the group, so any
+    /// 44.1k member pulls the group to 44.1 kHz).
+    pub fn ap2_group_rate<'a>(&self, members: impl IntoIterator<Item = &'a str>) -> u32 {
+        if members.into_iter().all(|n| self.ap2_effective_rate(n) == 48_000) {
+            48_000
+        } else {
+            44_100
+        }
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -166,10 +251,12 @@ mod tests {
         assert_eq!(s.group_lead_us(), 250_000);
         s.set_group_lead_ms(600).unwrap();
         s.set_sendspin_delay("sendspin-dev-kitchen", 40).unwrap();
+        s.set_ap2_latency("ap2-dev-dusche", Some(800)).unwrap();
 
         let reloaded = SyncSettings::load(&path).unwrap();
         assert_eq!(reloaded.group_lead_ms(), 600);
         assert_eq!(reloaded.sendspin_delays().get("sendspin-dev-kitchen").copied(), Some(40));
+        assert_eq!(reloaded.ap2_latency("ap2-dev-dusche"), Some(800));
         let _ = std::fs::remove_file(&path);
     }
 

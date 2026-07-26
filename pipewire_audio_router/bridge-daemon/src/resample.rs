@@ -52,6 +52,39 @@ pub fn to_48k_stereo_s16le(pcm: &[u8], src_rate: u32, src_channels: u16) -> Vec<
     out
 }
 
+/// Resample interleaved 48 kHz **stereo** S16LE to `dst_rate` stereo S16LE (linear).
+/// Passthrough when `dst_rate == 48000`. Used to rate-match an announce overlay
+/// (always produced at 48 kHz) to a group's capture rate — e.g. 48k→44.1k for a
+/// receiver that only does 44.1 kHz. One-shot at announcement start, not per chunk.
+pub fn from_48k_stereo_to(pcm: &[u8], dst_rate: u32) -> Vec<u8> {
+    if dst_rate == 0 || dst_rate == TARGET_RATE || pcm.len() < 4 {
+        return pcm.to_vec();
+    }
+    let frames = pcm.len() / 4; // stereo S16 = 4 bytes/frame
+    let at = |frame: usize, c: usize| -> i16 {
+        let idx = frame * 4 + c * 2;
+        i16::from_le_bytes([pcm[idx], pcm[idx + 1]])
+    };
+    let left: Vec<i16> = (0..frames).map(|f| at(f, 0)).collect();
+    let right: Vec<i16> = (0..frames).map(|f| at(f, 1)).collect();
+    let out_frames = ((frames as u64) * dst_rate as u64 / TARGET_RATE as u64) as usize;
+    let ratio = TARGET_RATE as f64 / dst_rate as f64;
+    let interp = |chan: &[i16], of: usize| -> i16 {
+        let pos = of as f64 * ratio;
+        let i = pos.floor() as usize;
+        let frac = pos - i as f64;
+        let a = chan.get(i).copied().unwrap_or(0) as f64;
+        let b = chan.get(i + 1).copied().unwrap_or(a as i16) as f64;
+        (a + (b - a) * frac).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+    };
+    let mut out = Vec::with_capacity(out_frames * 4);
+    for of in 0..out_frames {
+        out.extend_from_slice(&interp(&left, of).to_le_bytes());
+        out.extend_from_slice(&interp(&right, of).to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

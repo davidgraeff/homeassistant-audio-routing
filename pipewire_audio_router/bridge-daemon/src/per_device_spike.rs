@@ -156,13 +156,13 @@ pub async fn start(
     //    this device.
     let filter = std::collections::HashSet::from([fullname.clone()]);
     let display = format!("per-device spike: {}", routing::output_display_name(device_node_name));
-    let server = match sendspin_server::start_server(
+    let server = match sendspin_server::start_server_per_device(
         &sink_node_name,
         &display,
         SPIKE_PORT,
         sink_node_id,
-        Some(filter),
-        Some(send_ahead_us),
+        filter,
+        send_ahead_us,
         control.clone(),
         devices.clone(),
     )

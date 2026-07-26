@@ -31,7 +31,22 @@ pub struct SendspinControl {
     /// Live connections, keyed by virtual device node name.
     senders: HashMap<String, ServerSender>,
     /// Desired volume (0–100) per virtual device node name; absent = default.
+    /// This is also the *reported* volume: a device turning its physical knob
+    /// updates this entry via [`Self::note_reported_volume`], so it tracks the
+    /// device's real level rather than only what the UI last set.
     desired: HashMap<String, u8>,
+    /// Desired mute state per virtual device node name; absent = unmuted. Like
+    /// `desired`, this is also the *reported* mute: a device muting itself
+    /// updates it via [`Self::note_reported_mute`]. Re-applied on reconnect.
+    /// Independent of volume — uses the protocol's dedicated `Mute` command, so
+    /// unmuting restores the prior level (see [`mute_cmd`]).
+    desired_muted: HashMap<String, bool>,
+    /// Fired whenever `desired` changes so the routing-matrix WebSocket rebuilds
+    /// and pushes a fresh snapshot (routing.rs) — the device→UI half of volume
+    /// sync, without the UI having to poll. Injected once at startup from main.rs
+    /// (the same broadcast every other change source nudges); `None` until then
+    /// (e.g. in unit tests), where mutations simply don't notify.
+    change_notifier: Option<crate::pw_thread::ChangeNotifier>,
     /// Desired per-device *static delay* (ms), keyed by virtual device node
     /// name; absent = no extra delay. Unlike volume this IS persisted (across
     /// restarts) by sync_settings.rs and seeded back in via [`Self::seed_delays`]
@@ -59,6 +74,36 @@ pub fn shared() -> SharedSendspinControl {
 }
 
 impl SendspinControl {
+    /// Wire up the change-notifier (main.rs, once at startup) so `desired`
+    /// mutations push a fresh routing-matrix snapshot to watching UIs.
+    pub fn set_change_notifier(&mut self, changes: crate::pw_thread::ChangeNotifier) {
+        self.change_notifier = Some(changes);
+    }
+
+    fn notify_changed(&self) {
+        if let Some(changes) = &self.change_notifier {
+            let _ = changes.send(());
+        }
+    }
+
+    /// Record a **device-reported** current volume (from an inbound `client/state`
+    /// player update — see sendspin_server.rs) as the new desired level, WITHOUT
+    /// echoing a `Volume` command back to the device. Echoing would fight a user
+    /// turning the physical knob, and re-applying our own just-sent value on the
+    /// device's confirming state emit would loop. This is the device→UI half of
+    /// volume sync: the UI reads [`Self::volumes`] over the routing WebSocket, so
+    /// a physical change now surfaces there. No-op (and no push) when the value is
+    /// unchanged, so a device's steady-state re-emits don't spam the matrix.
+    pub fn note_reported_volume(&mut self, node_name: &str, volume: u8) {
+        let volume = volume.min(100);
+        if self.desired.get(node_name) == Some(&volume) {
+            return;
+        }
+        tracing::debug!("sendspin device '{node_name}' reported volume {volume}");
+        self.desired.insert(node_name.to_string(), volume);
+        self.notify_changed();
+    }
+
     /// Register a freshly-connected device (by its virtual node name) and
     /// (re)apply its stored volume + static delay so a reconnect restores what
     /// the user set.
@@ -72,6 +117,11 @@ impl SendspinControl {
         if let Some(&ms) = self.desired_delay.get(&node_name) {
             if let Err(e) = sender.send_player_command(delay_cmd(ms)).await {
                 tracing::warn!("failed to apply stored delay {ms}ms to '{node_name}': {e}");
+            }
+        }
+        if let Some(&muted) = self.desired_muted.get(&node_name) {
+            if let Err(e) = sender.send_player_command(mute_cmd(muted)).await {
+                tracing::warn!("failed to apply stored mute {muted} to '{node_name}': {e}");
             }
         }
         self.senders.insert(node_name, sender);
@@ -117,7 +167,12 @@ impl SendspinControl {
     /// Returns true if it reached a live device (false = stored for reconnect).
     pub async fn set_volume(&mut self, node_name: &str, volume: u8) -> bool {
         let volume = volume.min(100);
-        self.desired.insert(node_name.to_string(), volume);
+        let changed = self.desired.insert(node_name.to_string(), volume) != Some(volume);
+        if changed {
+            // Push to any other watching UI (the routing WS); the caller already
+            // has the value optimistically, so this is for the second client.
+            self.notify_changed();
+        }
         if let Some(sender) = self.senders.get(node_name) {
             match sender.send_player_command(volume_cmd(volume)).await {
                 Ok(()) => return true,
@@ -130,6 +185,42 @@ impl SendspinControl {
     /// Snapshot of the desired volumes by node name (for the UI sliders).
     pub fn volumes(&self) -> HashMap<String, u8> {
         self.desired.clone()
+    }
+
+    /// Set a device's desired mute state (persisted, re-applied on reconnect) and
+    /// push it via the dedicated `Mute` command — so unmuting restores the prior
+    /// volume. Returns true if it reached a live device. Unlike the transient
+    /// [`Self::set_mute`] (alignment wizard), this is the user-facing mute the UI
+    /// toggle drives and the matrix reflects.
+    pub async fn set_muted(&mut self, node_name: &str, muted: bool) -> bool {
+        let changed = self.desired_muted.insert(node_name.to_string(), muted) != Some(muted);
+        if changed {
+            self.notify_changed();
+        }
+        if let Some(sender) = self.senders.get(node_name) {
+            match sender.send_player_command(mute_cmd(muted)).await {
+                Ok(()) => return true,
+                Err(e) => tracing::warn!("failed to set mute for '{node_name}': {e}"),
+            }
+        }
+        false
+    }
+
+    /// Record a **device-reported** mute state (from an inbound `client/state`
+    /// player update) without echoing a command back — the device→UI half of
+    /// mute sync, mirroring [`Self::note_reported_volume`]. No-op when unchanged.
+    pub fn note_reported_mute(&mut self, node_name: &str, muted: bool) {
+        if self.desired_muted.get(node_name) == Some(&muted) {
+            return;
+        }
+        tracing::debug!("sendspin device '{node_name}' reported muted={muted}");
+        self.desired_muted.insert(node_name.to_string(), muted);
+        self.notify_changed();
+    }
+
+    /// Snapshot of the desired mute state by node name (for the UI).
+    pub fn mutes(&self) -> HashMap<String, bool> {
+        self.desired_muted.clone()
     }
 
     /// Push a **transient** mute/unmute to a device if connected, using the
@@ -165,5 +256,16 @@ mod tests {
         let mut c = SendspinControl::default();
         assert!(!c.set_volume("sendspin-dev-kitchen", 40).await);
         assert_eq!(c.volumes().get("sendspin-dev-kitchen").copied(), Some(40));
+    }
+
+    #[test]
+    fn note_reported_volume_updates_desired_and_clamps() {
+        let mut c = SendspinControl::default();
+        c.note_reported_volume("sendspin-dev-kitchen", 42);
+        assert_eq!(c.volumes().get("sendspin-dev-kitchen").copied(), Some(42));
+        // A device→UI report is the same channel the UI reads, so the reported
+        // level becomes the desired level; out-of-range is clamped like set_volume.
+        c.note_reported_volume("sendspin-dev-kitchen", 200);
+        assert_eq!(c.volumes().get("sendspin-dev-kitchen").copied(), Some(100));
     }
 }

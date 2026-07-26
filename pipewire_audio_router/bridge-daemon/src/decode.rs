@@ -6,13 +6,14 @@ use crate::wav::build_wav;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
-use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 /// Decodes the file at `path` — symphonia probes the actual format from
 /// content, so it doesn't matter whether it's mp3, wav, aac, ogg, or flac
@@ -79,35 +80,43 @@ fn decode_stream_to_wav(mss: MediaSourceStream, hint: Hint) -> anyhow::Result<Ve
 /// Decode the first audio track to interleaved S16LE PCM, returning it with its
 /// native sample rate and channel count.
 fn decode_stream_to_pcm(mss: MediaSourceStream, hint: Hint) -> anyhow::Result<(Vec<u8>, u32, u16)> {
-    let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())?;
-    let mut format = probed.format;
+    let mut format =
+        symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())?;
 
     let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .first_track_known_codec(TrackType::Audio)
         .ok_or_else(|| anyhow::anyhow!("no decodable audio track found"))?;
     let track_id = track.id;
-    let sample_rate = track.codec_params.sample_rate.ok_or_else(|| anyhow::anyhow!("announce audio has no known sample rate"))?;
-    let channels = track.codec_params.channels.ok_or_else(|| anyhow::anyhow!("announce audio has no known channel layout"))?.count() as u16;
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params,
+        _ => anyhow::bail!("no decodable audio track found"),
+    };
+    let sample_rate = audio_params.sample_rate.ok_or_else(|| anyhow::anyhow!("announce audio has no known sample rate"))?;
+    let channels = audio_params
+        .channels
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("announce audio has no known channel layout"))?
+        .count() as u16;
 
-    let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+    let mut decoder = symphonia::default::get_codecs().make_audio_decoder(audio_params, &AudioDecoderOptions::default())?;
 
+    // Reused across packets so the per-packet interleave doesn't reallocate.
+    let mut scratch: Vec<i16> = Vec::new();
     let mut pcm: Vec<u8> = Vec::new();
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
             // Normal end of stream, not an error — every format eventually
-            // exhausts its packets this way.
-            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            // exhausts its packets this way (now signalled as `Ok(None)`).
+            Ok(None) => break,
             Err(SymphoniaError::ResetRequired) => break,
             Err(e) => return Err(e.into()),
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
         match decoder.decode(&packet) {
-            Ok(decoded) => append_as_i16_le(decoded, &mut pcm),
+            Ok(decoded) => append_as_i16_le(decoded, &mut scratch, &mut pcm),
             // A single bad packet shouldn't sink the whole clip — skip it
             // and keep decoding the rest.
             Err(SymphoniaError::DecodeError(_)) => continue,
@@ -127,13 +136,12 @@ fn decode_stream_to_pcm(mss: MediaSourceStream, hint: Hint) -> anyhow::Result<(V
 /// PCM, appending to `out`. Standardizing on s16 here means the WAV we
 /// build is always in the one format pw-cat/libsndfile are guaranteed to
 /// handle, regardless of the source clip's original bit depth.
-fn append_as_i16_le(decoded: AudioBufferRef, out: &mut Vec<u8>) {
-    let spec = *decoded.spec();
-    let duration = decoded.capacity() as u64;
-    let mut sample_buf = SampleBuffer::<i16>::new(duration, spec);
-    sample_buf.copy_interleaved_ref(decoded);
-    out.reserve(sample_buf.samples().len() * 2);
-    for sample in sample_buf.samples() {
+fn append_as_i16_le(decoded: GenericAudioBufferRef, scratch: &mut Vec<i16>, out: &mut Vec<u8>) {
+    // `copy_to_vec_interleaved` resizes `scratch` to this packet's interleaved
+    // sample count and converts whatever the source sample format was into i16.
+    decoded.copy_to_vec_interleaved(scratch);
+    out.reserve(scratch.len() * 2);
+    for sample in scratch.iter() {
         out.extend_from_slice(&sample.to_le_bytes());
     }
 }

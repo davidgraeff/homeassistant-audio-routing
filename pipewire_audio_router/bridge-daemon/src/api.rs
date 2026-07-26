@@ -3,11 +3,12 @@
 
 use crate::airplay_source::AirplayHandle;
 use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
-use crate::config::{RaopEncryption, RaopOutputConfig, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
+use crate::ap2_discovery::SharedAp2Devices;
+use airplay_core::features::Features;
+use crate::ap2_ptp::SharedAp2Ptp;
+use crate::config::{AP2_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
-use crate::outputs_store::OutputsStore;
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
-use crate::raop::{raop_module_args, raop_node_name, RAOP_MODULE_NAME, RAOP_NODE_PREFIX};
 use crate::routing;
 use crate::routing_store::SharedRouting;
 use crate::rtp_source::{
@@ -18,21 +19,18 @@ use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::settings_store::SharedSettings;
 use crate::sources_store::{RtpSourceConfig, SourcesStore};
 use axum::{
-    extract::{FromRef, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
-    middleware::{self, Next},
-    response::Response,
+    body::{Body, Bytes},
+    extract::{Extension, FromRef, Path, Query, State},
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use tower_http::services::ServeDir;
-
-/// Runtime-managed set of RAOP outputs, shared between the CRUD handlers.
-pub type SharedStore = Arc<Mutex<OutputsStore>>;
 
 /// Runtime config for the AirPlay and RTP sources.
 pub type SharedSources = Arc<Mutex<SourcesStore>>;
@@ -43,16 +41,14 @@ pub type SharedSources = Arc<Mutex<SourcesStore>>;
 pub type SharedAirplay = Arc<tokio::sync::Mutex<Option<AirplayHandle>>>;
 
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
-/// change-notification channel (routing.rs), the command sender for
-/// runtime module load/unload (pw_thread.rs), and the persistent outputs store.
-/// Existing handlers extract just the piece they need via `FromRef` — they
-/// don't need to know this type grew more fields.
+/// change-notification channel (routing.rs), and the command sender for runtime
+/// module load/unload (pw_thread.rs). Existing handlers extract just the piece
+/// they need via `FromRef` — they don't need to know this type grew more fields.
 #[derive(Clone)]
 pub struct AppState {
     pub pw: SharedState,
     pub changes: ChangeNotifier,
     pub pw_cmd: PwCommandSender,
-    pub store: SharedStore,
     pub sources: SharedSources,
     pub airplay: SharedAirplay,
     /// Remembered AirPlay senders (airplay_clients.rs) — the Sources-tab
@@ -67,7 +63,15 @@ pub struct AppState {
     /// Live mDNS-discovered sendspin devices (sendspin_discovery.rs), surfaced
     /// as virtual routing outputs.
     pub sendspin_devices: SharedSendspinDevices,
+    /// Live mDNS-discovered AirPlay-2 receivers (ap2_discovery.rs), surfaced as
+    /// virtual routing outputs (`ap2-dev-*`). The RAOP-output replacement.
+    pub ap2_devices: SharedAp2Devices,
+    /// The daemon's single host-global AirPlay-2 PTP grandmaster (ap2_ptp.rs),
+    /// reused by the AP2 tone spike (ap2_spike.rs) so it shares 319/320 rather
+    /// than double-binding.
+    pub ap2_ptp: SharedAp2Ptp,
     pub sendspin_control: crate::sendspin_volume::SharedSendspinControl,
+    pub ap2_control: crate::ap2_volume::SharedAp2Control,
     /// Persistent routing intent (routing_store.rs): links by stable node
     /// name, reconciled onto the live graph so routing survives node reloads
     /// and device disappearance/reappearance.
@@ -76,18 +80,17 @@ pub struct AppState {
     /// lead + per-sendspin-device static delays.
     pub sync_settings: crate::sync_settings::SharedSyncSettings,
     /// General app settings (settings_store.rs): announce default duck, mDNS
-    /// discovery on/off, default RAOP latency for new outputs.
+    /// discovery on/off.
     pub settings: SharedSettings,
     /// Runtime mDNS on/off, driven by the discovery flag above.
     pub discovery: crate::discovery_supervisor::DiscoverySupervisor,
-    /// Resolved connection details of auto-discovered RAOP receivers
-    /// (discovery.rs), so list_outputs can show their IP/Port/Encryption.
-    pub discovered: crate::discovery::SharedDiscovered,
     /// Latency-alignment session manager (calibrate.rs) for the Align page.
     pub align: crate::calibrate::AlignManager,
     /// Live sync-group layout (sync_group.rs) — used to restart a group's
     /// sendspin stream when a static-delay change needs it to take effect.
     pub groups: crate::sync_group::SharedGroups,
+    /// Named music/announcement groups (groups_store.rs) — the MG/AG data model.
+    pub groups_config: crate::groups_store::SharedGroupsStore,
     /// Add-on version string (main.rs `addon_version()`), for `/api/status`.
     pub version: String,
     /// Process start instant, for the `/api/status` uptime.
@@ -114,21 +117,23 @@ pub fn router(
     pw_state: SharedState,
     changes: ChangeNotifier,
     pw_cmd: PwCommandSender,
-    store: SharedStore,
     sources: SharedSources,
     airplay: SharedAirplay,
     airplay_clients: crate::airplay_clients::SharedAirplayClients,
     airplay_prevent_takeover: crate::airplay_source::SharedPreventTakeover,
     meters: crate::metering::SharedMeters,
     sendspin_devices: SharedSendspinDevices,
+    ap2_devices: SharedAp2Devices,
+    ap2_ptp: SharedAp2Ptp,
     routing: SharedRouting,
     sendspin_control: crate::sendspin_volume::SharedSendspinControl,
+    ap2_control: crate::ap2_volume::SharedAp2Control,
     sync_settings: crate::sync_settings::SharedSyncSettings,
     settings: SharedSettings,
     discovery: crate::discovery_supervisor::DiscoverySupervisor,
-    discovered: crate::discovery::SharedDiscovered,
     align: crate::calibrate::AlignManager,
     groups: crate::sync_group::SharedGroups,
+    groups_config: crate::groups_store::SharedGroupsStore,
     version: String,
     started: std::time::Instant,
     static_dir: PathBuf,
@@ -137,21 +142,23 @@ pub fn router(
         pw: pw_state,
         changes,
         pw_cmd,
-        store,
         sources,
         airplay,
         airplay_clients,
         airplay_prevent_takeover,
         meters,
         sendspin_devices,
+        ap2_devices,
+        ap2_ptp,
         routing,
         sendspin_control,
+        ap2_control,
         sync_settings,
         settings,
         discovery,
-        discovered,
         align,
         groups,
+        groups_config,
         version,
         started,
     };
@@ -159,9 +166,9 @@ pub fn router(
         .route("/health", get(health))
         .route("/api/nodes", get(list_nodes))
         .route("/api/links", post(create_link))
-        .route("/api/outputs", get(list_outputs).post(add_output))
-        .route("/api/outputs/:node_name", delete(remove_output).put(configure_output))
-        .route("/api/outputs/:node_name/latency", put(set_output_latency))
+        .route("/api/outputs", get(list_outputs))
+        .route("/api/outputs/{node_name}/latency", put(set_output_latency))
+        .route("/api/outputs/{node_name}/ap2-rate", put(set_ap2_rate_mode))
         .route("/api/source/airplay", get(get_airplay_source).put(set_airplay_source).delete(delete_airplay_source))
         .route("/api/source/airplay/clients", get(list_airplay_clients))
         .route("/api/source/airplay/clients/forget", post(forget_airplay_client))
@@ -172,33 +179,46 @@ pub fn router(
         .route("/api/source/rtp", get(get_rtp_source).put(set_rtp_source).delete(delete_rtp_source))
         .route("/api/sendspin/volumes", get(get_sendspin_volumes))
         .route("/api/sendspin/volume", put(set_sendspin_volume))
+        .route("/api/sendspin/mute", put(set_sendspin_mute))
+        .route("/api/ap2/volume", put(set_ap2_volume))
+        .route("/api/ap2/mute", put(set_ap2_mute))
         .route("/api/sendspin/delays", get(get_sendspin_delays))
         .route("/api/sendspin/delay", put(set_sendspin_delay_handler))
         .route("/api/sync/settings", get(get_sync_settings).put(set_sync_settings))
         .route("/api/settings", get(get_settings).put(set_settings))
         .route("/api/status", get(get_status))
+        .route("/api/spike/per-device", post(spike_per_device_start).delete(spike_per_device_stop))
+        .route("/api/spike/multi-device", post(spike_multi_device_start).delete(spike_per_device_stop))
+        .route("/api/spike/overlay", post(spike_overlay_start).delete(spike_overlay_stop))
+        .route("/api/spike/ap2", post(spike_ap2_start).delete(spike_ap2_stop))
+        .route("/api/announce", post(ag_announce))
+        .route("/api/groups/music", get(list_music_groups).post(create_music_group))
+        .route("/api/groups/music/{id}", put(update_music_group).delete(delete_music_group))
+        .route("/api/groups/music/{id}/route", post(route_music_group).delete(unroute_music_group))
+        .route("/api/groups/announcement", get(list_announcement_groups).post(create_announcement_group))
+        .route("/api/groups/announcement/{id}", put(update_announcement_group).delete(delete_announcement_group))
         .route("/api/align/groups", get(align_groups))
         .route("/api/align", get(align_status).delete(align_stop))
         .route("/api/align/start", post(align_start))
         .route("/api/align/select", post(align_select))
         .route("/api/align/volume", post(align_volume))
         .route("/api/media_players", get(list_media_players))
-        .route("/api/media_players/:node_id/volume", get(get_volume).post(set_volume))
-        .route("/api/media_players/:node_id/announce", post(announce))
+        .route("/api/media_players/{node_id}/volume", get(get_volume).post(set_volume))
+        .route("/api/media_players/{node_id}/announce", post(announce))
         .route("/api/routing", get(routing::get_routing))
         .route("/api/routing/link", post(routing::link))
         .route("/api/routing/unlink", post(routing::unlink))
-        .route("/api/routing/entity/:node_name", delete(routing::forget_entity))
+        .route("/api/routing/entity/{node_name}", delete(routing::forget_entity))
         .route("/api/routing/ws", get(routing::routing_ws))
-        // Everything else (`/`, `/assets/*`, favicon, …) is the built Svelte
-        // SPA (frontend/, served from `static_dir`). `ServeDir` returns
-        // `index.html` for `/`.
-        .fallback_service(ServeDir::new(static_dir))
-        // Cache policy for the static SPA: hashed assets are immutable and cached
-        // for a year; `index.html` (and any other entrypoint) is `no-cache` so a
-        // new deploy — whose index references freshly-hashed asset names — is
-        // always picked up instead of a stale index pinning old asset URLs.
-        .layer(middleware::from_fn(spa_cache_control))
+        // Everything else (`/`, `/assets/*`, favicon, …) is the built Svelte SPA,
+        // read into memory ONCE at startup (below) and served from RAM. This
+        // deliberately does NOT use `ServeDir`: the add-on's `/data` lives on a USB
+        // stick whose filesystem gets slow (and slower as it fills), and a per-
+        // request `tokio::fs` read there — with no read timeout — stalls the
+        // blocking pool and the UI won't load. In-RAM serving does one boot-time
+        // read, then never touches the disk per request.
+        .fallback(static_fallback)
+        .layer(Extension(Arc::new(StaticAssets::load(&static_dir))))
         .with_state(state)
 }
 
@@ -206,23 +226,99 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Set `Cache-Control` on the static SPA served by `ServeDir`. Vite emits
-/// content-hashed asset filenames (`index-<hash>.js`), so those are safe to
-/// cache forever; `index.html` must never be cached, or a browser keeps serving
-/// an old index that points at asset URLs a new deploy no longer has. API and
-/// health responses are left untouched.
-async fn spa_cache_control(req: Request, next: Next) -> Response {
-    let path = req.uri().path().to_string();
-    let mut resp = next.run(req).await;
-    if !path.starts_with("/api") && path != "/health" {
-        let value = if path.starts_with("/assets/") {
-            HeaderValue::from_static("public, max-age=31536000, immutable")
-        } else {
-            HeaderValue::from_static("no-cache")
-        };
-        resp.headers_mut().insert(header::CACHE_CONTROL, value);
+/// The built web UI, read into memory at startup and served from RAM (see the
+/// `fallback` note in `router`). A UI redeploy restarts the daemon, which reloads.
+struct StaticAssets {
+    /// URL-path (no leading `/`, e.g. `assets/index-abc.js`) → file.
+    files: HashMap<String, StaticFile>,
+    /// `index.html`, cloned out for the SPA fallback (client-side routes → index).
+    index: Option<StaticFile>,
+}
+
+#[derive(Clone)]
+struct StaticFile {
+    body: Bytes, // ref-counted: cheap per-request clone, no re-read
+    content_type: &'static str,
+}
+
+impl StaticAssets {
+    fn load(dir: &FsPath) -> Self {
+        let mut files = HashMap::new();
+        Self::walk(dir, dir, &mut files);
+        let index = files.get("index.html").cloned();
+        tracing::info!("web UI: loaded {} file(s) into memory from {}", files.len(), dir.display());
+        if index.is_none() {
+            tracing::warn!("web UI: no index.html under {} — the UI won't serve", dir.display());
+        }
+        Self { files, index }
     }
-    resp
+
+    fn walk(root: &FsPath, cur: &FsPath, files: &mut HashMap<String, StaticFile>) {
+        let Ok(rd) = std::fs::read_dir(cur) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                Self::walk(root, &p, files);
+            } else if let (Ok(bytes), Ok(rel)) = (std::fs::read(&p), p.strip_prefix(root)) {
+                let key = rel.to_string_lossy().replace('\\', "/");
+                let content_type = content_type_for(&key);
+                files.insert(key, StaticFile { body: Bytes::from(bytes), content_type });
+            }
+        }
+    }
+}
+
+/// Minimal extension→MIME map for the assets Vite emits (no `mime_guess` dep).
+fn content_type_for(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "webmanifest" => "application/manifest+json",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn static_response(f: &StaticFile, key: &str) -> Response {
+    // Content-hashed assets are immutable (cache a year); the entrypoint HTML must
+    // never be cached, or a stale index pins old asset URLs after a redeploy.
+    let cache = if key.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, f.content_type)
+        .header(header::CACHE_CONTROL, cache)
+        .body(Body::from(f.body.clone()))
+        .expect("static response builds")
+}
+
+/// Serve the SPA from RAM. Exact file if present; a missing `/assets/*` is a real
+/// 404; any other unknown path falls back to `index.html` (client-side routing).
+async fn static_fallback(Extension(assets): Extension<Arc<StaticAssets>>, uri: Uri) -> Response {
+    let raw = uri.path().trim_start_matches('/');
+    let key = if raw.is_empty() { "index.html" } else { raw };
+    if let Some(f) = assets.files.get(key) {
+        return static_response(f, key);
+    }
+    if key.starts_with("assets/") {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    match &assets.index {
+        Some(f) => static_response(f, "index.html"),
+        None => (StatusCode::NOT_FOUND, "web UI not built").into_response(),
+    }
 }
 
 #[derive(Serialize)]
@@ -296,46 +392,96 @@ async fn create_link(State(app): State<AppState>, Json(req): Json<CreateLinkRequ
     }
 }
 
-// ---- Runtime-managed RAOP outputs ----------------------------------------
+// ---- Outputs listing ------------------------------------------------------
 //
-// Hot-reloadable: add/remove loads/unloads one `libpipewire-module-raop-sink`
-// into the daemon's own PipeWire context, live, with no restart and no
-// disturbance to audio on the other outputs. See docs/decisions.md "Loading
-// PipeWire modules at runtime". The outputs store (outputs_store.rs) is the
-// persistent source of truth; the live registry is what actually has a node.
+// Every output is now a *virtual*, auto-discovered device (sendspin `sendspin-dev-*`
+// or AirPlay-2 `ap2-dev-*`) — there is no manual output store and no runtime
+// module load/unload for outputs (the AirPlay-1/RAOP output path was removed).
 
-/// An output for the Outputs tab. Covers RAOP (AirPlay) receivers and
-/// discovered sendspin devices, across all three origins so the UI shows
-/// everything the routing matrix does:
-/// - **configured**: a manual RAOP store entry — `configured: true`,
-///   `ip`/`port`/`encryption` known.
-/// - **discovered**: present via mDNS, not in the store (a RAOP receiver or a
-///   sendspin device) — `configured: false`, `present: true`, connection
-///   details unknown here (`None`).
-/// - **offline**: referenced by saved routing intent but not currently in the
-///   graph — `present: false` (shown grayed; re-linked when it returns).
+/// An output for the Outputs tab. Covers discovered sendspin devices and
+/// AirPlay-2 receivers, in both origins the UI shows:
+/// - **discovered**: present via mDNS — `present: true`, `configured: false`.
+/// - **offline**: referenced by saved routing intent but not currently
+///   discovered — `present: false` (shown grayed; re-linked when it returns).
+/// Decoded AirPlay-2 capability flags (from the `features` TXT bitmask), surfaced
+/// in `/api/outputs` for the Diagnostics capability card. `raw` is the canonical
+/// `0xLOWER,0xUPPER` string for copy/paste + cross-referencing.
+#[derive(Serialize)]
+struct Ap2FeaturesInfo {
+    raw: String,
+    /// bit 41 — PTP timing supported.
+    ptp: bool,
+    /// bit 40 — buffered-audio mode supported (implies PTP is mandatory in that mode).
+    buffered_audio: bool,
+    /// bit 48 — HomeKit transient pairing (how we connect, PIN 3939).
+    transient_pairing: bool,
+}
+
 #[derive(Serialize)]
 struct OutputInfo {
     node_name: String,
     name: String,
-    /// `"airplay"` (RAOP) or `"sendspin"` — for the Type column / badge.
+    /// `"sendspin"` or `"airplay2"` — for the Type column / badge.
     kind: &'static str,
     /// Node/device is live right now.
     present: bool,
-    /// Manual store entry (`true`) vs mDNS auto-discovered (`false`).
+    /// Always `false` now that every output is mDNS auto-discovered (kept for
+    /// the API shape / a possible future manually-added output kind).
     configured: bool,
-    /// Connection details — known only for configured RAOP entries.
+    /// Connection details (from the mDNS-resolved address).
     ip: Option<String>,
     port: Option<u16>,
     encryption: Option<String>,
-    /// Per-output RAOP receiver latency in ms (`raop.latency.ms`); `None` = the
-    /// module default (1500 ms). Only meaningful for configured RAOP outputs.
+    /// Per-output latency override in ms; `None` = the type's built-in default
+    /// (1500 ms). For AirPlay-2 it's the render delay (ap2_server.rs). Not
+    /// meaningful for sendspin (uses a separate static-delay knob).
     latency_ms: Option<u16>,
-}
-
-/// Human name from a RAOP node name (`raop-out-living_room` -> `living room`).
-fn raop_display_name(node_name: &str) -> String {
-    node_name.strip_prefix(RAOP_NODE_PREFIX).unwrap_or(node_name).replace(['_', '-'], " ")
+    /// AirPlay-2 only: PTP-lock health. `Some(true)` = the receiver is currently
+    /// returning gPTP to our grandmaster (heard recently); `Some(false)` = registered
+    /// but not exchanging gPTP; `None` = not an AP2 output (or PTP not started). NOTE:
+    /// since we stream realtime ALAC (type 96), a single receiver renders fine WITHOUT
+    /// an active lock (it free-runs off the PT=87 anchors) — a lock only matters for
+    /// multi-room drift. So `false` is only alarming when `ptp_relevant` is true; the
+    /// UI badge keys off both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ptp_locked: Option<bool>,
+    /// AirPlay-2 only: seconds since the last gPTP packet from the receiver (lock age);
+    /// `None` if never seen / not AP2. Small = healthy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ptp_lock_age_s: Option<u64>,
+    /// AirPlay-2 only: does the receiver *advertise* PTP support (features bit 41)?
+    /// `None` if not AP2 or features weren't seen. A device that doesn't advertise PTP
+    /// will never lock, so the UI shouldn't alarm about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ptp_supported: Option<bool>,
+    /// AirPlay-2 only: is a live PTP lock actually *relevant* for this output right now?
+    /// True only when the receiver is present AND shares its source-set with ≥1 other
+    /// present AP2 receiver (a multi-room group, where drift is audible). A lone AP2
+    /// output plays realtime fine unlocked, so the UI shows an unlocked-but-single-room
+    /// device as neutral, not alarming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ptp_relevant: Option<bool>,
+    /// AirPlay-2 only: decoded capability flags from the `features` TXT, for the
+    /// Diagnostics card. `None` if not AP2 or features weren't seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ap2_features: Option<Ap2FeaturesInfo>,
+    /// AirPlay-2 only: wire sample-rate mode — `"auto"` (negotiate 48 kHz, fall back
+    /// to 44.1 kHz) or `"fixed_44100"`. `None` for non-AP2 outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ap2_rate_mode: Option<&'static str>,
+    /// AirPlay-2 only: the effective wire rate in Hz the output will use (48000 or
+    /// 44100), reflecting the mode + learned capability. `None` for non-AP2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ap2_rate: Option<u32>,
+    /// AirPlay-2 only: device-authoritative volume 0.0–1.0 — READ from the receiver
+    /// (or last set by the user), or `None` when unknown (receiver didn't report and
+    /// the user hasn't set it). Show unknown honestly (no level / 0), never a
+    /// fabricated 100 %. We never impose a volume on connect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ap2_volume: Option<f32>,
+    /// AirPlay-2 only: mute state (`true` = muted). `None` for non-AP2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ap2_muted: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -345,254 +491,142 @@ struct OutputOpResponse {
 }
 
 async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
-    // RAOP node names present in the live graph right now.
-    let present: BTreeSet<String> = {
-        let pw = state.pw.lock_recover();
-        pw.nodes.values().map(|n| n.node_name.clone()).filter(|n| n.starts_with(RAOP_NODE_PREFIX)).collect()
-    };
-    // Configured (manual) outputs: node_name -> config.
-    let configured: BTreeMap<String, RaopOutputConfig> =
-        state.store.lock_recover().list().iter().map(|o| (raop_node_name(&o.name), o.clone())).collect();
-    // RAOP outputs referenced by saved routing intent (offline ones surface here).
-    let intent_outputs: BTreeSet<String> =
-        state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(RAOP_NODE_PREFIX)).collect();
-    // Resolved details of auto-discovered receivers (discovery.rs) — the source
-    // of IP/Port/Encryption for entries not in the store.
-    let discovered: BTreeMap<String, RaopOutputConfig> = state.discovered.lock_recover().clone();
-
-    // Union: present ∪ configured ∪ discovered ∪ intent-referenced.
-    let mut names: BTreeSet<String> = present.iter().cloned().collect();
-    names.extend(configured.keys().cloned());
-    names.extend(discovered.keys().cloned());
-    names.extend(intent_outputs);
-
-    // Per-output RAOP latency overrides (sync_settings.rs) — for configured AND
-    // discovered receivers alike, keyed by node name.
-    let raop_latencies = state.sync_settings.lock_recover().raop_latencies();
-
-    let mut outputs: Vec<OutputInfo> = names
-        .into_iter()
-        .map(|node_name| {
-            // Prefer the manual store entry; fall back to discovery's resolved
-            // details so an auto-discovered receiver shows the same columns.
-            let cfg = configured.get(&node_name).or_else(|| discovered.get(&node_name));
-            OutputInfo {
-                kind: "airplay",
-                present: present.contains(&node_name),
-                configured: configured.contains_key(&node_name),
-                name: cfg.map(|c| c.name.clone()).unwrap_or_else(|| raop_display_name(&node_name)),
-                ip: cfg.map(|c| c.ip.clone()),
-                port: cfg.map(|c| c.port),
-                encryption: cfg.map(|c| c.encryption.as_pipewire_arg().to_string()),
-                latency_ms: raop_latencies.get(&node_name).copied(),
-                node_name,
-            }
-        })
-        .collect();
+    let mut outputs: Vec<OutputInfo> = Vec::new();
 
     // Discovered sendspin devices (present) + any offline ones still referenced
-    // by saved routing intent — surfaced here too so users see every routable
-    // output, not just RAOP.
+    // by saved routing intent — so users see every routable output.
     let devices = state.sendspin_devices.lock_recover().clone();
     let mut sendspin_names: BTreeSet<String> = devices.keys().cloned().collect();
     sendspin_names.extend(state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(SENDSPIN_DEV_PREFIX)));
     for node_name in sendspin_names {
-        let present = devices.contains_key(&node_name);
-        let name = devices
-            .get(&node_name)
+        let dev = devices.get(&node_name);
+        let present = dev.is_some();
+        let name = dev
             .map(|d| d.display_name.clone())
             .unwrap_or_else(|| node_name.strip_prefix(SENDSPIN_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
+        // IP/Port come from the mDNS-resolved server address (`None` until an
+        // IPv4 address resolves). Sendspin has no transport encryption, so the
+        // column is a constant "None" rather than an absent value.
+        let addr = dev.and_then(|d| d.addr);
         outputs.push(OutputInfo {
             kind: "sendspin",
             present,
             configured: false, // sendspin devices are always auto-discovered
             name,
-            ip: None,
-            port: None,
-            encryption: None,
+            ip: addr.map(|a| a.ip().to_string()),
+            port: addr.map(|a| a.port()),
+            encryption: Some("None".to_string()),
             latency_ms: None,
+            ptp_locked: None,   // sendspin has no PTP
+            ptp_lock_age_s: None,
+            ptp_supported: None,
+            ptp_relevant: None,
+            ap2_features: None,
+            ap2_rate_mode: None,
+            ap2_rate: None,
+            ap2_volume: None,
+            ap2_muted: None,
+            node_name,
+        });
+    }
+
+    // Discovered AirPlay-2 receivers (present) + offline ones still referenced by
+    // saved routing intent. These are the RAOP-output replacement; like sendspin
+    // devices they're virtual (no PipeWire node) and always auto-discovered.
+    let ap2_devices = state.ap2_devices.lock_recover().clone();
+    // Per-output AP2 render-delay overrides (sync_settings.rs), keyed by node name
+    // — the per-output latency field (`latency_ms`).
+    let ap2_latencies = state.sync_settings.lock_recover().ap2_latencies();
+    // Routing intent snapshot + the set of present AP2 receivers, so we can tell
+    // whether a live PTP lock is *relevant* for each output: it only matters when
+    // ≥2 present AP2 receivers share a source-set (a multi-room group that would
+    // audibly drift without a shared clock). A lone AP2 output renders realtime
+    // fine unlocked.
+    let ap2_intent = crate::routing_store::snapshot(&state.routing);
+    let ap2_present_nodes: Vec<String> = ap2_devices.keys().cloned().collect();
+    // Device-authoritative volume/mute snapshot (read from the receiver on connect,
+    // or set by the user); volume is absent when unknown → reported as `None`.
+    let (ap2_vols, ap2_mutes) = {
+        let c = state.ap2_control.lock().await;
+        (c.volumes(), c.mutes())
+    };
+    let mut ap2_names: BTreeSet<String> = ap2_devices.keys().cloned().collect();
+    ap2_names.extend(state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(AP2_DEV_PREFIX)));
+    for node_name in ap2_names {
+        let dev = ap2_devices.get(&node_name);
+        let present = dev.is_some();
+        let name = dev
+            .map(|d| d.display_name.clone())
+            .unwrap_or_else(|| node_name.strip_prefix(AP2_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
+        let addr = dev.and_then(|d| d.addr);
+        // PTP-lock health: has libairptp heard gPTP from this receiver recently? A
+        // locked receiver sends Delay_Req at a ~130ms cadence, so 5s is a generous
+        // "still locked" window. If a present, routed receiver isn't locked, its stream
+        // renders silence — surface that as degraded in the UI.
+        let ptp_age = addr.and_then(|a| state.ap2_ptp.peer_lock_age(&a.ip().to_string()));
+        let ptp_locked = if present {
+            Some(ptp_age.is_some_and(|age| age <= std::time::Duration::from_secs(5)))
+        } else {
+            None
+        };
+        // Decoded capabilities (features TXT bit 41 = PTP, 40 = buffered, 48 = transient).
+        let features = dev.and_then(|d| d.features).map(Features::from_raw);
+        let ptp_supported = features.map(|f| f.supports_ptp());
+        let ap2_features = features.map(|f| Ap2FeaturesInfo {
+            raw: f.to_txt_value(),
+            ptp: f.supports_ptp(),
+            buffered_audio: f.supports_buffered_audio(),
+            transient_pairing: f.supports_transient_pairing(),
+        });
+        // Relevant = present AND in a ≥2-member AP2 group (shares a non-empty
+        // source-set with another present AP2 receiver). Only then does an unlocked
+        // receiver risk audible multi-room drift.
+        let ptp_relevant = if present {
+            let my = crate::routing::source_set_of(&ap2_intent, &node_name);
+            Some(
+                !my.is_empty()
+                    && ap2_present_nodes
+                        .iter()
+                        .any(|o| o != &node_name && crate::routing::source_set_of(&ap2_intent, o) == my),
+            )
+        } else {
+            None
+        };
+        // Rate mode (user choice) + the effective wire rate it resolves to.
+        let (rate_mode, rate) = {
+            let ss = state.sync_settings.lock_recover();
+            let mode = match ss.ap2_rate_mode(&node_name) {
+                crate::sync_settings::Ap2RateMode::Auto => "auto",
+                crate::sync_settings::Ap2RateMode::Fixed44100 => "fixed_44100",
+            };
+            (mode, ss.ap2_effective_rate(&node_name))
+        };
+        outputs.push(OutputInfo {
+            kind: "airplay2",
+            present,
+            configured: false, // AP2 receivers are always auto-discovered
+            name,
+            ip: addr.map(|a| a.ip().to_string()),
+            port: addr.map(|a| a.port()),
+            // AirPlay 2 always uses HomeKit transient pairing + encryption.
+            encryption: Some("HomeKit".to_string()),
+            latency_ms: ap2_latencies.get(&node_name).copied(),
+            ptp_locked,
+            ptp_lock_age_s: ptp_age.map(|a| a.as_secs()),
+            ptp_supported,
+            ptp_relevant,
+            ap2_features,
+            ap2_rate_mode: Some(rate_mode),
+            ap2_rate: Some(rate),
+            ap2_volume: ap2_vols.get(&node_name).copied(),
+            ap2_muted: Some(ap2_mutes.get(&node_name).copied().unwrap_or(false)),
             node_name,
         });
     }
 
     Json(outputs)
-}
-
-/// Add a RAOP output and load its module live. Request body is a full output
-/// config (`{ "name", "ip", "port"?, "encryption"? }`) — the same shape as one
-/// entry of the add-on's `outputs`. The module is loaded first; only on success
-/// is the output persisted, so a failed load leaves no stale store entry.
-async fn add_output(State(state): State<AppState>, Json(output): Json<RaopOutputConfig>) -> (StatusCode, Json<OutputOpResponse>) {
-    let node_name = raop_node_name(&output.name);
-
-    if state.store.lock_recover().contains(&node_name) {
-        return (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: format!("output '{}' already exists", output.name) }));
-    }
-
-    // A new output inherits the global default latency (settings_store.rs) as its
-    // per-node override (sync_settings.rs); `None` keeps the module default. The
-    // per-output value is then tunable via PUT .../latency, uniform with sendspin.
-    let latency = state.settings.lock_recover().default_raop_latency_ms();
-
-    let args = raop_module_args(&output, latency);
-    let (tx, rx) = oneshot::channel();
-    if state
-        .pw_cmd
-        .send(PwCommand::Load { node_name: node_name.clone(), module_name: RAOP_MODULE_NAME.to_string(), args, reply: tx })
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
-        );
-    }
-
-    match rx.await {
-        Ok(Ok(())) => match state.store.lock_recover().add(output) {
-            Ok(()) => {
-                // Seed the per-node latency override so it shows in the UI and is
-                // reapplied on reload. Best-effort: a failure here doesn't undo the
-                // (already loaded + stored) output.
-                if latency.is_some() {
-                    if let Err(e) = state.sync_settings.lock_recover().set_raop_latency(&node_name, latency) {
-                        tracing::warn!("added '{node_name}' but failed to persist its latency: {e}");
-                    }
-                }
-                (StatusCode::CREATED, Json(OutputOpResponse { ok: true, message: format!("added output '{node_name}'") }))
-            }
-            // Loaded but not persisted: works this session, wouldn't survive a
-            // restart — report it rather than pretend clean success.
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(OutputOpResponse { ok: false, message: format!("loaded '{node_name}' but failed to persist it: {e}") }),
-            ),
-        },
-        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(OutputOpResponse { ok: false, message: format!("failed to load RAOP module: {e}") })),
-        Err(_) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: "no reply from PipeWire thread".to_string() }))
-        }
-    }
-}
-
-/// Remove a RAOP output by node name — works for all three origins:
-/// - **configured**: unload its module (if loaded) + drop the store entry.
-/// - **discovered**: unload it; it'll be re-discovered when the device next
-///   announces (mDNS), per the intended UX.
-/// - **offline**: nothing to unload; just forget its saved routing.
-///
-/// In every case the output's routing intent is dropped so it doesn't linger
-/// as an offline phantom. Unload is idempotent — the caller's intent ("gone")
-/// always holds afterward.
-async fn remove_output(State(state): State<AppState>, Path(node_name): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
-    let configured = state.store.lock_recover().contains(&node_name);
-    let present = { state.pw.lock_recover().nodes.values().any(|n| n.node_name == node_name) };
-    let has_intent = state.routing.lock_recover().referenced_outputs().contains(&node_name);
-    if !configured && !present && !has_intent {
-        return (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("no such output: {node_name}") }));
-    }
-
-    // Unload the live module if it has a node right now (discovered or
-    // configured-and-loaded). Offline entries skip this.
-    if present {
-        let (tx, rx) = oneshot::channel();
-        if state.pw_cmd.send(PwCommand::Unload { node_name: node_name.clone(), reply: tx }).is_err() {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
-            );
-        }
-        if let Ok(Err(e)) = rx.await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(OutputOpResponse { ok: false, message: format!("failed to unload module: {e}") }),
-            );
-        }
-    }
-
-    if let Err(e) = state.store.lock_recover().remove(&node_name) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to persist removal: {e}") }),
-        );
-    }
-    if let Err(e) = state.routing.lock_recover().remove_entity(&node_name) {
-        tracing::warn!("removed output '{node_name}' but failed to drop its routing intent: {e}");
-    }
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed output '{node_name}'") }))
-}
-
-#[derive(Deserialize)]
-struct ConfigureOutputRequest {
-    ip: String,
-    port: u16,
-    encryption: RaopEncryption,
-}
-
-/// Reconfigure a **manually-added** RAOP output's connection details (IP / port /
-/// encryption) and reload its module so the change takes effect. Auto-discovered
-/// receivers take these from mDNS and aren't editable here (→ 404). The display
-/// name is the output's identity (its node name keys routing/latency/etc.), so
-/// it isn't changed — remove and re-add to rename.
-async fn configure_output(
-    State(state): State<AppState>,
-    Path(node_name): Path<String>,
-    Json(req): Json<ConfigureOutputRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let Some(mut cfg) = state.store.lock_recover().get(&node_name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(OutputOpResponse {
-                ok: false,
-                message: format!("'{node_name}' is not a manually-added output (auto-discovered receivers take their settings from mDNS)"),
-            }),
-        );
-    };
-    cfg.ip = req.ip;
-    cfg.port = req.port;
-    cfg.encryption = req.encryption;
-
-    // Keep the output's current per-node latency override when rebuilding args.
-    let latency = state.sync_settings.lock_recover().raop_latency(&node_name);
-
-    // Reload the live module (unload + load) so the new details apply now.
-    let present = state.pw.lock_recover().nodes.values().any(|n| n.node_name == node_name);
-    if present {
-        let (tx, rx) = oneshot::channel();
-        if state.pw_cmd.send(PwCommand::Unload { node_name: node_name.clone(), reply: tx }).is_err() {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
-            );
-        }
-        let _ = rx.await;
-        let args = raop_module_args(&cfg, latency);
-        let (tx, rx) = oneshot::channel();
-        if state
-            .pw_cmd
-            .send(PwCommand::Load { node_name: node_name.clone(), module_name: RAOP_MODULE_NAME.to_string(), args, reply: tx })
-            .is_err()
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
-            );
-        }
-        if let Ok(Err(e)) = rx.await {
-            return (StatusCode::BAD_GATEWAY, Json(OutputOpResponse { ok: false, message: format!("failed to reload with new settings: {e}") }));
-        }
-    }
-
-    if let Err(e) = state.store.lock_recover().update(cfg) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to persist settings: {e}") }),
-        );
-    }
-    // The reload minted a new node id; nudge the reconcilers to re-link/regroup.
-    let _ = state.changes.send(());
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("reconfigured '{node_name}'") }))
 }
 
 // ---- AirPlay-receive source -----------------------------------------------
@@ -661,6 +695,10 @@ async fn set_airplay_source(
     State(state): State<AppState>,
     Json(req): Json<SetAirplaySourceRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
+    // NOTE: this RESTARTS the 'airplay-in' receiver (stops + re-starts the shairplay
+    // server + producer node), which cascades to a full sync-group rebuild. Logged as
+    // a USER ACTION so such a restart in the logs is attributable to a human, not a bug.
+    tracing::info!("USER ACTION: set AirPlay source (name={:?}) — restarts the 'airplay-in' receiver", req.name);
     // Persist first (normalizes empty -> None), then reconcile the receiver.
     let (stored, latency, auth_setup) = {
         let mut sources = state.sources.lock_recover();
@@ -702,6 +740,7 @@ async fn set_airplay_source(
 }
 
 async fn delete_airplay_source(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
+    tracing::info!("USER ACTION: delete/disable AirPlay source — stops the 'airplay-in' receiver");
     if let Err(e) = state.sources.lock_recover().set_airplay_source_name(None) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
     }
@@ -876,8 +915,8 @@ async fn set_airplay_policy(
 //
 // A single source, but — unlike the AirPlay source — a native PipeWire module,
 // not a subprocess. So it's loaded/unloaded via the PipeWire thread
-// (PwCommand::Load/Unload, keyed by RTP_SOURCE_NODE_NAME), exactly like a RAOP
-// sink, rather than through the process supervisor. Enable/disable and
+// (PwCommand::Load/Unload, keyed by RTP_SOURCE_NODE_NAME), rather than through
+// the process supervisor. Enable/disable and
 // re-point the port live, no restart. Once loaded, its node shows up in the
 // routing matrix automatically (routing.rs classifies it as a source).
 
@@ -1042,9 +1081,9 @@ async fn delete_rtp_source(State(state): State<AppState>) -> (StatusCode, Json<O
 
 // ---- Sendspin per-device volume ------------------------------------------
 //
-// Sendspin devices are virtual outputs fed by a shared group sink, so (unlike
-// AirPlay's raop-sink node volume) there's no PipeWire volume to drive. Volume
-// is carried in-band over the sendspin protocol to the specific device; see
+// Sendspin devices are virtual outputs fed by a shared group sink, so there's
+// no PipeWire node volume to drive. Volume is carried in-band over the sendspin
+// protocol to the specific device; see
 // sendspin_volume.rs. `GET` returns the desired volume per device node name
 // (sparse — absent means the default); `PUT` sets one device.
 
@@ -1074,14 +1113,85 @@ async fn set_sendspin_volume(
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
 
+#[derive(Deserialize)]
+struct SetSendspinMuteRequest {
+    /// Virtual device node name, e.g. `sendspin-dev-voice_pe_kitchen`.
+    node_name: String,
+    /// Target mute state.
+    muted: bool,
+}
+
+async fn set_sendspin_mute(
+    State(state): State<AppState>,
+    Json(req): Json<SetSendspinMuteRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let reached = state.sendspin_control.lock().await.set_muted(&req.node_name, req.muted).await;
+    let verb = if req.muted { "muted" } else { "unmuted" };
+    let message = if reached {
+        format!("{verb} '{}'", req.node_name)
+    } else {
+        format!("saved {verb} for '{}' (device not connected)", req.node_name)
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+}
+
+// ---- AirPlay-2 per-device volume/mute ------------------------------------
+//
+// AP2 receivers are virtual outputs (`ap2-dev-…`) like sendspin: no PipeWire
+// node volume. Volume is carried in-band as an RTSP SET_PARAMETER the sender
+// pushes to the receiver (ap2_volume.rs → ap2_server.rs); mute is volume 0.
+// Volume is 0.0–1.0 (matches the receiver's dB mapping and the matrix field).
+// There's no receiver→daemon feedback yet, so the UI shows the last-set level.
+
+#[derive(Deserialize)]
+struct SetAp2VolumeRequest {
+    /// Virtual device node name, e.g. `ap2-dev-yamaha`.
+    node_name: String,
+    /// Target volume, 0.0–1.0.
+    volume: f32,
+}
+
+async fn set_ap2_volume(
+    State(state): State<AppState>,
+    Json(req): Json<SetAp2VolumeRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let reached = state.ap2_control.lock().await.set_volume(&req.node_name, req.volume).await;
+    let pct = (req.volume.clamp(0.0, 1.0) * 100.0).round() as u8;
+    let message = if reached {
+        format!("set '{}' to {}%", req.node_name, pct)
+    } else {
+        format!("saved {}% for '{}' (not streaming)", pct, req.node_name)
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+}
+
+#[derive(Deserialize)]
+struct SetAp2MuteRequest {
+    node_name: String,
+    muted: bool,
+}
+
+async fn set_ap2_mute(
+    State(state): State<AppState>,
+    Json(req): Json<SetAp2MuteRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let reached = state.ap2_control.lock().await.set_muted(&req.node_name, req.muted).await;
+    let verb = if req.muted { "muted" } else { "unmuted" };
+    let message = if reached {
+        format!("{verb} '{}'", req.node_name)
+    } else {
+        format!("saved {verb} for '{}' (not streaming)", req.node_name)
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+}
+
 // ---- Sync tuning: group lead + per-device static delay -------------------
 //
 // The user-facing latency dials for group sync (sync_settings.rs). The group
-// lead is one daemon-wide value (raise it so the slowest member — e.g. a RAOP
-// receiver sharing a group's anchor — still plays in time; lower it for a
-// snappier start). The per-sendspin-device static delay trims one speaker that's
-// consistently early/late. RAOP's per-output counterpart is its `latency_ms`
-// (below), a module-load arg rather than a live push.
+// lead is one daemon-wide value (raise it so the slowest member still plays in
+// time; lower it for a snappier start). The per-sendspin-device static delay
+// trims one speaker that's consistently early/late. The AP2 per-output
+// counterpart is its render delay (`latency_ms`, below), applied live.
 
 #[derive(Serialize)]
 struct SyncSettingsInfo {
@@ -1117,32 +1227,21 @@ async fn set_sync_settings(
 struct SettingsInfo {
     default_duck: f32,
     discovery_enabled: bool,
-    default_raop_latency_ms: Option<u16>,
     sendspin_delay_live: bool,
+    expose_outputs_as_media_players: bool,
 }
 
-/// Partial update: every field is optional so the UI can PATCH one knob at a
-/// time. `default_raop_latency_ms` distinguishes "not sent" (omitted) from
-/// "cleared" (JSON `null`) via a nested `Option<Option<..>>`.
+/// Partial update: every field is optional so the UI can PATCH one knob at a time.
 #[derive(Deserialize)]
 struct SetSettingsRequest {
     #[serde(default)]
     default_duck: Option<f32>,
     #[serde(default)]
     discovery_enabled: Option<bool>,
-    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
-    default_raop_latency_ms: Option<Option<u16>>,
     #[serde(default)]
     sendspin_delay_live: Option<bool>,
-}
-
-/// serde helper: present-with-null → `Some(None)`, absent → `None`.
-fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Some(Option::deserialize(de)?))
+    #[serde(default)]
+    expose_outputs_as_media_players: Option<bool>,
 }
 
 fn settings_info(state: &AppState) -> SettingsInfo {
@@ -1150,8 +1249,8 @@ fn settings_info(state: &AppState) -> SettingsInfo {
     SettingsInfo {
         default_duck: s.default_duck(),
         discovery_enabled: s.discovery_enabled(),
-        default_raop_latency_ms: s.default_raop_latency_ms(),
         sendspin_delay_live: s.sendspin_delay_live(),
+        expose_outputs_as_media_players: s.expose_outputs_as_media_players(),
     }
 }
 
@@ -1168,11 +1267,6 @@ async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettings
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
             }
         }
-        if let Some(ms) = req.default_raop_latency_ms {
-            if let Err(e) = s.set_default_raop_latency_ms(ms) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
-            }
-        }
         if let Some(enabled) = req.discovery_enabled {
             if let Err(e) = s.set_discovery_enabled(enabled) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
@@ -1180,6 +1274,11 @@ async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettings
         }
         if let Some(live) = req.sendspin_delay_live {
             if let Err(e) = s.set_sendspin_delay_live(live) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            }
+        }
+        if let Some(expose) = req.expose_outputs_as_media_players {
+            if let Err(e) = s.set_expose_outputs_as_media_players(expose) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
             }
         }
@@ -1194,6 +1293,517 @@ async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettings
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "settings saved".to_string() }))
 }
 
+/// S3 spike (per_device_spike.rs): stand up one per-device PipeWire node +
+/// single-member sendspin sender for `device`, optionally fed from `source`.
+#[derive(Deserialize)]
+struct SpikeStartRequest {
+    /// The discovered sendspin device's node name (`sendspin-dev-…`).
+    device: String,
+    /// Source node to link into the per-device sink (its audio path). Optional:
+    /// without it the node is created but silent until something is routed in.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SpikeStartResponse {
+    ok: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spike: Option<crate::per_device_spike::SpikeInfo>,
+}
+
+async fn spike_per_device_start(
+    State(state): State<AppState>,
+    Json(req): Json<SpikeStartRequest>,
+) -> (StatusCode, Json<SpikeStartResponse>) {
+    let send_ahead_us = state.sync_settings.lock_recover().group_lead_us();
+    match crate::per_device_spike::start(
+        &req.device,
+        req.source.as_deref(),
+        &state.pw,
+        &state.pw_cmd,
+        &state.changes,
+        &state.routing,
+        &state.sendspin_devices,
+        &state.sendspin_control,
+        send_ahead_us,
+    )
+    .await
+    {
+        Ok(info) => (StatusCode::OK, Json(SpikeStartResponse { ok: true, message: info.message.clone(), spike: Some(info) })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(SpikeStartResponse { ok: false, message: e, spike: None })),
+    }
+}
+
+async fn spike_per_device_stop(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
+    match crate::per_device_spike::stop(&state.pw_cmd, &state.changes, &state.routing).await {
+        Ok(msg) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+    }
+}
+
+/// AirPlay-2 synchronized **test tone** spike (ap2_spike.rs). Streams a sine tone
+/// to the target receivers via the PROVEN file path (`start_streaming`), bypassing
+/// the live-capture producer, to check that AP2 + PTP multi-room works on the Pi.
+#[derive(Deserialize)]
+struct Ap2SpikeRequest {
+    /// Explicit receiver IPs. If empty, all present discovered AP2 receivers.
+    #[serde(default)]
+    ips: Vec<String>,
+    /// Tone frequency in Hz (default 440).
+    #[serde(default)]
+    freq: Option<f32>,
+    /// Tone duration in seconds (default 60).
+    #[serde(default)]
+    seconds: Option<f32>,
+    /// Render delay in ms (default `ap2_server::AP2_RENDER_DELAY_MS`).
+    #[serde(default)]
+    render_delay_ms: Option<u32>,
+    /// Streaming path to exercise: `"file"` (default; `start_streaming`, known-good)
+    /// or `"live"` (`start_streaming_live` + `LiveAudioDecoder`, the live-output path
+    /// fed a clean synthetic tone) — the bisection knob for the live-path silence.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Wire sample rate in Hz: 44100 (default) or 48000 — to test whether the
+    /// receivers accept 48 kHz realtime ALAC (drives the ALAC cookie + SETUP
+    /// `audioFormat` bit). Anything ≥ 48000 is treated as 48000.
+    #[serde(default)]
+    rate: Option<u32>,
+    /// Source clip: `"tone"` (default, generated sine) or `"voice"` (the embedded
+    /// `test-announcement.mp3`, decoded + resampled to `rate`). A voice makes a
+    /// wrong playback rate obvious to the ear. `"voice"` forces file mode.
+    #[serde(default)]
+    clip: Option<String>,
+}
+
+async fn spike_ap2_start(
+    State(state): State<AppState>,
+    Json(req): Json<Ap2SpikeRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    // Resolve targets: explicit IPs, else every present discovered AP2 receiver.
+    let targets: Vec<(String, std::net::IpAddr)> = if !req.ips.is_empty() {
+        req.ips
+            .iter()
+            .filter_map(|s| s.parse::<std::net::IpAddr>().ok().map(|ip| (s.clone(), ip)))
+            .collect()
+    } else {
+        state
+            .ap2_devices
+            .lock_recover()
+            .values()
+            .filter(|d| d.present)
+            .filter_map(|d| d.addr.map(|a| (d.display_name.clone(), a.ip())))
+            .collect()
+    };
+    if targets.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OutputOpResponse { ok: false, message: "no target receivers (none discovered/present and no valid ips given)".into() }),
+        );
+    }
+
+    let freq = req.freq.unwrap_or(440.0);
+    let secs = req.seconds.unwrap_or(60.0);
+    let delay = req.render_delay_ms.unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS);
+    let rate = if req.rate.unwrap_or(44_100) >= 48_000 { 48_000 } else { 44_100 };
+    // "voice" = play the embedded test clip (decoded to WAV; the spike's file path
+    // then resamples it to `rate`). A voice reveals a wrong playback rate by ear.
+    // Forces file mode (live is the synthetic sine only).
+    let voice = req.clip.as_deref() == Some("voice");
+    let (live, file_wav) = if voice {
+        match crate::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3").await {
+            Ok(wav) => (false, Some(wav)),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("decode test clip: {e}") })),
+        }
+    } else {
+        (req.mode.as_deref() == Some("live"), None)
+    };
+
+    match crate::ap2_spike::start(targets, &state.ap2_ptp, freq, secs, delay, live, rate, file_wav).await {
+        Ok(info) => (
+            StatusCode::OK,
+            Json(OutputOpResponse { ok: true, message: format!("{} — {}", info.message, info.targets.join(", ")) }),
+        ),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+    }
+}
+
+async fn spike_ap2_stop() -> (StatusCode, Json<OutputOpResponse>) {
+    let msg = crate::ap2_spike::stop().await;
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg }))
+}
+
+/// Multi-device shared-timeline spike (S1): one anchor + one timeline driving one
+/// sender per device. Teardown reuses `spike_per_device_stop` (same slot).
+#[derive(Deserialize)]
+struct SpikeMultiRequest {
+    /// Two or more discovered sendspin device node names.
+    devices: Vec<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+async fn spike_multi_device_start(
+    State(state): State<AppState>,
+    Json(req): Json<SpikeMultiRequest>,
+) -> (StatusCode, Json<SpikeStartResponse>) {
+    let send_ahead_us = state.sync_settings.lock_recover().group_lead_us();
+    match crate::per_device_spike::start_multi(
+        &req.devices,
+        req.source.as_deref(),
+        &state.pw,
+        &state.pw_cmd,
+        &state.changes,
+        &state.routing,
+        &state.sendspin_devices,
+        &state.sendspin_control,
+        send_ahead_us,
+    )
+    .await
+    {
+        Ok(info) => (StatusCode::OK, Json(SpikeStartResponse { ok: true, message: info.message.clone(), spike: Some(info) })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(SpikeStartResponse { ok: false, message: e, spike: None })),
+    }
+}
+
+/// Overlay spike (overlay_mixer.rs): inject a test-tone announcement overlay on
+/// one output. Audible on any sendspin device with a running per-device sender —
+/// i.e. any discovered device (grouped, or via its always-on idle sender).
+#[derive(Deserialize)]
+struct OverlayStartRequest {
+    /// The sendspin device's output node name (`sendspin-dev-…`).
+    device: String,
+    #[serde(default)]
+    seconds: Option<f32>,
+    #[serde(default)]
+    freq: Option<f32>,
+    /// Music duck gain while the overlay plays (0–1); default 0.25.
+    #[serde(default)]
+    duck: Option<f32>,
+}
+
+async fn spike_overlay_start(Json(req): Json<OverlayStartRequest>) -> (StatusCode, Json<OutputOpResponse>) {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seconds = req.seconds.unwrap_or(6.0);
+    let freq = req.freq.unwrap_or(660.0);
+    let duck = req.duck.unwrap_or(0.25);
+    let pcm = crate::overlay_mixer::test_tone(seconds, freq, 0.3);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::overlay_mixer::OverlayMixer::global().start(&req.device, id, pcm, duck);
+    (
+        StatusCode::OK,
+        Json(OutputOpResponse {
+            ok: true,
+            message: format!(
+                "overlay {freq}Hz for {seconds}s on '{}' (duck {duck}); audible only if that device is on per-device senders",
+                req.device
+            ),
+        }),
+    )
+}
+
+async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<OutputOpResponse>) {
+    match q.get("device") {
+        Some(device) => {
+            let stopped = crate::overlay_mixer::OverlayMixer::global().stop(device).is_some();
+            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("overlay on '{device}': {}", if stopped { "stopped" } else { "none active" }) }))
+        }
+        None => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: "missing ?device=".to_string() })),
+    }
+}
+
+/// Announcement-group announce (announce.rs): play a clip to a set of sendspin
+/// outputs with per-device duck+overlay and scheduler policy (queue/barge/TTL).
+/// Requires the target devices to be on per-device senders. The node-based path
+/// remains on `/api/media_players/:id/announce`.
+#[derive(Deserialize)]
+struct AgAnnounceRequest {
+    /// Target output node names (`sendspin-dev-…`). Optional if
+    /// `announcement_group` is given (its targets are used).
+    #[serde(default)]
+    targets: Vec<String>,
+    /// Named announcement group (groups_store.rs) to resolve targets/priority/duck.
+    #[serde(default)]
+    announcement_group: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    wyoming: Option<WyomingAnnounceRequest>,
+    /// Use the built-in test-announcement clip (no url/wyoming needed).
+    #[serde(default)]
+    test: bool,
+    /// Use the built-in calibration tone (the `calibrate.rs` click track) as a
+    /// quick "is this speaker alive and correctly wired" check.
+    #[serde(default)]
+    tone: bool,
+    #[serde(default)]
+    priority: i32,
+    /// "queue" (default) or "reject" when the targets are busy.
+    #[serde(default)]
+    on_busy: Option<String>,
+    #[serde(default)]
+    barge_in: bool,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+    #[serde(default)]
+    duck: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct AgAnnounceResponse {
+    ok: bool,
+    /// "playing" | "queued" | "rejected".
+    admission: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    message: String,
+}
+
+/// Acquire the announce audio as 48k/S16/stereo PCM from one of test/tone/url/wyoming.
+async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String> {
+    if req.test {
+        let wav = crate::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3")
+            .await
+            .map_err(|e| format!("decode test clip: {e}"))?;
+        let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("test clip not a PCM WAV")?;
+        return Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch));
+    }
+    if req.tone {
+        // The calibration click (calibrate.rs) — already 16-bit PCM WAV, so no
+        // decode step; just standardize to the announce mix format.
+        let wav = crate::calibrate::click_wav();
+        let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("tone clip not a PCM WAV")?;
+        return Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch));
+    }
+    match (&req.url, &req.wyoming) {
+        (Some(url), None) => {
+            let path = std::env::temp_dir().join("ag-announce-fetch");
+            let _ = tokio::fs::remove_file(&path).await;
+            fetch_to_file(url, &path).await.map_err(|e| format!("fetch: {e}"))?;
+            let pcm = crate::decode::decode_file_to_pcm_48k_stereo(&path).await.map_err(|e| format!("decode: {e}"));
+            let _ = tokio::fs::remove_file(&path).await;
+            pcm
+        }
+        (None, Some(w)) => {
+            let wav = crate::wyoming::synthesize_to_wav(&w.host, w.port, &w.text, w.voice.as_deref())
+                .await
+                .map_err(|e| format!("wyoming: {e}"))?;
+            let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("wyoming did not return a PCM WAV")?;
+            Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch))
+        }
+        _ => Err("provide exactly one of: test, tone, url, wyoming".to_string()),
+    }
+}
+
+async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRequest>) -> (StatusCode, Json<AgAnnounceResponse>) {
+    let reject = |msg: String| (StatusCode::BAD_REQUEST, Json(AgAnnounceResponse { ok: false, admission: "rejected".into(), position: None, reason: Some(msg.clone()), message: msg }));
+
+    // Resolve effective targets/priority/duck — optionally from a named
+    // announcement group (explicit `targets`/`duck` in the request still win).
+    // Done before the await below so the store guard doesn't span it.
+    let (targets, priority, ag_duck) = {
+        let mut targets = req.targets.clone();
+        let mut priority = req.priority;
+        let mut ag_duck = None;
+        if let Some(agid) = &req.announcement_group {
+            let store = state.groups_config.lock_recover();
+            match store.announcement_by_id(agid) {
+                Some(ag) => {
+                    if targets.is_empty() {
+                        targets = ag.targets.clone();
+                    }
+                    priority = ag.priority;
+                    ag_duck = Some(ag.duck);
+                }
+                None => return reject(format!("no announcement group '{agid}'")),
+            }
+        }
+        (targets, priority, ag_duck)
+    };
+    if targets.is_empty() {
+        return reject("no targets (provide `targets` or `announcement_group`)".into());
+    }
+    let duck = req.duck.or(ag_duck).unwrap_or_else(|| state.settings.lock_recover().default_duck());
+    let on_busy = match req.on_busy.as_deref() {
+        Some("reject") => crate::announce_arbiter::OnBusy::Reject,
+        _ => crate::announce_arbiter::OnBusy::Queue,
+    };
+
+    let pcm = match acquire_announce_pcm(&req).await {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => return reject("empty audio".into()),
+        Err(e) => return reject(e),
+    };
+
+    let target_count = targets.len();
+    let admission = crate::announce::AnnounceCoordinator::global().announce(targets, pcm, duck, priority, on_busy, req.barge_in, req.ttl_ms);
+    use crate::announce_arbiter::Admission;
+    let (label, position, reason, ok) = match admission {
+        Admission::Playing => ("playing", None, None, true),
+        Admission::Queued { position } => ("queued", Some(position), None, true),
+        Admission::Rejected(r) => ("rejected", None, Some(format!("{r:?}")), false),
+    };
+    (
+        StatusCode::OK,
+        Json(AgAnnounceResponse {
+            ok,
+            admission: label.to_string(),
+            position,
+            reason,
+            message: format!("announce to {target_count} target(s): {label}"),
+        }),
+    )
+}
+
+// ---- Named groups (groups_store.rs) -------------------------------------
+
+#[derive(Deserialize)]
+struct CreateMusicGroupRequest {
+    name: String,
+    #[serde(default)]
+    members: Vec<String>,
+}
+#[derive(Deserialize)]
+struct UpdateMusicGroupRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    members: Option<Vec<String>>,
+}
+#[derive(Deserialize)]
+struct CreateAnnouncementGroupRequest {
+    name: String,
+    #[serde(default)]
+    targets: Vec<String>,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default)]
+    duck: Option<f32>,
+}
+#[derive(Deserialize)]
+struct UpdateAnnouncementGroupRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    targets: Option<Vec<String>>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    duck: Option<f32>,
+}
+
+async fn list_music_groups(State(state): State<AppState>) -> Json<Vec<crate::groups_store::MusicGroup>> {
+    Json(state.groups_config.lock_recover().music().to_vec())
+}
+
+async fn create_music_group(State(state): State<AppState>, Json(req): Json<CreateMusicGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.groups_config.lock_recover().create_music(&req.name, req.members) {
+        Ok(mg) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": mg }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
+    }
+}
+
+async fn update_music_group(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<UpdateMusicGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.groups_config.lock_recover().update_music(&id, req.name, req.members) {
+        Ok(mg) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": mg }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
+    }
+}
+
+async fn delete_music_group(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+    match state.groups_config.lock_recover().delete_music(&id) {
+        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("deleted music group '{id}'") })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct RouteGroupRequest {
+    source: String,
+}
+
+/// Route a source to a whole music group: the group's members are (re)linked from
+/// `source` (replacing any prior source per member), so they play it in sync. The
+/// group is the routable unit; individual member re-routing is left to the raw
+/// matrix. Reuses the per-output routing store + reconciler (no special-casing).
+async fn route_music_group(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<RouteGroupRequest>) -> (StatusCode, Json<OutputOpResponse>) {
+    tracing::info!("USER ACTION: route music group '{}' (routing graph)", id);
+    let members = {
+        let g = state.groups_config.lock_recover();
+        match g.music().iter().find(|m| m.id == id) {
+            Some(m) => m.members.clone(),
+            None => return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("no music group '{id}'") })),
+        }
+    };
+    if members.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: "music group has no members".into() }));
+    }
+    let snapshot = crate::routing_store::snapshot(&state.routing);
+    {
+        let mut store = state.routing.lock_recover();
+        for member in &members {
+            for l in snapshot.iter().filter(|l| &l.output == member && l.source != req.source) {
+                let _ = store.remove(&l.source, member);
+            }
+            if let Err(e) = store.add(&req.source, member) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            }
+        }
+    }
+    let _ = state.changes.send(());
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("routed '{id}' ({} member(s)) from '{}'", members.len(), req.source) }))
+}
+
+/// Un-route a whole music group: remove all links feeding its members.
+async fn unroute_music_group(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+    tracing::info!("USER ACTION: unroute music group '{}' (routing graph)", id);
+    let members = {
+        let g = state.groups_config.lock_recover();
+        match g.music().iter().find(|m| m.id == id) {
+            Some(m) => m.members.clone(),
+            None => return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("no music group '{id}'") })),
+        }
+    };
+    let snapshot = crate::routing_store::snapshot(&state.routing);
+    {
+        let mut store = state.routing.lock_recover();
+        for l in snapshot.iter().filter(|l| members.contains(&l.output)) {
+            let _ = store.remove(&l.source, &l.output);
+        }
+    }
+    let _ = state.changes.send(());
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("un-routed music group '{id}'") }))
+}
+
+async fn list_announcement_groups(State(state): State<AppState>) -> Json<Vec<crate::groups_store::AnnouncementGroup>> {
+    Json(state.groups_config.lock_recover().announcement().to_vec())
+}
+
+async fn create_announcement_group(State(state): State<AppState>, Json(req): Json<CreateAnnouncementGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let duck = req.duck.unwrap_or_else(|| state.settings.lock_recover().default_duck());
+    match state.groups_config.lock_recover().create_announcement(&req.name, req.targets, req.priority, duck) {
+        Ok(ag) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": ag }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
+    }
+}
+
+async fn update_announcement_group(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<UpdateAnnouncementGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.groups_config.lock_recover().update_announcement(&id, req.name, req.targets, req.priority, req.duck) {
+        Ok(ag) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": ag }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
+    }
+}
+
+async fn delete_announcement_group(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+    match state.groups_config.lock_recover().delete_announcement(&id) {
+        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("deleted announcement group '{id}'") })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e.to_string() })),
+    }
+}
+
 /// Diagnostics snapshot for the Diagnostics page's status header.
 #[derive(Serialize)]
 struct StatusInfo {
@@ -1202,17 +1812,19 @@ struct StatusInfo {
     discovery_enabled: bool,
     /// Live PipeWire graph node count (0 while the graph is empty/unconnected).
     pipewire_nodes: usize,
-    /// Configured RAOP outputs in the store (excludes auto-discovered ones).
-    raop_outputs: usize,
+    /// mDNS-discovered AirPlay-2 receivers currently tracked.
+    ap2_receivers: usize,
     /// mDNS-discovered sendspin devices currently tracked.
     sendspin_devices: usize,
     /// Persisted routing links (by stable name).
     routes: usize,
+    /// Host capability / weak-system assessment (CPU, RAM, RT scheduling).
+    host: crate::host_assessment::HostAssessment,
 }
 
 async fn get_status(State(state): State<AppState>) -> Json<StatusInfo> {
     let pipewire_nodes = state.pw.lock_recover().nodes.len();
-    let raop_outputs = state.store.lock_recover().list().len();
+    let ap2_receivers = state.ap2_devices.lock_recover().len();
     let sendspin_devices = state.sendspin_devices.lock_recover().len();
     let routes = state.routing.lock_recover().links().count();
     Json(StatusInfo {
@@ -1220,9 +1832,10 @@ async fn get_status(State(state): State<AppState>) -> Json<StatusInfo> {
         uptime_secs: state.started.elapsed().as_secs(),
         discovery_enabled: state.discovery.is_running(),
         pipewire_nodes,
-        raop_outputs,
+        ap2_receivers,
         sendspin_devices,
         routes,
+        host: crate::host_assessment::assess(),
     })
 }
 
@@ -1325,8 +1938,8 @@ async fn set_sendspin_delay_handler(
     // Current ESPHome firmware reads the static delay only at stream start, so a
     // live push doesn't shift the running stream — restart the device's group
     // stream (drop + recreate its sendspin server on the next reconcile) so it
-    // reconnects and re-applies the delay, like a RAOP sink reload. Skipped when
-    // `sendspin_delay_live` is on (firmware that honors a live SetStaticDelay).
+    // reconnects and re-applies the delay. Skipped when `sendspin_delay_live` is
+    // on (firmware that honors a live SetStaticDelay).
     let live = state.settings.lock_recover().sendspin_delay_live();
     let mut restarted = false;
     if !live {
@@ -1348,91 +1961,107 @@ async fn set_sendspin_delay_handler(
 
 #[derive(Deserialize)]
 struct SetOutputLatencyRequest {
-    /// RAOP receiver latency in ms; `null`/omitted resets to the module default.
+    /// Receiver latency in ms; `null`/omitted resets to the type's default.
     latency_ms: Option<u16>,
 }
 
-/// Set a RAOP output's `raop.latency.ms` (the per-output group-sync knob) — for
-/// **both** manually-added and auto-discovered receivers. The value is persisted
-/// per node name in sync_settings.rs; a **configured** output is reloaded here
-/// immediately, while a **discovered** one is reloaded by the discovery loop
-/// within a tick (it owns discovered receivers, so we must not reload behind its
-/// back). `latency_ms: null` clears the override (back to the module default).
+/// Set an AirPlay-2 output's per-output **render delay** (ms), persisted per node
+/// name in sync_settings.rs. `latency_ms: null` clears the override (back to the
+/// sender's default). This is the only per-output latency knob now that the RAOP
+/// output path is gone.
+///
+/// There's no PipeWire module to reload: the value is applied **live** to the
+/// running stream (the PT=87 anchor offset the streamer reads per packet) with
+/// no reconnect, and reused as the initial delay on the next (membership/rate)
+/// reconnect. The input is clamped to the render-delay window so it fits the
+/// receiver's negotiated buffer.
 async fn set_output_latency(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetOutputLatencyRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    if !node_name.starts_with(RAOP_NODE_PREFIX) {
+    if !node_name.starts_with(AP2_DEV_PREFIX) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not a RAOP output") }),
+            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not an AirPlay-2 output") }),
         );
     }
-
-    // Persist the per-node override first — the source of truth both the reload
-    // below and the discovery loop read from.
-    if let Err(e) = state.sync_settings.lock_recover().set_raop_latency(&node_name, req.latency_ms) {
+    let clamped = req
+        .latency_ms
+        .map(|ms| ms.clamp(crate::ap2_server::AP2_RENDER_DELAY_MIN_MS, crate::ap2_server::AP2_RENDER_DELAY_MAX_MS));
+    if let Err(e) = state.sync_settings.lock_recover().set_ap2_latency(&node_name, clamped) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(OutputOpResponse { ok: false, message: format!("failed to persist latency: {e}") }),
         );
     }
-
-    let configured = state.store.lock_recover().get(&node_name);
-    let latency_label = match req.latency_ms {
+    // Apply live to the streaming session (no-op if not currently streaming —
+    // the persisted value then applies on the next connect).
+    let effective = clamped.unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16);
+    state.ap2_control.lock().await.set_render_delay(&node_name, effective).await;
+    let latency_label = match clamped {
         Some(ms) => format!("{ms} ms"),
         None => "default".to_string(),
     };
-
-    // A configured (store-managed) output isn't owned by discovery, so reload it
-    // here for an immediate effect. A discovered output is left to discovery.
-    if let Some(cfg) = configured {
-        let present = state.pw.lock_recover().nodes.values().any(|n| n.node_name == node_name);
-        if present {
-            let (tx, rx) = oneshot::channel();
-            if state.pw_cmd.send(PwCommand::Unload { node_name: node_name.clone(), reply: tx }).is_err() {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
-                );
-            }
-            let _ = rx.await;
-            let args = raop_module_args(&cfg, req.latency_ms);
-            let (tx, rx) = oneshot::channel();
-            if state
-                .pw_cmd
-                .send(PwCommand::Load { node_name: node_name.clone(), module_name: RAOP_MODULE_NAME.to_string(), args, reply: tx })
-                .is_err()
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
-                );
-            }
-            if let Ok(Err(e)) = rx.await {
-                return (StatusCode::BAD_GATEWAY, Json(OutputOpResponse { ok: false, message: format!("failed to reload with new latency: {e}") }));
-            }
-        }
-        // The reload minted a new node id; nudge the reconcilers to re-link/regroup.
-        let _ = state.changes.send(());
-        return (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' latency to {latency_label}") }));
-    }
-
-    // Discovered / not currently configured: persisted; discovery applies it on
-    // its next tick (or when the device next announces).
     (
         StatusCode::OK,
-        Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' latency to {latency_label} (applies shortly)") }),
+        Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' render delay to {latency_label} (live)") }),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct SetAp2RateModeRequest {
+    /// `"auto"` (negotiate 48 kHz, fall back to 44.1 kHz) or `"fixed_44100"`.
+    mode: String,
+}
+
+/// Set an AP2 output's wire-rate mode (persisted in sync_settings.rs) and nudge the
+/// reconciler so the group re-negotiates + restarts at the new rate. Choosing `auto`
+/// also clears any learned 44.1k cap so 48 kHz is re-probed.
+async fn set_ap2_rate_mode(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+    Json(req): Json<SetAp2RateModeRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if !node_name.starts_with(AP2_DEV_PREFIX) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not an AirPlay-2 output") }),
+        );
+    }
+    let mode = match req.mode.as_str() {
+        "auto" => crate::sync_settings::Ap2RateMode::Auto,
+        "fixed_44100" | "fixed44100" | "44100" => crate::sync_settings::Ap2RateMode::Fixed44100,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OutputOpResponse { ok: false, message: format!("unknown rate mode '{other}' (use 'auto' or 'fixed_44100')") }),
+            );
+        }
+    };
+    if let Err(e) = state.sync_settings.lock_recover().set_ap2_rate_mode(&node_name, mode) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist rate mode: {e}") }),
+        );
+    }
+    // Rate is part of the AP2 restart identity → the group re-negotiates + restarts.
+    let _ = state.changes.send(());
+    let label = match mode {
+        crate::sync_settings::Ap2RateMode::Auto => "auto (negotiate 48 kHz)",
+        crate::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
+    };
+    (
+        StatusCode::OK,
+        Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' sample rate to {label} (applies shortly)") }),
     )
 }
 
 /// One output the custom HA integration turns into a
-/// `media_player` entity: derived from the live registry, not from the
-/// add-on's static config, so it only lists outputs PipeWire actually
-/// created (a misconfigured RAOP device that never loaded still won't
-/// appear — matches this project's "trust the observed state" approach
-/// throughout).
+/// `media_player` entity: derived from the live registry, not from static
+/// config, so it only lists sinks PipeWire actually created — matching this
+/// project's "trust the observed state" approach throughout. (Virtual outputs —
+/// sendspin/AP2 devices — are exposed to HA separately, via `/api/outputs`.)
 #[derive(Serialize)]
 struct MediaPlayerInfo {
     node_id: u32,
@@ -1457,7 +2086,7 @@ async fn list_media_players(State(pw_state): State<SharedState>) -> Json<Vec<Med
         state
             .nodes
             .values()
-            .filter(|n| n.node_name.starts_with(RAOP_NODE_PREFIX) || n.node_name.starts_with(SENDSPIN_NODE_PREFIX))
+            .filter(|n| n.node_name.starts_with(SENDSPIN_NODE_PREFIX))
             .map(|n| (n.node_id, n.node_name.clone(), state.node_has_incoming_link(n.node_id)))
             .collect()
     };
