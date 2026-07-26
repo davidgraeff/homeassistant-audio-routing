@@ -1,0 +1,217 @@
+# PipeWire-sink output — roadmap
+
+Adding **another PipeWire Linux host as an independently routable output**,
+so a source (or a Music Group) can be fanned to a remote room running stock
+PipeWire, in sync, with per-device announce/duck. This is the AirConnect-style
+"bridge one audio world into another" idea, but for the one target that speaks
+our own transport natively — so it is by far the cheapest backend to add.
+
+Read [`architecture.md`](architecture.md) first; section numbers below refer to
+it. Design rationale that outlives this roadmap should graduate into
+[`decisions.md`](decisions.md).
+
+---
+
+## 1. Why this backend is different (and cheap)
+
+Sendspin and AP2 are expensive because the receiver cannot take a PipeWire
+stream: each needs a Rust relay (FIFO 40), an encoder, a `SharedTimeline`
+stamp, and per-device writers (§4, §5, §7). A remote PipeWire host is the
+opposite — it speaks PipeWire/RTP natively. So the sender **is** a native
+PipeWire module (`libpipewire-module-rtp-sink` + `-rtp-sap`) that appears as a
+real sink node fed off the group's `anchor.monitor` (§4). This is the
+"follower-sink" shape the old RAOP output had before it was removed — but here
+we extend it with a per-device native mix bus so it keeps full AG
+announce/duck (§4 two-tier grouping) without re-adding a Rust hot path.
+
+**Design pillars**
+
+| Pillar | Choice |
+|---|---|
+| Transport | Native PipeWire `rtp-sink` + `rtp-sap`, S16/48000/2 (matches the 48 kHz anchor bus, §8 — no resample) |
+| Routing | One node per target → independently routable `pw-dev-<slug>` in the matrix |
+| Sync (v1) | Fixed-offset alignment via a per-target jitter buffer (`sess.latency.msec`); separate-room use case |
+| Sync (v2, future) | Shared PTP clock — see §7 |
+| Announce/duck | **Native per-device mix bus** — a hard requirement, done in-graph, no Rust relay (§4 below) |
+| Discovery | mDNS `_workstation._tcp` candidates → user-approved → RTCP-confirmed liveness |
+| Volume | Native `Props`/`channelVolumes` on the sink node (§9) — free, no in-band protocol |
+
+**Non-goals (v1):** same-room sample-tight lock with an AP2 receiver (needs
+PTP, §7); auto-configuring the *remote* host's PipeWire (documented for the
+user via a help link instead).
+
+---
+
+## 2. Routing path — the follower-sink off the anchor
+
+No per-device Rust sender. Per routed target `X` in group `G` (anchor `A_G`,
+one `support.null-audio-sink` per source-set, §4):
+
+1. `rtp-sink` module loaded as a real node `pw-dev-<slug>` with a **unicast
+   destination** = the target's IP and a SAP announcement (SDP `c=IN IP4
+   <target>`), `sess.latency.msec = <configurable JB>`, format S16/48000/2.
+2. The remote host, running `libpipewire-module-rtp-sap` in listen mode,
+   auto-instantiates the matching `rtp-source` and plays.
+3. `sync_group.rs::reconcile` links `A_G.monitor → pw-dev-<slug>` (a monitor
+   link — the RAOP-style follower-sink step that was deleted; we re-introduce
+   exactly one such branch). Load on first route, unlink + unload on unroute.
+
+Because the anchor monitor is already the steady QUANT-1024 mix at 48 kHz
+(§8), the sink needs no resampling and no Rust relay — PipeWire does the egress
+on the data-loop (FIFO 83).
+
+---
+
+## 3. Per-device announce/duck — native, in-graph (**required**)
+
+Ducking lives in the Rust relay for Sendspin/AP2 only because those senders
+consume a raw PCM channel (§4/§5). A follower-sink is *in* the graph, so the
+per-device mix happens **in** the graph. Between the anchor monitor and the
+sink we insert a per-device mix bus:
+
+```
+ A_G.monitor ─► [loopback  pw-music-<X>] ──────────────► ┐
+                 channelVolumes = DUCK gain               │
+                                                          ├─► [null-sink pw-mix-<X>] ─monitor─► [rtp-sink pw-dev-<X>] ─► RTP/SAP ─► remote
+ announce pw::stream ─(linked only to targeted devices)─► ┘        channelVolumes = USER volume
+```
+
+Three daemon-created nodes per target (same class as the anchor — auto-managed,
+not user config):
+
+- **`pw-music-<X>`** (`module-loopback`): carries group music from
+  `A_G.monitor`; its `channelVolumes` **is the duck control** (1.0 normal,
+  ~0.2 during announce, ramped).
+- **`pw-mix-<X>`** (`support.null-audio-sink`): sums ducked-music + announce;
+  monitor feeds the sink.
+- **`pw-dev-<X>`** (`rtp-sink`): RTP/SAP egress; its `channelVolumes` = per-device
+  **user volume**.
+
+**Overlay** = link the existing announce `pw::stream` (§9) into the mix bus of
+*only the targeted devices* — that is the per-device addressing (symmetric with
+`OverlayMixer::mix_into` per `node_name` in the relays, §5, but done with links).
+**Duck** = step `pw-music-<X>.channelVolumes` down/up. **Volume** =
+`pw-dev-<X>.channelVolumes`. All are native `Props`/link mutations the control
+plane already performs (§9) — **no Rust hot-path mixing**, all on the data-loop.
+
+Design notes:
+- A *separate* loopback for music is required (not port-volume on the null-sink):
+  a null-sink's inputs share one `channelVolumes`, so music and announce gains
+  can't be independent unless music passes through its own node first.
+- User volume on the sink and duck on the music loopback compose multiplicatively
+  and independently — announcements are not attenuated by the duck.
+- **Verify in the spike:** glitch-free duck *ramp*. PipeWire exposes no volume-ramp
+  param; the daemon steps `channelVolumes` over ~150 ms from a control-plane timer
+  (same mechanism as §9 per-node volume). Confirm no zipper noise.
+- Cost: 3 nodes + a few links per target on the RT graph — negligible for a
+  handful of targets, and no Rust CPU on the steady path.
+
+---
+
+## 4. Discovery, approval, liveness
+
+Mirrors the Sendspin philosophy — "mDNS is discovery-only; liveness is
+connection-driven" (§5.1).
+
+1. **Candidates** — browse `_workstation._tcp.local.` (Avahi's default
+   advertisement; some distros ship it disabled — the help link covers that),
+   optionally enriched by `_ssh._tcp` / `_device-info._tcp`. This yields
+   *candidate Linux hosts*, **not** proof that rtp-sap is configured — there is
+   no standard "I am a PipeWire RTP sink" mDNS record.
+2. **User approval** — candidates surface as `unapproved`; approval is persisted
+   to config. Unapproved hosts never receive audio.
+3. **Liveness = RTCP receiver reports** — there is no reliable TCP port to probe
+   for rtp-sap readiness (SAP is passive multicast; PipeWire's native transport
+   is a Unix socket). Instead, once the target's `rtp-source` actually consumes
+   the stream it sends RTCP RRs back to the sender — a true "this target is
+   receiving" signal, and the honest confirmation that the user set their box up
+   right. Mirrors `sendspin_liveness.rs`.
+4. **Help button** in the discovery listing → docs for the *remote* setup: load
+   `libpipewire-module-rtp-sap` in listen mode (a `pipewire.conf.d/` drop-in or
+   `pactl load-module`). This is the only manual step, and it is on the remote —
+   nothing manual in this daemon or its graph.
+
+---
+
+## 5. Jitter buffer & sample rate
+
+- **JB** = the module's `sess.latency.msec`, exposed as a **per-target setting**.
+  Tune it so the target's fixed total latency lines up with the group's
+  presentation offset (Sendspin's 250 ms lead / AP2's render delay, §5). Account
+  for the two extra graph quanta from the loopback + mix bus (§3).
+- **Rate**: S16/48000/2 end-to-end — the anchor bus is 48 kHz (§8), so nothing
+  resamples anywhere on this path.
+- **v1 sync ceiling**: fixed-offset alignment holds phase at *start*, but the two
+  hosts' sample clocks free-run; PipeWire's adaptive resampler on the receiver
+  keeps it click-free while the target slowly phase-drifts vs AP2/Sendspin.
+  Inaudible in a separate room; not good enough for same-room sample-tight sync.
+  → §7.
+
+---
+
+## 6. Work breakdown (file-level)
+
+Mirrors the established discovery/output pattern.
+
+| File | Change | Mirrors |
+|---|---|---|
+| `pw_target_discovery.rs` (new) | Browse `_workstation._tcp`, populate `SharedPwTargets` (`pw-dev-<slug>`, `approved` flag), fire `changes` | `sendspin_discovery.rs` |
+| `discovery_supervisor.rs` | Register the browser on the shared LAN-restricted daemon in `start()` | existing browsers |
+| `config.rs` / `outputs_store.rs` | `PW_DEV_PREFIX`; persist approved targets + per-target `jb_msec`, dest IP/port | `RaopOutputConfig` |
+| `rtp_sink.rs` (new) | Load `rtp-sink` (+ SAP announce) as a real node via `pw_thread` `Load`/`Unload`; build the per-device mix bus (loopback + null-sink) | old `raop.rs` module-load; anchor `CreateSinkNode` |
+| `sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
+| `pw_target_liveness.rs` (new) | RTCP-RR-based liveness → output health | `sendspin_liveness.rs` |
+| `api.rs` | Candidate list + `approve` endpoint + per-target JB setter + help URL; expose `pw-dev-*` as routable output & `media_player` | §9 outputs derivation |
+| `frontend/` (Svelte) | Discovery listing: approve + help button; per-target JB slider | existing admin console |
+
+Freebies from it being a real node: per-target **volume** works via native
+`Props` (§9) with no in-band protocol; the HA `media_player` appears
+automatically from the generic outputs list (§9) — no per-backend Python.
+
+---
+
+## 7. Future extension — same-room sample-lock via shared PTP
+
+v1 is separate-room (JB alignment). For same-room, sample-tight sync against an
+AP2 receiver, both ends must slave to one clock:
+
+- We already run a **host-global gPTP grandmaster** (`Ap2PtpService`, `libairptp`
+  via FFI, §6).
+- PipeWire's RTP modules can slave to a PTP clock (`sess.ts-refclk` / AES67-style
+  `rtp.ptp`).
+- **The spike**: bridge `libairptp`'s gPTP domain to PipeWire's PTP integration
+  so the remote host and our graph share a clock domain. Unknown whether the two
+  PTP stacks co-exist cleanly on one host — prove it before committing. Estimated
+  days-to-weeks, tracked here as **Phase 3**, not scoped into v1.
+
+---
+
+## 8. Phases
+
+- **P0 — Two-box transport spike (½–1 day).** On two Linux boxes: `rtp-sink` +
+  SAP announce → `rtp-sap` listener. Verify (a) a **unicast** SAP session is
+  instantiated **only** by its addressed target (per-target routing doesn't leak
+  to every listener), (b) exact module params for unicast + SAP + 48 kHz S16 +
+  configurable JB, (c) RTCP RRs flow back. Everything downstream hinges on this.
+- **P1 — Routable output (~2–3 days).** Discovery browser + `SharedPwTargets` +
+  approval + config persistence; `rtp_sink.rs` node load/unload; the
+  follower-sink branch in `sync_group.rs`; expose in API + matrix + media_player;
+  frontend listing with approve + help.
+- **P2 — Per-device native announce/duck (~1–2 days).** The mix-bus topology
+  (§3): loopback duck gain + announce-stream links + ramp. AG duck/overlay parity
+  with Sendspin/AP2. **Required for done.**
+- **P3 — PTP sample-lock (future).** §7.
+
+Rough v1 (P0–P2): **~1 week**.
+
+---
+
+## 9. Open questions / risks
+
+- **P0 blockers**: unicast SAP per-target filtering; duck-ramp glitch-freeness (§3).
+- **Latency budget**: loopback + mix bus add ~2 quanta; fold into the JB default.
+- **Announce fan-out**: linking one announce `pw::stream` to many `pw-mix-<X>`
+  nodes — confirm the stream's output port count / auto-linking behaves, or use a
+  small tee. (Sendspin/AP2 fan in Rust; here we fan by links.)
+- **Discovery noise**: `_workstation._tcp` lists *all* Avahi hosts, not just
+  audio-capable ones — approval gating (§4) is what keeps the list meaningful.

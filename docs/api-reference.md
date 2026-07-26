@@ -78,6 +78,15 @@ unload its module live.
 Unknown `node_name` → 404. The unload is idempotent, so once the output
 existed it's gone afterward regardless of registry-timing races.
 
+> **Per-output diagnostics.** The Outputs tab's **Play tone** / **Play
+> announcement** buttons don't use a per-output endpoint; they post to the
+> per-device `POST /api/announce` with `{ "targets": ["<node_name>"], "tone":
+> true }` or `{ …, "test": true }` (built-in calibration tone / committed TTS
+> clip `bridge-daemon/assets/test-announcement.mp3`). This is the
+> backend-agnostic per-device-sender path (Sendspin now, AirPlay 2 later), so
+> it only works for targets running as per-device senders — not RAOP sink
+> nodes, which that path replaces.
+
 ## Sources
 
 Config for the non-RAOP sources, persisted in a daemon-owned store
@@ -372,7 +381,8 @@ routing matrix (outputs as rows, sources as columns, live over
 `/api/routing/ws`, clickable link/unlink cells, per-output volume sliders
 including sendspin devices, offline endpoints grayed with a forget button,
 synchronized-group badges, and a live input-level meter per source) plus
-RAOP-output and AirPlay/RTP-source management and an announce test. Sendspin
+RAOP-output and AirPlay/RTP-source management and per-output diagnostic test
+buttons (Play tone / Play announcement). Sendspin
 devices are auto-discovered, so there's no manual sendspin management — just a
 capabilities note. Volume sliders poll `/api/media_players` +
 `/api/sendspin/volumes` every few seconds, since volume changes aren't a

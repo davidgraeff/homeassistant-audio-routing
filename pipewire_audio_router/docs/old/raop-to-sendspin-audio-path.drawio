@@ -1,0 +1,173 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.0.0">
+  <diagram id="raop-to-sendspin" name="RAOP-in to sendspin-out">
+    <mxGraphModel dx="1600" dy="1000" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="1520" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- TITLE -->
+        <mxCell id="title" value="Audio path: RAOP (AirPlay) input  →  sendspin output — stutter / underflow map &amp; near-realtime mitigations" style="text;html=1;fontSize=17;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="16" width="1200" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="Green = realtime-paced (reliable timing) · Orange = own thread but NOT realtime · Red = shared tokio runtime (jitter enters here) · Yellow = buffer/queue · Red badge = hazard (RCn) · Green = mitigation (Mn)" style="text;html=1;fontSize=11;align=left;verticalAlign=middle;fontColor=#555555;" vertex="1" parent="1">
+          <mxGeometry x="40" y="44" width="1300" height="20" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== EXECUTION-CONTEXT BANDS (left labels) ===================== -->
+        <mxCell id="band_ingest" value="INGEST&#10;RAOP receiver&#10;(vendored shairplay)&#10;tokio + own thread" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fbe0dc;strokeColor=#b85450;verticalAlign=top;fontStyle=1;fontSize=11;align=center;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="90" width="150" height="430" as="geometry" />
+        </mxCell>
+        <mxCell id="band_graph" value="PIPEWIRE GRAPH&#10;system RT thread&#10;graph clock ~48 kHz" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=11;align=center;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="530" width="150" height="270" as="geometry" />
+        </mxCell>
+        <mxCell id="band_capture" value="CAPTURE&#10;dedicated RT thread&#10;paced by graph clock" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=11;align=center;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="810" width="150" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="band_relay" value="RELAY (HOT)&#10;shared tokio runtime&#10;⚠ NON-REALTIME" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fbe0dc;strokeColor=#b85450;verticalAlign=top;fontStyle=1;fontSize=11;align=center;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1000" width="150" height="190" as="geometry" />
+        </mxCell>
+        <mxCell id="band_egress" value="EGRESS&#10;tokio writer → wire" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fbe0dc;strokeColor=#b85450;verticalAlign=top;fontStyle=1;fontSize=11;align=center;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1200" width="150" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="band_rx" value="RECEIVER&#10;ESPHome / Voice PE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;fontSize=11;align=center;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1390" width="150" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== MAIN FLOW COLUMN (x=340 w=340) ===================== -->
+        <mxCell id="n1" value="AirPlay sender (phone / Mac)&#10;RTP/RTSP over WiFi" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="90" width="340" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="n2" value="shairplay: UDP/TCP recv + decrypt  [tokio worker]&#10;airplay_source.rs — vendor/shairplay/raop/rtp.rs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="160" width="340" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="n3" value="ALAC decode (pure Rust) / AAC (symphonia)&#10;[tokio worker  or  AAC delivery std::thread]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="232" width="340" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="n4" value="RING  (Mutex + VecDeque, f32)&#10;prebuffer 150 ms (latency_msec) · cap 4× · drop-oldest" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="304" width="300" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="n5" value="airplay-producer stream callback&#10;[dedicated OS thread · NON-RT · own mainloop clock]&#10;drains ring → F32LE 44.1 kHz 2ch → &quot;airplay-in&quot; node" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="388" width="340" height="66" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n6" value="&quot;airplay-in&quot;  PipeWire producer node  (source)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="540" width="340" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="n7" value="ANCHOR  support.null-audio-sink   (one per source-set = the group clock)&#10;[system PipeWire RT thread]  · resamples 44.1→48 kHz · quantum ~1024 (~21 ms)&#10;sync_group.rs links airplay-in INTO the anchor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="600" width="340" height="74" as="geometry" />
+        </mxCell>
+        <mxCell id="n8" value="anchor MONITOR ports" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="690" width="340" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n9" value="sendspin-capture stream callback&#10;[dedicated OS thread · RT_PROCESS · graph-clock paced]&#10;monitor → S16LE 48 kHz 2ch — sendspin_capture.rs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="810" width="340" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="n10" value="UNBOUNDED tokio mpsc  (capture → relay)&#10;no backpressure — lag ⇒ memory + latency growth" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="892" width="300" height="62" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n11" value="capture_forward_task  [plain tokio task — NON-RT]&#10;timeline.stamp()  +  overlay mix (Vec alloc / chunk)  +  fan-out&#10;holds groups + client_to_node mutex across the whole fan-out&#10;sendspin_server.rs · overlay_mixer.rs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="1000" width="340" height="84" as="geometry" />
+        </mxCell>
+        <mxCell id="n12" value="per-member enqueue_audio&#10;logical cap 32 frames → drop (Evicted) — connection.rs" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="1100" width="300" height="62" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n13" value="writer_task (one per member)  [tokio task]&#10;sink.send(WsBinary).await — NO pacing, TCP-throttled" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="1200" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="n14" value="WebSocket / TCP  →  WiFi" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="1272" width="340" height="44" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n15" value="ESPHome / Voice PE receiver&#10;send_ahead lead = 250 ms  ←  the ONLY jitter buffer end-to-end&#10;converts presentation-timestamp → local clock, plays then" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="340" y="1390" width="340" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== FLOW EDGES ===================== -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n1" target="n2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n2" target="n3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n3" target="n4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n4" target="n5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n5" target="n6"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n6" target="n7"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n7" target="n8"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n8" target="n9"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n9" target="n10"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n10" target="n11"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n11" target="n12"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n12" target="n13"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;" edge="1" parent="1" source="n13" target="n14"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeColor=#333333;dashed=1;" edge="1" parent="1" source="n14" target="n15"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ===================== HAZARD BADGES (red) x=720 ===================== -->
+        <mxCell id="h2" value="RC2 — Ring underrun ⇒ FULL 150 ms re-prebuffer.&#10;One late/lost packet = ~150 ms silence injected&#10;at the source → hits EVERY output of the group.&#10;airplay_source.rs:447-460" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="720" y="300" width="330" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="h3" value="RC3 — Producer mainloop clock ≠ graph clock;&#10;no adaptive resampler to track drift ⇒ ring slowly&#10;empties → recurring underruns over minutes." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="720" y="392" width="330" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="h1" value="RC1 — Relay is a PLAIN tokio task. Preempted by&#10;HTTP API / mDNS / discovery / other groups /&#10;ALAC work (observed 100–294 ms; peak 873 ms) —&#10;&gt; the receiver's 250 ms lead ⇒ underrun = stutter." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="720" y="966" width="340" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="h4" value="RC4 — groups + client_to_node mutex held across the whole fan-out + a Vec alloc per chunk in mix(); accept/event tasks contend → delivery stalls." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1044" width="340" height="62" as="geometry" />
+        </mxCell>
+        <mxCell id="h6" value="RC6 — 32-frame backlog full ⇒ every further chunk&#10;is silently DROPPED for that member = holes at fixed&#10;timestamps the receiver can't fill. connection.rs:33,153" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1112" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="h5" value="RC5 — writer sink.send().await has NO pacing;&#10;a full TCP window (WiFi radio power-save sleep)&#10;backs up the 32-cap → drops. AP2 disables power-save&#10;per-stream; do it host-wide." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1176" width="340" height="72" as="geometry" />
+        </mxCell>
+
+        <!-- Key callout on the 250ms budget -->
+        <mxCell id="budget" value="⚠ The ENTIRE end-to-end jitter tolerance for a sendspin output is the receiver's 250 ms lead.&#10;Every hiccup above that budget — from ingest ring, non-RT relay, mutex, or socket — is audible." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;align=left;spacingLeft=10;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="720" y="1390" width="680" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- hazard connectors (thin, dashed) -->
+        <mxCell id="ch2" style="endArrow=none;html=1;strokeColor=#b85450;dashed=1;" edge="1" parent="1" source="h2" target="n4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="ch3" style="endArrow=none;html=1;strokeColor=#b85450;dashed=1;" edge="1" parent="1" source="h3" target="n5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="ch1" style="endArrow=none;html=1;strokeColor=#b85450;dashed=1;" edge="1" parent="1" source="h1" target="n11"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="ch4" style="endArrow=none;html=1;strokeColor=#b85450;dashed=1;" edge="1" parent="1" source="h4" target="n11"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="ch6" style="endArrow=none;html=1;strokeColor=#b85450;dashed=1;" edge="1" parent="1" source="h6" target="n12"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="ch5" style="endArrow=none;html=1;strokeColor=#b85450;dashed=1;" edge="1" parent="1" source="h5" target="n13"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ===================== MITIGATIONS (green) x=1090 ===================== -->
+        <mxCell id="mtitle" value="ARCHITECTURE CHANGES — keep the SMALL buffers, make the feeders realtime (near-realtime, not bigger buffers)" style="text;html=1;fontStyle=1;fontSize=13;align=left;verticalAlign=middle;fontColor=#2d6a2d;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="150" width="560" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="m4" value="M4 — Fix the ingest ring (kills RC2 + RC3):&#10;• on underrun insert only the missing samples (or a 1-quantum guard) and keep draining — do NOT reset to a full 150 ms prebuffer&#10;• replace the hand-rolled ring + separate producer mainloop with a graph-clock-locked adaptive resampler (DLL / PipeWire rate-match), so the producer consumes at exactly the graph's pull rate and never drifts." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="184" width="560" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="m1" value="M1 — Realtime relay (kills RC1, the primary stutter cause):&#10;do timeline.stamp() + mix + fan-out ON the sendspin-capture RT thread (it is already graph-clock paced), OR on a dedicated SCHED_FIFO relay thread (prio just below the capture / AP2 sender). Delete the unbounded capture→relay mpsc — no async hop between capture and the wire. General-purpose tokio work then can't preempt audio." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=8;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="316" width="560" height="128" as="geometry" />
+        </mxCell>
+        <mxCell id="m5" value="M5 — Shrink the relay critical section (kills RC4):&#10;encode/mix once; snapshot the member list, release the group + client_to_node locks BEFORE fanning out; reuse a preallocated mix buffer instead of a Vec per chunk." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="456" width="560" height="86" as="geometry" />
+        </mxCell>
+        <mxCell id="m6" value="M6 — Drop-to-live, never replay-late (addresses RC6):&#10;when a member backlog is behind, skip forward to the newest chunk rather than sending the stale backlog (which arrives past the receiver deadline AND grows latency). Log every drop — today AP2 try_send and the 32-cap drop silently." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="554" width="560" height="96" as="geometry" />
+        </mxCell>
+        <mxCell id="m2" value="M2 — Real RT scheduling + isolation (backstop for RC1/RC5):&#10;chrt SCHED_FIFO + CPU affinity — pin the PipeWire-RT, capture and relay/sender threads to dedicated cores; keep the tokio worker pool OFF those cores. Verify no priority inversion (chrt / ps -eLo rtprio). Disable WiFi power-save host-wide." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="662" width="560" height="104" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== AP2 CONTRAST PANEL (Workstream A) ===================== -->
+        <mxCell id="ap2title" value="AirPlay-2 sender (Workstream A jitter) — same disease, mirror-image symptom" style="text;html=1;fontStyle=1;fontSize=13;align=left;verticalAlign=middle;fontColor=#444444;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="800" width="560" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="ap2" value="The final send IS an RT SCHED_FIFO thread with clock_nanosleep(TIMER_ABSTIME) ✓ — but its PRODUCER (run_streamer) is a NON-RT tokio task (= RC1) that, per 8 ms packet, does:&#10;   spawn_blocking(|| tx.send(msg)).await   +   yield_now().await&#10;= TWO scheduler round-trips/packet (RC5b), feeding a crossbeam bounded(8) ≈ 64 ms channel. Under load the producer is scheduled late → the channel drains → 'Sender thread fell behind by 135–294 ms'.&#10;Masked today by a 2 s AudioBuffer + ~1 s prefill + 1500 ms render delay — the OPPOSITE of near-realtime.&#10;&#10;M3 — Fuse producer → RT sender thread: move ALAC encode + encrypt + prepare onto the sender thread; at each deadline it drains the (already RT-paced) capture channel, encodes, sends. Delete spawn_blocking + yield_now + the bounded(8) split. Then the render delay can fall toward network + one quantum." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=8;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="826" width="560" height="230" as="geometry" />
+        </mxCell>
+
+        <!-- Root-cause summary strip -->
+        <mxCell id="rootcause" value="ROOT CAUSE (both paths): the timing-critical work sits on the shared general-purpose tokio runtime, decoupled from any realtime clock. Capture (PipeWire RT thread) and the AP2 final send (SCHED_FIFO thread) are correctly isolated — but the connective tissue between them (the sendspin relay / the AP2 producer) is not. Close that gap and the existing small buffers suffice." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=10;fontStyle=0;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="1076" width="560" height="120" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

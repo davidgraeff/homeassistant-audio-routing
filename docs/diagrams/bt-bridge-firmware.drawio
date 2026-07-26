@@ -17,7 +17,7 @@
           <mxGeometry x="300" y="90" width="260" height="90" as="geometry" />
         </mxCell>
 
-        <mxCell id="rtp_encoder" value="RTP encoder + UDP socket&#10;(send_rtp_packet_, S16LE&#10;native-endian, fixed SSRC&#10;per boot)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+        <mxCell id="rtp_encoder" value="RTP encoder + UDP socket&#10;(send_rtp_packet_, S16LE&#10;native-endian; SSRC derived from&#10;factory MAC — stable across reboots)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
           <mxGeometry x="620" y="90" width="260" height="90" as="geometry" />
         </mxCell>
 
@@ -76,6 +76,13 @@
               <mxPoint x="960" y="153" />
             </Array>
           </mxGeometry>
+        </mxCell>
+
+        <mxCell id="note_ssrc" value="Stable SSRC lets the add-on's rtp-source run sess.ignore-ssrc = false — it latches onto this one sender and rejects any other box on the same port (anti-interleave). Older firmware used a random per-boot SSRC, which forced ignore-ssrc = true (accept-any). Codec is effectively SBC-only on the ESP32." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="450" width="580" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="note_pi" value="Alternative implementation:&#10;a Raspberry Pi (BlueZ + PipeWire,&#10;no custom firmware) feeds the SAME&#10;add-on rtp-source, with real aptX/AAC&#10;codecs — see firmware/pi-bridge&#10;and decisions.md." style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=none;strokeColor=#999999;align=left;spacingLeft=8;fontSize=10;fontColor=#666666;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="10" y="470" width="260" height="120" as="geometry" />
         </mxCell>
       </root>
     </mxGraphModel>

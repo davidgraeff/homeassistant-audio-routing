@@ -117,32 +117,3 @@ path already incurs**, which has been in daily use without a latency complaint â
 so it is a known-acceptable cost, not a new one. If tighter latency is ever
 wanted, the anchor's quantum can be pinned low (e.g. `node.latency`/
 `clock.quantum` on the null sink) at some CPU cost.
-
-## Reproducing / diagnosing
-
-On the add-on host (`ssh root@homeassistant.local`, container
-`addon_local_pipewire_audio_router`, `export XDG_RUNTIME_DIR=/run/user/0`):
-
-```
-# who can drive: look for node.network / node.driver
-pw-dump | jq '.[] | select(.type|endswith("Node")) | .info.props
-  | {name:."node.name", network:."node.network", driver:."node.driver"}'
-
-# reproduce the stall (WARNING: freezes the source's whole component):
-pw-link bt-bridge-rtp:receive_FL raop-out-<name>:send_FL
-pw-top -b -n 3        # stalled nodes show QUANT 0 / RATE 0 / ??? , music stops
-pw-link -d bt-bridge-rtp:receive_FL raop-out-<name>:send_FL   # recover
-```
-
-A healthy (driver-anchored) cycle instead shows non-zero, advancing
-`QUANT/RATE/BUSY` with `ERR 0`.
-
-## Notes on measurement gotchas found during this investigation
-
-- **`pw-top` node state `running` does not mean audio is flowing.** A stalled,
-  driverless cycle still reports its nodes as `R`; the tell is `QUANT 0 /
-  RATE 0` and BUSY not advancing across samples.
-- `curl` is **not installed** in the add-on container; use the daemon's HTTP API
-  from another host (`http://<ha-ip>:8099/...`, host-network) or `pw-link`
-  directly. `python3` is also absent in the container â€” parse `pw-dump` output
-  on the client side.
