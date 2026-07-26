@@ -70,21 +70,29 @@ RAOP is already removed, so this is now acceptance, not a pre-removal gate:
 
 ### Real-time & allocation hardening
 
-The AP2 data path is already SCHED_FIFO end-to-end (ladder in
-[architecture.md](architecture.md#7-real-time-thread-ladder)). Remaining:
+The AP2 data path is SCHED_FIFO end-to-end (ladder in
+[architecture.md](architecture.md#7-real-time-thread-ladder)) and now
+allocation-free on the steady hot path:
 
-- **AP2 relay forward-loop allocations** (`ap2_server.rs`, the `blocking_recv`
-  loop): each chunk does `pcm.chunks_exact(2)…collect::<Vec<i16>>()` **and**
-  `samples.clone()` per receiver — N+1 heap allocations per chunk on the RT
-  relay. Reuse one `Vec<i16>` scratch + fan out via a shared `Arc<[i16]>`
-  (mirror the sendspin relay's reused `mix_buf`).
-- **Vendored streamer per-packet clones** — `run_streamer` clones
-  `frame.samples` every packet even with no EQ and rebuilds a `wire_packets`
-  Vec per packet. Encode from a borrow + reuse a per-connection scratch where
-  the vendored API allows. Lower priority than the relay allocations.
-- **Structural producer fuse (optional)** — the fully-fused form (encode on the
-  sender thread, no channel) is optional; the `crossbeam bounded(8)` split is
-  kept for backpressure and is sufficient now.
+- **AP2 relay forward-loop allocations** — ✅ **Done.** The relay
+  (`ap2_server.rs`) fans out with zero steady-state allocation: each sender hands
+  back a recycled `Vec<i16>` via `LiveFrameSender::take_buffer()` (a bounded
+  free-list; the decoder returns drained buffers), captured PCM is a pooled
+  buffer, and the overlay `mix_buf` is reused across chunks and devices.
+- **Vendored streamer per-packet PCM clone** — ✅ **Done.** `run_streamer`
+  (`streamer.rs`) no longer clones `frame.samples` on the common no-EQ path — it
+  encodes straight from the frame's shared `Arc<Vec<i16>>` (the ~1.4 KB/packet
+  clone is gone; only the EQ path, unused here, still needs an owned copy).
+- **Streamer `wire_packets` reuse** — deferred, deliberately. Each packet still
+  allocates the outer `Vec<Vec<u8>>` (len 1 per per-device connection) and the
+  encrypted RTP `Vec<u8>` from `prepare_audio`. Reusing them needs a
+  sender→producer recycle channel **and** an encrypt-into-buffer change to
+  `prepare_audio` — a deeper change to a proven-on-hardware encrypt path for a
+  few-hundred-bytes/packet gain now that the dominant clone is gone. Not worth the
+  RT-path risk yet.
+- **Structural producer fuse** — not doing it. The fully-fused form (encode on
+  the sender thread, no channel) is optional; the `crossbeam bounded(8)` split is
+  kept **on purpose** for backpressure and is sufficient.
 - **CPU affinity / host isolation (optional)** — pinning isn't required with
   relay + sender both at SCHED_FIFO; revisit only if a stall traces to CPU
   contention. WiFi power-save is disabled per-stream by the vendored sender; a

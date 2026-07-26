@@ -1163,22 +1163,27 @@ async fn run_streamer(
                     );
                 }
 
-                // Process through equalizer if enabled
-                let samples_to_encode: Vec<i16> = if let Some(ref mut eq) = guard.equalizer {
+                // Encode synchronously. The common (no-EQ) path encodes STRAIGHT
+                // from the frame's shared `Arc<Vec<i16>>` — no per-packet clone.
+                // Only the EQ path needs an owned, mutable copy to process in place;
+                // computing it first releases the `equalizer` borrow before the
+                // `encoder` borrow (both are fields of the same mutex guard).
+                let encode_start = Instant::now();
+                let eq_samples: Option<Vec<i16>> = if let Some(ref mut eq) = guard.equalizer {
                     let mut samples = (*frame.samples).clone();
                     eq.process(&mut samples);
-                    samples
+                    Some(samples)
                 } else {
-                    (*frame.samples).clone()
+                    None
                 };
-
-                // Encode synchronously
-                let encode_start = Instant::now();
                 let encoder = guard
                     .encoder
                     .as_mut()
                     .ok_or_else(|| airplay_core::error::StreamingError::Encoding("Encoder missing".into()))?;
-                let packet = encoder.encode(&samples_to_encode)?;
+                let packet = match eq_samples {
+                    Some(ref samples) => encoder.encode(samples)?,
+                    None => encoder.encode(&frame.samples)?,
+                };
                 let encode_elapsed = encode_start.elapsed();
 
                 // Diagnostic: log encoded ALAC data and timing for first few packets
