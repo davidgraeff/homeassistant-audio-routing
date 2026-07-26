@@ -37,16 +37,24 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import PipewireRouterCoordinator
 from .api import AnnouncementGroup, MusicGroup
-from .api import MediaPlayerState as ApiMediaPlayerState
 from .api import RoutingMatrix, RoutingNode
 from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NONE
 
 # Must match the bridge-daemon's node-name prefixes exactly — no shared source
-# of truth across the Rust/Python boundary, just this comment. RAOP outputs and
-# the (auto-discovered) sendspin *devices* both surface as routing-matrix
-# outputs, and each becomes one media_player.
-RAOP_NODE_PREFIX = "raop-out-"
+# of truth across the Rust/Python boundary, just this comment. The
+# (auto-discovered) sendspin *devices* and AirPlay-2 receivers all surface as
+# routing-matrix outputs, and each becomes one media_player.
 SENDSPIN_DEV_PREFIX = "sendspin-dev-"
+AP2_DEV_PREFIX = "ap2-dev-"
+
+# All output kinds' prefixes. Used to derive a fallback display name for any
+# output regardless of kind.
+_OUTPUT_PREFIXES = (SENDSPIN_DEV_PREFIX, AP2_DEV_PREFIX)
+
+# Host/IP-ish keys that AV-receiver integrations commonly store the receiver
+# address under in their config entry (MusicCast, Onkyo/Pioneer, HEOS, …). Used
+# to correlate an AirPlay-2 output to an existing HA device by IP.
+_HOST_CONF_KEYS = ("host", "ip_address", "address", "ip")
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,7 +62,7 @@ _LOGGER = logging.getLogger(__name__)
 def _display_name(node_name: str) -> str:
     """Strips the bridge daemon's node-name prefix and turns
     e.g. "sendspin-dev-voice_pe_kitchen" into "Voice Pe Kitchen"."""
-    for prefix in (RAOP_NODE_PREFIX, SENDSPIN_DEV_PREFIX):
+    for prefix in _OUTPUT_PREFIXES:
         if node_name.startswith(prefix):
             return node_name[len(prefix) :].replace("_", " ").title()
     return node_name
@@ -64,7 +72,7 @@ def _esphome_hostname(node_name: str) -> str | None:
     """The ESPHome node name (== the device's mDNS hostname with `-`→`_`) that a
     sendspin output's node name is built from: `sendspin-dev-<hostname>` gives
     `<hostname>`, e.g. `home_assistant_voice_093ca8`. `None` for non-sendspin
-    outputs (RAOP), which carry no such identity."""
+    outputs (AirPlay-2), which carry no such identity."""
     if node_name.startswith(SENDSPIN_DEV_PREFIX):
         return node_name[len(SENDSPIN_DEV_PREFIX) :]
     return None
@@ -113,6 +121,65 @@ def _find_ha_device(hass: HomeAssistant, node_name: str) -> dr.DeviceEntry | Non
             )
         return None
     return dr.async_get(hass).async_get(next(iter(device_ids)))
+
+
+def _entry_targets_ip(entry: ConfigEntry, ip: str) -> bool:
+    """True if a config entry connects to `ip`, matched against the common
+    host/IP keys in its data + options (`_HOST_CONF_KEYS`)."""
+    for mapping in (entry.data, entry.options):
+        for key in _HOST_CONF_KEYS:
+            if str(mapping.get(key) or "") == ip:
+                return True
+    return False
+
+
+def _find_ap2_ha_device(hass: HomeAssistant, ip: str | None) -> dr.DeviceEntry | None:
+    """Correlate an AirPlay-2 receiver to the Home Assistant device that already
+    represents the same physical box, so the `ap2-dev` media_player adopts HA's
+    name + area instead of the daemon's slug.
+
+    The adoption rule (kept deliberately small + testable):
+
+    Unlike sendspin — ESPHome speakers matched by the mDNS hostname baked into
+    their entity unique_ids — AP2 receivers are third-party AV gear (Yamaha
+    MusicCast, Onkyo/Pioneer, a HomeKit/AirPlay device, …), so that trick
+    doesn't apply. The one stable identity the daemon exposes for them *without
+    a daemon-side change* is the resolved **IP address** (`/api/outputs`→`ip`).
+    So: find the HA device whose own integration talks to that same IP —
+    either a config entry that stores the IP as its host (`_HOST_CONF_KEYS`), or
+    any device whose `configuration_url` points at it. Exactly one match →
+    adopt it (the entity links to that device, inheriting its area). Zero, or
+    several (ambiguous), → no adoption: the entity stays standalone and the user
+    can assign its area in the UI.
+
+    Resolved once at entity creation (like the sendspin path); a receiver whose
+    matching HA device only appears later is picked up on the next reload."""
+    if not ip:
+        return None
+    dev_reg = dr.async_get(hass)
+    matched: set[str] = set()
+    # A config entry (e.g. MusicCast/Onkyo) pointed at this IP → its device(s).
+    for entry in hass.config_entries.async_entries():
+        if entry.domain == DOMAIN:
+            continue
+        if _entry_targets_ip(entry, ip):
+            for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+                matched.add(device.id)
+    # A device that advertises the IP in its configuration URL (some HomeKit /
+    # AirPlay devices do), regardless of how its config entry stores the host.
+    for device in dev_reg.devices.values():
+        if device.configuration_url and ip in str(device.configuration_url):
+            matched.add(device.id)
+
+    if len(matched) != 1:
+        if len(matched) > 1:
+            _LOGGER.warning(
+                "AirPlay-2 receiver at %s matched %d Home Assistant devices; not linking (ambiguous)",
+                ip,
+                len(matched),
+            )
+        return None
+    return dev_reg.async_get(next(iter(matched)))
 
 
 def _output_node_names(coordinator: PipewireRouterCoordinator) -> list[str]:
@@ -195,7 +262,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 
 class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaPlayerEntity):
-    """A single PipeWire output (RAOP or sendspin) exposed as a media_player.
+    """A single PipeWire output (sendspin or AirPlay-2) exposed as a
+    media_player.
 
     The output's *input wiring* is modelled as the media_player "source":
     `source_list` is the routable sources the daemon reports, `source` is
@@ -203,42 +271,62 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
     — the previously linked source is unlinked first). This is one source
     per output by design; the `link`/`unlink` services are the additive
     escape hatch for anything more.
+
+    Behaviour is keyed off the node-name *prefix*, not a per-kind subclass.
+    Both output kinds are *virtual* (no PipeWire node): state is derived from
+    routing, and volume is carried in-band per device — sendspin through its
+    per-device store, AirPlay-2 through the daemon's AP2 control plane
+    (`/api/ap2/volume`|`/api/ap2/mute`, which additionally backs VOLUME_MUTE).
     """
 
-    _attr_supported_features = (
-        MediaPlayerEntityFeature.VOLUME_SET
-        | MediaPlayerEntityFeature.PLAY_MEDIA
-        | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
-        | MediaPlayerEntityFeature.SELECT_SOURCE
-    )
     _attr_has_entity_name = True
 
     def __init__(
         self, hass: HomeAssistant, coordinator: PipewireRouterCoordinator, entry: ConfigEntry, node_name: str
     ) -> None:
         super().__init__(coordinator)
-        # Identity is the stable node *name*; the ephemeral node_id is
-        # re-resolved from each snapshot (see `_current`) so this entity
-        # keeps working across a module reload that changes the id.
+        # Identity is the stable node *name* (the daemon's ephemeral node_id is
+        # never used for these virtual outputs), so this entity keeps working
+        # across a module reload that changes the id.
         self.node_name = node_name
         self._attr_unique_id = f"{entry.entry_id}_out_{node_name}"
 
-        # Correlate a sendspin output to its Home Assistant device (by mDNS
-        # hostname → the ESPHome device) once, at creation. When matched, the
-        # entity links to that device and takes HA's name + area; unmatched
-        # (RAOP, or an unknown device), it falls back to the daemon's derived
-        # display name with no device. Resolved here — the ESPHome device is
-        # registered at HA start, before this integration sets up — so a device
-        # that only appears later is picked up on the next reload.
-        self._ha_device = _find_ha_device(hass, node_name)
+        # Feature set by kind. Every (virtual) output kind gets source selection
+        # + volume. AirPlay-2 volume/mute go through the daemon's AP2 control
+        # plane (PUT /api/ap2/volume|mute), so AP2 additionally advertises
+        # VOLUME_MUTE. Per-device announce for a virtual output is a separate,
+        # still-pending piece of work, so neither kind advertises PLAY_MEDIA
+        # /MEDIA_ANNOUNCE — announcements fan out via the announcement group.
+        features = MediaPlayerEntityFeature.SELECT_SOURCE | MediaPlayerEntityFeature.VOLUME_SET
+        if self._is_ap2:
+            features |= MediaPlayerEntityFeature.VOLUME_MUTE
+        self._attr_supported_features = features
+
+        # Correlate a virtual output to its Home Assistant device once, at
+        # creation, so the entity links to that device and takes HA's name +
+        # area. Two correlation rules by kind: sendspin matches the ESPHome
+        # device by mDNS hostname; AirPlay-2 matches a third-party AV device by
+        # the receiver's IP (`_find_ap2_ha_device`). Unmatched outputs fall back
+        # to the daemon-derived display name with no device link.
+        # Resolved here — matching devices are typically registered at HA start,
+        # before this integration sets up — so one that only appears later is
+        # picked up on the next reload.
+        if self._is_ap2:
+            meta = coordinator.outputs_meta.get(node_name)
+            self._ha_device = _find_ap2_ha_device(hass, meta.ip if meta else None)
+        elif self._is_sendspin:
+            self._ha_device = _find_ha_device(hass, node_name)
+        else:
+            self._ha_device = None
+
         if self._ha_device is None:
             self._attr_name = _display_name(node_name)
         else:
             # has_entity_name + a name → "<device name> <name>", e.g.
             # "Home Assistant Voice Badezimmer Audio Routing". The suffix keeps
             # this routing output distinct from the speaker's own built-in
-            # assist media_player ("<device name> Media Player") on the same
-            # device, while still leading with the HA device name.
+            # media_player ("<device name> Media Player") on the same device,
+            # while still leading with the HA device name.
             self._attr_name = "Audio Routing"
 
     @property
@@ -246,12 +334,35 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         return self.node_name.startswith(SENDSPIN_DEV_PREFIX)
 
     @property
+    def _is_ap2(self) -> bool:
+        return self.node_name.startswith(AP2_DEV_PREFIX)
+
+    @property
+    def _is_virtual(self) -> bool:
+        """A virtual output (sendspin or AirPlay-2) has no PipeWire node: it
+        never appears in the polled media_players feed, so its state comes from
+        routing rather than the feed."""
+        return self._is_sendspin or self._is_ap2
+
+    @property
+    def _virtual_prefix(self) -> str | None:
+        """The node-name prefix of this output's virtual kind — used to group
+        same-kind co-routed devices."""
+        if self._is_sendspin:
+            return SENDSPIN_DEV_PREFIX
+        if self._is_ap2:
+            return AP2_DEV_PREFIX
+        return None
+
+    @property
     def device_info(self) -> DeviceInfo | None:
-        """Link to the matched Home Assistant device by its genuine full-MAC
-        connection(s), so this media_player is grouped under the real speaker
-        and inherits its name + area. `None` when unmatched (kept standalone).
-        We reuse the device's existing connections (never reconstruct a MAC),
-        which is what merges this entity into that exact device."""
+        """Merge this media_player into the matched Home Assistant device, so it
+        is grouped under the real speaker and inherits its name + area. `None`
+        when unmatched (kept standalone). We reuse the device's own existing
+        identity — its full-MAC connection(s) if it has any (sendspin's ESPHome
+        device, some AV gear), else its integration identifiers (MusicCast /
+        HomeKit devices keyed that way) — never reconstruct one, which is what
+        makes HA merge this entity into that exact device."""
         if self._ha_device is None:
             return None
         mac_connections = {
@@ -259,29 +370,19 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
             for conn_type, conn_value in self._ha_device.connections
             if conn_type == dr.CONNECTION_NETWORK_MAC
         }
-        if not mac_connections:
-            return None
-        return DeviceInfo(connections=mac_connections)
-
-    def _current(self) -> ApiMediaPlayerState | None:
-        """This output's entry in the polled /api/media_players feed (RAOP
-        only — sendspin devices are virtual and never appear there)."""
-        return next((p for p in self.coordinator.data if p.node_name == self.node_name), None)
+        if mac_connections:
+            return DeviceInfo(connections=mac_connections)
+        if self._ha_device.identifiers:
+            return DeviceInfo(identifiers=set(self._ha_device.identifiers))
+        return None
 
     def _output(self) -> RoutingNode | None:
         """This output's routing-matrix entry (the authoritative existence +
-        present/offline signal for both RAOP and sendspin)."""
+        present/offline signal for sendspin and AirPlay-2 alike)."""
         return next((o for o in self._matrix().outputs if o.node_name == self.node_name), None)
 
     def _matrix(self) -> RoutingMatrix:
         return self.coordinator.routing
-
-    @property
-    def _live_node_id(self) -> int | None:
-        """This output's node_id in the latest snapshot, or None if it's
-        gone. All daemon calls go through this rather than a stored id."""
-        current = self._current()
-        return current.node_id if current else None
 
     @property
     def available(self) -> bool:
@@ -293,13 +394,9 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
 
     @property
     def state(self) -> MediaPlayerState | None:
-        # RAOP: authoritative playing/idle from the media_players feed.
-        current = self._current()
-        if current is not None:
-            return MediaPlayerState.PLAYING if current.state == "playing" else MediaPlayerState.IDLE
-        # Sendspin (virtual, not in the feed): derive from routing — playing if
-        # a present source is linked into it, else idle.
-        if self._is_sendspin and self.available:
+        # Virtual (sendspin / AirPlay-2): derive from routing — playing if a
+        # present source is linked into this output, else idle.
+        if self._is_virtual and self.available:
             present_sources = {s.node_name for s in self._matrix().sources if s.present}
             linked = any(out == self.node_name and src in present_sources for src, out in self._matrix().links)
             return MediaPlayerState.PLAYING if linked else MediaPlayerState.IDLE
@@ -307,29 +404,53 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
 
     @property
     def volume_level(self) -> float | None:
+        # AirPlay-2 volume comes from the daemon's per-device store, surfaced on
+        # `/api/outputs` as `ap2_volume` (0.0–1.0). It's device-authoritative
+        # when known, but genuinely unknown until the receiver reports one or the
+        # user sets one — in which case the daemon omits it and we honestly report
+        # None rather than fabricating full scale.
+        if self._is_ap2:
+            meta = self.coordinator.outputs_meta.get(self.node_name)
+            return meta.ap2_volume if meta else None
         # Sendspin volume is carried in-band (no PipeWire node volume); it comes
         # from the daemon's per-device store (0-100), default full scale.
         if self._is_sendspin:
             return self.coordinator.sendspin_volumes.get(self.node_name, 100) / 100
-        current = self._current()
-        return current.volume if current else None
+        return None
+
+    @property
+    def is_volume_muted(self) -> bool | None:
+        # Only AirPlay-2 advertises VOLUME_MUTE; its mute flag is carried on
+        # `/api/outputs` as `ap2_muted` (defaults to False daemon-side).
+        if self._is_ap2:
+            meta = self.coordinator.outputs_meta.get(self.node_name)
+            return meta.ap2_muted if meta else None
+        return None
 
     @property
     def extra_state_attributes(self) -> dict[str, object] | None:
-        """For a sendspin device that shares its exact source-set with other
-        sendspin devices, expose the synchronized group it's part of (the
-        daemon forms these automatically — sendspin_group.rs). Absent for a
-        lone/ungrouped device and for RAOP outputs."""
-        if not self._is_sendspin:
+        """For a virtual device that shares its exact source-set with other
+        devices of the same kind, expose the synchronized group it's part of
+        (the daemon forms these automatically — sync_group.rs). Absent for a
+        lone/ungrouped device. Reported under a kind-specific key
+        (`sendspin_group_members` / `airplay2_group_members`)."""
+        if not self._is_virtual:
             return None
         members = self._group_members()
         if len(members) < 2:
             return None
-        return {"sendspin_group_members": [_display_name(n) for n in members]}
+        key = "airplay2_group_members" if self._is_ap2 else "sendspin_group_members"
+        return {key: [_display_name(n) for n in members]}
 
     def _group_members(self) -> list[str]:
-        """Node names of the sendspin devices sharing this device's exact
-        (non-empty) set of routed sources — i.e. its synchronized group."""
+        """Node names of the same-kind virtual devices sharing this device's
+        exact (non-empty) set of routed sources — i.e. its synchronized group.
+        Grouping is within one protocol (sendspin with sendspin, AP2 with AP2):
+        a mixed-protocol group is a separate acoustic-alignment concern the
+        daemon doesn't form automatically."""
+        prefix = self._virtual_prefix
+        if prefix is None:
+            return []
         matrix = self._matrix()
 
         def source_key(output_name: str) -> tuple[str, ...]:
@@ -341,7 +462,7 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         return sorted(
             o.node_name
             for o in matrix.outputs
-            if o.node_name.startswith(SENDSPIN_DEV_PREFIX) and source_key(o.node_name) == mine
+            if o.node_name.startswith(prefix) and source_key(o.node_name) == mine
         )
 
     @property
@@ -365,18 +486,24 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
             raise HomeAssistantError(f"unknown source '{source}' for {self.entity_id}")
         return target.node_name
 
-    def _require_node_id(self) -> int:
-        node_id = self._live_node_id
-        if node_id is None:
-            raise HomeAssistantError(f"output '{self.node_name}' is not currently available")
-        return node_id
-
     async def async_set_volume_level(self, volume: float) -> None:
-        if self._is_sendspin:
+        if self._is_ap2:
+            # 0.0–1.0 pushed in-band to the receiver via the AP2 control plane
+            # (no PipeWire node volume for a virtual AP2 output).
+            await self.coordinator.client.async_set_ap2_volume(self.node_name, volume)
+        elif self._is_sendspin:
             # 0.0–1.0 → 0–100, sent in-band to the device (no PipeWire node vol).
             await self.coordinator.client.async_set_sendspin_volume(self.node_name, round(volume * 100))
         else:
-            await self.coordinator.client.async_set_volume(self._require_node_id(), volume)
+            raise HomeAssistantError(f"volume is not supported for {self.entity_id}")
+        await self.coordinator.async_request_refresh()
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        if not self._is_ap2:
+            # Only AirPlay-2 advertises VOLUME_MUTE; guard so a direct service
+            # call on another kind fails loudly instead of silently no-op-ing.
+            raise HomeAssistantError(f"mute is not supported for {self.entity_id}")
+        await self.coordinator.client.async_set_ap2_mute(self.node_name, mute)
         await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
@@ -413,68 +540,6 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
             for src in {src for src, out in self._matrix().links if out == self.node_name}:
                 await self.coordinator.client.async_unlink(src, self.node_name)
         await self.coordinator.async_request_refresh()
-
-    async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs) -> None:
-        # This entity has no "primary playback" contract of its own (no
-        # queue, no PLAY/PAUSE) — the only thing `play_media` can mean for
-        # a passive routing sink is the ducked announce-stream mix from
-        # Section 5.6, regardless of whether the caller set `announce`
-        # (tts.speak already does; a doorbell automation calling
-        # play_media directly might not, per PLAN.md Section 6's
-        # reasoning for declaring MEDIA_ANNOUNCE explicitly).
-        #
-        # Section 5.6 v2 (Phase 3.5), additive: a caller opts into the
-        # Wyoming path per call via the core `play_media` service's
-        # `extra` dict (the same HA-standard mechanism other integrations
-        # use for implementation-specific options, e.g. Sonos/cast) —
-        # `media_id` is ignored in that case since the text to synthesize
-        # comes from `extra.wyoming.text` instead. Everyone else
-        # (`tts.speak`, existing automations) keeps calling this with a
-        # plain rendered-clip URL exactly as before.
-        extra = kwargs.get("extra") or {}
-        # Deliberately at INFO so the "did HA ever route audio to us?" question
-        # is answerable from the normal log without turning on debug — this is
-        # the first thing to check when TTS/announce "does nothing".
-        _LOGGER.info(
-            "play_media on %s (node=%s): media_type=%s announce=%s media_id=%r extra=%r",
-            self.entity_id,
-            self.node_name,
-            media_type,
-            kwargs.get("announce"),
-            media_id,
-            extra,
-        )
-        node_id = self._require_node_id()
-        wyoming = extra.get("wyoming")
-        try:
-            if wyoming:
-                await self.coordinator.client.async_announce_wyoming(
-                    node_id,
-                    host=wyoming["host"],
-                    text=wyoming["text"],
-                    port=wyoming.get("port", 10200),
-                    voice=wyoming.get("voice"),
-                )
-            else:
-                # tts.speak / the media browser hand us a `media-source://` URI,
-                # not a URL — resolve it to a concrete one, then make it
-                # absolute (async_process_play_media_url) so the bridge daemon,
-                # which runs on a different host, can actually fetch it. A plain
-                # URL passes through both steps unchanged.
-                if media_source.is_media_source_id(media_id):
-                    resolved = await media_source.async_resolve_media(
-                        self.hass, media_id, self.entity_id
-                    )
-                    _LOGGER.debug("resolved media-source %r -> %r", media_id, resolved.url)
-                    media_id = resolved.url
-                media_id = async_process_play_media_url(self.hass, media_id)
-                _LOGGER.info("announcing %r into %s (node=%s)", media_id, self.entity_id, node_id)
-                await self.coordinator.client.async_announce(node_id, media_id)
-        except Exception as err:
-            # Surface the failure both to the caller (service error) and the log,
-            # so a broken announce is never silent.
-            _LOGGER.error("play_media on %s failed: %s", self.entity_id, err)
-            raise
 
 
 class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaPlayerEntity):
@@ -538,10 +603,10 @@ class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaP
         for name in g.members:
             if name.startswith(SENDSPIN_DEV_PREFIX):
                 levels.append(self.coordinator.sendspin_volumes.get(name, 100) / 100)
-            else:
-                current = next((p for p in self.coordinator.data if p.node_name == name), None)
-                if current is not None and current.volume is not None:
-                    levels.append(current.volume)
+            elif name.startswith(AP2_DEV_PREFIX):
+                meta = self.coordinator.outputs_meta.get(name)
+                if meta is not None and meta.ap2_volume is not None:
+                    levels.append(meta.ap2_volume)
         return sum(levels) / len(levels) if levels else None
 
     def _resolve_source_name(self, source: str) -> str:
@@ -558,18 +623,16 @@ class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaP
         await self.coordinator.async_request_refresh()
 
     async def async_set_volume_level(self, volume: float) -> None:
-        """Apply the master volume to every member (in-band for sendspin, node
-        volume for RAOP)."""
+        """Apply the master volume to every member, in-band per device: sendspin
+        through its per-device store, AirPlay-2 through the AP2 control plane."""
         g = self._group()
         if not g:
             return
         for name in g.members:
             if name.startswith(SENDSPIN_DEV_PREFIX):
                 await self.coordinator.client.async_set_sendspin_volume(name, round(volume * 100))
-            else:
-                current = next((p for p in self.coordinator.data if p.node_name == name), None)
-                if current is not None:
-                    await self.coordinator.client.async_set_volume(current.node_id, volume)
+            elif name.startswith(AP2_DEV_PREFIX):
+                await self.coordinator.client.async_set_ap2_volume(name, volume)
         await self.coordinator.async_request_refresh()
 
 

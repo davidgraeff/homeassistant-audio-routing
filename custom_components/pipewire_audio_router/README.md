@@ -53,10 +53,10 @@ expose `/api/source/rtp`.
 
 ### Outputs (`media_player`)
 
-One `media_player` entity per output the add-on reports via
-`GET /api/media_players`, named by stripping the `raop-out-`/
-`sendspin-out-` prefix and title-casing the rest (e.g.
-`sendspin-out-kitchen` → **Kitchen**). Volume and playing/idle state are
+One `media_player` entity per output in the add-on's routing matrix — the
+auto-discovered virtual AirPlay-2 (`ap2-dev-*`) and sendspin (`sendspin-dev-*`)
+devices — named by stripping the prefix and title-casing the rest (e.g.
+`sendspin-dev-kitchen` → **Kitchen**). Playing/idle state and volume are
 polled every 5 seconds; the routing (`source`) is **pushed live** over the
 add-on's `/api/routing/ws` WebSocket, so re-wiring shows up immediately.
 

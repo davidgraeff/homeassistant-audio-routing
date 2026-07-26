@@ -48,6 +48,20 @@ async def _setup(hass, stack, rtp=RTP_DISABLED):
     )
     stack.enter_context(patch(f"{API}.async_get_rtp_source", new=AsyncMock(return_value=rtp)))
     stack.enter_context(patch(f"{API}.async_get_sendspin_volumes", new=AsyncMock(return_value={})))
+    # Also mock the secondary polls (outputs/groups/settings) so setup is fully
+    # offline and doesn't depend on a refused connection — a socket-blocking
+    # test env turns that refusal into a hard error instead.
+    stack.enter_context(patch(f"{API}.async_get_outputs", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{API}.async_get_music_groups", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=[])))
+    from custom_components.pipewire_audio_router.api import AppSettings
+
+    stack.enter_context(
+        patch(
+            f"{API}.async_get_settings",
+            new=AsyncMock(return_value=AppSettings(expose_outputs_as_media_players=False)),
+        )
+    )
     stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()

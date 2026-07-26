@@ -28,6 +28,30 @@ class MediaPlayerState:
 
 
 @dataclass
+class OutputMeta:
+    """Supplementary per-output info from `/api/outputs` that the routing
+    *matrix* (the entity source of truth) doesn't carry — the output `kind`
+    (`"airplay"` | `"sendspin"` | `"airplay2"`) and the receiver's resolved
+    `ip`. The IP is what lets an AirPlay-2 output correlate to its Home
+    Assistant device for name/area adoption (there's no mDNS hostname trick for
+    third-party receivers the way there is for ESPHome sendspin devices).
+
+    For AirPlay-2 outputs (`kind == "airplay2"`) the daemon also carries the
+    receiver's per-device volume/mute here: `ap2_volume` is the device-
+    authoritative level (0.0–1.0) or `None` when it's genuinely unknown (the
+    receiver hasn't reported it and the user hasn't set one) — reported to HA as
+    `volume_level = None` rather than fabricating a value. `ap2_muted` is the
+    last-known mute flag (defaulting to False). Both are `None` for non-AP2
+    outputs (and for any daemon too old to send them)."""
+
+    node_name: str
+    kind: str
+    ip: str | None
+    ap2_volume: float | None = None
+    ap2_muted: bool | None = None
+
+
+@dataclass
 class RtpSourceState:
     """Mirrors bridge-daemon's `RtpSourceInfo` JSON shape (api.rs). The
     Bluetooth-bridge RTP source is a native PipeWire module, not a subprocess,
@@ -136,6 +160,32 @@ class PipewireRouterApiClient:
             for item in data
         ]
 
+    async def async_get_outputs(self) -> list[OutputMeta]:
+        """Fetch the Outputs listing (`GET /api/outputs`) for the per-output
+        `kind` and resolved `ip`. The routing matrix omits both, but the
+        AirPlay-2 device-adoption path needs the IP; the `kind` is a convenience
+        (the media_player platform still keys behaviour off the node-name
+        prefix). Best-effort — an older daemon without this endpoint just yields
+        an empty map coordinator-side."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/outputs") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        return [
+            OutputMeta(
+                node_name=str(item["node_name"]),
+                kind=str(item.get("kind", "")),
+                ip=item.get("ip"),
+                # Absent/null => volume genuinely unknown; keep it None (do not
+                # coerce to a number) so the entity can report volume_level=None.
+                ap2_volume=item.get("ap2_volume"),
+                ap2_muted=item.get("ap2_muted"),
+            )
+            for item in data
+        ]
+
     async def async_set_volume(self, node_id: int, volume: float) -> None:
         try:
             async with self._session.post(
@@ -170,6 +220,32 @@ class PipewireRouterApiClient:
                 resp.raise_for_status()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not set sendspin volume: {err}") from err
+
+    async def async_set_ap2_volume(self, node_name: str, volume: float) -> None:
+        """Set one AirPlay-2 receiver's volume (`PUT /api/ap2/volume`, 0.0–1.0).
+        Pushed in-band to the receiver as an RTSP SET_PARAMETER and stored
+        daemon-side (re-applied while streaming). Like the sendspin outputs
+        these are virtual — there's no PipeWire node volume to set."""
+        try:
+            async with self._session.put(
+                f"{self._base_url}/api/ap2/volume",
+                json={"node_name": node_name, "volume": volume},
+            ) as resp:
+                resp.raise_for_status()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not set AirPlay-2 volume: {err}") from err
+
+    async def async_set_ap2_mute(self, node_name: str, muted: bool) -> None:
+        """Mute/unmute one AirPlay-2 receiver (`PUT /api/ap2/mute`). Daemon-side
+        this maps to volume 0; stored and re-applied like the volume."""
+        try:
+            async with self._session.put(
+                f"{self._base_url}/api/ap2/mute",
+                json={"node_name": node_name, "muted": muted},
+            ) as resp:
+                resp.raise_for_status()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not set AirPlay-2 mute: {err}") from err
 
     async def async_announce(self, node_id: int, url: str, duck_volume: float | None = None) -> None:
         """Ducks whatever is currently linked into this output and plays

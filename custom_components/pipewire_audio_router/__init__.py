@@ -23,6 +23,7 @@ from .api import (
     AnnouncementGroup,
     MediaPlayerState,
     MusicGroup,
+    OutputMeta,
     PipewireRouterApiClient,
     PipewireRouterApiError,
     RoutingMatrix,
@@ -88,6 +89,11 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         # each poll. Sendspin devices are virtual (no PipeWire node volume), so
         # their media_player volume comes from here, not from `.data`.
         self.sendspin_volumes: dict[str, int] = {}
+        # Supplementary per-output metadata from `/api/outputs`, keyed by node
+        # name, refreshed each poll. The routing matrix (which drives the
+        # entities) doesn't carry the receiver IP, and the AirPlay-2 output's
+        # device/area adoption needs it — so it's fetched here alongside it.
+        self.outputs_meta: dict[str, OutputMeta] = {}
         # Named music/announcement groups (groups_store.rs) + the per-output
         # entity toggle, refreshed each poll. These drive which media_player
         # entities exist: one per music group + one per announcement group, plus
@@ -117,6 +123,12 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
             self.sendspin_volumes = await self.client.async_get_sendspin_volumes()
         except PipewireRouterApiError as err:
             _LOGGER.debug("sendspin volumes unavailable: %s", err)
+        # Output metadata (IP/kind) is secondary too — an AP2 output simply
+        # doesn't adopt an HA device if this is unavailable.
+        try:
+            self.outputs_meta = {o.node_name: o for o in await self.client.async_get_outputs()}
+        except PipewireRouterApiError as err:
+            _LOGGER.debug("outputs listing unavailable: %s", err)
         # Groups + the per-output toggle drive entity creation; secondary, and an
         # older daemon without these endpoints simply yields no groups.
         try:
