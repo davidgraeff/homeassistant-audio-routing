@@ -33,6 +33,13 @@ RUN npm run build
 # audio *input* path, not its client-side playback (`cpal`) — that crate has
 # no feature flag to opt out of its own audio-output module. Only needed to
 # link at build time; the -dev package doesn't ship in the runtime image.
+#
+# libevent-dev: the vendored libairptp (bridge-daemon/vendor/libairptp/, OwnTone's
+# MIT AirPlay-2 gPTP grandmaster, compiled by build.rs — see src/ap2_ptp.rs) uses
+# libevent for its PTP socket event loop. Provides <event2/*.h> + the link libs
+# (-levent/-levent_pthreads). Unlike libasound2, libevent IS reachable at runtime
+# (libairptp actively runs its event loop), so the runtime image installs the
+# matching shared lib below.
 FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
 ARG TARGETARCH
 ARG BUILDARCH
@@ -50,7 +57,7 @@ RUN set -eux; \
     if [ "$TARGETARCH" = "$BUILDARCH" ]; then \
         apt-get update; \
         apt-get install -y --no-install-recommends \
-            pkg-config clang libpipewire-0.3-dev libspa-0.2-dev libasound2-dev; \
+            pkg-config clang libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libevent-dev; \
     else \
         dpkg --add-architecture "$TARGETARCH"; \
         apt-get update; \
@@ -59,9 +66,14 @@ RUN set -eux; \
         # clang look — without it, cc-based crates like `ring` fail with
         # "bits/libc-header-start.h: No such file or directory". Co-installs
         # cleanly alongside the base image's amd64 libc6-dev on trixie.
+        # gcc-<triplet> is the C cross-compiler; g++-<triplet> is the matching
+        # C++ one (provides cc1plus) — needed by cc-rs crates that build C++,
+        # e.g. fdk-aac-sys. Without it the AAC build dies with "cannot execute
+        # 'cc1plus'". (Native builds get g++ from the base image's build tools.)
         apt-get install -y --no-install-recommends \
-            pkg-config clang "gcc-${gnu}" "libc6-dev:$TARGETARCH" \
-            "libpipewire-0.3-dev:$TARGETARCH" "libspa-0.2-dev:$TARGETARCH" "libasound2-dev:$TARGETARCH"; \
+            pkg-config clang "gcc-${gnu}" "g++-${gnu}" "libc6-dev:$TARGETARCH" \
+            "libpipewire-0.3-dev:$TARGETARCH" "libspa-0.2-dev:$TARGETARCH" "libasound2-dev:$TARGETARCH" \
+            "libevent-dev:$TARGETARCH"; \
         up_triple="$(echo "$triple" | tr 'a-z-' 'A-Z_')"; \
         { echo "export CARGO_TARGET_${up_triple}_LINKER=${gnu}-gcc"; \
           echo "export PKG_CONFIG_ALLOW_CROSS=1"; \
@@ -106,6 +118,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dbus-x11 \
         procps \
         bash \
+        # Runtime shared libs for the vendored libairptp (AirPlay-2 gPTP master,
+        # src/ap2_ptp.rs) — it runs a libevent loop, so unlike libasound2 the
+        # DT_NEEDED is NOT dropped and the .so must be present. Names carry the
+        # t64 (64-bit time_t) suffix on Ubuntu 26.04.
+        libevent-2.1-7t64 \
+        libevent-pthreads-2.1-7t64 \
     && rm -rf /var/lib/apt/lists/* \
     # Man pages, translated message catalogs, and long-form package docs are
     # dead weight in a container that only ever talks over its own REST API
@@ -137,14 +155,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # No avahi-daemon (and no system D-Bus started in run.sh) either: it was only
 # ever there for the shairport-sync subprocess, which hard-required avahi + a
 # real system bus to start. The native AirPlay receiver replaced it, and all
-# mDNS discovery/advertising (RAOP outputs, AirPlay, sendspin) now goes through
-# the pure-Rust `mdns-sd` crate, which needs no daemon — see docs/decisions.md
-# "Native AirPlay-receive source".
+# mDNS discovery/advertising (AirPlay-2 + sendspin outputs, AirPlay receive) now
+# goes through the pure-Rust `mdns-sd` crate, which needs no daemon — see
+# docs/decisions.md "Native AirPlay-receive source".
 
 # Real-time scheduling without RTKit. The `pipewire` daemon, `wireplumber`, AND
 # every PipeWire *client* (client.conf — this includes the bridge daemon, which
-# hosts the raop-sink/sendspin nodes in its own context, so its data-loop is the
-# most latency-critical of the three) load `libpipewire-module-rt`. By default
+# hosts the group anchor / RTP-source nodes in its own context, so its data-loop
+# is the most latency-critical of the three) load `libpipewire-module-rt`. By default
 # (`rtkit.enabled` unset -> true) it tries to obtain RT priority through the
 # RTKit D-Bus service. There is no rtkit-daemon on this container's system bus,
 # so that path only spams `RTKit error: org.freedesktop.DBus.Error.ServiceUnknown`

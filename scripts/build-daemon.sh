@@ -55,7 +55,10 @@ echo "--- building bridge-daemon with $ENGINE (output owned by $(id -un)) ---"
 mkdir -p "$OUT"
 cid="$("$ENGINE" create "$TAG")"
 trap '"$ENGINE" rm -f "$cid" >/dev/null 2>&1 || true' EXIT
-"$ENGINE" cp "$cid:/build/target/release/bridge-daemon" "$OUT/bridge-daemon"
+# The build stage cross-compiles into target/<triple>/release/ (CARGO_BUILD_TARGET
+# is always set in the Dockerfile) and copies the result to a fixed /bridge-daemon
+# so extraction doesn't need to know the triple. Copy from that fixed path.
+"$ENGINE" cp "$cid:/bridge-daemon" "$OUT/bridge-daemon"
 
 echo "--- done ---"
 ls -l "$OUT/bridge-daemon"

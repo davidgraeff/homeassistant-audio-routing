@@ -18,11 +18,12 @@ rm -f "$XDG_RUNTIME_DIR"/pipewire-0 "$XDG_RUNTIME_DIR"/pipewire-0-manager
 eval "$(dbus-launch --sh-syntax)"
 export DBUS_SESSION_BUS_ADDRESS
 
-# RAOP outputs are NOT statically configured before pipewire starts anymore.
-# The bridge daemon loads one libpipewire-module-raop-sink per output into its
-# own PipeWire context at runtime — hot-reloadable via the /api/outputs API —
-# so there's nothing to generate up front. See docs/decisions.md "Loading
-# PipeWire modules at runtime" and bridge-daemon/src/pw_module.rs.
+# Nothing audio-related is statically configured before pipewire starts. Outputs
+# (AirPlay-2 + sendspin) are auto-discovered virtual endpoints, and the bridge
+# daemon loads the RTP-source module into its own PipeWire context at runtime —
+# hot-reloadable via the REST API — so there's nothing to generate up front. See
+# docs/decisions.md "Loading PipeWire modules at runtime" and
+# bridge-daemon/src/pw_module.rs.
 
 pipewire &
 PIDS=("$!")
@@ -38,12 +39,12 @@ PIDS+=("$!")
 sleep 1
 
 # The bridge daemon owns everything user-configurable at runtime, all
-# in-process: it loads a raop-sink module per RAOP output, runs the native
-# AirPlay-receive source (airplay_source.rs) and the RTP source, and hosts the
-# embedded sendspin server per output (sendspin_server.rs). No source/adapter
-# subprocesses to spawn or supervise anymore, and no boot-time process plan —
-# outputs, the AirPlay/RTP sources, and sendspin outputs are all managed live
-# via the API (see bridge-daemon/src/sources_store.rs and docs/decisions.md).
+# in-process: it runs the native AirPlay-receive source (airplay_source.rs) and
+# the RTP source, drives AirPlay-2 receivers with in-process senders
+# (ap2_server.rs), and hosts the embedded sendspin server per output
+# (sendspin_server.rs). No source/adapter subprocesses to spawn or supervise, and
+# no boot-time process plan — the AirPlay/RTP sources and all outputs are managed
+# live via the API (see bridge-daemon/src/sources_store.rs and docs/decisions.md).
 # mDNS discovery/advertising is all mdns-sd (no avahi/system-D-Bus daemon).
 bridge-daemon serve &
 PIDS+=("$!")
