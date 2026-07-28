@@ -272,48 +272,96 @@ class PipewireRouterApiClient:
             wyoming["voice"] = voice
         await self._async_announce(node_id, {"wyoming": wyoming}, duck_volume)
 
-    async def async_get_rtp_source(self) -> RtpSourceState:
-        """Fetch the Bluetooth-bridge RTP source state (`GET /api/source/rtp`)."""
+    # The RTP source is now one entry in the daemon's source collection
+    # (`/api/sources`), not the retired singular `/api/source/rtp`. This
+    # integration models a single Bluetooth-bridge RTP input, so it operates on
+    # THE rtp source: the well-known legacy id `bt-bridge-rtp` if present, else
+    # the first source of kind `rtp`. Disabled defaults mirror the daemon's own
+    # (rtp_source.rs): 46000 / 200 ms.
+    _RTP_LEGACY_ID = "bt-bridge-rtp"
+    _RTP_DEFAULT_PORT = 46000
+    _RTP_DEFAULT_LATENCY_MSEC = 200
+
+    async def _async_list_sources(self) -> list[dict]:
+        """The daemon's source collection (`GET /api/sources`)."""
         try:
-            async with self._session.get(f"{self._base_url}/api/source/rtp") as resp:
+            async with self._session.get(f"{self._base_url}/api/sources") as resp:
                 resp.raise_for_status()
                 data = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        return list(data.get("sources", []))
+
+    def _pick_rtp(self, sources: list[dict]) -> dict | None:
+        """THE rtp source this integration manages (legacy id, else first rtp)."""
+        rtp = [s for s in sources if s.get("kind") == "rtp"]
+        for src in rtp:
+            if src.get("id") == self._RTP_LEGACY_ID:
+                return src
+        return rtp[0] if rtp else None
+
+    async def async_get_rtp_source(self) -> RtpSourceState:
+        """Fetch the Bluetooth-bridge RTP source state from the source collection
+        (`GET /api/sources`). `enabled` = the source exists in the collection;
+        `loaded` = its PipeWire node is live (`present`)."""
+        src = self._pick_rtp(await self._async_list_sources())
+        if src is None:
+            return RtpSourceState(
+                enabled=False,
+                port=self._RTP_DEFAULT_PORT,
+                latency_msec=self._RTP_DEFAULT_LATENCY_MSEC,
+                loaded=False,
+            )
+        rtp = src.get("rtp") or {}
         return RtpSourceState(
-            enabled=bool(data.get("enabled", False)),
-            port=int(data.get("port", 0)),
-            latency_msec=int(data.get("latency_msec", 0)),
-            loaded=bool(data.get("loaded", False)),
+            enabled=True,
+            port=int(rtp.get("port", self._RTP_DEFAULT_PORT)),
+            latency_msec=int(rtp.get("latency_msec", self._RTP_DEFAULT_LATENCY_MSEC)),
+            loaded=bool(src.get("present", False)),
         )
 
     async def async_set_rtp_source(self, port: int, latency_msec: int) -> None:
-        """Enable (or re-point) the RTP source (`PUT /api/source/rtp`). Sends both
-        the listen `port` and the jitter-buffer `latency_msec` — the daemon
-        replaces the whole config each call, so both are always supplied (the
-        caller passes the current value for whichever knob it isn't changing).
-        The daemon reports logical failure (e.g. the module refusing to load) as
-        `{ok: false}` carried on a non-2xx status, so — like the routing ops —
-        the `ok` flag, not the HTTP status alone, is authoritative."""
+        """Enable (or re-point) the RTP source. If it already exists, its stored
+        config is read and only `port`/`latency_msec` are overridden — so
+        `source_addr`/`ignore_ssrc`/`rate` (e.g. a multicast group) are PRESERVED
+        (`PUT /api/sources/{id}`); if it doesn't exist yet it's created with the
+        daemon's defaults for the rest (`POST /api/sources`). Logical failure is
+        carried as `{ok: false}`, so that flag — not the HTTP status alone — is
+        authoritative. (ids are slugs, URL-safe, so used unescaped.)"""
+        src = self._pick_rtp(await self._async_list_sources())
+        if src is not None:
+            rtp = dict(src.get("rtp") or {})
+            rtp["port"] = port
+            rtp["latency_msec"] = latency_msec
+            url = f"{self._base_url}/api/sources/{src['id']}"
+            payload: dict = {"rtp": rtp}
+            request = self._session.put
+        else:
+            url = f"{self._base_url}/api/sources"
+            payload = {"label": "Bluetooth Bridge", "kind": "rtp", "rtp": {"port": port, "latency_msec": latency_msec}}
+            request = self._session.post
         try:
-            async with self._session.put(
-                f"{self._base_url}/api/source/rtp",
-                json={"port": port, "latency_msec": latency_msec},
-            ) as resp:
+            async with request(url, json=payload) as resp:
                 body = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not enable RTP source: {err}") from err
-        if not body.get("ok", False):
+        # POST returns the created SourceView (no `ok` field = success); PUT and
+        # error responses carry `ok`. Only an explicit `ok: false` is a failure.
+        if isinstance(body, dict) and body.get("ok") is False:
             raise PipewireRouterApiError(body.get("message") or "could not enable RTP source")
 
     async def async_disable_rtp_source(self) -> None:
-        """Disable the RTP source (`DELETE /api/source/rtp`). Idempotent daemon-side."""
+        """Disable the RTP source by removing it from the collection
+        (`DELETE /api/sources/{id}`). Idempotent: a no-op if none exists."""
+        src = self._pick_rtp(await self._async_list_sources())
+        if src is None:
+            return
         try:
-            async with self._session.delete(f"{self._base_url}/api/source/rtp") as resp:
+            async with self._session.delete(f"{self._base_url}/api/sources/{src['id']}") as resp:
                 body = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not disable RTP source: {err}") from err
-        if not body.get("ok", False):
+        if isinstance(body, dict) and body.get("ok") is False:
             raise PipewireRouterApiError(body.get("message") or "could not disable RTP source")
 
     async def async_get_routing(self) -> RoutingMatrix:

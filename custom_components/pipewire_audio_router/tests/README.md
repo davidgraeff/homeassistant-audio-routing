@@ -26,4 +26,4 @@ python3 -m pytest custom_components/pipewire_audio_router/tests/ -p pytest_homea
   routing WebSocket.
 - `test_rtp_source.py` — the Bluetooth-bridge RTP `switch`/`number`: entities
   reflect daemon state, enable/disable, live vs. remembered port changes, and
-  the API client's `/api/source/rtp` calls (parsing + `ok`-flag errors).
+  the API client's `/api/sources` calls (parsing + `ok`-flag errors).

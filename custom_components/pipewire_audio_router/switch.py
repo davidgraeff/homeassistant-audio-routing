@@ -1,8 +1,8 @@
 """Switch to enable/disable the Bluetooth-bridge RTP source on the add-on.
 
 A single switch per daemon. Turning it on loads `libpipewire-module-rtp-source`
-into the add-on (via `PUT /api/source/rtp`) on the port held by the companion
-`number` entity; turning it off unloads it (`DELETE /api/source/rtp`). Once on,
+into the add-on (via the `/api/sources` collection) on the port held by the companion
+`number` entity; turning it off removes it (`DELETE /api/sources/{id}`). Once on,
 the source's `bt-bridge-rtp` node shows up in every output's `source_list`
 automatically (the routing matrix is pushed live over the WebSocket), so there
 is nothing else to wire — pick it as an output's source like any other.
@@ -41,7 +41,7 @@ class PipewireRtpSourceSwitch(CoordinatorEntity[PipewireRouterCoordinator], Swit
     @property
     def available(self) -> bool:
         # Unavailable if the daemon is unreachable, or too old to expose
-        # `/api/source/rtp` (coordinator leaves `rtp` None in that case).
+        # `/api/sources` (coordinator leaves `rtp` None in that case).
         return super().available and self.coordinator.rtp is not None
 
     @property

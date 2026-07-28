@@ -4,7 +4,7 @@ receiver-side jitter-buffer latency.
 The port must match what the ESP32 firmware sends to. The latency is the
 receiver's jitter buffer in ms — raise it on a weak-signal bridge to trade
 latency for fewer audible dropouts. Changing either while the source is enabled
-re-points it live (`PUT /api/source/rtp` reloads the module); while it's
+re-points it live (`PUT /api/sources/{id}` reloads the module); while it's
 disabled the value is just remembered for the next enable.
 
 The add-on's daemon only persists these while the source is *enabled* — when

@@ -46,9 +46,11 @@ Design notes proven on real hardware (see ../../docs/decisions.md, the
     locks onto it. When no phone is connected the capture sits on the sink's own
     monitor, but that cycle has no driver -> **zero packets are sent while
     idle** (measured), so nothing is renamed and nothing leaks airtime.
-  - `module-rtp-sink`'s S16LE/44100/stereo output matches what the add-on's
-    `libpipewire-module-rtp-source` already expects (rtp_source.rs), so the Pi
-    is a drop-in alternative to the ESP32 with no receiver-side change.
+  - `module-rtp-sink`'s S16LE/**48000**/stereo output matches what the add-on's
+    `libpipewire-module-rtp-source` now defaults to (rtp_source.rs). Both ends at
+    48 kHz keeps the whole path at the router graph's native rate — no resample
+    on the Pi (phones stream 48 kHz over aptX/AAC) and none on the receiver. If
+    you change the add-on's RTP source rate, pass a matching `--rate` here.
 
 Run it AS the bridge user (not root), on the Pi, with passwordless sudo:
 
@@ -72,7 +74,7 @@ import tempfile
 
 DEFAULT_PORT = 46000
 DEFAULT_FORMAT = "S16LE"  # native-endian PCM; matches rtp_source.rs on the add-on
-DEFAULT_RATE = 44100
+DEFAULT_RATE = 48000
 DEFAULT_CHANNELS = 2
 # Bluetooth Class of Device: major "Audio/Video", minor "Loudspeaker", with the
 # Audio + Rendering service bits set, so phones show the Pi as a speaker.

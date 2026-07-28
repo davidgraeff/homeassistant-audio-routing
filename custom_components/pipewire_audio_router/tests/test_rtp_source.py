@@ -187,38 +187,78 @@ class _FakeResp:
 
 
 class _FakeHttpSession:
-    def __init__(self, resp):
-        self._resp = resp
+    """The RTP client now works against the `/api/sources` collection, so its
+    get/set/disable each do TWO calls: a GET (list the sources) then the mutating
+    verb (PUT/POST/DELETE on `/api/sources/{id}`). This fake serves `get_resp` to
+    GET and `mutate_resp` to the mutating verbs (defaulting to `get_resp`)."""
+
+    def __init__(self, get_resp, mutate_resp=None):
+        self._get = get_resp
+        self._mutate = mutate_resp if mutate_resp is not None else get_resp
 
     def get(self, url):
-        return self._resp
+        return self._get
 
     def put(self, url, json=None):
-        return self._resp
+        return self._mutate
+
+    def post(self, url, json=None):
+        return self._mutate
 
     def delete(self, url):
-        return self._resp
+        return self._mutate
+
+
+def _sources_list(*, present=True, port=46000, latency_msec=200, source_addr="239.255.42.42", ignore_ssrc=False, rate=48000):
+    """A `GET /api/sources` body containing the single Bluetooth-bridge RTP
+    source (legacy id) the client operates on."""
+    return {
+        "sources": [
+            {
+                "id": "bt-bridge-rtp",
+                "label": "Bluetooth Bridge",
+                "kind": "rtp",
+                "present": present,
+                "node_name": "bt-bridge-rtp",
+                "airplay": None,
+                "rtp": {"port": port, "latency_msec": latency_msec, "source_addr": source_addr, "ignore_ssrc": ignore_ssrc, "rate": rate},
+            }
+        ]
+    }
 
 
 async def test_get_rtp_source_parses_shape():
+    # `enabled` = the rtp source exists in the collection; `loaded` = present.
     client = PipewireRouterApiClient(
-        _FakeHttpSession(_FakeResp({"enabled": True, "port": 46000, "latency_msec": 250, "loaded": True})), "h", 8099
+        _FakeHttpSession(_FakeResp(_sources_list(present=True, port=46000, latency_msec=250))), "h", 8099
     )
     state = await client.async_get_rtp_source()
     assert (state.enabled, state.port, state.latency_msec, state.loaded) == (True, 46000, 250, True)
 
 
 async def test_set_rtp_source_raises_daemon_message_on_ok_false():
-    # 502 with ok:false carries the daemon's reason — surfaced, not swallowed.
+    # set reads the collection (GET → existing source), then PUTs the update; a
+    # 502 with ok:false on the PUT carries the daemon's reason — surfaced.
     client = PipewireRouterApiClient(
-        _FakeHttpSession(_FakeResp({"ok": False, "message": "failed to load module"}, status=502)), "h", 8099
+        _FakeHttpSession(
+            _FakeResp(_sources_list()),
+            _FakeResp({"ok": False, "message": "failed to load module"}, status=502),
+        ),
+        "h",
+        8099,
     )
     with pytest.raises(PipewireRouterApiError, match="failed to load module"):
         await client.async_set_rtp_source(46000, 200)
 
 
 async def test_disable_rtp_source_ok():
+    # disable finds the source (GET) then DELETEs it (ok:true).
     client = PipewireRouterApiClient(
-        _FakeHttpSession(_FakeResp({"ok": True, "message": "RTP source disabled"})), "h", 8099
+        _FakeHttpSession(
+            _FakeResp(_sources_list()),
+            _FakeResp({"ok": True, "message": "removed source 'bt-bridge-rtp'"}),
+        ),
+        "h",
+        8099,
     )
     await client.async_disable_rtp_source()  # no raise

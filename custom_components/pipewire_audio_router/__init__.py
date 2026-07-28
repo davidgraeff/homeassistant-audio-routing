@@ -72,7 +72,7 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         # it before the socket's first push arrives.
         self.routing: RoutingMatrix = _EMPTY_ROUTING
         # Latest RTP-source state, refreshed each poll (best-effort — an older
-        # daemon without `/api/source/rtp` leaves this `None`). `None` = the
+        # daemon without an RTP source in `/api/sources` leaves this `None`). `None` = the
         # switch/number entities show unavailable.
         self.rtp: RtpSourceState | None = None
         # The port the switch enables with. The daemon only remembers a port

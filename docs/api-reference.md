@@ -83,9 +83,19 @@ existed it's gone afterward regardless of registry-timing races.
 > per-device `POST /api/announce` with `{ "targets": ["<node_name>"], "tone":
 > true }` or `{ …, "test": true }` (built-in calibration tone / committed TTS
 > clip `bridge-daemon/assets/test-announcement.mp3`). This is the
-> backend-agnostic per-device-sender path (Sendspin now, AirPlay 2 later), so
-> it only works for targets running as per-device senders — not RAOP sink
-> nodes, which that path replaces.
+> backend-agnostic per-device-sender path (Sendspin + AirPlay 2 + pw-sink).
+>
+> A target only hears the clip while a per-device sender is streaming it, so
+> before starting the clip the daemon makes sure one is: a Sendspin device
+> always has its idle sender, and an **AirPlay-2 receiver or pw-sink target
+> with nothing routed into it gets an on-demand session** — audible a few
+> seconds later (AP2: pairing + its render delay; pw-sink: the target
+> discovering our advert and initiating the handshake) and handed back after a
+> 30 s lease. Targets that nothing can carry are **dropped from the
+> announcement and named in `message`** (with all of them unavailable the call
+> is rejected), so a "playing" answer means audio is really going somewhere.
+> See
+> [architecture.md §5.4](../pipewire_audio_router/docs/architecture.md#54-announcing-to-an-output-with-nothing-routed-into-it).
 
 ## Sources
 

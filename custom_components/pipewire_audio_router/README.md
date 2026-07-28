@@ -37,7 +37,7 @@ Two entities let you turn on and configure the RTP source that receives the
 without opening the add-on's web UI:
 
 - **Switch** *"Bluetooth bridge RTP source"* — on loads the RTP source
-  into the add-on (`PUT /api/source/rtp`), off unloads it. Once on, the
+  into the add-on (via `/api/sources`), off removes it. Once on, the
   source appears in every output's `source_list` automatically (it's just
   another routable source — pick it with `select_source`, below).
 - **Number** *"Bluetooth bridge RTP port"* — the UDP port to listen on;
@@ -49,7 +49,7 @@ without opening the add-on's web UI:
 
 Both are config entities (they show under the device's *Configuration*
 section) and go **unavailable** if the add-on is unreachable or too old to
-expose `/api/source/rtp`.
+expose the `/api/sources` collection.
 
 ### Outputs (`media_player`)
 
