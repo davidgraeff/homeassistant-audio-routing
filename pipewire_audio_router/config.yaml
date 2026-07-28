@@ -9,8 +9,7 @@ url: "https://github.com/davidgraeff/homeassistant-audio-routing"
 # .github/workflows/build-addon.yml, dev images by scripts/deploy-dev.sh).
 # Because this field is set, Supervisor treats the add-on as image-based
 # (build: false) and PULLS this image rather than compiling the Rust bridge
-# daemon on-device — true even for the local /addons/ dev install, which is
-# the whole point (a Rust release build on a Pi is minutes). Supervisor
+# daemon on-device — true even for the local /addons/ dev install. Supervisor
 # substitutes {arch} with the target's HA arch (aarch64/amd64/…).
 image: "ghcr.io/davidgraeff/{arch}-addon-pipewire_audio_router"
 arch:
@@ -20,8 +19,7 @@ startup: application
 boot: auto
 # Required: PC-sourced RTP audio and the AirPlay-2 senders (RTP + gPTP on
 # 319/320) need to receive/send unsolicited traffic on the LAN. Default bridge
-# networking isolates the container from the host's other interfaces by design —
-# confirmed necessary empirically, see spikes/03b-rtp-pc-transfer.md.
+# networking isolates the container from the host's other interfaces by design.
 host_network: true
 # Extra Linux capabilities for glitch-free audio under host load (an OS update
 # or compile on the same Pi) — not full_access, just these two:
@@ -45,10 +43,3 @@ ingress: true
 ingress_port: 8099
 panel_icon: mdi:speaker-multiple
 panel_title: Audio Router
-# No add-on options. Everything user-facing — the AirPlay-receive source, RTP
-# source, and routing of the auto-discovered AirPlay-2 / sendspin outputs — is
-# configured at runtime via the bridge daemon's REST API / web UI and persisted
-# under /data (sources.json, routing.json, groups.json). User testing found the
-# static seed options confusing (they looked authoritative but were ignored
-# after first run), so they were removed.
-# See docs/api-reference.md.
