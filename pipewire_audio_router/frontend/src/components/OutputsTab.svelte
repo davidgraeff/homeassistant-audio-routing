@@ -131,27 +131,35 @@
   // Which outputs can be announced to individually via the per-device path
   // (/api/announce). Every output kind is a per-device sender wired into the
   // OverlayMixer: sendspin, AirPlay 2 (own overlay path), and pw-sink (the
-  // per-target AppleMIDI relay applies mix_into). The gate is mDNS presence, NOT
-  // `isOnline`: for pw-sink the latter means "a receiver is attached to a session
-  // right now", which is not required to stand one up.
+  // per-target AppleMIDI relay applies mix_into). Neither dialed backend needs a
+  // wired input — the daemon opens an on-demand session for an unrouted AirPlay-2
+  // receiver or pw-sink target — so the gate is mDNS presence, NOT `isOnline`:
+  // for pw-sink the latter means "a receiver is attached to a session right now",
+  // which is exactly the case we're standing one up for.
   function canTest(o: OutputInfo): boolean {
     return o.present && (o.kind === 'sendspin' || o.kind === 'airplay2' || o.kind === 'pwsink');
   }
   function testHint(o: OutputInfo): string {
     if (!o.present) return 'Output is offline';
+    if (o.kind === 'pwsink' && !isOnline(o)) return 'Opens a temporary session — the target connects to it, so audio starts a moment later';
     return '';
   }
 
-  async function playTone(o: OutputInfo) {
-    testing = { ...testing, [o.node_name]: 'tone' };
-    await run(() => api.announce({ targets: [o.node_name], tone: true }), `Played test tone on '${o.name}'`);
+  // The daemon's own message is the honest one: whether the clip is playing now,
+  // queued behind another, or waiting on an on-demand AirPlay session that takes a
+  // few seconds to pair — so surface it verbatim instead of a fixed "Played …".
+  async function playClip(o: OutputInfo, what: 'tone' | 'announce') {
+    testing = { ...testing, [o.node_name]: what };
+    try {
+      const res = await api.announce({ targets: [o.node_name], ...(what === 'tone' ? { tone: true } : { test: true }) });
+      toast(res.ok ? 'success' : 'error', res.message);
+    } catch (e) {
+      toast('error', e instanceof Error ? e.message : String(e));
+    }
     testing = { ...testing, [o.node_name]: null };
   }
-  async function playAnnouncement(o: OutputInfo) {
-    testing = { ...testing, [o.node_name]: 'announce' };
-    await run(() => api.announce({ targets: [o.node_name], test: true }), `Played test announcement on '${o.name}'`);
-    testing = { ...testing, [o.node_name]: null };
-  }
+  const playTone = (o: OutputInfo) => playClip(o, 'tone');
+  const playAnnouncement = (o: OutputInfo) => playClip(o, 'announce');
 
   // Per-device volume / mute for present sendspin + AirPlay-2 outputs, from the
   // always-visible card header. Optimistic (no live stream on this tab).
