@@ -79,7 +79,21 @@
   }
 
   function kindLabel(o: OutputInfo): string {
-    return o.kind === 'sendspin' ? 'Sendspin' : 'AirPlay 2';
+    if (o.kind === 'sendspin') return 'Sendspin';
+    if (o.kind === 'pwsink') return 'PipeWire';
+    return 'AirPlay 2';
+  }
+
+  // "Online" for the standard status badge. Most kinds use mDNS presence +
+  // liveness (`present`). pw-sink is different: the remote host advertises over
+  // mDNS, but audio only flows once its module-rtp-session initiates the
+  // AppleMIDI handshake (receiver-driven). Treating mere mDNS presence as
+  // "online" would leave a routed-but-unconnected target showing a perpetual
+  // "connecting…" — so pw-sink counts as online only while actually streaming,
+  // and reads "offline" otherwise, matching how every other kind shows offline.
+  function isOnline(o: OutputInfo): boolean {
+    if (o.kind === 'pwsink') return o.pwsink_streaming === true;
+    return o.present;
   }
 
   // PTP-lock badge for an AirPlay-2 output — tri-state, because a lock is not
@@ -115,10 +129,13 @@
   }
 
   // Which outputs can be announced to individually via the per-device path
-  // (/api/announce). Both output kinds are per-device senders: sendspin is wired
-  // into OverlayMixer, and AirPlay 2 goes through its own announce/overlay path.
+  // (/api/announce). Every output kind is a per-device sender wired into the
+  // OverlayMixer: sendspin, AirPlay 2 (own overlay path), and pw-sink (the
+  // per-target AppleMIDI relay applies mix_into). The gate is mDNS presence, NOT
+  // `isOnline`: for pw-sink the latter means "a receiver is attached to a session
+  // right now", which is not required to stand one up.
   function canTest(o: OutputInfo): boolean {
-    return o.present && (o.kind === 'sendspin' || o.kind === 'airplay2');
+    return o.present && (o.kind === 'sendspin' || o.kind === 'airplay2' || o.kind === 'pwsink');
   }
   function testHint(o: OutputInfo): string {
     if (!o.present) return 'Output is offline';
@@ -260,7 +277,7 @@
           <h3>{o.name}</h3>
           <div class="out-badges">
             <span class="badge">{kindLabel(o)}</span>
-            <span class="badge {o.present ? 'on' : 'off'}">{o.present ? 'online' : 'offline'}</span>
+            <span class="badge {isOnline(o) ? 'on' : 'off'}">{isOnline(o) ? 'online' : 'offline'}</span>
             {#if ptpBadge(o)}
               {@const ptp = ptpBadge(o)!}
               <span class={ptp.cls} title={ptp.title}>{ptp.text}</span>
@@ -287,6 +304,7 @@
         </dl>
 
         <div class="out-controls">
+          {#if o.kind === 'sendspin' || o.kind === 'airplay2'}
           <div class="sync-field">
             <label for="sync-{o.node_name}">
               {o.kind === 'sendspin' ? 'Static delay (ms)' : 'Render delay (ms)'}
@@ -307,6 +325,7 @@
               <button onclick={() => applySync(o)} title="Apply">Set</button>
             </div>
           </div>
+          {/if}
 
           <!-- Diagnostic playback sits next to the delay it exists to check:
                play a tone, hear where it lands, adjust the delay, play again. -->

@@ -61,8 +61,9 @@ export type Encryption = 'none' | 'RSA' | 'auth_setup';
 export interface OutputInfo {
   node_name: string;
   name: string;
-  /** 'airplay2' (AirPlay 2) or 'sendspin' — for the Type column / badge. */
-  kind: 'airplay2' | 'sendspin';
+  /** 'airplay2' (AirPlay 2), 'sendspin', or 'pwsink' (remote PipeWire host via
+   * module-rtp-session) — for the Type column / badge. */
+  kind: 'airplay2' | 'sendspin' | 'pwsink';
   /** In the live graph now. */
   present: boolean;
   /** Manual store entry (`true`) vs mDNS auto-discovered (`false`). */
@@ -114,6 +115,11 @@ export interface OutputInfo {
   ap2_volume?: number | null;
   /** AirPlay 2 only: mute state. undefined for non-AP2. */
   ap2_muted?: boolean | null;
+  /** pw-sink only: a remote module-rtp-session receiver has completed the
+   * AppleMIDI handshake and is being streamed to right now. false = discovered +
+   * routed but the receiver hasn't connected yet; undefined = not a pw-sink
+   * output. Distinct from `present` (mDNS visibility). */
+  pwsink_streaming?: boolean;
   /** sendspin only: stored wire-codec choice — 'auto' | 'pcm' | 'opus' | 'flac'. */
   sendspin_codec?: SendspinCodec;
   /** sendspin only: the codec the stream actually uses (the choice narrowed by what
