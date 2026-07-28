@@ -14,12 +14,14 @@
 //! as a routable source — outputting silence when idle. A `mem`-cheap peak
 //! level is computed inline from the received PCM for the UI meter.
 
-use crate::airplay_clients::{self, SharedAirplayClients};
+use crate::airplay_clients::{self, AirplayClientStore, SharedAirplayClients};
 use crate::locks::LockRecover;
+use crate::sources_store::{AirplaySourceConfig, SourceConfig, SourceEntry, SourceId};
 use pipewire as pw;
 use pw::spa;
 use shairplay::{Ap1Encryption, AudioFormat, AudioHandler, AudioSession, RaopServer, SessionDecision, SessionInfo};
 use spa::pod::Pod;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,14 +31,18 @@ use std::sync::{Arc, Mutex};
 /// policy without restarting the receiver.
 pub type SharedPreventTakeover = Arc<AtomicBool>;
 
-/// Stable PipeWire node name for the AirPlay source — what the matrix/routing
-/// key on. (shairport-sync, by contrast, made an unpredictably-named node only
-/// while a session was live.)
+/// Stable PipeWire node name for the *legacy* single AirPlay source — kept as a
+/// const only for the legacy-id node-name mapping (routing.rs) and tests. It is
+/// **no longer** the source of truth for a running receiver: each receiver's
+/// node name is now passed to [`start`] per source (sources_store.rs derives it
+/// via `source_node_name`), so multiple receivers get distinct nodes.
 pub const AIRPLAY_NODE_NAME: &str = "airplay-in";
 
-/// RTSP port the AirPlay receiver listens on (the RAOP default; shairport used
-/// it too, and it's free once shairport is gone).
-const AIRPLAY_PORT: u16 = 5000;
+/// Default RTSP port for an AirPlay receiver (the RAOP default). No longer the
+/// source of truth — each source's port is allocated + persisted in
+/// `AirplaySourceConfig.port` and passed to [`start`]; this const is only a
+/// fallback for a config that somehow still carries port 0.
+const DEFAULT_AIRPLAY_PORT: u16 = 5000;
 
 /// The producer node's fixed format. AirPlay is 44.1 kHz stereo in practice
 /// (AP1 ALAC and, so far, AP2 AAC); `audio_init` warns if a session ever
@@ -50,7 +56,7 @@ const CHANNELS: usize = 2;
 /// The producer prebuffers this much before draining and re-buffers on
 /// underrun. 150 ms rides out LAN jitter + drift while staying imperceptible
 /// for one-way audio. Stored per install (sources_store.rs) and settable via
-/// `/api/source/airplay`, so a noisy install can trade latency for fewer
+/// `/api/sources`, so a noisy install can trade latency for fewer
 /// dropouts.
 pub const DEFAULT_AIRPLAY_LATENCY_MSEC: u32 = 150;
 
@@ -92,6 +98,15 @@ pub struct AirplayHandle {
     server: Option<RaopServer>,
     producer_stop: Option<pw::channel::Sender<ProducerCmd>>,
     peak: Arc<AtomicU32>,
+    /// The service (mDNS/display) name this receiver was started with — part of
+    /// the restart-diff (a rename = restart, so the mDNS advertisement updates).
+    service_name: String,
+    /// The config this receiver was started with — the [`reconcile`] restart
+    /// diff compares the live config against the stored one.
+    cfg: AirplaySourceConfig,
+    /// Live anti-takeover flag shared with this receiver's session gate, so the
+    /// API can toggle it (per source) without a restart.
+    prevent_takeover: SharedPreventTakeover,
 }
 
 impl AirplayHandle {
@@ -107,6 +122,25 @@ impl AirplayHandle {
         if let Some(server) = &self.server {
             server.disconnect_client(addr);
         }
+    }
+
+    /// Toggle this receiver's anti-takeover policy live (no restart), used by
+    /// `PUT /api/sources/{id}/policy`.
+    pub fn set_prevent_takeover(&self, prevent: bool) {
+        self.prevent_takeover.store(prevent, Ordering::Relaxed);
+    }
+
+    /// Whether the given entry differs from what this handle was started with in
+    /// a way that requires a full restart (service name / port / latency /
+    /// auth-setup). A `prevent_takeover`-only change does **not** need a restart
+    /// (it's toggled live via [`set_prevent_takeover`]); a kind mismatch or a
+    /// non-AirPlay entry is treated as "restart" (the reconciler will re-derive).
+    fn needs_restart(&self, entry: &SourceEntry) -> bool {
+        let SourceConfig::Airplay(new) = &entry.config else { return true };
+        self.service_name != entry.label
+            || self.cfg.port != new.port
+            || self.cfg.latency_msec != new.latency_msec
+            || self.cfg.auth_setup != new.auth_setup
     }
 
     /// Stop the RAOP server (unregister mDNS, close listeners) and the PipeWire
@@ -131,30 +165,39 @@ impl Drop for AirplayHandle {
     }
 }
 
-/// Start the AirPlay source advertised as `name`: bring up the PipeWire
-/// producer node, then the embedded RAOP server feeding it. `latency_msec` is
-/// the jitter-buffer target the producer prebuffers before draining.
+/// Start one AirPlay receiver: bring up its PipeWire producer node (named
+/// `node_name`), then the embedded RAOP server that feeds it, advertised over
+/// mDNS as `service_name` on RTSP `port`. `latency_msec` is the jitter-buffer
+/// target the producer prebuffers before draining. `clients` /
+/// `prevent_takeover` are this receiver's **own** per-source registry + policy
+/// flag (Phase 4 — each receiver is independent).
 ///
 /// `auth_setup` additionally advertises the MFi auth-setup encryption mode
 /// (`et=0,4`) so encryption-*requiring* senders can negotiate. Off by default:
 /// PipeWire's raop-discover selects the highest `et`, so enabling it switches
 /// PipeWire from unencrypted to auth_setup — a different (still-supported) path
 /// that broadens compatibility to non-Apple senders that demand encryption.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
-    name: String,
+    node_name: String,
+    service_name: String,
+    port: u16,
     latency_msec: u32,
     auth_setup: bool,
     clients: SharedAirplayClients,
     prevent_takeover: SharedPreventTakeover,
 ) -> anyhow::Result<AirplayHandle> {
+    // A config left at port 0 shouldn't reach here (the store allocates on add/
+    // load), but fall back to the RAOP default rather than binding port 0.
+    let port = if port == 0 { DEFAULT_AIRPLAY_PORT } else { port };
     // STACK lifecycle marker: a full AirPlay-receiver (re)start. If this appears in
     // the logs WITHOUT a preceding `USER ACTION: set AirPlay source`, the receiver
     // is being restarted by the stack (a bug) rather than by a human — that's the
     // signal distinguishing the two for the `airplay-in` cycling investigation.
-    tracing::info!("STACK: airplay_source::start — (re)starting AirPlay receiver 'airplay-in' (name={name:?})");
+    tracing::info!("STACK: airplay_source::start — (re)starting AirPlay receiver node={node_name:?} (name={service_name:?}, port={port})");
     // Fresh receiver: nothing is streaming yet, so clear any stale live flags a
     // prior handle might have left (a restart that skipped a disconnect).
-    clients.lock_recover().reset_connected();
+    clients.reset_connected();
 
     let target = samples_for_ms(latency_msec);
     // Bound the ring well past the prebuffer target so a stalled consumer can't
@@ -168,11 +211,11 @@ pub async fn start(
     let flush = Arc::new(AtomicBool::new(false));
     let peak = Arc::new(AtomicU32::new(0));
 
-    let producer_stop = spawn_producer(consumer, peak.clone(), target, flush.clone())
+    let producer_stop = spawn_producer(node_name.clone(), consumer, peak.clone(), target, flush.clone())
         .map_err(|e| anyhow::anyhow!("failed to start AirPlay PipeWire producer: {e}"))?;
 
-    let handler = Arc::new(Handler { ring_prod, flush, peak: peak.clone(), clients, prevent_takeover });
-    let mut builder = RaopServer::builder().name(name.clone()).hwaddr(derive_hwaddr(&name)).port(AIRPLAY_PORT);
+    let handler = Arc::new(Handler { ring_prod, flush, peak: peak.clone(), clients, prevent_takeover: prevent_takeover.clone() });
+    let mut builder = RaopServer::builder().name(service_name.clone()).hwaddr(derive_hwaddr(&service_name)).port(port);
     // Advertise on the process-wide shared, LAN-restricted mDNS daemon so the
     // receiver's `_raop._tcp`/`_airplay._tcp` records share one interface-pinned
     // daemon thread with everything else — avoids the host-network multicast
@@ -188,9 +231,85 @@ pub async fn start(
         builder = builder.advertise_encryption(vec![Ap1Encryption::None, Ap1Encryption::AuthSetup]);
     }
     let mut server = builder.build(handler).map_err(|e| anyhow::anyhow!("failed to build AirPlay server: {e}"))?;
-    server.start().await.map_err(|e| anyhow::anyhow!("failed to start AirPlay server on port {AIRPLAY_PORT}: {e}"))?;
+    server.start().await.map_err(|e| anyhow::anyhow!("failed to start AirPlay server on port {port}: {e}"))?;
 
-    Ok(AirplayHandle { server: Some(server), producer_stop: Some(producer_stop), peak })
+    let cfg = AirplaySourceConfig {
+        latency_msec,
+        auth_setup,
+        prevent_takeover: prevent_takeover.load(Ordering::Relaxed),
+        port,
+    };
+    Ok(AirplayHandle { server: Some(server), producer_stop: Some(producer_stop), peak, service_name, cfg, prevent_takeover })
+}
+
+/// Runtime collection of running AirPlay receivers, keyed by source id. Held by
+/// `main.rs`/`AppState` and reconciled against the [`SourcesStore`] by
+/// [`reconcile`]. `tokio` mutex because start/stop `.await`.
+///
+/// [`SourcesStore`]: crate::sources_store::SourcesStore
+pub type SharedAirplayMap = Arc<tokio::sync::Mutex<BTreeMap<SourceId, AirplayHandle>>>;
+
+/// Reconcile the running AirPlay receivers against the stored source list:
+/// start receivers that are configured but not running, stop ones that were
+/// removed (or disabled — an AirPlay entry whose label is blank), and restart
+/// one whose restart-significant config changed (name/port/latency/auth-setup).
+/// A `prevent_takeover`-only change is applied live without a restart.
+///
+/// Each receiver gets its OWN per-source client registry (from `clients`) and
+/// its own `prevent_takeover` flag seeded from the stored config. Best-effort:
+/// a receiver that fails to start is logged and skipped; the others still run.
+pub async fn reconcile(map: &SharedAirplayMap, entries: &[SourceEntry], clients: &AirplayClientStore) {
+    // Desired = AirPlay entries with a non-blank label. A blank label is the
+    // "knobs configured but disabled" state (matches the singular era, where an
+    // empty name meant "off"); such an entry must not run a receiver.
+    let desired: BTreeMap<SourceId, (SourceEntry, AirplaySourceConfig)> = entries
+        .iter()
+        .filter_map(|e| match &e.config {
+            SourceConfig::Airplay(a) if !e.label.trim().is_empty() => Some((e.id.clone(), (e.clone(), a.clone()))),
+            _ => None,
+        })
+        .collect();
+
+    let mut guard = map.lock().await;
+
+    // Stop receivers that are gone or need a restart; live-sync the policy flag
+    // on the ones that stay.
+    let mut to_stop: Vec<SourceId> = Vec::new();
+    for (id, handle) in guard.iter() {
+        match desired.get(id) {
+            None => to_stop.push(id.clone()),
+            Some((entry, cfg)) => {
+                if handle.needs_restart(entry) {
+                    to_stop.push(id.clone());
+                } else {
+                    handle.set_prevent_takeover(cfg.prevent_takeover);
+                }
+            }
+        }
+    }
+    for id in to_stop {
+        if let Some(handle) = guard.remove(&id) {
+            tracing::info!("AirPlay reconcile: stopping receiver '{id}'");
+            handle.stop().await;
+        }
+    }
+
+    // Start receivers that are configured but not (or no longer) running.
+    for (id, (entry, cfg)) in &desired {
+        if guard.contains_key(id) {
+            continue;
+        }
+        let node_name = entry.node_name();
+        let registry = clients.registry(id);
+        let prevent_takeover: SharedPreventTakeover = Arc::new(AtomicBool::new(cfg.prevent_takeover));
+        match start(node_name, entry.label.clone(), cfg.port, cfg.latency_msec, cfg.auth_setup, registry, prevent_takeover).await {
+            Ok(handle) => {
+                guard.insert(id.clone(), handle);
+                tracing::info!("AirPlay reconcile: started receiver '{id}' ('{}')", entry.label);
+            }
+            Err(e) => tracing::warn!("AirPlay reconcile: failed to start receiver '{id}' ('{}'): {e}", entry.label),
+        }
+    }
 }
 
 /// The uppercase-hex MAC (no separators) shairplay puts before `@` in its mDNS
@@ -246,7 +365,7 @@ impl AudioHandler for Handler {
     }
 
     fn authorize_session(&self, addr: &str, name: Option<&str>, current: Option<&SessionInfo>) -> SessionDecision {
-        let clients = self.clients.lock_recover();
+        let clients = &self.clients;
         if clients.is_banned(addr, name) {
             tracing::info!("AirPlay: refusing banned client {addr} (name={name:?})");
             return SessionDecision::Reject;
@@ -460,12 +579,12 @@ impl Resampler {
 /// Spawn the PipeWire producer on a dedicated thread (mirrors
 /// sendspin_capture's thread+channel+mainloop shape). Returns a stop sender.
 /// `target` is the jitter-buffer prebuffer, in interleaved-f32 samples.
-fn spawn_producer(consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, flush: Arc<AtomicBool>) -> Result<pw::channel::Sender<ProducerCmd>, String> {
+fn spawn_producer(node_name: String, consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, flush: Arc<AtomicBool>) -> Result<pw::channel::Sender<ProducerCmd>, String> {
     let (cmd_tx, cmd_rx) = pw::channel::channel::<ProducerCmd>();
     std::thread::Builder::new()
         .name("airplay-producer".into())
         .spawn(move || {
-            if let Err(e) = run_producer(consumer, peak, target, cmd_rx, flush) {
+            if let Err(e) = run_producer(node_name, consumer, peak, target, cmd_rx, flush) {
                 tracing::error!("AirPlay PipeWire producer exited with error: {e}");
             }
         })
@@ -500,7 +619,7 @@ fn set_producer_realtime_priority() {
 #[cfg(not(target_os = "linux"))]
 fn set_producer_realtime_priority() {}
 
-fn run_producer(consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::channel::Receiver<ProducerCmd>, flush: Arc<AtomicBool>) -> Result<(), String> {
+fn run_producer(node_name: String, consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::channel::Receiver<ProducerCmd>, flush: Arc<AtomicBool>) -> Result<(), String> {
     set_producer_realtime_priority();
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
@@ -509,11 +628,11 @@ fn run_producer(consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usi
 
     let stream = pw::stream::StreamBox::new(
         &core,
-        AIRPLAY_NODE_NAME,
+        &node_name,
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Playback",
-            *pw::keys::NODE_NAME => AIRPLAY_NODE_NAME,
+            *pw::keys::NODE_NAME => node_name.as_str(),
         },
     )
     .map_err(|e| format!("create stream: {e}"))?;
@@ -660,7 +779,7 @@ fn run_producer(consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usi
         ProducerCmd::Stop => mainloop_for_cmd.quit(),
     });
 
-    tracing::info!("AirPlay producer node '{AIRPLAY_NODE_NAME}' ready");
+    tracing::info!("AirPlay producer node '{node_name}' ready");
     mainloop.run();
 
     if let Some(e) = error.borrow_mut().take() {

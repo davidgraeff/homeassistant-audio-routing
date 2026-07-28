@@ -1,7 +1,7 @@
 //! REST API: health check, live PipeWire registry state, and manual link
 //! creation
 
-use crate::airplay_source::AirplayHandle;
+use crate::airplay_clients::AirplayClientStore;
 use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
 use crate::ap2_discovery::SharedAp2Devices;
 use airplay_core::features::Features;
@@ -12,12 +12,12 @@ use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, Sha
 use crate::routing;
 use crate::routing_store::SharedRouting;
 use crate::rtp_source::{
-    rtp_source_module_args, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_SOURCE_ADDR,
+    rtp_source_module_args, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR,
     RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME,
 };
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::settings_store::SharedSettings;
-use crate::sources_store::{RtpSourceConfig, SourcesStore};
+use crate::sources_store::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore, LEGACY_AIRPLAY_ID};
 use axum::{
     body::{Body, Bytes},
     extract::{Extension, FromRef, Path, Query, State},
@@ -35,10 +35,10 @@ use tokio::sync::oneshot;
 /// Runtime config for the AirPlay and RTP sources.
 pub type SharedSources = Arc<Mutex<SourcesStore>>;
 
-/// The running AirPlay-receive source (airplay_source.rs), if configured —
-/// a native embedded RAOP server feeding a PipeWire source node. `tokio` mutex
-/// since start/stop `.await`. `None` = disabled.
-pub type SharedAirplay = Arc<tokio::sync::Mutex<Option<AirplayHandle>>>;
+/// The running AirPlay-receive sources (airplay_source.rs), keyed by source id —
+/// each a native embedded RAOP server feeding its own PipeWire source node.
+/// Phase 4: multiple concurrent receivers, reconciled against the store.
+pub type SharedAirplay = crate::airplay_source::SharedAirplayMap;
 
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
 /// change-notification channel (routing.rs), and the command sender for runtime
@@ -51,12 +51,12 @@ pub struct AppState {
     pub pw_cmd: PwCommandSender,
     pub sources: SharedSources,
     pub airplay: SharedAirplay,
-    /// Remembered AirPlay senders (airplay_clients.rs) — the Sources-tab
-    /// connection list and the base for later priority/ban controls.
-    pub airplay_clients: crate::airplay_clients::SharedAirplayClients,
-    /// Live anti-takeover flag, shared with the running receiver's session gate
-    /// so the API can toggle it without a restart.
-    pub airplay_prevent_takeover: crate::airplay_source::SharedPreventTakeover,
+    /// Remembered AirPlay senders (airplay_clients.rs), per-receiver — the
+    /// backing store for each source's connection list + ban/priority controls.
+    /// Per-source views are taken via `.registry(id)`. Anti-takeover is now
+    /// per-receiver too (each running `AirplayHandle` owns its flag), so there is
+    /// no process-wide flag here anymore.
+    pub airplay_clients: AirplayClientStore,
     /// On-demand source peak meters (metering.rs); taps live only while a
     /// routing-matrix WS client is connected.
     pub meters: crate::metering::SharedMeters,
@@ -119,8 +119,7 @@ pub fn router(
     pw_cmd: PwCommandSender,
     sources: SharedSources,
     airplay: SharedAirplay,
-    airplay_clients: crate::airplay_clients::SharedAirplayClients,
-    airplay_prevent_takeover: crate::airplay_source::SharedPreventTakeover,
+    airplay_clients: AirplayClientStore,
     meters: crate::metering::SharedMeters,
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
@@ -145,7 +144,6 @@ pub fn router(
         sources,
         airplay,
         airplay_clients,
-        airplay_prevent_takeover,
         meters,
         sendspin_devices,
         ap2_devices,
@@ -170,14 +168,17 @@ pub fn router(
         .route("/api/outputs/{node_name}/latency", put(set_output_latency))
         .route("/api/outputs/{node_name}/ap2-rate", put(set_ap2_rate_mode))
         .route("/api/outputs/{node_name}/sendspin-codec", put(set_sendspin_codec))
-        .route("/api/source/airplay", get(get_airplay_source).put(set_airplay_source).delete(delete_airplay_source))
-        .route("/api/source/airplay/clients", get(list_airplay_clients))
-        .route("/api/source/airplay/clients/forget", post(forget_airplay_client))
-        .route("/api/source/airplay/clients/ban", post(ban_airplay_client))
-        .route("/api/source/airplay/clients/priority", post(set_airplay_client_priority))
-        .route("/api/source/airplay/clients/disconnect", post(disconnect_airplay_client))
-        .route("/api/source/airplay/policy", put(set_airplay_policy))
-        .route("/api/source/rtp", get(get_rtp_source).put(set_rtp_source).delete(delete_rtp_source))
+        // Per-receiver AirPlay client/policy routes. `{id}` is the source id;
+        // each receiver has its own client list + anti-takeover flag.
+        .route("/api/sources/{id}/clients", get(list_source_clients))
+        .route("/api/sources/{id}/clients/forget", post(forget_source_client))
+        .route("/api/sources/{id}/clients/ban", post(ban_source_client))
+        .route("/api/sources/{id}/clients/priority", post(set_source_client_priority))
+        .route("/api/sources/{id}/clients/disconnect", post(disconnect_source_client))
+        .route("/api/sources/{id}/policy", put(set_source_policy))
+        // Multi-source collection CRUD — the sole source-management API.
+        .route("/api/sources", get(list_sources).post(create_source))
+        .route("/api/sources/{id}", get(get_source).put(update_source).delete(delete_source))
         .route("/api/sendspin/volumes", get(get_sendspin_volumes))
         .route("/api/sendspin/volume", put(set_sendspin_volume))
         .route("/api/sendspin/mute", put(set_sendspin_mute))
@@ -739,114 +740,18 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
 // seeding) and is then authoritative. Same "runtime, no restart" model as
 // /api/outputs, but backed by an in-process receiver rather than a module.
 
-#[derive(Serialize)]
-struct AirplaySourceInfo {
-    /// `None` when the source is disabled.
-    name: Option<String>,
-    /// Whether the embedded AirPlay receiver is running right now.
-    running: bool,
-    /// Producer jitter-buffer target in ms. Higher = fewer stutters, more latency.
-    latency_msec: u32,
-    /// Whether the auth-setup encryption mode is advertised (`et=0,4`), letting
-    /// encryption-requiring senders connect (default off = unencrypted only).
-    auth_setup: bool,
-    /// Whether a new sender is refused while one is already streaming
-    /// (anti-takeover). Toggled via `PUT /api/source/airplay/policy`.
-    prevent_takeover: bool,
-}
-
-#[derive(Deserialize)]
-struct SetAirplaySourceRequest {
-    /// The advertised AirPlay name; an empty string disables the source.
-    name: String,
-    /// Jitter buffer target in ms; omitted by older clients, so it defaults.
-    #[serde(default = "default_airplay_source_latency_msec")]
-    latency_msec: u32,
-    /// Advertise the auth-setup encryption mode; omitted by older clients.
-    #[serde(default)]
-    auth_setup: bool,
-}
-
 fn default_airplay_source_latency_msec() -> u32 {
     DEFAULT_AIRPLAY_LATENCY_MSEC
 }
 
-async fn get_airplay_source(State(state): State<AppState>) -> Json<AirplaySourceInfo> {
-    let (name, latency_msec, auth_setup, prevent_takeover) = {
-        let s = state.sources.lock_recover();
-        (
-            s.airplay_source_name().map(str::to_string),
-            s.airplay_latency_msec(),
-            s.airplay_auth_setup(),
-            s.airplay_prevent_takeover(),
-        )
-    };
-    let running = state.airplay.lock().await.is_some();
-    Json(AirplaySourceInfo { name, running, latency_msec, auth_setup, prevent_takeover })
-}
-
-/// Stop the current AirPlay receiver (if any). Caller holds no locks.
-async fn stop_airplay(state: &AppState) {
-    if let Some(handle) = state.airplay.lock().await.take() {
-        handle.stop().await;
-    }
-}
-
-async fn set_airplay_source(
-    State(state): State<AppState>,
-    Json(req): Json<SetAirplaySourceRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    // NOTE: this RESTARTS the 'airplay-in' receiver (stops + re-starts the shairplay
-    // server + producer node), which cascades to a full sync-group rebuild. Logged as
-    // a USER ACTION so such a restart in the logs is attributable to a human, not a bug.
-    tracing::info!("USER ACTION: set AirPlay source (name={:?}) — restarts the 'airplay-in' receiver", req.name);
-    // Persist first (normalizes empty -> None), then reconcile the receiver.
-    let (stored, latency, auth_setup) = {
-        let mut sources = state.sources.lock_recover();
-        if let Err(e) = sources.set_airplay_source_name(Some(req.name.clone())) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
-        }
-        if let Err(e) = sources.set_airplay_latency_msec(req.latency_msec) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
-        }
-        if let Err(e) = sources.set_airplay_auth_setup(req.auth_setup) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
-        }
-        (sources.airplay_source_name().map(str::to_string), sources.airplay_latency_msec(), sources.airplay_auth_setup())
-    };
-
-    // Tear down any existing receiver, then (re)start for the new name.
-    stop_airplay(&state).await;
-    match stored {
-        Some(name) => match crate::airplay_source::start(
-            name.clone(),
-            latency,
-            auth_setup,
-            state.airplay_clients.clone(),
-            state.airplay_prevent_takeover.clone(),
-        )
-        .await
-        {
-            Ok(handle) => {
-                *state.airplay.lock().await = Some(handle);
-                (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("AirPlay source set to '{name}'") }))
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(OutputOpResponse { ok: false, message: format!("saved '{name}' but failed to start it: {e}") }),
-            ),
-        },
-        None => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() })),
-    }
-}
-
-async fn delete_airplay_source(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
-    tracing::info!("USER ACTION: delete/disable AirPlay source — stops the 'airplay-in' receiver");
-    if let Err(e) = state.sources.lock_recover().set_airplay_source_name(None) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
-    }
-    stop_airplay(&state).await;
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "AirPlay source disabled".to_string() }))
+/// Reconcile BOTH source kinds after a `/api/sources` mutation: (un)load RTP
+/// modules (Phase 2) and start/stop AirPlay receivers (Phase 4) to match the
+/// persisted set. Idempotent, so it's safe to call after every add/update/
+/// remove. `list()` returns an owned snapshot so no lock is held across await.
+async fn reconcile_sources(state: &AppState) {
+    let entries = state.sources.lock_recover().list();
+    crate::rtp_source::reconcile(&entries, &state.pw_cmd, &state.pw).await;
+    crate::airplay_source::reconcile(&state.airplay, &entries, &state.airplay_clients).await;
 }
 
 /// One remembered AirPlay sender for the Sources tab. `key` (name if known,
@@ -864,10 +769,16 @@ struct AirplayClientInfo {
     priority: i32,
 }
 
-async fn list_airplay_clients(State(state): State<AppState>) -> Json<Vec<AirplayClientInfo>> {
-    let clients = state
+// --- per-receiver client-registry helpers ----------------------------------
+//
+// Shared by the legacy singular routes (which target `LEGACY_AIRPLAY_ID`) and
+// the per-source `/api/sources/{id}/clients/*` routes. Each operates on that
+// source's own client registry (airplay_clients.rs).
+
+fn list_clients_for(state: &AppState, id: &str) -> Vec<AirplayClientInfo> {
+    state
         .airplay_clients
-        .lock_recover()
+        .registry(id)
         .list()
         .into_iter()
         .map(|c| AirplayClientInfo {
@@ -880,32 +791,73 @@ async fn list_airplay_clients(State(state): State<AppState>) -> Json<Vec<Airplay
             banned: c.banned,
             priority: c.priority,
         })
-        .collect();
-    Json(clients)
+        .collect()
 }
 
-#[derive(Deserialize)]
-struct ForgetClientRequest {
-    key: String,
-}
-
-async fn forget_airplay_client(
-    State(state): State<AppState>,
-    Json(req): Json<ForgetClientRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let forgotten = state.airplay_clients.lock_recover().forget(&req.key);
-    if forgotten {
-        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("forgot AirPlay client '{}'", req.key) }))
+fn forget_client_for(state: &AppState, id: &str, key: &str) -> (StatusCode, Json<OutputOpResponse>) {
+    if state.airplay_clients.registry(id).forget(key) {
+        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("forgot AirPlay client '{key}'") }))
     } else {
         // Not found, or still connected (a live client can't be forgotten).
         (
             StatusCode::CONFLICT,
-            Json(OutputOpResponse {
-                ok: false,
-                message: format!("could not forget '{}' (unknown or still connected)", req.key),
-            }),
+            Json(OutputOpResponse { ok: false, message: format!("could not forget '{key}' (unknown or still connected)") }),
         )
     }
+}
+
+fn ban_client_for(state: &AppState, id: &str, key: &str, banned: bool) -> (StatusCode, Json<OutputOpResponse>) {
+    if state.airplay_clients.registry(id).set_banned(key, banned) {
+        let verb = if banned { "banned" } else { "unbanned" };
+        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{verb} AirPlay client '{key}'") }))
+    } else {
+        (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{key}'") }))
+    }
+}
+
+fn set_priority_for(state: &AppState, id: &str, key: &str, priority: i32) -> (StatusCode, Json<OutputOpResponse>) {
+    if state.airplay_clients.registry(id).set_priority(key, priority) {
+        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set priority {priority} for '{key}'") }))
+    } else {
+        (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{key}'") }))
+    }
+}
+
+/// Force-disconnect a currently-connected client on source `id` by dropping its
+/// RTSP connection (the receiver stops its stream shortly after).
+async fn disconnect_client_for(state: &AppState, id: &str, key: &str) -> (StatusCode, Json<OutputOpResponse>) {
+    // Resolve the key to the live peer IP the RAOP server keys connections on.
+    let Some(addr) = state.airplay_clients.registry(id).connected_addr(key) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(OutputOpResponse { ok: false, message: format!("'{key}' is not currently connected") }),
+        );
+    };
+    match state.airplay.lock().await.get(id) {
+        Some(handle) => {
+            handle.disconnect_client(&addr);
+            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("disconnecting AirPlay client '{key}'") }))
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(OutputOpResponse { ok: false, message: format!("AirPlay source '{id}' is not running") }),
+        ),
+    }
+}
+
+fn policy_message(prevent_takeover: bool) -> &'static str {
+    if prevent_takeover {
+        "AirPlay: new senders refused while one is streaming"
+    } else {
+        "AirPlay: new senders may take over the current stream"
+    }
+}
+
+// --- legacy singular routes (target the legacy AirPlay id) ------------------
+
+#[derive(Deserialize)]
+struct ForgetClientRequest {
+    key: String,
 }
 
 #[derive(Deserialize)]
@@ -914,48 +866,10 @@ struct BanClientRequest {
     banned: bool,
 }
 
-/// Ban/unban a remembered client. A ban is enforced at the next session start
-/// (`authorize_session`); it does not evict a client that's already streaming.
-async fn ban_airplay_client(
-    State(state): State<AppState>,
-    Json(req): Json<BanClientRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let ok = state.airplay_clients.lock_recover().set_banned(&req.key, req.banned);
-    if ok {
-        let verb = if req.banned { "banned" } else { "unbanned" };
-        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{verb} AirPlay client '{}'", req.key) }))
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{}'", req.key) }),
-        )
-    }
-}
-
 #[derive(Deserialize)]
 struct SetPriorityRequest {
     key: String,
     priority: i32,
-}
-
-/// Set a client's takeover priority. A connecting client with a strictly higher
-/// priority than the current one takes the session over (see `authorize_session`).
-async fn set_airplay_client_priority(
-    State(state): State<AppState>,
-    Json(req): Json<SetPriorityRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let ok = state.airplay_clients.lock_recover().set_priority(&req.key, req.priority);
-    if ok {
-        (
-            StatusCode::OK,
-            Json(OutputOpResponse { ok: true, message: format!("set priority {} for '{}'", req.priority, req.key) }),
-        )
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{}'", req.key) }),
-        )
-    }
 }
 
 #[derive(Deserialize)]
@@ -963,53 +877,72 @@ struct DisconnectClientRequest {
     key: String,
 }
 
-/// Force-disconnect a currently-connected client by dropping its RTSP
-/// connection (the receiver stops its stream shortly after).
-async fn disconnect_airplay_client(
-    State(state): State<AppState>,
-    Json(req): Json<DisconnectClientRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    // Resolve the key to the live peer IP the RAOP server keys connections on.
-    let addr = state.airplay_clients.lock_recover().connected_addr(&req.key);
-    let Some(addr) = addr else {
-        return (
-            StatusCode::CONFLICT,
-            Json(OutputOpResponse { ok: false, message: format!("'{}' is not currently connected", req.key) }),
-        );
-    };
-    match &*state.airplay.lock().await {
-        Some(handle) => {
-            handle.disconnect_client(&addr);
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("disconnecting AirPlay client '{}'", req.key) }))
-        }
-        None => (
-            StatusCode::CONFLICT,
-            Json(OutputOpResponse { ok: false, message: "AirPlay source is not running".to_string() }),
-        ),
-    }
-}
-
 #[derive(Deserialize)]
 struct SetAirplayPolicyRequest {
     prevent_takeover: bool,
 }
 
-/// Toggle the anti-takeover policy. Updates the live flag the receiver's session
-/// gate reads (no restart, so the current stream is undisturbed) and persists it.
-async fn set_airplay_policy(
+// --- per-source routes (Phase 4): /api/sources/{id}/clients/* + /policy -----
+
+async fn list_source_clients(State(state): State<AppState>, Path(id): Path<String>) -> Json<Vec<AirplayClientInfo>> {
+    Json(list_clients_for(&state, &id))
+}
+
+async fn forget_source_client(
     State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForgetClientRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    forget_client_for(&state, &id, &req.key)
+}
+
+async fn ban_source_client(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<BanClientRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    ban_client_for(&state, &id, &req.key, req.banned)
+}
+
+async fn set_source_client_priority(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SetPriorityRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    set_priority_for(&state, &id, &req.key, req.priority)
+}
+
+async fn disconnect_source_client(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<DisconnectClientRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    disconnect_client_for(&state, &id, &req.key).await
+}
+
+/// Toggle one AirPlay source's anti-takeover policy: persist it into that
+/// source's config and live-update its running receiver's flag (no restart).
+async fn set_source_policy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
     Json(req): Json<SetAirplayPolicyRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    if let Err(e) = state.sources.lock_recover().set_airplay_prevent_takeover(req.prevent_takeover) {
+    // Read the current AirPlay config for this id, flip prevent_takeover, save.
+    let entry = state.sources.lock_recover().get(&id);
+    let Some(entry) = entry else {
+        return (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("no source '{id}'") }));
+    };
+    let SourceConfig::Airplay(mut cfg) = entry.config else {
+        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("source '{id}' is not an AirPlay source") }));
+    };
+    cfg.prevent_takeover = req.prevent_takeover;
+    if let Err(e) = state.sources.lock_recover().update(&id, None, Some(SourceConfig::Airplay(cfg))) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
     }
-    state.airplay_prevent_takeover.store(req.prevent_takeover, std::sync::atomic::Ordering::Relaxed);
-    let msg = if req.prevent_takeover {
-        "AirPlay: new senders refused while one is streaming"
-    } else {
-        "AirPlay: new senders may take over the current stream"
-    };
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg.to_string() }))
+    if let Some(handle) = state.airplay.lock().await.get(&id) {
+        handle.set_prevent_takeover(req.prevent_takeover);
+    }
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: policy_message(req.prevent_takeover).to_string() }))
 }
 
 // ---- RTP source (Bluetooth bridge firmware target) ------------------------
@@ -1021,49 +954,12 @@ async fn set_airplay_policy(
 // re-point the port live, no restart. Once loaded, its node shows up in the
 // routing matrix automatically (routing.rs classifies it as a source).
 
-#[derive(Serialize)]
-struct RtpSourceInfo {
-    /// Whether the source is enabled in the store.
-    enabled: bool,
-    /// UDP port it listens on (the stored value, or the default when disabled).
-    port: u16,
-    /// Receiver-side jitter buffer target in ms (stored value, or default when
-    /// disabled). Higher = more dropout tolerance on a weak link, more latency.
-    latency_msec: u32,
-    /// `source.ip`: `0.0.0.0` = unicast, or a multicast group so several
-    /// receivers can share one firmware stream. Stored value, or default.
-    source_addr: String,
-    /// `sess.ignore-ssrc`: `true` accepts any sender on the port, `false` locks
-    /// onto the first SSRC and rejects the rest ("Only one client"). Stored
-    /// value, or default. Needs a stable-SSRC firmware to use `false`.
-    ignore_ssrc: bool,
-    /// Whether the `bt-bridge-rtp` node is actually present in the live
-    /// registry right now — the module analogue of the AirPlay source's
-    /// `running`. Can lag briefly after enabling, or be `false` if libpipewire
-    /// refused the load.
-    loaded: bool,
-}
-
-#[derive(Deserialize)]
-struct SetRtpSourceRequest {
-    /// UDP port to listen on; must match the firmware's configured target port.
-    #[serde(default = "default_rtp_source_port")]
-    port: u16,
-    /// Jitter buffer target in ms; omitted by older clients, so it defaults.
-    #[serde(default = "default_rtp_source_latency_msec")]
-    latency_msec: u32,
-    /// `source.ip` to bind: `0.0.0.0` unicast, or a multicast group. Older
-    /// clients omit it, so it defaults to unicast.
-    #[serde(default = "default_rtp_source_addr")]
-    source_addr: String,
-    /// `sess.ignore-ssrc`: `true` accept any sender, `false` lock onto the first
-    /// SSRC ("Only one client"). Older clients omit it, so it defaults to `true`.
-    #[serde(default = "default_rtp_source_ignore_ssrc")]
-    ignore_ssrc: bool,
-}
-
 fn default_rtp_source_port() -> u16 {
     DEFAULT_RTP_PORT
+}
+
+fn default_rtp_source_rate() -> u32 {
+    DEFAULT_RTP_RATE
 }
 
 fn default_rtp_source_latency_msec() -> u32 {
@@ -1083,101 +979,194 @@ fn rtp_source_loaded(pw: &SharedState) -> bool {
     pw.lock_recover().nodes.values().any(|n| n.node_name == RTP_SOURCE_NODE_NAME)
 }
 
-/// (Re)load the rtp-source module on `port`. Unloads any existing instance
-/// first so a re-enable or a port change is a clean reload — `Load` errors if
-/// a module is already registered under the node name. Unload is idempotent, so
-/// its result is intentionally ignored.
-async fn reload_rtp_source(
-    pw_cmd: &PwCommandSender,
-    port: u16,
-    latency_msec: u32,
-    source_addr: &str,
-    ignore_ssrc: bool,
-) -> Result<(), String> {
-    let (tx, rx) = oneshot::channel();
-    if pw_cmd.send(PwCommand::Unload { node_name: RTP_SOURCE_NODE_NAME.to_string(), reply: tx }).is_err() {
-        return Err("PipeWire thread is not running".to_string());
-    }
-    let _ = rx.await;
+// ---- Multi-source collection CRUD (Phase 3) ------------------------------
+//
+// The generalized, keyed replacement for the two singular `/api/source/*`
+// routes above: a collection of AirPlay + RTP input sources, each with its own
+// stable id / node name (sources_store.rs). These handlers only mutate the
+// STORE — actually loading/unloading the PipeWire module (RTP) or starting/
+// stopping the embedded receiver (AirPlay) is done by the per-kind reconcilers
+// wired from main.rs (Phases 2 & 4). After each mutation we nudge the change
+// notifier so watchers refresh.
 
-    let args = rtp_source_module_args(port, latency_msec, source_addr, ignore_ssrc);
-    let (tx, rx) = oneshot::channel();
-    if pw_cmd
-        .send(PwCommand::Load {
-            node_name: RTP_SOURCE_NODE_NAME.to_string(),
-            module_name: RTP_SOURCE_MODULE_NAME.to_string(),
-            args,
-            reply: tx,
-        })
-        .is_err()
-    {
-        return Err("PipeWire thread is not running".to_string());
-    }
-    match rx.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("no reply from PipeWire thread".to_string()),
+/// Nested response shape for a single source. Distinct from the *flat* stored
+/// [`SourceEntry`] (`{id,label,kind,<config...>}`): here the kind-specific
+/// config is nested under `airplay`/`rtp` (exactly one non-null), plus the
+/// derived `node_name` and the live `present` flag. Matches the frontend's
+/// `SourceView` (Phase 5) exactly.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct SourceView {
+    id: String,
+    label: String,
+    kind: SourceKind,
+    /// A node named `node_name` exists in the live PipeWire registry right now
+    /// (the source is actually loaded/running). Generalizes the singular
+    /// `rtp_source_loaded` / AirPlay `running` flags.
+    present: bool,
+    node_name: String,
+    /// The AirPlay config when `kind == airplay`, else `null`.
+    airplay: Option<AirplaySourceConfig>,
+    /// The RTP config when `kind == rtp`, else `null`.
+    rtp: Option<RtpSourceConfig>,
+}
+
+/// Pure conversion: flat stored [`SourceEntry`] + a live `present` flag → the
+/// nested [`SourceView`] wire shape. Kept side-effect-free so it is unit-tested
+/// directly (see tests below).
+fn source_view(entry: &SourceEntry, present: bool) -> SourceView {
+    let (airplay, rtp) = match &entry.config {
+        SourceConfig::Airplay(a) => (Some(a.clone()), None),
+        SourceConfig::Rtp(r) => (None, Some(r.clone())),
+    };
+    SourceView { id: entry.id.clone(), label: entry.label.clone(), kind: entry.kind(), present, node_name: entry.node_name(), airplay, rtp }
+}
+
+/// Whether a node with `node_name` is present in the live registry right now.
+/// Generalizes [`rtp_source_loaded`] to any source node.
+fn node_present(pw: &SharedState, node_name: &str) -> bool {
+    pw.lock_recover().nodes.values().any(|n| n.node_name == node_name)
+}
+
+/// The set of node names currently present in the live registry — snapshotted
+/// once so a list of sources can be resolved without re-locking per entry.
+fn present_node_names(pw: &SharedState) -> std::collections::HashSet<String> {
+    pw.lock_recover().nodes.values().map(|n| n.node_name.clone()).collect()
+}
+
+/// A default RTP config (all knobs at their `DEFAULT_RTP_*`), used when a
+/// `POST` omits the `rtp` object. `RtpSourceConfig` has no `Default` impl, so
+/// this spells it out from the shared constants.
+fn default_rtp_config() -> RtpSourceConfig {
+    RtpSourceConfig {
+        port: DEFAULT_RTP_PORT,
+        latency_msec: DEFAULT_RTP_LATENCY_MSEC,
+        source_addr: DEFAULT_RTP_SOURCE_ADDR.to_string(),
+        ignore_ssrc: DEFAULT_RTP_IGNORE_SSRC,
+        rate: DEFAULT_RTP_RATE,
     }
 }
 
-async fn get_rtp_source(State(state): State<AppState>) -> Json<RtpSourceInfo> {
-    let cfg = state.sources.lock_recover().rtp_source();
-    Json(RtpSourceInfo {
-        enabled: cfg.is_some(),
-        port: cfg.as_ref().map(|c| c.port).unwrap_or(DEFAULT_RTP_PORT),
-        latency_msec: cfg.as_ref().map(|c| c.latency_msec).unwrap_or(DEFAULT_RTP_LATENCY_MSEC),
-        source_addr: cfg.as_ref().map(|c| c.source_addr.clone()).unwrap_or_else(|| DEFAULT_RTP_SOURCE_ADDR.to_string()),
-        ignore_ssrc: cfg.map(|c| c.ignore_ssrc).unwrap_or(DEFAULT_RTP_IGNORE_SSRC),
-        loaded: rtp_source_loaded(&state.pw),
-    })
+#[derive(Serialize)]
+struct SourcesListResponse {
+    sources: Vec<SourceView>,
 }
 
-/// Enable the RTP source (or change its port). Persists first, then reconciles
-/// the module — same "saved even if the load fails" contract as the AirPlay
-/// source, so a transient PipeWire failure never silently drops the setting.
-async fn set_rtp_source(State(state): State<AppState>, Json(req): Json<SetRtpSourceRequest>) -> (StatusCode, Json<OutputOpResponse>) {
-    if let Err(e) = state.sources.lock_recover().set_rtp_source(Some(RtpSourceConfig {
-        port: req.port,
-        latency_msec: req.latency_msec,
-        source_addr: req.source_addr.clone(),
-        ignore_ssrc: req.ignore_ssrc,
-    })) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
-    }
-    match reload_rtp_source(&state.pw_cmd, req.port, req.latency_msec, &req.source_addr, req.ignore_ssrc).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(OutputOpResponse {
-                ok: true,
-                message: format!(
-                    "RTP source enabled on {}:{} ({} ms jitter buffer, {})",
-                    req.source_addr,
-                    req.port,
-                    req.latency_msec,
-                    if req.ignore_ssrc { "any sender" } else { "single sender" },
-                ),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(OutputOpResponse { ok: false, message: format!("saved port {} but failed to start it: {e}", req.port) }),
-        ),
-    }
+/// `POST /api/sources` body. `kind` selects which config object is honored; the
+/// matching `airplay`/`rtp` object carries partial fields (every field has a
+/// serde default), and may be omitted entirely to accept all defaults.
+#[derive(Deserialize)]
+struct CreateSourceRequest {
+    label: String,
+    kind: SourceKind,
+    #[serde(default)]
+    airplay: Option<AirplaySourceConfig>,
+    #[serde(default)]
+    rtp: Option<RtpSourceConfig>,
 }
 
-async fn delete_rtp_source(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
-    if let Err(e) = state.sources.lock_recover().set_rtp_source(None) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+/// `PUT /api/sources/{id}` body. All fields optional: `label` renames, and an
+/// `airplay`/`rtp` object replaces the config (must match the source's
+/// immutable kind — the store rejects a mismatch). Omitting both config objects
+/// is a label-only update.
+#[derive(Deserialize)]
+struct UpdateSourceRequest {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    airplay: Option<AirplaySourceConfig>,
+    #[serde(default)]
+    rtp: Option<RtpSourceConfig>,
+}
+
+/// A source-CRUD error as a `{ok:false, message}` body + status code. Both the
+/// success and error arms implement `IntoResponse`, so handlers return
+/// `Result<_, SourceError>`.
+type SourceError = (StatusCode, Json<OutputOpResponse>);
+
+fn source_err(code: StatusCode, message: String) -> SourceError {
+    (code, Json(OutputOpResponse { ok: false, message }))
+}
+
+async fn list_sources(State(state): State<AppState>) -> Json<SourcesListResponse> {
+    let entries = state.sources.lock_recover().list();
+    let present = present_node_names(&state.pw);
+    let sources = entries.iter().map(|e| source_view(e, present.contains(&e.node_name()))).collect();
+    Json(SourcesListResponse { sources })
+}
+
+async fn create_source(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSourceRequest>,
+) -> Result<(StatusCode, Json<SourceView>), SourceError> {
+    let config = match req.kind {
+        SourceKind::Airplay => SourceConfig::Airplay(req.airplay.unwrap_or_default()),
+        SourceKind::Rtp => SourceConfig::Rtp(req.rtp.unwrap_or_else(default_rtp_config)),
+    };
+    let entry = {
+        let mut store = state.sources.lock_recover();
+        // add() validates (e.g. RTP port collisions) — surface that as a 400.
+        store.add(req.label, config).map_err(|e| source_err(StatusCode::BAD_REQUEST, e.to_string()))?
+    };
+    // Load/start the new source now, then nudge downstream (routing/groups).
+    reconcile_sources(&state).await;
+    let _ = state.changes.send(());
+    let present = node_present(&state.pw, &entry.node_name());
+    Ok((StatusCode::CREATED, Json(source_view(&entry, present))))
+}
+
+async fn get_source(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<SourceView>, SourceError> {
+    let entry = state
+        .sources
+        .lock_recover()
+        .get(&id)
+        .ok_or_else(|| source_err(StatusCode::NOT_FOUND, format!("no source with id '{id}'")))?;
+    let present = node_present(&state.pw, &entry.node_name());
+    Ok(Json(source_view(&entry, present)))
+}
+
+async fn update_source(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateSourceRequest>,
+) -> Result<Json<SourceView>, SourceError> {
+    // Kind is immutable, so it's derived from whichever config object is present
+    // (the store rejects a config whose kind differs from the stored entry's).
+    let config = match (req.airplay, req.rtp) {
+        (Some(a), _) => Some(SourceConfig::Airplay(a)),
+        (None, Some(r)) => Some(SourceConfig::Rtp(r)),
+        (None, None) => None,
+    };
+    let entry = {
+        let mut store = state.sources.lock_recover();
+        store.update(&id, req.label, config).map_err(|e| {
+            let msg = e.to_string();
+            // "no source with id" → 404; validation (kind change, port clash) → 400.
+            let code = if msg.contains("no source with id") { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
+            source_err(code, msg)
+        })?
+    };
+    // Apply the config change to the running source, then nudge downstream.
+    reconcile_sources(&state).await;
+    let _ = state.changes.send(());
+    let present = node_present(&state.pw, &entry.node_name());
+    Ok(Json(source_view(&entry, present)))
+}
+
+async fn delete_source(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+    // Bind the result so the std MutexGuard drops HERE — a match scrutinee holds
+    // its temporaries for the whole match, which would keep the guard alive
+    // across the `.await` below and make the handler future `!Send`.
+    let removed = state.sources.lock_recover().remove(&id);
+    match removed {
+        Ok(true) => {
+            // Unload/stop the removed source now, then nudge downstream.
+            reconcile_sources(&state).await;
+            let _ = state.changes.send(());
+            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed source '{id}'") }))
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("no source with id '{id}'") })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") })),
     }
-    let (tx, rx) = oneshot::channel();
-    if state.pw_cmd.send(PwCommand::Unload { node_name: RTP_SOURCE_NODE_NAME.to_string(), reply: tx }).is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: "PipeWire thread is not running".to_string() }),
-        );
-    }
-    let _ = rx.await;
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "RTP source disabled".to_string() }))
 }
 
 // ---- Sendspin per-device volume ------------------------------------------
@@ -2575,4 +2564,101 @@ async fn fetch_to_file(url: &str, path: &std::path::Path) -> anyhow::Result<()> 
     let bytes = response.bytes().await?;
     tokio::fs::write(path, &bytes).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources_store::LEGACY_RTP_ID;
+
+    fn airplay_entry() -> SourceEntry {
+        SourceEntry {
+            id: "kitchen-airplay".to_string(),
+            label: "Kitchen AirPlay".to_string(),
+            config: SourceConfig::Airplay(AirplaySourceConfig { latency_msec: 100, auth_setup: false, prevent_takeover: true, port: 5000 }),
+        }
+    }
+
+    fn rtp_entry() -> SourceEntry {
+        SourceEntry {
+            id: "garage-bridge".to_string(),
+            label: "Garage Bridge".to_string(),
+            config: SourceConfig::Rtp(RtpSourceConfig {
+                port: 47000,
+                latency_msec: 200,
+                source_addr: "0.0.0.0".to_string(),
+                ignore_ssrc: true,
+                rate: 48000,
+            }),
+        }
+    }
+
+    #[test]
+    fn source_view_airplay_shape() {
+        let view = source_view(&airplay_entry(), true);
+        assert_eq!(view.id, "kitchen-airplay");
+        assert_eq!(view.kind, SourceKind::Airplay);
+        assert!(view.present); // passed through verbatim
+        assert_eq!(view.node_name, "airplay-in-kitchen-airplay");
+        assert!(view.airplay.is_some());
+        assert!(view.rtp.is_none()); // exactly one config populated
+
+        // Exact JSON: nested `airplay` object (flat 4 knobs), `rtp` null.
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["kind"], "airplay");
+        assert_eq!(json["present"], true);
+        assert_eq!(json["node_name"], "airplay-in-kitchen-airplay");
+        assert_eq!(json["rtp"], serde_json::Value::Null);
+        assert_eq!(json["airplay"]["latency_msec"], 100);
+        assert_eq!(json["airplay"]["auth_setup"], false);
+        assert_eq!(json["airplay"]["prevent_takeover"], true);
+        assert_eq!(json["airplay"]["port"], 5000);
+        // The nested config must NOT carry the `kind` tag (that's flat-shape only).
+        assert!(json["airplay"].get("kind").is_none());
+    }
+
+    #[test]
+    fn source_view_rtp_shape() {
+        let view = source_view(&rtp_entry(), false);
+        assert_eq!(view.kind, SourceKind::Rtp);
+        assert!(!view.present);
+        assert_eq!(view.node_name, "rtp-in-garage-bridge");
+        assert!(view.airplay.is_none());
+        assert!(view.rtp.is_some());
+
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["kind"], "rtp");
+        assert_eq!(json["present"], false);
+        assert_eq!(json["airplay"], serde_json::Value::Null);
+        assert_eq!(json["rtp"]["port"], 47000);
+        assert_eq!(json["rtp"]["latency_msec"], 200);
+        assert_eq!(json["rtp"]["source_addr"], "0.0.0.0");
+        assert_eq!(json["rtp"]["ignore_ssrc"], true);
+        assert_eq!(json["rtp"]["rate"], 48000);
+    }
+
+    #[test]
+    fn source_view_uses_legacy_node_name() {
+        // Legacy ids collapse to the bare node names so routing links resolve.
+        let mut e = rtp_entry();
+        e.id = LEGACY_RTP_ID.to_string();
+        assert_eq!(source_view(&e, true).node_name, "bt-bridge-rtp");
+    }
+
+    #[test]
+    fn create_request_config_defaults() {
+        // `airplay`/`rtp` omitted → full defaults; a partial object fills the rest.
+        let full_default: CreateSourceRequest = serde_json::from_str(r#"{"label":"X","kind":"airplay"}"#).unwrap();
+        assert!(full_default.airplay.is_none()); // handler applies default
+        assert_eq!(AirplaySourceConfig::default().latency_msec, DEFAULT_AIRPLAY_LATENCY_MSEC);
+
+        let partial: CreateSourceRequest = serde_json::from_str(r#"{"label":"X","kind":"rtp","rtp":{"port":46000}}"#).unwrap();
+        let rtp = partial.rtp.unwrap();
+        assert_eq!(rtp.port, 46000);
+        assert_eq!(rtp.latency_msec, DEFAULT_RTP_LATENCY_MSEC); // filled by serde default
+        assert_eq!(rtp.rate, DEFAULT_RTP_RATE);
+
+        // The omitted-object fallback the handler uses.
+        assert_eq!(default_rtp_config().port, DEFAULT_RTP_PORT);
+    }
 }

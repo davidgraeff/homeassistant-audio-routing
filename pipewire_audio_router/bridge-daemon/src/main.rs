@@ -64,7 +64,7 @@ enum Command {
     /// Run the long-lived daemon: connect to the already-running PipeWire
     /// instance, bring up the stored AirPlay and RTP sources, and serve the REST
     /// API — all of which can be reconfigured live (api.rs's
-    /// `/api/source/airplay`, `/api/source/rtp`). Sendspin devices and AirPlay-2
+    /// `/api/sources`). Sendspin devices and AirPlay-2
     /// receivers are discovered and grouped dynamically, so there's nothing
     /// stored for them.
     Serve {
@@ -142,16 +142,15 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     raop_migration::migrate_raop_prefixes(routing_path, &groups_config_path);
 
     let sources = sources_store::SourcesStore::load(sources_path)?;
-    tracing::info!(
-        "sources: airplay={:?}, rtp={:?} in {}",
-        sources.airplay_source_name(),
-        sources.rtp_source().map(|c| c.port),
-        sources_path.display()
-    );
-    // Live anti-takeover flag, seeded from the store; the API toggles it without
-    // restarting the receiver (airplay_source's `authorize_session` reads it).
-    let airplay_prevent_takeover: airplay_source::SharedPreventTakeover =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(sources.airplay_prevent_takeover()));
+    {
+        let list = sources.list();
+        let airplay = list.iter().filter(|e| matches!(e.config, sources_store::SourceConfig::Airplay(_))).count();
+        let rtp = list.iter().filter(|e| matches!(e.config, sources_store::SourceConfig::Rtp(_))).count();
+        tracing::info!("sources: {} configured ({airplay} AirPlay, {rtp} RTP) in {}", list.len(), sources_path.display());
+    }
+    // Anti-takeover is now per-receiver: each running AirplayHandle owns its own
+    // flag (seeded from that source's stored config by airplay_source::reconcile),
+    // so there's no single process-wide flag here anymore.
     let sources = std::sync::Arc::new(std::sync::Mutex::new(sources));
 
     let routing = routing_store::RoutingStore::load(routing_path)?;
@@ -200,14 +199,16 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     );
     let groups_config: groups_store::SharedGroupsStore = std::sync::Arc::new(std::sync::Mutex::new(groups_config));
 
-    let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    // Running AirPlay receivers, keyed by source id (one per configured AirPlay
+    // source), reconciled against the store below and via the API.
+    let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
 
-    // Remembered AirPlay senders (Sources-tab connection list). Lives beside
-    // sources.json in /data; loads with everyone marked disconnected.
+    // Remembered AirPlay senders (Sources-tab connection list), per-receiver.
+    // One backing file beside sources.json in /data holds a client list per
+    // source id; loads with everyone marked disconnected.
     let airplay_clients_path = sources_path.with_file_name("airplay_clients.json");
-    let airplay_clients = airplay_clients::AirplayClientRegistry::load(&airplay_clients_path)?;
-    tracing::info!("{} remembered AirPlay client(s) in {}", airplay_clients.list().len(), airplay_clients_path.display());
-    let airplay_clients = airplay_clients.shared();
+    let airplay_clients = airplay_clients::AirplayClientStore::load(&airplay_clients_path)?;
+    tracing::info!("{} remembered AirPlay client(s) in {}", airplay_clients.total_clients(), airplay_clients_path.display());
     let meters = metering::MeterHub::new();
     let sendspin_control = sendspin_volume::shared();
     let ap2_control = ap2_volume::shared();
@@ -260,7 +261,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Start every stored source/adapter process (AirPlay source via
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
         // — the rest still start and it can be re-enabled live.
-        spawn_stored_sources(&sources, &airplay, &airplay_clients, &airplay_prevent_takeover, pw_cmd.clone()).await;
+        spawn_stored_sources(&sources, &airplay, &airplay_clients, &pw_state, pw_cmd.clone()).await;
 
         // Own sendspin device online/offline (and eventual removal) from the
         // live connection state + an active TCP probe — mDNS only ever adds.
@@ -369,7 +370,6 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             sources,
             airplay.clone(),
             airplay_clients,
-            airplay_prevent_takeover,
             meters,
             sendspin_devices,
             ap2_devices,
@@ -391,11 +391,11 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         tracing::info!("listening on {listen}");
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 
-        // On SIGTERM/SIGINT (run.sh's trap / container stop), stop the AirPlay
+        // On SIGTERM/SIGINT (run.sh's trap / container stop), stop every AirPlay
         // receiver cleanly (unregister its mDNS, close listeners). Sendspin
         // group servers and the RTP module tear down with the process.
-        tracing::info!("shutting down; stopping AirPlay source");
-        if let Some(handle) = airplay.lock().await.take() {
+        tracing::info!("shutting down; stopping AirPlay sources");
+        for (_id, handle) in std::mem::take(&mut *airplay.lock().await) {
             handle.stop().await;
         }
         Ok::<(), anyhow::Error>(())
@@ -409,52 +409,27 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 async fn spawn_stored_sources(
     sources: &api::SharedSources,
     airplay: &api::SharedAirplay,
-    airplay_clients: &airplay_clients::SharedAirplayClients,
-    airplay_prevent_takeover: &airplay_source::SharedPreventTakeover,
+    airplay_clients: &airplay_clients::AirplayClientStore,
+    pw: &pw_thread::SharedState,
     pw_cmd: pw_thread::PwCommandSender,
 ) {
-    // Snapshot the config and drop the (std) lock before awaiting anything.
-    let (airplay_name, airplay_latency, airplay_auth_setup, rtp) = {
+    // Snapshot the source list and drop the (std) lock before awaiting anything.
+    let entries = {
         let s = sources.lock_recover();
-        (s.airplay_source_name().map(str::to_string), s.airplay_latency_msec(), s.airplay_auth_setup(), s.rtp_source())
+        s.list()
     };
 
-    // The RTP source (bt-bridge) is a native PipeWire module, not a subprocess
-    // — load it via the PipeWire thread like a RAOP sink, not the supervisor. A
-    // failed load is logged, not fatal; it can be re-enabled live via the API.
-    if let Some(rtp) = rtp {
-        let args = rtp_source::rtp_source_module_args(rtp.port, rtp.latency_msec, &rtp.source_addr, rtp.ignore_ssrc);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let sent = pw_cmd.send(pw_thread::PwCommand::Load {
-            node_name: rtp_source::RTP_SOURCE_NODE_NAME.to_string(),
-            module_name: rtp_source::RTP_SOURCE_MODULE_NAME.to_string(),
-            args,
-            reply: tx,
-        });
-        if sent.is_err() {
-            tracing::error!("PipeWire thread unavailable while loading RTP source");
-        } else {
-            match rx.await {
-                Ok(Ok(())) => {
-                    tracing::info!("started RTP source on port {} ({} ms jitter buffer)", rtp.port, rtp.latency_msec)
-                }
-                Ok(Err(e)) => tracing::warn!("failed to start RTP source: {e}"),
-                Err(_) => tracing::warn!("no reply loading RTP source"),
-            }
-        }
-    }
+    // The RTP sources (bt-bridge et al.) are native PipeWire modules, not
+    // subprocesses — loaded via the PipeWire thread like a RAOP sink, not the
+    // supervisor. reconcile loads one module per stored RTP source and unloads
+    // any orphans; a failed load is logged inside, not fatal — each can be
+    // re-enabled live via the API.
+    rtp_source::reconcile(&entries, &pw_cmd, pw).await;
 
-    if let Some(name) = airplay_name {
-        match airplay_source::start(name.clone(), airplay_latency, airplay_auth_setup, airplay_clients.clone(), airplay_prevent_takeover.clone())
-            .await
-        {
-            Ok(handle) => {
-                *airplay.lock().await = Some(handle);
-                tracing::info!("started AirPlay source '{name}'");
-            }
-            Err(e) => tracing::warn!("failed to start AirPlay source '{name}': {e}"),
-        }
-    }
+    // Every configured AirPlay receiver (one per AirPlay source with a name):
+    // the reconciler starts each on its own node/port/mDNS name with its own
+    // per-source client registry + anti-takeover flag.
+    airplay_source::reconcile(airplay, &entries, airplay_clients).await;
 }
 
 /// Completes on SIGTERM or SIGINT — the trigger for axum's graceful shutdown.

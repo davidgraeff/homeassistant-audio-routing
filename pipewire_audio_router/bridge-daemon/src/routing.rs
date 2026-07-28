@@ -24,7 +24,6 @@
 //! by hand in every test script in `tests/`, generalized here instead of
 //! being hardcoded per source/output type.
 
-use crate::airplay_source::AIRPLAY_NODE_NAME;
 use crate::api::AppState;
 use crate::config::{AP2_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
@@ -113,7 +112,7 @@ fn build_matrix(
     reg: &RegistryState,
     devices: &BTreeMap<String, SendspinDevice>,
     ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
-    airplay_display: Option<&str>,
+    source_labels: &std::collections::HashMap<String, String>,
     meters: &crate::metering::MeterHub,
     intent: &[RoutingLink],
     sendspin_volumes: &std::collections::HashMap<String, u8>,
@@ -204,12 +203,10 @@ fn build_matrix(
         .into_iter()
         .map(|name| {
             let node_id = present_sources.get(&name).copied();
-            // The AirPlay source's node is named `airplay-in`; show the
-            // user-facing service name instead when we know it.
-            let display_name = match airplay_display {
-                Some(ap) if name == AIRPLAY_NODE_NAME => ap.to_string(),
-                _ => name.clone(),
-            };
+            // Show the source's user-facing label (from the source store) when we
+            // know it; otherwise fall back to the raw node name. Works for every
+            // source instance, not just a fixed-name AirPlay/RTP source.
+            let display_name = source_labels.get(&name).cloned().unwrap_or_else(|| name.clone());
             let peak = meters.peak(&name);
             RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name, peak, volume: None, muted: None }
         })
@@ -242,9 +239,14 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let intent = routing_store::snapshot(&state.routing);
     let devices = state.sendspin_devices.lock_recover().clone();
     let ap2_devices = state.ap2_devices.lock_recover().clone();
-    let airplay = state.sources.lock_recover().airplay_source_name().map(str::to_string);
+    // Per-source display label, keyed by node name, for every configured source
+    // instance (AirPlay or RTP) — not just a fixed-name one.
+    let source_labels: std::collections::HashMap<String, String> = {
+        let sources = state.sources.lock_recover();
+        sources.list().into_iter().map(|entry| (entry.node_name(), entry.label.clone())).collect()
+    };
     let reg = state.pw.lock_recover();
-    build_matrix(&reg, &devices, &ap2_devices, airplay.as_deref(), &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes)
+    build_matrix(&reg, &devices, &ap2_devices, &source_labels, &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes)
 }
 
 /// Present source nodes as `(node_name, node_id)` — the set the meter hub taps
@@ -542,6 +544,7 @@ async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::airplay_source::AIRPLAY_NODE_NAME;
 
     fn link(source: &str, output: &str) -> RoutingLink {
         RoutingLink { source: source.to_string(), output: output.to_string() }
