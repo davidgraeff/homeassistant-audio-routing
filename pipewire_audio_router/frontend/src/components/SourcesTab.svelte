@@ -3,55 +3,114 @@
   import { api } from '../lib/api';
   import { routing } from '../lib/routing';
   import { run } from '../lib/toast';
-  import type { AirplayClient, AirplaySourceInfo, RtpSourceInfo } from '../lib/types';
+  import RtpSenderDocs from './RtpSenderDocs.svelte';
+  import type { AirplayClient, AirplaySourceCfg, RtpSourceCfg, SourceKind, SourceView } from '../lib/types';
 
-  // Live input-level meters. The daemon meters present sources on-demand while
-  // the routing matrix is watched — subscribing to the `routing` store here
-  // opens that same WebSocket, so each snapshot carries these sources' current
-  // peak (0.0–1.0). Match by the daemon's stable source node names (see
-  // airplay_source.rs / rtp_source.rs). Same data the routing graph meter uses.
-  const AIRPLAY_NODE = 'airplay-in';
-  const RTP_NODE = 'bt-bridge-rtp';
-  const sources = $derived($routing.matrix.sources);
-  const airplayPeak = $derived(sources.find((s) => s.node_name === AIRPLAY_NODE)?.peak ?? 0);
-  const rtpPeak = $derived(sources.find((s) => s.node_name === RTP_NODE)?.peak ?? 0);
-  const pct = (peak: number) => Math.min(100, Math.round(peak * 100));
-
-  let airplay = $state<AirplaySourceInfo>({
-    name: null,
-    running: false,
-    latency_msec: 150,
-    auth_setup: false,
-    prevent_takeover: true,
-  });
-  let airplayName = $state('');
-  let airplayLatency = $state(150);
-  let airplayAuthSetup = $state(false);
-  let airplayPreventTakeover = $state(true);
-  let rtp = $state<RtpSourceInfo>({
-    enabled: false,
-    port: 46000,
-    latency_msec: 200,
-    source_addr: '0.0.0.0',
-    ignore_ssrc: true,
-    loaded: false,
-  });
-  let rtpPort = $state(46000);
-  let rtpLatency = $state(200);
-  // The "Source" radio: which senders this receiver accepts. Two of the three
-  // modes pin source.ip to 0.0.0.0 and differ only in sess.ignore-ssrc; the
-  // multicast mode reveals the group-address field. Kept in the UI (rather than
-  // one raw source.ip field + a checkbox) to match how people actually reason
-  // about it. See mode→(source_addr, ignore_ssrc) mapping in saveRtp/refresh.
-  type RtpMode = 'all' | 'multicast' | 'single';
-  let rtpMode = $state<RtpMode>('all');
-  let rtpMulticastAddr = $state('239.255.42.42');
+  // The set of configured input sources (AirPlay-receive + RTP-receive). Loaded
+  // from the daemon's /api/sources collection; the user adds / edits / removes
+  // entries of either kind, and each shows up in the routing matrix by its
+  // node_name automatically. (The CRUD endpoints land in a later phase, so
+  // these calls 404 until then — that's expected.)
+  let sources = $state<SourceView[]>([]);
+  let loading = $state(true);
   let busy = $state(false);
 
-  // The three source modes, with the copy that used to live inline in the radio
-  // list. Now driven from data so the compact dropdown can render the name in
-  // the closed trigger and name+description in the open list, and the card can
-  // show the selected mode's description on its own line below the control.
+  async function refresh() {
+    loading = true;
+    try {
+      const res = await api.listSources();
+      sources = res.sources;
+    } catch {
+      sources = [];
+    }
+    loading = false;
+    // Pull the client lists for whatever AirPlay sources we now know about.
+    await refreshAllClients();
+  }
+
+  // ---- AirPlay senders (per-source clients) --------------------------------
+  // Each AirPlay source owns one receiver with its own remembered-sender list.
+  // We keep the lists keyed by source id, poll them on a light interval while
+  // this tab is mounted, and refresh after each management action. RTP sources
+  // have no such list. The list itself lives in the expanded card body; the
+  // header only carries the connected count.
+  let clientsBySource = $state<Record<string, AirplayClient[]>>({});
+
+  function clientsFor(id: string): AirplayClient[] {
+    const list = clientsBySource[id] ?? [];
+    // Connected senders first, then by most-recent connection.
+    return [...list].sort(
+      (a, b) => Number(b.connected) - Number(a.connected) || b.last_connected - a.last_connected,
+    );
+  }
+  const connectedCount = (id: string) => (clientsBySource[id] ?? []).filter((c) => c.connected).length;
+
+  function clientLabel(c: AirplayClient): string {
+    return c.name ?? c.addr ?? c.key;
+  }
+  function formatWhen(unixSecs: number): string {
+    if (!unixSecs) return 'never';
+    return new Date(unixSecs * 1000).toLocaleString();
+  }
+
+  async function refreshClients(id: string) {
+    try {
+      clientsBySource = { ...clientsBySource, [id]: await api.listSourceClients(id) };
+    } catch {
+      /* keep last-known for this source */
+    }
+  }
+  async function refreshAllClients() {
+    await Promise.all(sources.filter((s) => s.kind === 'airplay').map((s) => refreshClients(s.id)));
+  }
+
+  async function forgetClient(id: string, c: AirplayClient) {
+    if (await run(() => api.forgetSourceClient(id, c.key), `Forgot '${clientLabel(c)}'`)) {
+      await refreshClients(id);
+    }
+  }
+  async function banClient(id: string, c: AirplayClient, banned: boolean) {
+    const msg = banned ? `Banned '${clientLabel(c)}'` : `Unbanned '${clientLabel(c)}'`;
+    if (await run(() => api.banSourceClient(id, c.key, banned), msg)) {
+      await refreshClients(id);
+    }
+  }
+  async function setPriority(id: string, c: AirplayClient, priority: number) {
+    if (await run(() => api.setSourceClientPriority(id, c.key, priority), `Priority ${priority} for '${clientLabel(c)}'`)) {
+      await refreshClients(id);
+    }
+  }
+  async function disconnectClient(id: string, c: AirplayClient) {
+    if (await run(() => api.disconnectSourceClient(id, c.key), `Disconnecting '${clientLabel(c)}'`)) {
+      await refreshClients(id);
+    }
+  }
+
+  onMount(() => {
+    refresh();
+    // Light poll so connect/disconnect/ban shows up without a manual reload.
+    const timer = setInterval(refreshAllClients, 5000);
+    return () => clearInterval(timer);
+  });
+
+  // Live input-level meters. Subscribing to the `routing` store opens the same
+  // WebSocket the routing matrix uses, whose snapshots carry each present
+  // source's current peak (0.0–1.0). Match by the daemon's stable source node
+  // name — every SourceView carries its `node_name`.
+  const liveSources = $derived($routing.matrix.sources);
+  const pct = (peak: number) => Math.min(100, Math.round(peak * 100));
+  function peakFor(nodeName: string): number {
+    return liveSources.find((s) => s.node_name === nodeName)?.peak ?? 0;
+  }
+
+  function kindLabel(kind: SourceKind): string {
+    return kind === 'airplay' ? 'AirPlay' : 'RTP';
+  }
+
+  // ---- RTP "Source" mode (same mapping as the legacy single RTP panel) -----
+  // Two of the three modes pin source.ip to 0.0.0.0 and differ only in
+  // sess.ignore-ssrc; the multicast mode reveals the group-address field.
+  type RtpMode = 'all' | 'multicast' | 'single';
   const RTP_MODES: { value: RtpMode; label: string; desc: string }[] = [
     {
       value: 'all',
@@ -71,17 +130,27 @@
   ];
   const rtpModeInfo = $derived(RTP_MODES.find((m) => m.value === rtpMode) ?? RTP_MODES[0]);
 
-  // Custom dropdown (a native <select> can't show a description per option, and
-  // shows the same text open and closed). A button + popup listbox lets the
-  // closed trigger stay compact while the open list carries each mode's blurb.
+  // A non-empty, non-0.0.0.0 source.ip means the receiver joined a multicast
+  // group; otherwise ignore-ssrc distinguishes "accept all" from "single".
+  function deriveRtpMode(addr: string, ignoreSsrc: boolean): RtpMode {
+    if (addr && addr !== '0.0.0.0') return 'multicast';
+    return ignoreSsrc ? 'all' : 'single';
+  }
+  // Map the "Source" mode to the two backend knobs.
+  function rtpModeToParams(): { sourceAddr: string; ignoreSsrc: boolean } {
+    if (rtpMode === 'multicast') return { sourceAddr: rtpMulticastAddr.trim() || '239.255.42.42', ignoreSsrc: true };
+    if (rtpMode === 'single') return { sourceAddr: '0.0.0.0', ignoreSsrc: false };
+    return { sourceAddr: '0.0.0.0', ignoreSsrc: true };
+  }
+
+  // Custom dropdown for the RTP mode (a native <select> can't show a per-option
+  // description). Only one form is open at a time, so a single open-state suffices.
   let rtpMenuOpen = $state(false);
   let rtpDropdownEl = $state<HTMLDivElement>();
   function selectRtpMode(value: RtpMode) {
     rtpMode = value;
     rtpMenuOpen = false;
   }
-  // Close when clicking away or pressing Escape. pointerdown fires before the
-  // trigger's click, but a click inside is contained, so it never self-closes.
   function onDocPointerDown(e: PointerEvent) {
     if (rtpMenuOpen && rtpDropdownEl && !rtpDropdownEl.contains(e.target as Node)) rtpMenuOpen = false;
   }
@@ -89,432 +158,597 @@
     if (e.key === 'Escape') rtpMenuOpen = false;
   }
 
-  // A non-empty, non-0.0.0.0 source.ip means the receiver joined a multicast
-  // group; otherwise ignore-ssrc distinguishes "accept all" from "single".
-  function deriveRtpMode(addr: string, ignoreSsrc: boolean): RtpMode {
-    if (addr && addr !== '0.0.0.0') return 'multicast';
-    return ignoreSsrc ? 'all' : 'single';
+  // ---- Add / edit form -----------------------------------------------------
+  // One editor at a time: either adding a new source of a chosen kind, or
+  // editing an existing one (id + kind are immutable, so the kind is fixed for
+  // the lifetime of the form). Field state is shared between add and edit and
+  // reset/seeded whenever the form opens.
+  //
+  // For configured sources this doubles as the card's collapse state: a source
+  // card is expanded exactly while it is the one being edited, so the header
+  // chevron seeds/tears down the form (there is no separate "Edit" button and
+  // no "Cancel" — collapsing the card is the cancel).
+  type FormMode = { type: 'add'; kind: SourceKind } | { type: 'edit'; id: string; kind: SourceKind };
+  let form = $state<FormMode | null>(null);
+
+  let formLabel = $state('');
+  // AirPlay fields
+  let apLatency = $state(150);
+  let apAuthSetup = $state(false);
+  let apPreventTakeover = $state(true);
+  let apPort = $state(0); // 0 = let the daemon allocate the RTSP port
+  // RTP fields
+  let rtpPort = $state(46000);
+  let rtpLatency = $state(200);
+  let rtpRate = $state(48000);
+  let rtpMode = $state<RtpMode>('all');
+  let rtpMulticastAddr = $state('239.255.42.42');
+
+  function resetAirplayFields(cfg?: AirplaySourceCfg | null) {
+    apLatency = cfg?.latency_msec ?? 150;
+    apAuthSetup = cfg?.auth_setup ?? false;
+    apPreventTakeover = cfg?.prevent_takeover ?? true;
+    apPort = cfg?.port ?? 0;
+  }
+  function resetRtpFields(cfg?: RtpSourceCfg | null) {
+    rtpPort = cfg?.port ?? 46000;
+    rtpLatency = cfg?.latency_msec ?? 200;
+    rtpRate = cfg?.rate ?? 48000;
+    rtpMode = cfg ? deriveRtpMode(cfg.source_addr, cfg.ignore_ssrc) : 'all';
+    // Keep the group field populated with the stored group (so it round-trips)
+    // but never with 0.0.0.0 — the field only shows in multicast mode.
+    if (cfg && rtpMode === 'multicast') rtpMulticastAddr = cfg.source_addr;
+    else rtpMulticastAddr = '239.255.42.42';
   }
 
-  // Remembered AirPlay senders (current + previous). Polled while this tab is
-  // open so the connection badge and the manage-connections list stay live.
-  let clients = $state<AirplayClient[]>([]);
-  let showManage = $state(false);
-
-  const connectedClients = $derived(clients.filter((c) => c.connected));
-
-  function clientLabel(c: AirplayClient): string {
-    return c.name ?? c.addr;
+  function openAdd(kind: SourceKind) {
+    form = { type: 'add', kind };
+    formLabel = '';
+    rtpMenuOpen = false;
+    if (kind === 'airplay') resetAirplayFields();
+    else resetRtpFields();
+  }
+  function openEdit(s: SourceView) {
+    form = { type: 'edit', id: s.id, kind: s.kind };
+    formLabel = s.label;
+    rtpMenuOpen = false;
+    if (s.kind === 'airplay') resetAirplayFields(s.airplay);
+    else resetRtpFields(s.rtp);
+  }
+  function closeForm() {
+    form = null;
+    rtpMenuOpen = false;
+  }
+  // Cards start collapsed; expanding one opens its editor (and implicitly
+  // collapses whichever card was open before).
+  const isExpanded = (s: SourceView) => !!form && form.type === 'edit' && form.id === s.id;
+  function toggleCard(s: SourceView) {
+    if (isExpanded(s)) closeForm();
+    else openEdit(s);
   }
 
-  function formatWhen(unixSecs: number): string {
-    if (!unixSecs) return 'never';
-    return new Date(unixSecs * 1000).toLocaleString();
+  function airplayBody(): Partial<AirplaySourceCfg> {
+    const body: Partial<AirplaySourceCfg> = {
+      latency_msec: apLatency,
+      auth_setup: apAuthSetup,
+      prevent_takeover: apPreventTakeover,
+    };
+    // Only pin a port when the user set one; otherwise let the daemon allocate.
+    if (apPort > 0) body.port = apPort;
+    return body;
+  }
+  function rtpBody(): Partial<RtpSourceCfg> {
+    const { sourceAddr, ignoreSsrc } = rtpModeToParams();
+    return {
+      port: rtpPort,
+      latency_msec: rtpLatency,
+      source_addr: sourceAddr,
+      ignore_ssrc: ignoreSsrc,
+      rate: rtpRate,
+    };
   }
 
-  async function refreshClients() {
-    try {
-      clients = await api.airplayClients();
-    } catch {
-      /* keep last-known */
-    }
-  }
-
-  async function refresh() {
-    try {
-      airplay = await api.airplaySource();
-      airplayName = airplay.name ?? '';
-      airplayLatency = airplay.latency_msec;
-      airplayAuthSetup = airplay.auth_setup;
-      airplayPreventTakeover = airplay.prevent_takeover;
-    } catch {
-      /* keep last-known */
-    }
-    try {
-      rtp = await api.rtpSource();
-      rtpPort = rtp.port;
-      rtpLatency = rtp.latency_msec;
-      rtpMode = deriveRtpMode(rtp.source_addr, rtp.ignore_ssrc);
-      // Keep the group field populated with the stored group (so it round-trips)
-      // but never with 0.0.0.0 — the field only shows in multicast mode.
-      if (rtpMode === 'multicast') rtpMulticastAddr = rtp.source_addr;
-    } catch {
-      /* keep last-known */
-    }
-    await refreshClients();
-  }
-
-  onMount(() => {
-    refresh();
-    // Light poll so connect/disconnect shows up without a manual reload.
-    const timer = setInterval(refreshClients, 5000);
-    return () => clearInterval(timer);
-  });
-
-  async function forgetClient(c: AirplayClient) {
-    if (await run(() => api.forgetAirplayClient(c.key), `Forgot '${clientLabel(c)}'`)) {
-      await refreshClients();
-    }
-  }
-
-  async function banClient(c: AirplayClient, banned: boolean) {
-    const msg = banned ? `Banned '${clientLabel(c)}'` : `Unbanned '${clientLabel(c)}'`;
-    if (await run(() => api.banAirplayClient(c.key, banned), msg)) {
-      await refreshClients();
-    }
-  }
-
-  async function setPriority(c: AirplayClient, priority: number) {
-    if (await run(() => api.setAirplayClientPriority(c.key, priority), `Priority ${priority} for '${clientLabel(c)}'`)) {
-      await refreshClients();
-    }
-  }
-
-  async function disconnectClient(c: AirplayClient) {
-    if (await run(() => api.disconnectAirplayClient(c.key), `Disconnecting '${clientLabel(c)}'`)) {
-      await refreshClients();
-    }
-  }
-
-  // Live toggle — no receiver restart, so the current stream isn't disturbed.
-  async function savePreventTakeover() {
-    await run(
-      () => api.setAirplayPolicy(airplayPreventTakeover),
-      airplayPreventTakeover ? 'New senders refused while one is streaming' : 'New senders may take over the stream',
-    );
-    await refresh();
-  }
-
-  async function saveAirplay(e?: Event) {
+  async function save(e?: Event) {
     e?.preventDefault();
+    const f = form;
+    if (!f) return;
+    const label = formLabel.trim();
+    if (!label) return;
     busy = true;
-    const trimmed = airplayName.trim();
-    const ok = await run(
-      () => api.setAirplaySource(trimmed, airplayLatency, airplayAuthSetup),
-      trimmed ? `AirPlay source set to '${trimmed}'` : 'AirPlay source disabled',
-    );
+    let ok = false;
+    if (f.type === 'add') {
+      const body =
+        f.kind === 'airplay'
+          ? { label, kind: f.kind, airplay: airplayBody() }
+          : { label, kind: f.kind, rtp: rtpBody() };
+      ok = await run(() => api.addSource(body), `Added ${kindLabel(f.kind)} source '${label}'`);
+    } else {
+      const body = f.kind === 'airplay' ? { label, airplay: airplayBody() } : { label, rtp: rtpBody() };
+      ok = await run(() => api.updateSource(f.id, body), `Updated source '${label}'`);
+    }
     busy = false;
-    if (ok) await refresh();
-  }
-
-  async function disableAirplay() {
-    if (await run(() => api.disableAirplaySource(), 'AirPlay source disabled')) {
-      airplayName = '';
+    if (ok) {
+      closeForm();
       await refresh();
     }
   }
 
-  // Map the "Source" radio to the two backend knobs. Multicast joins a group
-  // (any sender on it); "single" binds all interfaces but locks onto the first
-  // SSRC and rejects the rest; "all" is the plain accept-everything listener.
-  function rtpModeToParams(): { sourceAddr: string; ignoreSsrc: boolean } {
-    if (rtpMode === 'multicast') return { sourceAddr: rtpMulticastAddr.trim() || '239.255.42.42', ignoreSsrc: true };
-    if (rtpMode === 'single') return { sourceAddr: '0.0.0.0', ignoreSsrc: false };
-    return { sourceAddr: '0.0.0.0', ignoreSsrc: true };
+  async function remove(s: SourceView) {
+    if (!confirm(`Remove source '${s.label}'? Its routing will be forgotten.`)) return;
+    if (form && form.type === 'edit' && form.id === s.id) closeForm();
+    if (await run(() => api.deleteSource(s.id), `Removed source '${s.label}'`)) await refresh();
   }
 
-  async function saveRtp(e?: Event) {
-    e?.preventDefault();
-    busy = true;
-    const { sourceAddr, ignoreSsrc } = rtpModeToParams();
-    const where = rtpMode === 'multicast' ? sourceAddr : rtpMode === 'single' ? 'single sender' : 'any sender';
-    const ok = await run(
-      () => api.setRtpSource(rtpPort, rtpLatency, sourceAddr, ignoreSsrc),
-      `RTP source enabled on :${rtpPort} (${where}, ${rtpLatency} ms buffer)`,
-    );
-    busy = false;
-    if (ok) await refresh();
-  }
-
-  async function disableRtp() {
-    if (await run(() => api.disableRtpSource(), 'RTP source disabled')) await refresh();
+  // ---- Sender setup docs (RTP only) ---------------------------------------
+  // Fed the port/rate/mode currently in view so the sample configs are
+  // copy-pasteable for this install (see RtpSenderDocs.svelte).
+  let docsParams = $state<{
+    port: number;
+    latencyMsec: number;
+    rate: number;
+    sourceAddr: string;
+    ignoreSsrc: boolean;
+  } | null>(null);
+  // Single entry point, from the tab header — so it's readable *before* any RTP
+  // source exists. Whichever settings are most relevant win: the RTP form's live
+  // values while one is open, else the first configured RTP source, else the
+  // defaults a fresh RTP source would get (never a generic template).
+  function openDocs() {
+    if (form?.kind === 'rtp') {
+      const { sourceAddr, ignoreSsrc } = rtpModeToParams();
+      docsParams = { port: rtpPort, latencyMsec: rtpLatency, rate: rtpRate, sourceAddr, ignoreSsrc };
+      return;
+    }
+    const cfg = sources.find((s) => s.kind === 'rtp')?.rtp;
+    docsParams = cfg
+      ? {
+          port: cfg.port,
+          latencyMsec: cfg.latency_msec,
+          rate: cfg.rate,
+          sourceAddr: cfg.source_addr,
+          ignoreSsrc: cfg.ignore_ssrc,
+        }
+      : { port: 46000, latencyMsec: 200, rate: 48000, sourceAddr: '0.0.0.0', ignoreSsrc: true };
   }
 </script>
 
 <svelte:window onpointerdown={onDocPointerDown} onkeydown={onDocKeydown} />
 
-<div class="card">
-  <div class="card-head">
-    <h2>AirPlay-receive source</h2>
-    {#if airplay.name}
-      <button class="toggle off" type="button" onclick={disableAirplay} disabled={busy}>Disable</button>
-    {:else}
-      <button class="toggle on" type="button" onclick={() => saveAirplay()} disabled={busy || !airplayName.trim()}>Enable</button>
-    {/if}
+<div class="card info">
+  <div class="info-head">
+    <h2>Input sources</h2>
+    <button
+      class="ghost"
+      type="button"
+      title="How to turn a PipeWire machine into a sender that feeds an RTP-receive source"
+      onclick={openDocs}
+    >
+      Explain RTP sender setup
+    </button>
   </div>
   <p class="card-sub">
-    A single AirPlay target that phones and PCs can cast into. Give it a service name and Save, then use
-    the button in the corner to turn it on or off. Encryption compatibility and takeover policy live under
-    Advanced.
+    The audio this router can receive and route onward. Add as many as you like of two kinds:
+    an <strong>AirPlay-receive</strong> endpoint (a target phones and PCs cast into) or an
+    <strong>RTP-receive</strong> endpoint (an ESP32 / Raspberry Pi Bluetooth bridge, or any PipeWire
+    machine running <code>module-rtp-sink</code>). Each source is independently routable in the matrix.
   </p>
-  <form onsubmit={saveAirplay}>
-    <div class="field">
-      <label for="ap-name">Service name</label>
-      <input id="ap-name" type="text" bind:value={airplayName} placeholder="PipeWire Router" />
-    </div>
-
-    <details class="advanced">
-      <summary>Advanced</summary>
-      <div class="row">
-        <div class="field">
-          <label for="ap-latency">Jitter buffer (ms)</label>
-          <input id="ap-latency" type="number" min="20" max="2000" step="10" bind:value={airplayLatency} placeholder="150" />
-          <span class="hint">Raise if playback stutters — trades latency for smoother audio.</span>
-        </div>
-        <div class="field grow">
-          <label class="check">
-            <input id="ap-auth" type="checkbox" bind:checked={airplayAuthSetup} />
-            Auth-setup
-          </label>
-          <span class="hint">Advertises the auth-setup encryption mode (et=0,4). Enable only if a sender refuses to connect unencrypted — it broadens compatibility but changes how PipeWire senders negotiate.</span>
-        </div>
-        <div class="field grow">
-          <label class="check">
-            <input id="ap-takeover" type="checkbox" bind:checked={airplayPreventTakeover} onchange={savePreventTakeover} />
-            Prevent takeover
-          </label>
-          <span class="hint">Refuse a new sender while one is already streaming (applied live, no restart).</span>
-        </div>
-      </div>
-    </details>
-
-    <div class="status-bar">
-      <p class="status">
-        Status:
-        {#if airplay.name}
-          <span class="badge {airplay.running ? 'on' : 'off'}">{airplay.running ? 'running' : 'stopped'}</span>
-          as <strong>{airplay.name}</strong>
-          {#if connectedClients.length}
-            — <span class="badge on">streaming</span>
-            from
-            <strong>{connectedClients.map(clientLabel).join(', ')}</strong>
-          {:else}
-            — <span class="badge off">no client</span>
-          {/if}
-        {:else}
-          <span class="badge off">disabled</span>
-        {/if}
-      </p>
-      {#if airplay.name}
-        <div class="meter" title="Input level {pct(airplayPeak)}%" aria-label="input level">
-          <div class="meter-fill" style="width:{pct(airplayPeak)}%"></div>
-        </div>
-      {/if}
-      <div class="status-actions">
-        <button class="ghost" type="button" onclick={() => { showManage = true; refreshClients(); }}>
-          Manage connections{#if clients.length}&nbsp;({clients.length}){/if}
-        </button>
-        <button class="primary" type="submit" disabled={busy}>Save</button>
-      </div>
-    </div>
-  </form>
+  <p class="card-sub" style="margin-bottom:0">
+    A <span class="badge on">present</span> source has a live PipeWire node right now; an
+    <span class="badge off">offline</span> one is configured but not currently receiving. Expand a card
+    for its settings, its connected senders, and to remove it.
+  </p>
 </div>
 
-{#if showManage}
-  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => (showManage = false)}>
-    <div class="modal-card card" onclick={(e) => e.stopPropagation()}>
-      <div class="card-head">
-        <h2>AirPlay connections</h2>
-        <button class="ghost" type="button" onclick={() => (showManage = false)}>Close</button>
-      </div>
-      <p class="card-sub">
-        Senders that have connected to this AirPlay source. Currently-connected devices are shown live.
-        <strong>Ban</strong> refuses a client's future connections (matched by name if known, else by IP;
-        it doesn't drop a stream already playing — use <strong>Disconnect</strong> for that).
-        <strong>Priority</strong> arbitrates takeover: a connecting sender with a strictly higher priority than
-        the current one takes the stream over; otherwise the "Prevent takeover" policy applies.
-        Forgetting is for previously-seen clients.
-      </p>
-      {#if clients.length === 0}
-        <p class="empty">No AirPlay client has connected yet.</p>
-      {:else}
-        <table class="clients">
-          <thead>
-            <tr><th>Client</th><th>Address</th><th>Last connected</th><th>Priority</th><th></th></tr>
-          </thead>
-          <tbody>
-            {#each clients as c (c.key)}
-              <tr>
-                <td>
-                  <strong>{clientLabel(c)}</strong>
-                  {#if c.connected}<span class="badge on">connected</span>{/if}
-                  {#if c.banned}<span class="badge off" title="Future connections refused">banned</span>{/if}
-                  {#if !c.name}<span class="badge off" title="Sender advertised no name">IP&nbsp;only</span>{/if}
-                </td>
-                <td class="muted">{c.addr}</td>
-                <td class="muted">{formatWhen(c.last_connected)}</td>
-                <td>
-                  <input
-                    class="prio"
-                    type="number"
-                    step="1"
-                    value={c.priority}
-                    title="Higher priority takes over a lower-priority stream"
-                    onchange={(e) => setPriority(c, Number((e.currentTarget as HTMLInputElement).value) || 0)}
-                  />
-                </td>
-                <td style="text-align:right; white-space:nowrap">
-                  {#if c.connected}
-                    <button class="ghost danger" type="button" title="Drop this client's current connection" onclick={() => disconnectClient(c)}>
-                      Disconnect
-                    </button>
-                  {/if}
-                  {#if c.banned}
-                    <button class="ghost" type="button" title="Allow this client again" onclick={() => banClient(c, false)}>
-                      Unban
-                    </button>
-                  {:else}
-                    <button class="ghost danger" type="button" title="Refuse this client's future connections" onclick={() => banClient(c, true)}>
-                      Ban
-                    </button>
-                  {/if}
-                  <button
-                    class="ghost danger"
-                    type="button"
-                    disabled={c.connected}
-                    title={c.connected ? 'Disconnect before forgetting' : 'Forget this client'}
-                    onclick={() => forgetClient(c)}
-                  >
-                    Forget
-                  </button>
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      {/if}
+<!-- AirPlay field group, shared by add + edit (references the ap* form state). -->
+{#snippet airplayFields()}
+  <div class="field">
+    <label for="src-latency">Jitter buffer (ms)</label>
+    <input id="src-latency" type="number" min="20" max="2000" step="10" bind:value={apLatency} placeholder="150" />
+    <span class="hint">Raise if playback stutters — trades latency for smoother audio.</span>
+  </div>
+  <div class="row">
+    <div class="field grow">
+      <label class="check">
+        <input type="checkbox" bind:checked={apAuthSetup} />
+        Auth-setup
+      </label>
+      <span class="hint">Advertises the auth-setup encryption mode (et=0,4). Enable only if a sender refuses to connect unencrypted — it broadens compatibility but changes how PipeWire senders negotiate.</span>
+    </div>
+    <div class="field grow">
+      <label class="check">
+        <input type="checkbox" bind:checked={apPreventTakeover} />
+        Prevent takeover
+      </label>
+      <span class="hint">Refuse a new sender while one is already streaming.</span>
     </div>
   </div>
-{/if}
+  <details class="advanced">
+    <summary>Advanced</summary>
+    <div class="field">
+      <label for="src-ap-port">RTSP port</label>
+      <input id="src-ap-port" type="number" min="0" max="65535" bind:value={apPort} placeholder="auto" />
+      <span class="hint">The AirPlay control port. Leave 0 to let the router allocate a free one (starting at 5000) and keep it stable across restarts.</span>
+    </div>
+  </details>
+{/snippet}
 
-<div class="card">
-  <div class="card-head">
-    <h2>RTP-receive source</h2>
-    {#if rtp.enabled}
-      <button class="toggle off" type="button" onclick={disableRtp} disabled={busy}>Disable</button>
-    {:else}
-      <button class="toggle on" type="button" onclick={() => saveRtp()} disabled={busy}>Enable</button>
-    {/if}
+<!-- RTP field group, shared by add + edit (references the rtp* form state). -->
+{#snippet rtpFields()}
+  <div class="field">
+    <label for="src-rtp-port">Listen port</label>
+    <input id="src-rtp-port" type="number" min="1" max="65535" bind:value={rtpPort} placeholder="46000" />
+    <span class="hint">Must match the port the sender targets. Two enabled RTP sources can't share a port.</span>
   </div>
-  <p class="card-sub">
-    Receives an RTP/UDP audio stream and exposes it as a routable source. Feed it from the ESP32
-    Bluetooth bridge, a Raspberry Pi Bluetooth bridge, or any PipeWire installation running
-    <code>module-rtp-sink</code> — they all land on the same <code>bt-bridge-rtp</code> node, so the
-    add-on needs no change to accept either. The listen port must match the port the sender targets.
-  </p>
-  <form onsubmit={saveRtp}>
-    <div class="field">
-      <label for="rtp-port">Listen port</label>
-      <input id="rtp-port" type="number" min="1" max="65535" bind:value={rtpPort} placeholder="46000" />
-    </div>
-    <div class="field">
-      <span class="group-label" id="rtp-source-label">Source</span>
-      <div class="rtp-source-row">
-        <div class="dropdown" bind:this={rtpDropdownEl}>
-          <button
-            type="button"
-            class="dd-trigger"
-            aria-haspopup="listbox"
-            aria-expanded={rtpMenuOpen}
-            aria-labelledby="rtp-source-label"
-            onclick={() => (rtpMenuOpen = !rtpMenuOpen)}
-          >
-            <span>{rtpModeInfo.label}</span>
-            <span class="caret" aria-hidden="true">▾</span>
-          </button>
-          {#if rtpMenuOpen}
-            <ul class="dd-menu" role="listbox" aria-labelledby="rtp-source-label">
-              {#each RTP_MODES as m (m.value)}
-                <li role="option" aria-selected={m.value === rtpMode}>
-                  <button type="button" class="dd-item" class:active={m.value === rtpMode} onclick={() => selectRtpMode(m.value)}>
-                    <strong>{m.label}</strong>
-                    <span class="muted">{m.desc}</span>
-                  </button>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        </div>
-        {#if rtpMode === 'multicast'}
-          <input
-            id="rtp-mcast"
-            class="mcast-input"
-            type="text"
-            bind:value={rtpMulticastAddr}
-            placeholder="239.255.42.42"
-            aria-label="Multicast group address"
-          />
+  <div class="field">
+    <span class="group-label" id="src-rtp-source-label">Source</span>
+    <div class="rtp-source-row">
+      <div class="dropdown" bind:this={rtpDropdownEl}>
+        <button
+          type="button"
+          class="dd-trigger"
+          aria-haspopup="listbox"
+          aria-expanded={rtpMenuOpen}
+          aria-labelledby="src-rtp-source-label"
+          onclick={() => (rtpMenuOpen = !rtpMenuOpen)}
+        >
+          <span>{rtpModeInfo.label}</span>
+          <span class="caret" aria-hidden="true">▾</span>
+        </button>
+        {#if rtpMenuOpen}
+          <ul class="dd-menu" role="listbox" aria-labelledby="src-rtp-source-label">
+            {#each RTP_MODES as m (m.value)}
+              <li role="option" aria-selected={m.value === rtpMode}>
+                <button type="button" class="dd-item" class:active={m.value === rtpMode} onclick={() => selectRtpMode(m.value)}>
+                  <strong>{m.label}</strong>
+                  <span class="muted">{m.desc}</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
         {/if}
       </div>
-      <span class="hint">{rtpModeInfo.desc}</span>
+      {#if rtpMode === 'multicast'}
+        <input
+          class="mcast-input"
+          type="text"
+          bind:value={rtpMulticastAddr}
+          placeholder="239.255.42.42"
+          aria-label="Multicast group address"
+        />
+      {/if}
     </div>
-
-    <details class="advanced">
-      <summary>Advanced</summary>
+    <span class="hint">{rtpModeInfo.desc}</span>
+  </div>
+  <details class="advanced">
+    <summary>Advanced</summary>
+    <div class="row">
       <div class="field">
-        <label for="rtp-latency">Jitter buffer (ms)</label>
-        <input id="rtp-latency" type="number" min="20" max="2000" step="10" bind:value={rtpLatency} placeholder="200" />
+        <label for="src-rtp-latency">Jitter buffer (ms)</label>
+        <input id="src-rtp-latency" type="number" min="20" max="2000" step="10" bind:value={rtpLatency} placeholder="200" />
         <span class="hint">Raise if a weak-signal bridge stutters — trades latency for dropout tolerance.</span>
       </div>
-    </details>
-
-    <div class="status-bar">
-      <p class="status">
-        Status:
-        {#if rtp.enabled}
-          <span class="badge {rtp.loaded ? 'on' : 'off'}">{rtp.loaded ? 'loaded' : 'not loaded'}</span>
-          on <strong>:{rtp.port}</strong>, <strong>{rtp.latency_msec} ms</strong> buffer —
-          {#if rtp.source_addr !== '0.0.0.0'}
-            multicast <strong>{rtp.source_addr}</strong>
-          {:else if rtp.ignore_ssrc}
-            <strong>any sender</strong>
-          {:else}
-            <strong>single sender</strong>
-          {/if}
-        {:else}
-          <span class="badge off">disabled</span>
-        {/if}
-      </p>
-      {#if rtp.enabled}
-        <div class="meter" title="Input level {pct(rtpPeak)}%" aria-label="input level">
-          <div class="meter-fill" style="width:{pct(rtpPeak)}%"></div>
-        </div>
-      {/if}
-      <div class="status-actions">
-        <button class="primary" type="submit" disabled={busy}>Save</button>
+      <div class="field">
+        <label for="src-rtp-rate">Sample rate</label>
+        <select id="src-rtp-rate" bind:value={rtpRate}>
+          <option value={48000}>48 kHz (recommended)</option>
+          <option value={44100}>44.1 kHz</option>
+        </select>
+        <span class="hint">Must match the sender. 48 kHz keeps the whole path at the router's native rate (no resample).</span>
       </div>
     </div>
-  </form>
-</div>
+  </details>
+{/snippet}
+
+{#if loading}
+  <div class="card"><p class="empty" style="padding:0">Loading…</p></div>
+{:else}
+  {#if sources.length === 0 && !(form && form.type === 'add')}
+    <div class="card">
+      <p class="empty" style="padding:0">No input sources yet. Add an AirPlay or RTP receiver below.</p>
+    </div>
+  {/if}
+
+  {#each sources as s (s.id)}
+    <article class="card src-card" class:offline={!s.present} class:collapsed={!isExpanded(s)}>
+      <header class="src-head">
+        <button
+          class="collapse-toggle"
+          type="button"
+          aria-expanded={isExpanded(s)}
+          title={isExpanded(s) ? 'Hide settings' : 'Show settings'}
+          onclick={() => toggleCard(s)}
+        >
+          <span class="chevron">▶</span>
+        </button>
+        <div class="src-title">
+          <h3>{s.label}</h3>
+          <div class="src-badges">
+            <span class="badge">{kindLabel(s.kind)}</span>
+            <span class="badge {s.present ? 'on' : 'off'}">{s.present ? 'present' : 'offline'}</span>
+            {#if s.kind === 'airplay' && connectedCount(s.id)}
+              <span class="badge on" title="Senders streaming into this receiver right now">
+                {connectedCount(s.id)}&nbsp;connected
+              </span>
+            {/if}
+            <code class="muted node-name" title="Routing node name">{s.node_name}</code>
+          </div>
+        </div>
+        {#if s.present}
+          <div class="meter" title="Input level {pct(peakFor(s.node_name))}%" aria-label="input level">
+            <div class="meter-fill" style="width:{pct(peakFor(s.node_name))}%"></div>
+          </div>
+        {/if}
+      </header>
+
+      {#if isExpanded(s)}
+        <form class="src-form" onsubmit={save}>
+          <div class="field">
+            <label for="src-label">Name</label>
+            <input id="src-label" type="text" bind:value={formLabel} placeholder="Kitchen AirPlay" />
+            {#if s.kind === 'airplay'}
+              <span class="hint">The service name phones and PCs see when casting.</span>
+            {/if}
+          </div>
+          {#if s.kind === 'airplay'}
+            {@render airplayFields()}
+          {:else}
+            {@render rtpFields()}
+          {/if}
+          <div class="form-actions">
+            <span class="spacer"></span>
+            <button class="ghost danger" type="button" onclick={() => remove(s)} disabled={busy}>Remove</button>
+            <button class="primary" type="submit" disabled={busy || !formLabel.trim()}>Save</button>
+          </div>
+        </form>
+      {/if}
+
+      {#if s.kind === 'airplay' && isExpanded(s)}
+        {@const list = clientsFor(s.id)}
+        <div class="clients-panel">
+          <p class="hint" style="margin-top:0">
+            Senders that have connected to this AirPlay receiver. <strong>Ban</strong> refuses a client's future
+            connections (matched by name if known, else by IP; it doesn't drop a live stream — use
+            <strong>Disconnect</strong> for that). <strong>Priority</strong> arbitrates takeover: a connecting
+            sender with a strictly higher priority takes over the current one. <strong>Forget</strong> drops a
+            previously-seen client (only when not connected).
+          </p>
+          {#if list.length === 0}
+            <p class="empty" style="padding:0">No sender has connected to this receiver yet.</p>
+          {:else}
+            <table class="clients">
+              <thead>
+                <tr><th>Client</th><th>Address</th><th>Last connected</th><th>Priority</th><th></th></tr>
+              </thead>
+              <tbody>
+                {#each list as c (c.key)}
+                  <tr class:connected={c.connected}>
+                    <td>
+                      <strong>{clientLabel(c)}</strong>
+                      {#if c.connected}<span class="badge on">connected</span>{/if}
+                      {#if c.banned}<span class="badge off" title="Future connections refused">banned</span>{/if}
+                      {#if !c.name}<span class="badge off" title="Sender advertised no name">IP&nbsp;only</span>{/if}
+                    </td>
+                    <td class="muted">{c.addr}</td>
+                    <td class="muted">{formatWhen(c.last_connected)}</td>
+                    <td>
+                      <input
+                        class="prio"
+                        type="number"
+                        step="1"
+                        value={c.priority}
+                        title="Higher priority takes over a lower-priority stream"
+                        onchange={(e) => setPriority(s.id, c, Number((e.currentTarget as HTMLInputElement).value) || 0)}
+                      />
+                    </td>
+                    <td style="text-align:right; white-space:nowrap">
+                      {#if c.connected}
+                        <button class="ghost danger" type="button" title="Drop this client's current connection" onclick={() => disconnectClient(s.id, c)}>
+                          Disconnect
+                        </button>
+                      {/if}
+                      {#if c.banned}
+                        <button class="ghost" type="button" title="Allow this client again" onclick={() => banClient(s.id, c, false)}>
+                          Unban
+                        </button>
+                      {:else}
+                        <button class="ghost danger" type="button" title="Refuse this client's future connections" onclick={() => banClient(s.id, c, true)}>
+                          Ban
+                        </button>
+                      {/if}
+                      <button
+                        class="ghost danger"
+                        type="button"
+                        disabled={c.connected}
+                        title={c.connected ? 'Disconnect before forgetting' : 'Forget this client'}
+                        onclick={() => forgetClient(s.id, c)}
+                      >
+                        Forget
+                      </button>
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+        </div>
+      {/if}
+    </article>
+  {/each}
+
+  {#if form && form.type === 'add'}
+    <article class="card src-card add-form">
+      <header class="src-head">
+        <div class="src-title">
+          <h3>New {kindLabel(form.kind)} source</h3>
+        </div>
+      </header>
+      <form class="src-form" onsubmit={save}>
+        <div class="field">
+          <label for="src-label-new">Name</label>
+          <input id="src-label-new" type="text" bind:value={formLabel} placeholder={form.kind === 'airplay' ? 'Kitchen AirPlay' : 'Bluetooth Bridge'} />
+          {#if form.kind === 'airplay'}
+            <span class="hint">The service name phones and PCs see when casting.</span>
+          {/if}
+        </div>
+        {#if form.kind === 'airplay'}
+          {@render airplayFields()}
+        {:else}
+          {@render rtpFields()}
+        {/if}
+        <div class="form-actions">
+          <span class="spacer"></span>
+          <button class="ghost" type="button" onclick={closeForm} disabled={busy}>Cancel</button>
+          <button class="primary" type="submit" disabled={busy || !formLabel.trim()}>Add source</button>
+        </div>
+      </form>
+    </article>
+  {:else}
+    <div class="card add-bar">
+      <span class="add-label">Add source:</span>
+      <button class="ghost" type="button" onclick={() => openAdd('airplay')} disabled={busy}>+ AirPlay receiver</button>
+      <button class="ghost" type="button" onclick={() => openAdd('rtp')} disabled={busy}>+ RTP receiver</button>
+    </div>
+  {/if}
+{/if}
+
+{#if docsParams}
+  <RtpSenderDocs
+    port={docsParams.port}
+    latencyMsec={docsParams.latencyMsec}
+    rate={docsParams.rate}
+    sourceAddr={docsParams.sourceAddr}
+    ignoreSsrc={docsParams.ignoreSsrc}
+    onClose={() => (docsParams = null)}
+  />
+{/if}
 
 <style>
-  /* Card header: title on the left, the master enable/disable toggle top-right. */
-  .card-head {
+  /* Tab header: title with the sender-setup docs button beside it, so the
+     document is reachable before the first RTP source exists. */
+  .info-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
-    margin-bottom: 4px;
+    gap: 12px;
+    flex-wrap: wrap;
   }
-  .card-head h2 {
+  .info-head h2 {
     margin: 0;
   }
 
-  /* Master on/off toggle — green to enable, red to disable. */
-  button.toggle {
-    color: #fff;
-    border-color: transparent;
+  /* One card per source; offline ones dim like the outputs list. */
+  .src-card.offline {
+    opacity: 0.6;
+  }
+  /* Collapsed cards are a single compact line (same shape as the outputs
+     list): no body, tighter padding, and nothing wraps — the node name
+     truncates instead. */
+  .src-card.collapsed {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+  .src-card.collapsed .src-head,
+  .src-card.collapsed .src-title,
+  .src-card.collapsed .src-badges {
+    flex-wrap: nowrap;
+  }
+  .src-card.collapsed .src-head {
+    overflow: hidden;
+  }
+  .src-card.collapsed .src-title h3,
+  .src-card.collapsed .node-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .src-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .collapse-toggle {
     flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--secondary-text-color);
+    cursor: pointer;
+    border-radius: 6px;
   }
-  button.toggle.on {
-    background: var(--success-color);
+  .collapse-toggle:hover {
+    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+    color: var(--primary-color);
   }
-  button.toggle.off {
-    background: var(--error-color);
+  .chevron {
+    font-size: 0.7rem;
+    line-height: 1;
+    transition: transform 0.15s ease;
+  }
+  .collapse-toggle[aria-expanded='true'] .chevron {
+    transform: rotate(90deg);
+  }
+  .src-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .src-title h3 {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 500;
+  }
+  .src-badges {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .node-name {
+    font-size: 0.75rem;
+  }
+  button.ghost.danger {
+    color: var(--error-color, #db4437);
   }
 
-  /* Collapsible advanced block, hidden by default. */
+  /* The inline add/edit form under a card header. */
+  .src-form {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--divider-color);
+  }
+  .form-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .form-actions .spacer {
+    flex: 1 1 auto;
+  }
+
+  /* The bottom "Add source:" bar. */
+  .add-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .add-label {
+    color: var(--secondary-text-color);
+    font-size: 0.9rem;
+  }
+
+  /* Collapsible advanced block, hidden by default (same as the old panels). */
   details.advanced {
     margin-top: 12px;
     border-top: 1px solid var(--divider-color);
@@ -562,67 +796,8 @@
     color: var(--secondary-text-color);
   }
 
-  /* Bottom bar: live status on the left, Save (and Manage) on the right. */
-  .status-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 16px;
-    padding-top: 12px;
-    border-top: 1px solid var(--divider-color);
-  }
-  .status-bar .status {
-    flex: 1 1 auto;
-    margin: 0;
-    font-size: 0.85rem;
-    color: var(--secondary-text-color);
-  }
-  .status-bar .status-actions {
-    display: flex;
-    gap: 8px;
-    flex: 0 0 auto;
-  }
-
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
-    padding: 6vh 1rem 1rem;
-    z-index: 50;
-  }
-  .modal-card {
-    width: min(720px, 100%);
-    max-height: 84vh;
-    overflow: auto;
-    margin: 0;
-  }
-  table.clients {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.9rem;
-  }
-  table.clients th,
-  table.clients td {
-    text-align: left;
-    padding: 0.4rem 0.5rem;
-    border-bottom: 1px solid var(--divider-color);
-    vertical-align: middle;
-  }
-  table.clients th {
-    font-weight: 600;
-    color: var(--secondary-text-color);
-  }
-  table.clients .badge {
-    margin-left: 0.4rem;
-  }
-  input.prio {
-    width: 4rem;
-  }
-  /* Compact source picker: one line (dropdown + optional group address), the
-     selected mode's description on the line below (rendered as .hint). */
+  /* Compact RTP source picker: dropdown + optional group address on one line,
+     the selected mode's description below (as .hint). */
   .rtp-source-row {
     display: flex;
     align-items: center;
@@ -701,10 +876,45 @@
     margin: 0;
   }
 
+  /* Per-source AirPlay senders sub-panel. */
+  .clients-panel {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--divider-color);
+    overflow-x: auto;
+  }
+  table.clients {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  table.clients th,
+  table.clients td {
+    text-align: left;
+    padding: 0.4rem 0.5rem;
+    border-bottom: 1px solid var(--divider-color);
+    vertical-align: middle;
+  }
+  table.clients th {
+    font-weight: 600;
+    color: var(--secondary-text-color);
+  }
+  table.clients tr.connected td {
+    background: color-mix(in srgb, var(--success-color, #2e7d32) 8%, transparent);
+  }
+  table.clients .badge {
+    margin-left: 0.4rem;
+  }
+  input.prio {
+    width: 4rem;
+    margin: 0;
+  }
+
   /* Live input-level meter — same look as the routing-graph meter. */
   .meter {
-    flex: 1 1 100px;
-    max-width: 220px;
+    flex: 0 1 120px;
+    min-width: 48px;
+    max-width: 160px;
     height: 4px;
     border-radius: 2px;
     background: color-mix(in srgb, var(--secondary-text-color) 20%, transparent);

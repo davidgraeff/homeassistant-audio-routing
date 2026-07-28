@@ -7,12 +7,12 @@
 
 import type {
   AirplayClient,
-  AirplaySourceInfo,
   AlignGroup,
   AlignState,
   AnnounceRequest,
   AnnounceResponse,
   AnnouncementGroup,
+  AirplaySourceCfg,
   AppSettings,
   AppSettingsUpdate,
   MediaPlayerInfo,
@@ -21,8 +21,10 @@ import type {
   OpResponse,
   OutputInfo,
   RoutingMatrix,
+  RtpSourceCfg,
   SendspinCodec,
-  RtpSourceInfo,
+  SourceKind,
+  SourceView,
   StatusInfo,
   SyncSettingsInfo,
   VolumeResponse,
@@ -110,22 +112,21 @@ export const api = {
   // Outputs tab's Play tone / Play announcement diagnostics.
   announce: (req: AnnounceRequest) => request<AnnounceResponse>('POST', 'api/announce', req),
 
-  // AirPlay-receive source (single)
-  airplaySource: () => request<AirplaySourceInfo>('GET', 'api/source/airplay'),
-  setAirplaySource: (name: string, latencyMsec: number, authSetup: boolean) =>
-    request<OpResponse>('PUT', 'api/source/airplay', { name, latency_msec: latencyMsec, auth_setup: authSetup }),
-  disableAirplaySource: () => request<OpResponse>('DELETE', 'api/source/airplay'),
-  airplayClients: () => request<AirplayClient[]>('GET', 'api/source/airplay/clients'),
-  forgetAirplayClient: (key: string) =>
-    request<OpResponse>('POST', 'api/source/airplay/clients/forget', { key }),
-  banAirplayClient: (key: string, banned: boolean) =>
-    request<OpResponse>('POST', 'api/source/airplay/clients/ban', { key, banned }),
-  setAirplayClientPriority: (key: string, priority: number) =>
-    request<OpResponse>('POST', 'api/source/airplay/clients/priority', { key, priority }),
-  disconnectAirplayClient: (key: string) =>
-    request<OpResponse>('POST', 'api/source/airplay/clients/disconnect', { key }),
-  setAirplayPolicy: (preventTakeover: boolean) =>
-    request<OpResponse>('PUT', 'api/source/airplay/policy', { prevent_takeover: preventTakeover }),
+  // Per-source AirPlay senders (clients). Each AirPlay source id has its own
+  // receiver, so these are scoped by the source id (encodeURIComponent'd).
+  // `key` matches the sender by advertised name if known, else by IP.
+  listSourceClients: (id: string) =>
+    request<AirplayClient[]>('GET', `api/sources/${encodeURIComponent(id)}/clients`),
+  forgetSourceClient: (id: string, key: string) =>
+    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/forget`, { key }),
+  banSourceClient: (id: string, key: string, banned: boolean) =>
+    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/ban`, { key, banned }),
+  setSourceClientPriority: (id: string, key: string, priority: number) =>
+    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/priority`, { key, priority }),
+  disconnectSourceClient: (id: string, key: string) =>
+    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/disconnect`, { key }),
+  setSourcePolicy: (id: string, preventTakeover: boolean) =>
+    request<OpResponse>('PUT', `api/sources/${encodeURIComponent(id)}/policy`, { prevent_takeover: preventTakeover }),
 
   // Sendspin per-device volume (virtual outputs; volume is carried in-band over
   // the sendspin protocol, not a PipeWire node volume). Map is node_name -> 0-100.
@@ -189,14 +190,21 @@ export const api = {
   alignVolume: (volume: number) => request<AlignState>('POST', 'api/align/volume', { volume }),
   alignStop: () => request<AlignState>('DELETE', 'api/align'),
 
-  // RTP source (single — Bluetooth bridge firmware target)
-  rtpSource: () => request<RtpSourceInfo>('GET', 'api/source/rtp'),
-  setRtpSource: (port: number, latencyMsec: number, sourceAddr: string, ignoreSsrc: boolean) =>
-    request<OpResponse>('PUT', 'api/source/rtp', {
-      port,
-      latency_msec: latencyMsec,
-      source_addr: sourceAddr,
-      ignore_ssrc: ignoreSsrc,
-    }),
-  disableRtpSource: () => request<OpResponse>('DELETE', 'api/source/rtp'),
+  // Dynamic input sources — collection CRUD (multi-source refactor). Supersedes
+  // the singular /api/source/{airplay,rtp} endpoints above. The backend routes
+  // land in a later phase, so these 404 until then. `add`/`update` take a
+  // partial per-kind config; the daemon fills defaults + allocates ports.
+  listSources: () => request<{ sources: SourceView[] }>('GET', 'api/sources'),
+  addSource: (body: {
+    label: string;
+    kind: SourceKind;
+    airplay?: Partial<AirplaySourceCfg>;
+    rtp?: Partial<RtpSourceCfg>;
+  }) => request<SourceView>('POST', 'api/sources', body),
+  updateSource: (
+    id: string,
+    body: { label?: string; airplay?: Partial<AirplaySourceCfg>; rtp?: Partial<RtpSourceCfg> },
+  ) => request<SourceView>('PUT', `api/sources/${encodeURIComponent(id)}`, body),
+  deleteSource: (id: string) =>
+    request<OpResponse>('DELETE', `api/sources/${encodeURIComponent(id)}`),
 };

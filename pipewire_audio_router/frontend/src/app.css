@@ -211,6 +211,28 @@ th {
   color: var(--secondary-text-color);
 }
 
+/* ---- Modals ------------------------------------------------------------ */
+/* Shared dialog chrome: a dimming backdrop that closes on click, holding one
+   `.card`. Global (not scoped to a component) because several components put up
+   a dialog — the AirPlay connection manager, the RTP sender docs — and they
+   should be the same object. Width is the one thing a dialog overrides. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 1rem 1rem;
+  z-index: 50;
+}
+.modal-card {
+  width: min(720px, 100%);
+  max-height: 84vh;
+  overflow: auto;
+  margin: 0;
+}
+
 /* ---- Misc -------------------------------------------------------------- */
 .empty {
   color: var(--secondary-text-color);

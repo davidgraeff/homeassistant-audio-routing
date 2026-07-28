@@ -270,29 +270,18 @@ export interface NodesResponse {
   ports: unknown[];
 }
 
-export interface AirplaySourceInfo {
-  name: string | null;
-  running: boolean;
-  /** Producer jitter-buffer target in ms. Higher = fewer stutters, more latency. */
-  latency_msec: number;
-  /** Advertise the auth-setup encryption mode so encryption-requiring senders can connect. */
-  auth_setup: boolean;
-  /** Refuse a new sender while one is already streaming (anti-takeover). */
-  prevent_takeover: boolean;
-}
-
+/** A remembered AirPlay sender for one AirPlay source's receiver (the daemon's
+ * `AirplayClientInfo`). Listed/managed via the per-source /clients endpoints. */
 export interface AirplayClient {
-  /** Stable identifier for forget calls: the name if known, else the IP. */
+  /** Stable identifier for forget/ban/priority calls: the name if known, else the IP. */
   key: string;
   /** Friendly device name once the sender advertised one; null if only seen by IP. */
   name: string | null;
   /** Most recent IP address this client connected from. */
   addr: string;
-  /** Unix seconds this client was first ever seen. */
-  first_seen: number;
   /** Unix seconds of the most recent connection. */
   last_connected: number;
-  /** Streaming to the AirPlay source right now. */
+  /** Streaming to this AirPlay source right now. */
   connected: boolean;
   /** Future sessions from this client are refused (enforced at RTSP SETUP). */
   banned: boolean;
@@ -300,22 +289,43 @@ export interface AirplayClient {
   priority: number;
 }
 
-export interface RtpSourceInfo {
-  /** Whether the source is enabled in the store. */
-  enabled: boolean;
-  /** UDP port it listens on (the stored value, or the default when disabled). */
-  port: number;
-  /** Receiver-side jitter buffer target in ms (stored value, or default when
-   *  disabled). Higher = more dropout tolerance on a weak link, more latency. */
+// ---- Dynamic input sources (multi-source refactor) ---------------------
+// A source is either an AirPlay-receive endpoint or an RTP-receive endpoint.
+// The daemon holds a keyed collection; the UI adds/edits/removes entries via
+// the /api/sources CRUD endpoints (docs/multi-source-inputs-plan.md).
+
+export type SourceKind = 'airplay' | 'rtp';
+
+/** AirPlay-receive per-instance config. `port` is the RTSP port, allocated by
+ *  the daemon on add (0 = allocate on next load) and stable across restarts. */
+export interface AirplaySourceCfg {
   latency_msec: number;
-  /** `source.ip`: `0.0.0.0` = unicast, or a multicast group so several
-   *  receivers can share one firmware stream. */
+  auth_setup: boolean;
+  prevent_takeover: boolean;
+  port: number;
+}
+
+/** RTP-receive per-instance config (same fields as the legacy single RTP source). */
+export interface RtpSourceCfg {
+  port: number;
+  latency_msec: number;
   source_addr: string;
-  /** `sess.ignore-ssrc`: `true` accepts any sender on the port, `false` locks
-   *  onto the first SSRC and rejects the rest ("Only one client"). */
   ignore_ssrc: boolean;
-  /** Whether the `bt-bridge-rtp` node is present in the live PipeWire graph. */
-  loaded: boolean;
+  rate: number;
+}
+
+/** One configured input source as returned by the daemon. `present` = a live
+ *  PipeWire node named `node_name` exists right now (generalizes the old
+ *  "airplay running" / "rtp loaded" flags). Exactly one of `airplay`/`rtp` is
+ *  populated, matching `kind`. */
+export interface SourceView {
+  id: string;
+  label: string;
+  kind: SourceKind;
+  present: boolean;
+  node_name: string;
+  airplay?: AirplaySourceCfg | null;
+  rtp?: RtpSourceCfg | null;
 }
 
 export interface MediaPlayerInfo {
