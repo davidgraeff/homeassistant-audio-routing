@@ -148,13 +148,30 @@ struct RunningGroup {
     /// two. Reset to 0 when the server stops, so the next one starts from the real
     /// requirement rather than a departed device's.
     server_send_ahead_us: i64,
-    /// Set by [`GroupReconciler::force_server_restart`] to make the next reconcile
-    /// restart this group's sendspin server even though its stream config is
-    /// unchanged — the static-delay path, where a reconnect is the *point* (current
-    /// ESPHome firmware reads `SetStaticDelay` at stream start, not live). A flag
-    /// rather than dropping the handle on the spot, so the teardown still goes
-    /// through the graceful path.
-    force_restart: bool,
+    /// Device node names whose *own* connection the next reconcile must recycle,
+    /// set by [`GroupReconciler::force_device_reconnect`] — the static-delay path,
+    /// where a reconnect is the *point* (current ESPHome firmware reads
+    /// `SetStaticDelay` at stream start, not live).
+    ///
+    /// A **set of devices**, not a whole-group flag, because a device's static delay
+    /// is a property of its own per-device sender: the other members' timestamps,
+    /// codec and send-ahead are all unchanged, so there is nothing for them to
+    /// re-arm. Restarting the group's single server to apply one speaker's
+    /// calibration dropped every member — 219 ms of daemon work, but each
+    /// reconnected speaker then went silent for tens of seconds (firmware-side), so
+    /// a one-device tweak caused a group-wide outage
+    /// (docs/sendspin-group-churn-plan.md §4.10, the same shape as the membership
+    /// bug §4.1 fixed).
+    ///
+    /// The one case that genuinely IS group-wide — a delay big enough to raise the
+    /// group's send-ahead high-water mark — is not handled here at all: it shows up
+    /// as a *stream config* change (see [`sendspin_config_changed`]) and takes the
+    /// ordinary restart path, which is correct.
+    ///
+    /// A set consumed by the reconcile pass rather than a teardown on the spot, so
+    /// the graceful `stream/end` runs on the reconcile task like every other
+    /// teardown.
+    force_device_reconnect: BTreeSet<String>,
     /// Live AP2 senders (ap2_server.rs) for this group; drop = TEARDOWN each
     /// receiver session. `None` when the group has no present AP2 receivers.
     ap2_sender: Option<crate::ap2_server::Ap2ServerHandle>,
@@ -389,21 +406,35 @@ pub struct GroupSnapshot {
 }
 
 impl GroupReconciler {
-    /// Force the sendspin server of the group containing `sendspin_node_name` to
-    /// restart on the next reconcile. The devices reconnect and re-apply their
-    /// static delay on connect — the only way current ESPHome firmware picks up a
-    /// delay change (it reads `SetStaticDelay` at stream start, not live). Returns
-    /// true if a group was found; the caller must nudge a reconcile
-    /// (ChangeNotifier) afterwards.
+    /// Make the next reconcile recycle **just this device's** connection, so it
+    /// re-applies its static delay on connect — the only way current ESPHome firmware
+    /// picks up a delay change (it reads `SetStaticDelay` at stream start, not live).
+    /// Returns true if a running group has this device; the caller must nudge a
+    /// reconcile (ChangeNotifier) afterwards.
     ///
-    /// Sets a flag instead of dropping the handle here: membership is no longer part
-    /// of the restart identity, so clearing the remembered device set would not
-    /// restart anything — and the teardown belongs on the reconcile path, which can
-    /// `await` the graceful shutdown (`stream/end` before the socket goes).
-    pub fn force_server_restart(&mut self, sendspin_node_name: &str) -> bool {
+    /// **Scoped to the one device on purpose.** This used to force a whole-*server*
+    /// restart, which dropped every member of the group for a change that belongs to
+    /// one member's sender. Daemon-side that was only 219 ms, but each reconnected
+    /// speaker then goes silent for tens of seconds (a firmware-side cost, §4.9), so
+    /// calibrating one speaker blacked out the room (§4.10). Nothing about the other
+    /// members' streams changes: same timeline, same codec, same send-ahead, same
+    /// timestamps.
+    ///
+    /// The exception is deliberately **not** handled here: if the new delay raises the
+    /// group's send-ahead requirement above what the running server was started with,
+    /// that is a stream-config change and the ordinary restart path re-arms everyone
+    /// (see [`sendspin_config_changed`]) — correct, because the send-ahead is a
+    /// high-water mark over all members (§4.6) and the timeline fixes it at
+    /// construction. This flag then costs nothing extra: the reconcile clears it when
+    /// the whole server restarts.
+    ///
+    /// Records intent instead of tearing down on the spot: the teardown belongs on the
+    /// reconcile path, which can `await` the graceful per-device `stream/end`
+    /// (`SendspinServerHandle::stop_device`).
+    pub fn force_device_reconnect(&mut self, sendspin_node_name: &str) -> bool {
         for g in self.running.values_mut() {
             if g.server_devices.iter().any(|d| d == sendspin_node_name) {
-                g.force_restart = true;
+                g.force_device_reconnect.insert(sendspin_node_name.to_string());
                 return true;
             }
         }
@@ -430,6 +461,9 @@ impl GroupReconciler {
                 g.server_devices.clear();
                 g.server_members.clear();
                 g.server_send_ahead_us = 0;
+                // Every member is about to be told `stream/end` anyway, so a pending
+                // per-device reconnect has nothing left to ask for.
+                g.force_device_reconnect.clear();
             }
         }
         // Idle senders are connected too (that is their whole point), and an idle
@@ -1138,7 +1172,7 @@ impl GroupReconciler {
                         server_members: Vec::new(),
                         server_codec: "pcm",
                         server_send_ahead_us: 0,
-                        force_restart: false,
+                        force_device_reconnect: BTreeSet::new(),
                         ap2_sender: None,
                         ap2_members: Vec::new(),
                         ap2_rate: 48_000,
@@ -1158,7 +1192,6 @@ impl GroupReconciler {
                 prev_members,
                 prev_codec,
                 prev_lead,
-                prev_force,
                 have_server,
                 prev_ap2,
                 prev_ap2_rate,
@@ -1172,7 +1205,6 @@ impl GroupReconciler {
                     rg.server_members.clone(),
                     rg.server_codec,
                     rg.server_send_ahead_us,
-                    rg.force_restart,
                     rg.server.is_some(),
                     rg.ap2_members.clone(),
                     rg.ap2_rate,
@@ -1206,10 +1238,7 @@ impl GroupReconciler {
             let action = sendspin_server_action(SendspinServerState {
                 routed: !d.sendspin_node_names.is_empty(),
                 have_server,
-                // Codec: any change. Send-ahead: only a RAISE — see
-                // `server_send_ahead_us`, it is a high-water mark.
-                config_changed: d.sendspin_codec != prev_codec || d.sendspin_send_ahead_us > prev_lead,
-                force_restart: prev_force,
+                config_changed: sendspin_config_changed(prev_codec, prev_lead, d.sendspin_codec, d.sendspin_send_ahead_us),
             });
             let restart = action == ServerAction::Start;
             if matches!(action, ServerAction::Start | ServerAction::Stop) {
@@ -1222,11 +1251,13 @@ impl GroupReconciler {
                         "sync group '{anchor_name}': stopping sendspin server ({}) — every member reconnects, and real firmware answers a reconnect with seconds of silence",
                         if action == ServerAction::Stop {
                             "no sendspin devices routed here any more".to_string()
-                        } else if prev_force {
-                            "a static-delay change needs a reconnect".to_string()
                         } else if d.sendspin_codec != prev_codec {
                             format!("wire codec {prev_codec} -> {}", d.sendspin_codec)
                         } else {
+                            // Since §4.10 this is the only way a static-delay edit
+                            // reaches the whole group: the delay fed into the
+                            // send-ahead high-water mark and pushed it up, which every
+                            // member's timeline shares.
                             format!(
                                 "a member needs a longer send-ahead than the running {} ms ({} ms)",
                                 prev_lead / 1000,
@@ -1239,7 +1270,10 @@ impl GroupReconciler {
                 if let Some(rg) = self.running.get_mut(key) {
                     rg.server_devices = Vec::new();
                     rg.server_members = Vec::new();
-                    rg.force_restart = false;
+                    // Every member is reconnecting anyway, so any pending per-device
+                    // reconnect (§4.10) has already been granted — and re-granting it
+                    // in step (c3) below would drop a device we just re-armed.
+                    rg.force_device_reconnect.clear();
                     rg.server_send_ahead_us = 0; // the high-water mark dies with its server
                 }
             }
@@ -1334,6 +1368,70 @@ impl GroupReconciler {
                 if rg.server.is_some() {
                     rg.server_devices = d.sendspin_node_names.clone();
                     rg.server_members = d.sendspin_members.clone();
+                }
+            }
+
+            // c3. Per-device forced reconnect — the static-delay path
+            //     (docs/sendspin-group-churn-plan.md §4.10). ESPHome firmware reads
+            //     `SetStaticDelay` at stream start, so a live push doesn't shift a
+            //     running stream and the device has to reconnect; nothing about its
+            //     *groupmates'* streams changes, so only it does.
+            //
+            //     Done in two passes on purpose. This one ends the device's stream and
+            //     drops it from the remembered member set; the *next* pass sees the
+            //     member set differ from what's desired and re-supervises it through
+            //     the ordinary membership path (c2), which redials.
+            //
+            //     Why not `stop_device` + `supervise` back-to-back here: `stop_client`
+            //     only *signals* the old supervisor, which then emits its
+            //     `Disconnected` event, while `supervise` immediately spawns a fresh
+            //     one for the same fullname. Both feed one serial event loop, so a
+            //     `Disconnected` that lands after the new `Connected` would remove the
+            //     new connection's `pending`/`groups`/`client_to_node` entries and
+            //     unregister its control sender — the device would sit connected and
+            //     never be streamed to (exactly the silent-but-healthy-looking failure
+            //     §4.8 had to add instrumentation to see). The dial takes ~130 ms, so
+            //     that ordering is *likely* fine and not *guaranteed*; splitting the
+            //     passes makes it structural instead. It costs up to `RECONCILE_RETRY`
+            //     (3 s) before the redial, which is free against the tens of seconds
+            //     the speaker's own resync costs (§4.9) — and only this speaker waits.
+            //
+            //     Read fresh from `running` rather than from the snapshot above: a
+            //     restart earlier in this pass already reconnected everyone and cleared
+            //     the set, and acting on a stale copy would drop a device we had just
+            //     re-armed.
+            let forced_reconnects: Vec<String> =
+                self.running.get(key).map(|rg| rg.force_device_reconnect.iter().cloned().collect()).unwrap_or_default();
+            if !forced_reconnects.is_empty() {
+                // Resolve node names to the mDNS fullnames the server supervises, and
+                // only for devices this group actually has a supervised member for (a
+                // device whose URL never resolved has no connection to recycle — it
+                // will pick the delay up from `SendspinControl::register` when it first
+                // connects).
+                let stopping: Vec<(String, String)> = forced_reconnects
+                    .iter()
+                    .filter_map(|node| devices_map.get(node).map(|dev| (node.clone(), dev.fullname.clone())))
+                    .filter(|(_, fullname)| d.sendspin_members.iter().any(|(f, _)| f == fullname))
+                    .collect();
+                if let Some(server) = self.running.get(key).and_then(|rg| rg.server.as_ref()) {
+                    for (node, fullname) in &stopping {
+                        tracing::info!(
+                            "sync group '{anchor_name}': reconnecting only '{node}' to apply its static delay — the other {} member(s) keep streaming",
+                            d.sendspin_members.len().saturating_sub(1)
+                        );
+                        server.stop_device(fullname).await;
+                    }
+                }
+                if let Some(rg) = self.running.get_mut(key) {
+                    // Consumed either way: a device we couldn't stop has nothing to
+                    // reconnect, and leaving the request set would retry forever.
+                    rg.force_device_reconnect.clear();
+                    if !stopping.is_empty() {
+                        rg.server_members.retain(|(f, _)| !stopping.iter().any(|(_, sf)| sf == f));
+                        // The next pass re-supervises it via (c2); nothing else would
+                        // wake this change-driven task, so ask for that pass.
+                        self.retry_wanted = true;
+                    }
                 }
             }
 
@@ -1537,11 +1635,9 @@ struct SendspinServerState {
     have_server: bool,
     /// Did the **stream config** change — the codec or the send-ahead? That is the
     /// server's whole restart identity, because it's what `stream/start` carries and
-    /// what the shared timeline fixes at construction.
+    /// what the shared timeline fixes at construction. See
+    /// [`sendspin_config_changed`].
     config_changed: bool,
-    /// A caller asked for a reconnect for its own reasons
-    /// ([`GroupReconciler::force_server_restart`], the static-delay path).
-    force_restart: bool,
 }
 
 /// Decide it. Extracted from `reconcile` so the rule is testable without a live
@@ -1549,14 +1645,51 @@ struct SendspinServerState {
 /// thing that regressed: membership used to be part of the identity, so routing one
 /// more speaker into a live group made every other member reconnect
 /// (docs/sendspin-group-churn-plan.md §2b).
+///
+/// There is deliberately no "a caller asked for a reconnect" input any more. The one
+/// caller that did — a per-device static-delay edit — now recycles just that device's
+/// connection ([`GroupReconciler::force_device_reconnect`], §4.10); the only part of a
+/// delay change that is genuinely group-wide reaches this function as
+/// `config_changed`, via the send-ahead.
 fn sendspin_server_action(s: SendspinServerState) -> ServerAction {
     match (s.routed, s.have_server) {
         (false, false) => ServerAction::Idle,
         (false, true) => ServerAction::Stop,
         (true, false) => ServerAction::Start,
-        (true, true) if s.config_changed || s.force_restart => ServerAction::Start,
+        (true, true) if s.config_changed => ServerAction::Start,
         (true, true) => ServerAction::KeepRunning,
     }
+}
+
+/// Does the group's wanted stream config differ from what the running server was
+/// started with — i.e. must **every** member re-arm?
+///
+/// Two asymmetric rules, and the asymmetry is the whole point:
+///
+/// - **Codec**: any change. A different `stream/start` payload, and the timeline's
+///   encoder is fixed at construction.
+/// - **Send-ahead**: only a **raise**. `server_send_ahead_us` is a high-water mark
+///   (§4.6) — it is a floor the spec asks us to clear, derived from membership *and*
+///   from each member's static delay, so it moves both ways as devices and delays
+///   change. Honouring a *drop* would reconnect every member to buy tens of
+///   milliseconds of latency back, and a reconnect costs tens of seconds of silence
+///   per speaker (§4.9). Keeping a stale-but-larger lead costs latency, never
+///   correctness.
+///
+/// This is also what decides the blast radius of a static-delay edit (§4.10): a
+/// member's delay feeds `required_send_ahead_us`, so a delay big enough to push the
+/// group's requirement past the running lead lands here and re-arms everyone —
+/// correct, because they share one timeline. Anything smaller leaves this false, and
+/// only the edited device reconnects.
+///
+/// **Honest caveat.** "Does the group lead move" is judged against the *running*
+/// server's high-water mark, not against the freshly-computed
+/// `group_lead_effective_ms` that `GET /api/sync/settings` reports. Those differ
+/// after a member with a large requirement leaves: the API's number drops while the
+/// mark stays. So a delay edit can change the reported effective lead and still
+/// (deliberately) not re-arm the group.
+fn sendspin_config_changed(prev_codec: &str, prev_lead_us: i64, want_codec: &str, want_lead_us: i64) -> bool {
+    want_codec != prev_codec || want_lead_us > prev_lead_us
 }
 
 /// A short human label for a group's embedded server / logs.
@@ -1593,7 +1726,7 @@ mod tests {
             server_members: Vec::new(),
             server_codec: "pcm",
             server_send_ahead_us: 0,
-            force_restart: false,
+            force_device_reconnect: BTreeSet::new(),
             ap2_sender: None,
             ap2_members: ap2.iter().map(|s| s.to_string()).collect(),
             ap2_rate: 48_000,
@@ -1608,29 +1741,111 @@ mod tests {
     /// *other* member a full reconnect and a re-anchored stream.
     #[test]
     fn membership_alone_does_not_restart_the_sendspin_server() {
-        let running = |config_changed, force_restart| {
-            sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed, force_restart })
-        };
+        let running =
+            |config_changed| sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed });
         // A join or a departure changes neither the codec nor the send-ahead, so the
         // stream config is unchanged — and the server keeps running.
-        assert_eq!(running(false, false), ServerAction::KeepRunning);
+        assert_eq!(running(false), ServerAction::KeepRunning);
         // A codec or send-ahead change is a genuinely different `stream/start`; the
         // shared timeline fixes both at construction, so this one has to restart.
-        assert_eq!(running(true, false), ServerAction::Start);
-        // ...as does an explicitly forced reconnect (the static-delay path, where the
-        // reconnect IS the point — firmware reads SetStaticDelay at stream start).
-        assert_eq!(running(false, true), ServerAction::Start);
+        assert_eq!(running(true), ServerAction::Start);
+        // (There is no third case any more: a static-delay edit used to force a
+        // whole-group restart from here, and now scopes itself to the one device —
+        // see `a_static_delay_change_within_the_running_lead_touches_only_that_device`.)
     }
 
     #[test]
     fn the_server_follows_whether_anything_is_routed() {
-        let state = |routed, have_server| SendspinServerState { routed, have_server, config_changed: false, force_restart: false };
+        let state = |routed, have_server| SendspinServerState { routed, have_server, config_changed: false };
         // First device routed here ⇒ stand a server up.
         assert_eq!(sendspin_server_action(state(true, false)), ServerAction::Start);
         // Last device unrouted ⇒ take it down (and release its port + advert).
         assert_eq!(sendspin_server_action(state(false, true)), ServerAction::Stop);
         // Nothing either way ⇒ nothing to do; a group can be AP2-only.
         assert_eq!(sendspin_server_action(state(false, false)), ServerAction::Idle);
+    }
+
+    /// A two-member Opus group's send-ahead, from the real resolver: `bath` reports a
+    /// 300 ms buffer requirement and sets the group's floor, `kitchen` only 100 ms.
+    /// Both members' static delays are inputs, because the spec makes a player's
+    /// send-ahead `min_buffer_ms + static_delay_ms` and a group's the maximum of those
+    /// (see `sendspin_server::required_send_ahead_us`).
+    fn group_lead_us(kitchen_delay_ms: u16, bath_delay_ms: u16) -> i64 {
+        sendspin_server::required_send_ahead_us(
+            100_000, // the user's configured group lead
+            "opus",
+            [(Some(100), kitchen_delay_ms), (Some(300), bath_delay_ms)],
+        )
+    }
+
+    /// §4.10, the half that fixes the bug: editing ONE speaker's static delay must not
+    /// restart the group's server, because that drops every member — 219 ms of daemon
+    /// work, then tens of seconds of firmware-side silence per speaker (§4.9) for a
+    /// one-device calibration tweak.
+    #[test]
+    fn a_static_delay_change_within_the_running_lead_touches_only_that_device() {
+        let running_lead = group_lead_us(0, 0);
+        assert_eq!(running_lead, 300_000, "bath's 300 ms requirement sets the group floor");
+
+        // Giving kitchen 40 ms leaves its own requirement (100 + 40) well under bath's,
+        // so the group's send-ahead — the one thing every member shares — is untouched.
+        assert_eq!(group_lead_us(40, 0), running_lead);
+        assert!(!sendspin_config_changed("opus", running_lead, "opus", group_lead_us(40, 0)));
+
+        // A *reduction* can't move it either, because the running lead is a high-water
+        // mark (§4.6): dropping bath to 0 lowers the requirement, and we keep the
+        // larger lead rather than reconnect everyone to save latency.
+        assert!(!sendspin_config_changed("opus", group_lead_us(0, 200), "opus", group_lead_us(0, 0)));
+
+        // So the reconcile keeps the server exactly as it is...
+        assert_eq!(
+            sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed: false }),
+            ServerAction::KeepRunning
+        );
+        // ...and the edit is carried by a per-device reconnect instead.
+        let mut r = GroupReconciler::new();
+        r.running.insert("src".into(), running_group(&["sendspin-dev-kitchen", "sendspin-dev-bath"], &[], &[]));
+        assert!(r.force_device_reconnect("sendspin-dev-kitchen"));
+        let marked = &r.running["src"].force_device_reconnect;
+        assert_eq!(marked.iter().map(String::as_str).collect::<Vec<_>>(), vec!["sendspin-dev-kitchen"], "bath must be left streaming");
+    }
+
+    /// §4.10's constraint: the group *lead* genuinely is group-wide, so the delay
+    /// change that raises it must still re-arm every member. This is the guard that
+    /// stops the scoping above from being applied too eagerly.
+    #[test]
+    fn a_static_delay_change_that_raises_the_group_lead_re_arms_every_member() {
+        let running_lead = group_lead_us(0, 0);
+        // 250 ms on kitchen puts its own requirement (100 + 250) above bath's 300, so
+        // the high-water mark moves — and the send-ahead is fixed when the shared
+        // timeline is constructed, so every member's timing changes with it.
+        let raised = group_lead_us(250, 0);
+        assert_eq!(raised, 350_000);
+        assert!(sendspin_config_changed("opus", running_lead, "opus", raised));
+        assert_eq!(
+            sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed: true }),
+            ServerAction::Start
+        );
+    }
+
+    /// The request is addressed to one device in one group: a delay edit must not
+    /// disturb a co-existing group (a different source-set, its own anchor and server),
+    /// and an unknown device must not silently mark anything.
+    #[test]
+    fn a_forced_reconnect_is_scoped_to_one_device_and_one_group() {
+        let mut r = GroupReconciler::new();
+        r.running.insert("radio".into(), running_group(&["sendspin-dev-kitchen"], &[], &[]));
+        r.running.insert("tv".into(), running_group(&["sendspin-dev-office"], &["ap2-dev-dusche"], &[]));
+
+        assert!(r.force_device_reconnect("sendspin-dev-office"));
+        assert!(r.running["radio"].force_device_reconnect.is_empty(), "the other group must not be touched");
+        assert_eq!(r.running["tv"].force_device_reconnect.len(), 1);
+
+        // A device no running group has (offline, unrouted, or never discovered): the
+        // delay is still persisted by the caller and applied on its next connect, so
+        // there is nothing to mark and the caller is told so.
+        assert!(!r.force_device_reconnect("sendspin-dev-nowhere"));
+        assert_eq!(r.running["tv"].force_device_reconnect.len(), 1);
     }
 
     #[test]

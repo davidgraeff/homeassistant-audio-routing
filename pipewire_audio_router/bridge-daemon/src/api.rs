@@ -2299,24 +2299,29 @@ async fn set_sendspin_delay_handler(
     let reached = pending.apply().await;
     let ms = req.delay_ms.min(5000);
 
-    // Current ESPHome firmware reads the static delay only at stream start, so a
-    // live push doesn't shift the running stream — restart the device's group
-    // stream (drop + recreate its sendspin server on the next reconcile) so it
-    // reconnects and re-applies the delay. Skipped when `sendspin_delay_live` is
-    // on (firmware that honors a live SetStaticDelay).
+    // Current ESPHome firmware reads the static delay only at stream start, so the
+    // live push above doesn't shift the running stream — the device has to reconnect
+    // for it to take. Scoped to THIS device's connection on the next reconcile
+    // (`force_device_reconnect`): its groupmates' streams are unaffected by its delay,
+    // and restarting the group's server for them cost every speaker in the room tens
+    // of seconds of silence (docs/sendspin-group-churn-plan.md §4.10). The one
+    // genuinely group-wide case — a delay large enough to raise the group's send-ahead
+    // high-water mark — is picked up by the reconciler's ordinary stream-config check.
+    // Skipped entirely when `sendspin_delay_live` is on (firmware that honors a live
+    // SetStaticDelay).
     let live = state.settings.lock_recover().sendspin_delay_live();
-    let mut restarted = false;
+    let mut reconnecting = false;
     if !live {
-        restarted = state.groups.lock().await.force_server_restart(&req.node_name);
-        if restarted {
+        reconnecting = state.groups.lock().await.force_device_reconnect(&req.node_name);
+        if reconnecting {
             let _ = state.changes.send(());
         }
     }
 
     let message = if !reached {
         format!("saved {ms} ms for '{}' (device not connected)", req.node_name)
-    } else if restarted {
-        format!("set '{}' static delay to {ms} ms (restarting stream to apply)", req.node_name)
+    } else if reconnecting {
+        format!("set '{}' static delay to {ms} ms (reconnecting just this speaker to apply)", req.node_name)
     } else {
         format!("set '{}' static delay to {ms} ms", req.node_name)
     };

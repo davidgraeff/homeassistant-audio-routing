@@ -195,8 +195,8 @@
     </label>
     <p class="muted" style="font-size:0.8rem; margin:4px 0 0">
       Leave off for current ESPHome firmware, which only picks up a per-speaker delay at stream start — so changing one
-      briefly restarts the group's stream (like an AirPlay reload). Turn on only for firmware that applies
-      <code>SetStaticDelay</code> to the running stream, to avoid the restart.
+      reconnects <em>that</em> speaker (the rest of the group keeps playing). Turn on only for firmware that applies
+      <code>SetStaticDelay</code> to the running stream, to avoid the reconnect.
     </p>
   </div>
 

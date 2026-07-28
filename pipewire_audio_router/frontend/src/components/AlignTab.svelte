@@ -14,7 +14,7 @@
   // Audible-member playback level (0–100), mirrored to the daemon.
   let level = $state(50);
   // Whether sendspin firmware applies a delay change live (Settings). When
-  // false, a change restarts the group stream, so we don't stream during drag.
+  // false, a change reconnects that one speaker, so we don't stream during drag.
   let sendspinDelayLive = $state(false);
 
   const active = $derived(session?.active ?? false);
@@ -147,7 +147,7 @@
   function liveOffset(m: AlignMember, ms: number) {
     offsets[m.node_name] = ms; // immediate readout
     // Only stream while dragging when it actually takes effect live: sendspin
-    // firmware that honors it. Otherwise (sendspin needing a restart, or
+    // firmware that honors it. Otherwise (sendspin needing a reconnect, or
     // AirPlay 2) we commit once on release.
     if (m.kind !== 'sendspin' || !sendspinDelayLive) return;
     pending = { m, ms };
@@ -270,7 +270,10 @@
                   <button onclick={() => applyOffset(m, (offsets[m.node_name] ?? 0) + 10)}>+10</button>
                 </div>
                 {#if m.kind === 'sendspin' && !sendspinDelayLive}
-                  <p class="muted warn">Each change restarts the group stream — expect a brief gap before the click returns.</p>
+                  <p class="muted warn">
+                    Each change reconnects this speaker (the others keep playing) — expect a long gap, tens of seconds, before
+                    the click returns from it.
+                  </p>
                 {/if}
               {/if}
             </td>
