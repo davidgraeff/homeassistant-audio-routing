@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>BT bridge · testing console</title>
+<style>
+  :root{
+    --bg:#12151a; --panel:#1a1f27; --line:#2a3140; --fg:#e6eaf0; --dim:#8b95a6;
+    --ok:#3ddc97; --warn:#ffc857; --bad:#ff5d5d; --accent:#5aa9ff;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:light){
+    :root{--bg:#f4f6f9;--panel:#fff;--line:#dbe1ea;--fg:#141a22;--dim:#5c6675}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+         padding:14px 18px;border-bottom:1px solid var(--line)}
+  h1{font-size:16px;margin:0;font-weight:650}
+  .sub{color:var(--dim);font-size:12px}
+  main{padding:18px;display:grid;gap:16px;max-width:1200px;margin:0 auto}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+            color:var(--dim);margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+
+  /* waveform */
+  #waveWrap{position:relative}
+  canvas{width:100%;height:190px;display:block;background:#0b0e12;border-radius:8px}
+  @media (prefers-color-scheme:light){canvas{background:#0b0e12}}
+  #badge{position:absolute;top:10px;left:12px;font:600 11px/1 var(--mono);
+         letter-spacing:.08em;padding:5px 9px;border-radius:5px;text-transform:uppercase}
+  #badge.audio{background:rgba(61,220,151,.16);color:var(--ok)}
+  #badge.silent{background:rgba(255,93,93,.18);color:var(--bad)}
+  #badge.nodata{background:rgba(139,149,166,.18);color:var(--dim)}
+  .scale{display:flex;justify-content:space-between;color:var(--dim);
+         font:11px var(--mono);margin-top:6px}
+
+  /* meter */
+  .meter{height:12px;border-radius:6px;background:#0b0e12;overflow:hidden;flex:1;min-width:140px}
+  .meter>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--ok),var(--warn) 78%,var(--bad));
+           transition:width .08s linear}
+
+  /* stats */
+  dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}
+  dt{color:var(--dim);font-size:12px}
+  dd{margin:0;font:13px var(--mono);word-break:break-word}
+  .big{font:600 26px/1 var(--mono)}
+  .pill{font:600 11px/1 var(--mono);padding:4px 8px;border-radius:999px;
+        border:1px solid var(--line);color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .pill.ok{color:var(--ok);border-color:rgba(61,220,151,.4)}
+  .pill.bad{color:var(--bad);border-color:rgba(255,93,93,.4)}
+  .pill.warn{color:var(--warn);border-color:rgba(255,200,87,.4)}
+
+  button,select{font:13px inherit;color:var(--fg);background:#222835;border:1px solid var(--line);
+                border-radius:7px;padding:7px 11px;cursor:pointer}
+  button:hover:not(:disabled),select:hover{border-color:var(--accent)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#08121f;font-weight:600}
+  code{font:12px var(--mono);color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font:12px var(--mono)}
+  th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:600}
+  .msg{margin-top:10px;font-size:12px;padding:8px 10px;border-radius:6px;display:none}
+  .msg.show{display:block}
+  .msg.ok{background:rgba(61,220,151,.12);color:var(--ok)}
+  .msg.err{background:rgba(255,93,93,.14);color:var(--bad)}
+  .note{color:var(--dim);font-size:12px;margin:10px 0 0}
+  .chain{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font:12px var(--mono)}
+  .chain span.hop{padding:4px 8px;border-radius:6px;border:1px solid var(--line)}
+  .chain span.hop.ok{border-color:rgba(61,220,151,.45);color:var(--ok)}
+  .chain span.hop.bad{border-color:rgba(255,93,93,.45);color:var(--bad)}
+  .arrow{color:var(--dim)}
+  .codecs{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  .codecs label{display:inline-flex;align-items:center;gap:7px;cursor:pointer;
+                border:1px solid var(--line);border-radius:7px;padding:7px 11px;
+                font:13px var(--mono);user-select:none}
+  .codecs label:hover{border-color:var(--accent)}
+  .codecs label.on{border-color:rgba(61,220,151,.55);background:rgba(61,220,151,.09)}
+  .codecs label.off{color:var(--dim)}
+  .codecs input{accent-color:var(--accent);margin:0}
+  button.link{background:none;border:none;color:var(--accent);padding:6px 4px;
+              text-decoration:underline;font-size:12px}
+  button.link:hover{border:none;opacity:.8}
+</style>
+</head>
+<body>
+<header>
+  <h1>Bluetooth bridge · testing console</h1>
+  <span class="sub" id="conn">connecting…</span>
+</header>
+
+<main>
+  <!-- WAVEFORM -->
+  <section class="panel">
+    <h2>Incoming audio — last <span id="histS">15</span> s</h2>
+    <div class="row" style="margin-bottom:10px">
+      <label class="sub" for="target">Visualizing</label>
+      <select id="target"></select>
+      <span class="pill" id="codecPill">codec ?</span>
+    </div>
+    <div id="waveWrap">
+      <canvas id="wave"></canvas>
+      <div id="badge" class="nodata">no data</div>
+    </div>
+    <div class="scale"><span id="tOld">-15s</span><span>now</span></div>
+    <div class="row" style="margin-top:12px">
+      <span class="sub" style="min-width:42px">peak</span>
+      <div class="meter"><i id="peakBar"></i></div>
+      <span class="big" id="peakDb">—</span>
+    </div>
+    <p class="note">
+      <strong>Digital silence</strong> (every sample exactly 0) is flagged separately from
+      “quiet”. That distinction is the whole point of this view: a stalled sender or a
+      failing decoder produces exact zeros at full bitrate, which looks identical to
+      healthy on any packet counter.
+    </p>
+  </section>
+
+  <div class="grid">
+    <!-- SILENCE -->
+    <section class="panel">
+      <h2>Silence tracking</h2>
+      <dl>
+        <dt>Current streak</dt><dd id="streak">—</dd>
+        <dt>Silent duty</dt><dd id="duty">—</dd>
+        <dt>Capture uptime</dt><dd id="uptime">—</dd>
+      </dl>
+      <table style="margin-top:12px">
+        <thead><tr><th>Episode (ago)</th><th>Duration</th></tr></thead>
+        <tbody id="episodes"><tr><td colspan="2" style="color:var(--dim)">none yet</td></tr></tbody>
+      </table>
+    </section>
+
+    <!-- LINK / TRANSMIT -->
+    <section class="panel">
+      <h2>Bluetooth link &amp; transmit</h2>
+      <dl>
+        <dt>A2DP in</dt><dd id="a2dpRate">—</dd>
+        <dt>Transport</dt><dd id="transport">—</dd>
+        <dt>RTP out</dt><dd id="udpRate">—</dd>
+        <dt>Connected</dt><dd id="connected">—</dd>
+      </dl>
+      <p class="note">
+        A2DP rate says the radio link is alive; it does <em>not</em> say the bytes carry
+        audio. Compare it with the waveform above — full rate plus digital silence is
+        the signature of a sender-side fault.
+      </p>
+    </section>
+  </div>
+
+  <!-- CHAIN -->
+  <section class="panel">
+    <h2>PipeWire chain (phone → loopback → RTP sender)</h2>
+    <div class="chain" id="chain"><span class="sub">loading…</span></div>
+    <p class="note" id="chainNote"></p>
+  </section>
+
+  <!-- CODEC -->
+  <section class="panel">
+    <h2>A2DP codec</h2>
+    <p class="note" style="margin-top:0">
+      The <strong>phone</strong> picks the codec from what this Pi advertises, so there is
+      no direct “use SBC now” command. Two levers, and only the ones this box really
+      offers are enabled below.
+    </p>
+
+    <div id="leverProfile" style="margin-top:14px">
+      <strong style="font-size:13px">1 · Switch device profile</strong>
+      <span class="pill" id="profileAvail">checking…</span>
+      <div class="row" style="margin-top:8px">
+        <select id="profileSel"></select>
+        <button id="profileBtn" class="primary" disabled>Apply</button>
+      </div>
+      <p class="note">Renegotiates in place — no restart, no reconnect.</p>
+    </div>
+
+    <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
+      <strong style="font-size:13px">2 · Allowed codec set</strong>
+      <span class="pill" id="pinnedPill">unrestricted</span>
+      <p class="note" style="margin:6px 0 0">
+        <code>bluez5.codecs</code> is an <strong>allow-list</strong>: tick what the Pi may
+        advertise, and the phone can only choose from those. Excluding a codec means
+        leaving it unticked — untick <em>aptx</em> and <em>aptx_hd</em> to force a
+        fallback to AAC/SBC.
+      </p>
+      <div id="codecBoxes" class="codecs"></div>
+      <div class="row" style="margin-top:10px">
+        <button id="applyBtn" class="primary">Apply &amp; renegotiate</button>
+        <button id="pinBtn">Write file only</button>
+        <button id="reconnBtn">Reconnect phone</button>
+        <span style="flex:1"></span>
+        <button id="presetNoAptx" class="link">exclude aptX</button>
+        <button id="presetAll" class="link">allow all</button>
+      </div>
+      <p class="note">
+        WirePlumber reads this only at startup, so <strong>Apply &amp; renegotiate</strong>
+        does the whole safe sequence: write → disconnect the phone → restart
+        WirePlumber → reconnect. That order matters — restarting WirePlumber while a
+        phone is connected orphans the bridge's loopback, so the restart happens with
+        nothing connected. <em>Write file only</em> leaves it for the next reconnect.
+        Ticking nothing is rejected: an empty allow-list would stop audio entirely.
+      </p>
+    </div>
+    <div class="msg" id="msg"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+/* ---------- waveform ---------- */
+const cv = $("wave"), cx = cv.getContext("2d");
+let ring = [], HISTORY_PTS = 750, BLOCK_MS = 20;
+
+function fitCanvas() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = Math.max(1, Math.round(r.width * dpr));
+  cv.height = Math.max(1, Math.round(r.height * dpr));
+  cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+addEventListener("resize", fitCanvas);
+
+function draw() {
+  const w = cv.clientWidth, h = cv.clientHeight, mid = h / 2;
+  cx.clearRect(0, 0, w, h);
+
+  // grid: 0 dB centre + -6/-12 dB guides
+  cx.strokeStyle = "rgba(255,255,255,.07)"; cx.lineWidth = 1;
+  for (const f of [1, 0.5, 0.25]) {
+    for (const s of [-1, 1]) {
+      const y = mid + s * f * mid * 0.92;
+      cx.beginPath(); cx.moveTo(0, y); cx.lineTo(w, y); cx.stroke();
+    }
+  }
+  cx.strokeStyle = "rgba(255,255,255,.16)";
+  cx.beginPath(); cx.moveTo(0, mid); cx.lineTo(w, mid); cx.stroke();
+
+  if (!ring.length) return;
+  const n = HISTORY_PTS, step = w / n, start = Math.max(0, ring.length - n);
+
+  // silence runs get a red wash so a dropout is unmissable at a glance
+  cx.fillStyle = "rgba(255,93,93,.13)";
+  let runStart = -1;
+  for (let i = start; i <= ring.length; i++) {
+    const silent = i < ring.length && ring[i].p === 0;
+    if (silent && runStart < 0) runStart = i;
+    if (!silent && runStart >= 0) {
+      const x0 = (runStart - start) * step;
+      cx.fillRect(x0, 0, Math.max(1, (i - runStart) * step), h);
+      runStart = -1;
+    }
+  }
+
+  // envelope, mirrored around the centre line
+  cx.beginPath();
+  for (let i = start; i < ring.length; i++) {
+    const x = (i - start) * step, a = (ring[i].p / 32768) * mid * 0.92;
+    if (i === start) cx.moveTo(x, mid - a); else cx.lineTo(x, mid - a);
+  }
+  for (let i = ring.length - 1; i >= start; i--) {
+    const x = (i - start) * step, a = (ring[i].p / 32768) * mid * 0.92;
+    cx.lineTo(x, mid + a);
+  }
+  cx.closePath();
+  const g = cx.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, "rgba(90,169,255,.85)");
+  g.addColorStop(.5, "rgba(61,220,151,.95)");
+  g.addColorStop(1, "rgba(90,169,255,.85)");
+  cx.fillStyle = g; cx.fill();
+
+  // RMS core, so quiet-but-present audio is still legible
+  cx.strokeStyle = "rgba(255,255,255,.55)"; cx.lineWidth = 1;
+  cx.beginPath();
+  for (let i = start; i < ring.length; i++) {
+    const x = (i - start) * step, a = (ring[i].r / 32768) * mid * 0.92;
+    if (i === start) cx.moveTo(x, mid - a); else cx.lineTo(x, mid - a);
+  }
+  cx.stroke();
+}
+
+const dbfs = (p) => p <= 0 ? null : 20 * Math.log10(p / 32768);
+const fmtDb = (p) => { const d = dbfs(p); return d === null ? "−∞" : d.toFixed(1); };
+
+/* ---------- rendering ---------- */
+let lastTargets = "", lastProfiles = "", lastCodecs = "";
+
+function render(s) {
+  const a = s.audio, g = s.graph, c = s.counters;
+
+  BLOCK_MS = a.block_ms || 20;
+  HISTORY_PTS = Math.round((a.history_s || 15) * 1000 / BLOCK_MS);
+  $("histS").textContent = a.history_s || 15;
+  $("tOld").textContent = "-" + (a.history_s || 15) + "s";
+
+  // append only what's new, then trim
+  for (let i = 0; i < a.peak.length; i++) ring.push({ p: a.peak[i], r: a.rms[i] });
+  if (ring.length > HISTORY_PTS + 50) ring = ring.slice(-HISTORY_PTS);
+  draw();
+
+  const last = ring.length ? ring[ring.length - 1] : null;
+  const badge = $("badge");
+  if (a.error) { badge.className = "nodata"; badge.textContent = a.error.slice(0, 60); }
+  else if (!last) { badge.className = "nodata"; badge.textContent = "no data"; }
+  else if (last.p === 0) { badge.className = "silent"; badge.textContent = "digital silence"; }
+  else { badge.className = "audio"; badge.textContent = "audio"; }
+
+  $("peakDb").textContent = last ? fmtDb(last.p) + " dBFS" : "—";
+  const d = last ? dbfs(last.p) : null;
+  $("peakBar").style.width = (d === null ? 0 : Math.max(0, Math.min(100, (d + 60) / 60 * 100))) + "%";
+
+  $("streak").textContent = a.silence_streak_s > 0 ? a.silence_streak_s.toFixed(1) + " s" : "—";
+  $("duty").textContent = (a.silent_duty * 100).toFixed(1) + " %";
+  $("uptime").textContent = a.uptime_s.toFixed(0) + " s";
+
+  const tb = $("episodes");
+  tb.innerHTML = a.episodes.length
+    ? a.episodes.slice().reverse().map(e =>
+        `<tr><td>${e.start_ago_s.toFixed(0)} s ago</td><td>${e.duration_s.toFixed(1)} s</td></tr>`).join("")
+    : `<tr><td colspan="2" style="color:var(--dim)">none yet</td></tr>`;
+
+  // link + transmit
+  $("a2dpRate").textContent = c.hci_available
+    ? (c.a2dp_kb_s === null ? "measuring…" : c.a2dp_kb_s.toFixed(1) + " kB/s")
+    : "hciconfig unavailable";
+  $("udpRate").textContent = c.udp_pkts_s === null ? "measuring…" : c.udp_pkts_s.toFixed(0) + " datagrams/s";
+  const t = (c.transports || [])[0];
+  $("transport").textContent = t ? `${t.state || "?"} (codec ${t.codec ?? "?"})` : "none";
+  $("connected").textContent = (c.connected || []).length
+    ? c.connected.map(x => `${x.name}${x.link_quality != null ? ` · LQ ${x.link_quality}/255` : ""}`).join(", ")
+    : "none";
+
+  // codec pill from the live node
+  const src = (g.chain && g.chain.a2dp_sources || [])[0];
+  $("codecPill").textContent = "codec " + (src && src.codec ? src.codec : "?");
+  $("codecPill").className = "pill" + (src && src.codec ? " ok" : "");
+
+  renderChain(g.chain, g.pipewire_ok);
+  renderTargets(g.capture_targets, a.target);
+  renderCodecControls(g);
+}
+
+function renderChain(chain, pwOk) {
+  const el = $("chain");
+  if (!pwOk) { el.innerHTML = `<span class="pill bad">PipeWire unreachable</span>`; return; }
+  if (!chain) return;
+  const parts = [];
+  const src = (chain.a2dp_sources || [])[0];
+  parts.push(`<span class="hop ${src ? "ok" : "bad"}">${src ? src.label : "no phone"}</span>`);
+  for (const h of chain.hops) {
+    parts.push(`<span class="arrow">→</span>`);
+    parts.push(`<span class="hop ${h.present ? "ok" : "bad"}">${h.node}${h.state ? " · " + h.state : ""}</span>`);
+  }
+  el.innerHTML = parts.join("");
+
+  const notes = [];
+  if (!chain.capture_linked) notes.push("The loopback capture has nothing wired into it.");
+  else if (!chain.capture_bound_to_a2dp)
+    notes.push(`⚠ The loopback capture is bound to <code>${chain.capture_fed_by.join(", ")}</code>, not a phone — the capture end follows the default source, so it can bind to the wrong thing.`);
+  if (!chain.sender_linked) notes.push("Nothing is feeding the RTP sender.");
+  $("chainNote").innerHTML = notes.join(" ");
+}
+
+function renderTargets(targets, current) {
+  const key = JSON.stringify([targets, current]);
+  if (key === lastTargets) return;
+  lastTargets = key;
+  const sel = $("target");
+  sel.innerHTML = (targets || []).map(t =>
+    `<option value="${t.node}"${t.node === current ? " selected" : ""}>${t.label}</option>`).join("")
+    || `<option value="">(nothing to capture)</option>`;
+}
+
+function renderCodecControls(g) {
+  const lever = g.levers || {};
+  const avail = $("profileAvail");
+  avail.textContent = lever.profile_switching ? "available" : "not offered by this build";
+  avail.className = "pill " + (lever.profile_switching ? "ok" : "warn");
+
+  const opts = [];
+  for (const d of g.devices || [])
+    for (const p of d.codec_profiles || [])
+      opts.push(`<option value="${d.id}:${p.index}">${d.alias || d.name} → ${p.codec} (${p.description || p.name})</option>`);
+  const key = opts.join("");
+  if (key !== lastProfiles) {
+    lastProfiles = key;
+    $("profileSel").innerHTML = opts.join("") || `<option value="">(no per-codec profiles)</option>`;
+    $("profileBtn").disabled = !opts.length;
+  }
+
+  // Checkboxes, not a <select multiple>: six options with all their states
+  // visible beats ctrl-clicking a listbox, and "which are excluded" is the
+  // question being asked here.
+  const allowed = g.allowed_codecs || [];
+  const ck = JSON.stringify([g.known_codecs, allowed]);
+  if (ck !== lastCodecs) {
+    lastCodecs = ck;
+    // No restriction == every codec permitted, so show all ticked.
+    const on = allowed.length ? new Set(allowed) : new Set(g.known_codecs || []);
+    $("codecBoxes").innerHTML = (g.known_codecs || []).map(c =>
+      `<label class="${on.has(c) ? "on" : "off"}">
+         <input type="checkbox" value="${c}"${on.has(c) ? " checked" : ""}>${c}</label>`).join("");
+    wireCodecBoxes();
+  }
+  const pp = $("pinnedPill");
+  if (!allowed.length) { pp.textContent = "unrestricted"; pp.className = "pill"; }
+  else {
+    const excluded = (g.known_codecs || []).filter(c => !allowed.includes(c));
+    pp.textContent = excluded.length ? "excluding " + excluded.join(" ") : "all allowed";
+    pp.className = "pill warn";
+  }
+
+  const addr = ((g.chain && g.chain.a2dp_sources || [])[0] || {}).address
+            || ((g.devices || [])[0] || {}).address;
+  $("reconnBtn").disabled = !addr;
+  $("reconnBtn").dataset.address = addr || "";
+}
+
+/* ---------- actions ---------- */
+function say(text, ok) {
+  const m = $("msg");
+  m.textContent = text;
+  m.className = "msg show " + (ok ? "ok" : "err");
+  setTimeout(() => { m.className = "msg"; }, 9000);
+}
+async function post(path, body) {
+  const btns = document.querySelectorAll("button");
+  btns.forEach(b => b.disabled = true);
+  try {
+    const r = await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    say(j.message || (j.ok ? "done" : "failed"), !!j.ok);
+  } catch (e) {
+    say("request failed: " + e, false);
+  } finally {
+    btns.forEach(b => b.disabled = false);
+    lastProfiles = lastCodecs = "";   // force control refresh
+  }
+}
+
+$("target").onchange = (e) => { ring = []; post("/api/capture", { target: e.target.value }); };
+$("profileBtn").onclick = () => {
+  const v = $("profileSel").value; if (!v) return;
+  const [device_id, profile_index] = v.split(":").map(Number);
+  post("/api/codec/profile", { device_id, profile_index });
+};
+function codecBoxes() { return [...document.querySelectorAll("#codecBoxes input")]; }
+function wireCodecBoxes() {
+  for (const b of codecBoxes())
+    b.onchange = () => { b.closest("label").className = b.checked ? "on" : "off"; };
+}
+function setCodecs(list) {
+  for (const b of codecBoxes()) {
+    b.checked = list.includes(b.value);
+    b.closest("label").className = b.checked ? "on" : "off";
+  }
+}
+function pickedCodecs() {
+  const picked = codecBoxes().filter(b => b.checked).map(b => b.value);
+  if (!picked.length) { say("Tick at least one codec — an empty allow-list would stop audio.", false); return null; }
+  // Everything ticked == no restriction; send [] so the drop-in goes inert
+  // rather than pinning a list that happens to be the full set.
+  return picked.length === codecBoxes().length ? [] : picked;
+}
+$("pinBtn").onclick = () => {
+  const c = pickedCodecs(); if (c === null) return;
+  post("/api/codec/pin", { codecs: c });
+};
+$("applyBtn").onclick = () => {
+  const c = pickedCodecs(); if (c === null) return;
+  say("applying: disconnect → restart WirePlumber → reconnect…", true);
+  post("/api/codec/apply", { codecs: c });
+};
+$("presetNoAptx").onclick = () =>
+  setCodecs(codecBoxes().map(b => b.value).filter(c => c !== "aptx" && c !== "aptx_hd"));
+$("presetAll").onclick = () => setCodecs(codecBoxes().map(b => b.value));
+$("reconnBtn").onclick = (e) => post("/api/reconnect", { address: e.target.dataset.address });
+
+/* ---------- live stream ---------- */
+let es = null;
+function connect() {
+  if (es) es.close();
+  es = new EventSource("/api/stream");
+  es.onopen = () => { $("conn").textContent = "live"; };
+  es.onmessage = (ev) => {
+    try { render(JSON.parse(ev.data)); } catch (e) { /* skip a bad frame */ }
+  };
+  es.onerror = () => {
+    $("conn").textContent = "reconnecting…";
+    es.close();
+    setTimeout(connect, 2000);
+  };
+}
+fitCanvas();
+connect();
+</script>
+</body>
+</html>

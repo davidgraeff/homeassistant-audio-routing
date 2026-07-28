@@ -119,6 +119,12 @@ pw-link -l | grep -A2 bt-bridge-capture:input       # while playing: bound to bl
 cat /sys/class/net/wlan0/statistics/tx_packets      # rises ~150/s while streaming
 ```
 
+For anything more than a one-off check, use the
+[**Bluetooth testing app**](bluetooth-testing-app/README.md) instead: a
+dependency-free web console that shows a live waveform of the incoming Bluetooth
+audio, flags **digital silence** (which every counter above reports as healthy),
+switches the A2DP codec, and shows the sender chain's PipeWire state.
+
 **Do not use `tcpdump` to confirm RTP egress on the Pi** — this WiFi driver
 offloads locally-generated multicast TX past tcpdump's capture hook, so it
 misleadingly shows **0 packets even when audio is flowing**. Use the `wlan0`
@@ -158,6 +164,7 @@ add-on plays.
 ## Directory layout
 
 ```
-setup_pi_bridge.py    the idempotent configurator (run on the Pi)
-README.md             this file
+setup_pi_bridge.py       the idempotent configurator (run on the Pi)
+bluetooth-testing-app/   live web console: waveform, codec switching, sender state
+README.md                this file
 ```
