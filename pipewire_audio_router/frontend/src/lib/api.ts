@@ -21,6 +21,7 @@ import type {
   OpResponse,
   OutputInfo,
   RoutingMatrix,
+  SendspinCodec,
   RtpSourceInfo,
   StatusInfo,
   SyncSettingsInfo,
@@ -97,6 +98,11 @@ export const api = {
   // 44.1 kHz) or 'fixed_44100'. Restarts that receiver's group at the new rate.
   setAp2RateMode: (nodeName: string, mode: 'auto' | 'fixed_44100') =>
     request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/ap2-rate`, { mode }),
+
+  /** Per-sendspin-output wire codec. Rejected (with a reason) if that codec isn't
+   * currently usable — the add-on can't encode it, or the device doesn't decode it. */
+  setSendspinCodec: (nodeName: string, codec: SendspinCodec) =>
+    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/sendspin-codec`, { codec }),
 
   // Per-device announcement (announce.rs). Plays a clip (built-in test/tone,
   // or url/wyoming) to a set of per-device-sender outputs with duck/overlay —

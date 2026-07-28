@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import { run, toast } from '../lib/toast';
-  import type { OutputInfo } from '../lib/types';
+  import type { OutputInfo, SendspinCodec } from '../lib/types';
   import VolumeControl from './VolumeControl.svelte';
 
   let outputs = $state<OutputInfo[]>([]);
@@ -166,6 +166,44 @@
     await refresh();
   }
 
+  // Sendspin wire codec. Restarts that device's group (one stream = one format), so
+  // the daemon sends a fresh stream/start; unavailable options are disabled below, so
+  // this only ever posts something the daemon accepts.
+  //
+  // A codec change also moves this speaker's *buffer requirement* — a compressed codec
+  // needs a head start for decode warmup, and the daemon raises the group's send-ahead
+  // to cover it. That value only arrives once the device has reconnected and reported
+  // it, which takes a moment, so refresh again after the restart has settled instead of
+  // leaving a stale figure on screen.
+  async function setCodec(o: OutputInfo, e: Event) {
+    const codec = (e.currentTarget as HTMLSelectElement).value as SendspinCodec;
+    await run(() => api.setSendspinCodec(o.node_name, codec), `Set '${o.name}' codec to ${codec}`);
+    await refresh();
+    setTimeout(refresh, 3000);
+  }
+
+  // What this speaker asked us to keep buffered, and what its stream actually gets.
+  // Both are protocol-driven, not preferences: the daemon must not send less than the
+  // device's `min_buffer_ms`, so this is where a "it stutters" investigation starts.
+  function bufferNote(o: OutputInfo): string | null {
+    if (o.kind !== 'sendspin' || o.sendspin_send_ahead_ms == null) return null;
+    if (o.sendspin_min_buffer_ms == null) {
+      return `sending ${o.sendspin_send_ahead_ms} ms ahead (this speaker hasn't reported a buffer requirement yet)`;
+    }
+    const asked = o.sendspin_min_buffer_ms;
+    return `asks for ${asked} ms buffer, sending ${o.sendspin_send_ahead_ms} ms ahead`;
+  }
+
+  // Label for a codec option, with the bandwidth trade-off spelled out — that's the
+  // whole reason to pick one.
+  function codecLabel(codec: string): string {
+    if (codec === 'auto') return 'Auto (Opus when the speaker supports it, else PCM)';
+    if (codec === 'pcm') return 'PCM — uncompressed, ~1.5 Mbit/s';
+    if (codec === 'opus') return 'Opus — lossy, ~10× less WiFi traffic';
+    if (codec === 'flac') return 'FLAC — lossless, ~2× less WiFi traffic';
+    return codec;
+  }
+
   // Apply the per-row sync value: sendspin → static delay; AP2 → render delay
   // (via setOutputLatency).
   async function applySync(o: OutputInfo) {
@@ -191,9 +229,9 @@
     Sendspin devices — or a mix of Sendspin and AirPlay 2 — and they play in one synchronized group.
   </p>
   <p class="card-sub" style="margin-bottom:0">
-    Each output below is everything this router can send audio to right now. Auto-discovered devices are
-    tagged <span class="badge auto">auto</span>; <span class="badge off">offline</span> ones have saved
-    routing but aren't currently on the network.
+    Each output below is everything this router can send audio to right now — all of them found by
+    auto-discovery. An <span class="badge off">offline</span> one has saved routing but isn't currently on
+    the network. Expand a card for its connection details, delay tuning and test playback.
   </p>
 </div>
 
@@ -222,7 +260,6 @@
           <h3>{o.name}</h3>
           <div class="out-badges">
             <span class="badge">{kindLabel(o)}</span>
-            {#if !o.configured}<span class="badge auto" title="Found via mDNS auto-discovery">auto</span>{/if}
             <span class="badge {o.present ? 'on' : 'off'}">{o.present ? 'online' : 'offline'}</span>
             {#if ptpBadge(o)}
               {@const ptp = ptpBadge(o)!}
@@ -240,15 +277,6 @@
             />
           </div>
         {/if}
-        <div class="btn-group out-play" title={testHint(o)}>
-          <button class="ghost seg label" disabled>Play:</button>
-          <button class="ghost seg" disabled={!canTest(o) || testing[o.node_name] != null} onclick={() => playTone(o)}>
-            {testing[o.node_name] === 'tone' ? 'Playing…' : 'Tone'}
-          </button>
-          <button class="ghost seg" disabled={!canTest(o) || testing[o.node_name] != null} onclick={() => playAnnouncement(o)}>
-            {testing[o.node_name] === 'announce' ? 'Playing…' : 'Announcement'}
-          </button>
-        </div>
       </header>
 
       {#if !isCollapsed(o)}
@@ -280,6 +308,47 @@
             </div>
           </div>
 
+          <!-- Diagnostic playback sits next to the delay it exists to check:
+               play a tone, hear where it lands, adjust the delay, play again. -->
+          <div class="btn-group out-play" title={testHint(o)}>
+            <button class="ghost seg label" disabled>Play:</button>
+            <button class="ghost seg" disabled={!canTest(o) || testing[o.node_name] != null} onclick={() => playTone(o)}>
+              {testing[o.node_name] === 'tone' ? 'Playing…' : 'Tone'}
+            </button>
+            <button class="ghost seg" disabled={!canTest(o) || testing[o.node_name] != null} onclick={() => playAnnouncement(o)}>
+              {testing[o.node_name] === 'announce' ? 'Playing…' : 'Announcement'}
+            </button>
+          </div>
+
+          {#if o.kind === 'sendspin' && o.sendspin_codec_options}
+            <div class="sync-field">
+              <label for="codec-{o.node_name}">Codec</label>
+              <div class="sync-cell">
+                <select
+                  id="codec-{o.node_name}"
+                  value={o.sendspin_codec ?? 'auto'}
+                  onchange={(e) => setCodec(o, e)}
+                  title="Wire format for this speaker's audio. Options the add-on can't encode, or that this device didn't advertise, are unavailable."
+                >
+                  {#each o.sendspin_codec_options as opt (opt.codec)}
+                    <option value={opt.codec} disabled={!opt.available} title={opt.reason ?? ''}>
+                      {codecLabel(opt.codec)}{opt.available ? '' : ' — unavailable'}
+                    </option>
+                  {/each}
+                </select>
+                <!-- What it actually resolves to, which differs from the choice
+                     whenever the pick isn't usable. -->
+                <span class="muted" style="white-space:nowrap">
+                  {o.sendspin_codec_active ? `using ${o.sendspin_codec_active}` : ''}
+                </span>
+              </div>
+              {#if bufferNote(o)}
+                <!-- Moves with the codec, which is why changing it refreshes this. -->
+                <p class="muted" style="font-size:0.8rem; margin:4px 0 0">{bufferNote(o)}</p>
+              {/if}
+            </div>
+          {/if}
+
           {#if o.kind === 'airplay2'}
             <div class="sync-field">
               <label for="rate-{o.node_name}">Sample rate</label>
@@ -306,12 +375,6 @@
 {/if}
 
 <style>
-  .badge.auto {
-    background: color-mix(in srgb, var(--primary-color) 18%, transparent);
-    color: var(--primary-color);
-    border-color: transparent;
-  }
-
   /* ---- One card per output ---------------------------------------------- */
   .out-card.offline {
     opacity: 0.6;
@@ -361,10 +424,6 @@
     flex-wrap: wrap;
     min-width: 0;
     flex: 1 1 auto;
-  }
-  .out-play {
-    flex: 0 0 auto;
-    margin-left: auto;
   }
   .out-vol {
     flex: 0 0 auto;
@@ -427,15 +486,20 @@
     font-size: 0.95rem;
   }
 
-  /* Sync + test controls */
+  /* Sync + test controls, in one left-aligned row: delay, then the play
+     actions right beside it, then any kind-specific field. Bottom-aligned so
+     the button group lines up with the labelled inputs' boxes, not their
+     labels. */
   .out-controls {
     display: flex;
     align-items: flex-end;
-    justify-content: space-between;
     gap: 16px;
     flex-wrap: wrap;
     padding-top: 14px;
     border-top: 1px solid var(--divider-color);
+  }
+  .out-play {
+    flex: 0 0 auto;
   }
   .sync-field label {
     display: block;

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
-  import { run } from '../lib/toast';
+  import { run, toast } from '../lib/toast';
+  import type { LeadFloorSource } from '../lib/types';
 
   let loading = $state(true);
 
@@ -14,6 +15,13 @@
   // Sync (moved here from the Outputs tab): daemon-wide presentation lead.
   let groupLeadMs = $state<number | ''>('');
   let syncBusy = $state(false);
+  // The daemon raises every group's send-ahead to the largest buffer a member asked
+  // for (`min_buffer_ms` + its static delay), because the protocol makes that
+  // mandatory — so a lower value here simply has no effect. Kept in state so the input
+  // can enforce it as its minimum and the copy can say which speaker set it.
+  let leadFloorMs = $state(0);
+  let leadEffectiveMs = $state(0);
+  let leadFloorSources = $state<LeadFloorSource[]>([]);
   // Whether sendspin delay changes apply to the running stream (future firmware)
   // or need a stream restart (current ESPHome firmware).
   let sendspinDelayLive = $state(false);
@@ -32,7 +40,12 @@
       discovery = s.discovery_enabled;
       sendspinDelayLive = s.sendspin_delay_live;
       exposeOutputs = s.expose_outputs_as_media_players;
-      if (sync) groupLeadMs = sync.group_lead_ms;
+      if (sync) {
+        groupLeadMs = sync.group_lead_ms;
+        leadFloorMs = sync.group_lead_floor_ms;
+        leadEffectiveMs = sync.group_lead_effective_ms;
+        leadFloorSources = sync.group_lead_floor_sources;
+      }
     } catch {
       // leave defaults; a toast already surfaced the error via run() elsewhere
     }
@@ -59,7 +72,15 @@
   async function saveGroupLead() {
     if (groupLeadMs === '' || Number(groupLeadMs) < 0) return;
     syncBusy = true;
-    await run(() => api.setGroupLead(Number(groupLeadMs)), `Group lead set to ${groupLeadMs} ms`);
+    // Surface the daemon's own message: it says when the stored value is below the
+    // floor and which speaker raised it, rather than us implying the number took.
+    try {
+      const res = await api.setGroupLead(Number(groupLeadMs));
+      toast(res.ok === false ? 'error' : 'success', res.message ?? `Group lead set to ${groupLeadMs} ms`);
+    } catch (e) {
+      toast('error', e instanceof Error ? e.message : String(e));
+    }
+    await refresh(); // the effective value (and the floor) may have moved
     syncBusy = false;
   }
 
@@ -125,12 +146,48 @@
     <div class="row">
       <div class="field" style="flex:0 0 160px">
         <label for="group-lead">Group lead (ms)</label>
-        <input id="group-lead" type="number" min="0" max="5000" step="10" bind:value={groupLeadMs} placeholder="250" />
+        <!-- min is the device-reported floor, not 0: the daemon raises the send-ahead
+             to it regardless, so offering lower values would only mislead. -->
+        <input
+          id="group-lead"
+          type="number"
+          min={leadFloorMs}
+          max="5000"
+          step="10"
+          bind:value={groupLeadMs}
+          placeholder="250"
+          title={leadFloorMs > 0
+            ? `At least ${leadFloorMs} ms — that is what your speakers ask for with their current codec`
+            : 'How far ahead audio is scheduled'}
+        />
       </div>
       <div class="field">
         <button class="primary" onclick={saveGroupLead} disabled={syncBusy || groupLeadMs === ''}>Apply</button>
       </div>
     </div>
+    {#if leadFloorMs > 0}
+      <p class="muted" style="font-size:0.8rem; margin:6px 0 0">
+        At least <strong>{leadFloorMs} ms</strong> is needed here, so that is the lowest value with any effect — the
+        add-on uses <strong>{leadEffectiveMs} ms</strong>.
+        {#if leadFloorSources.length}
+          <br />
+          {leadFloorSources[0].name} needs {leadFloorSources[0].required_ms} ms:
+          {#if leadFloorSources[0].min_buffer_ms != null}
+            it asks for {leadFloorSources[0].min_buffer_ms} ms of buffer
+          {:else if leadFloorSources[0].codec_minimum_ms > 0}
+            {leadFloorSources[0].codec} needs {leadFloorSources[0].codec_minimum_ms} ms to decode in time
+          {:else}
+            no buffer requirement of its own
+          {/if}
+          {#if leadFloorSources[0].static_delay_ms > 0}
+            + its {leadFloorSources[0].static_delay_ms} ms speaker delay (it plays that early, so audio must be sent
+            that much sooner)
+          {/if}.
+        {/if}
+        A speaker can need more with a compressed codec than with PCM, so this floor moves when you change a codec on
+        the Outputs tab.
+      </p>
+    {/if}
 
     <label class="check" style="margin-top:12px">
       <input type="checkbox" checked={sendspinDelayLive} disabled={delayModeBusy} onchange={toggleDelayLive} />

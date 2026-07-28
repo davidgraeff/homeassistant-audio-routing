@@ -114,11 +114,63 @@ export interface OutputInfo {
   ap2_volume?: number | null;
   /** AirPlay 2 only: mute state. undefined for non-AP2. */
   ap2_muted?: boolean | null;
+  /** sendspin only: stored wire-codec choice — 'auto' | 'pcm' | 'opus' | 'flac'. */
+  sendspin_codec?: SendspinCodec;
+  /** sendspin only: the codec the stream actually uses (the choice narrowed by what
+   * the add-on can encode and what the device advertised). */
+  sendspin_codec_active?: string;
+  /** sendspin only: every codec the picker offers, with availability + why not. */
+  sendspin_codec_options?: CodecOption[];
+  /** sendspin only: buffer this device asks us to keep queued (ms). Undefined until
+   * it has connected and reported one; can change with the wire codec. */
+  sendspin_min_buffer_ms?: number;
+  /** sendspin only: startup lead it would like (ms) — diagnostics only. */
+  sendspin_required_lead_ms?: number;
+  /** sendspin only: send-ahead its stream actually uses (ms). */
+  sendspin_send_ahead_ms?: number;
+}
+
+export type SendspinCodec = 'auto' | 'pcm' | 'opus' | 'flac';
+
+/** One entry in a sendspin output's codec picker (`/api/outputs`). */
+export interface CodecOption {
+  codec: SendspinCodec;
+  /** False ⇒ greyed out; `reason` says why. */
+  available: boolean;
+  reason?: string;
 }
 
 export interface SyncSettingsInfo {
-  /** Group presentation lead in ms (sendspin `send_ahead`). */
+  /** Group presentation lead in ms (sendspin `send_ahead`), as configured. */
   group_lead_ms: number;
+  /** Largest buffering requirement reported by a present sendspin device
+   * (`min_buffer_ms` + its static delay). The daemon raises every group's send-ahead
+   * to at least this, so configuring less has no effect. 0 = nothing reported yet.
+   * Can change when a device's wire codec changes (decode warmup differs). */
+  group_lead_floor_ms: number;
+  /** What the daemon actually uses: max(group_lead_ms, group_lead_floor_ms). */
+  group_lead_effective_ms: number;
+  /** Which devices set the floor, largest first — for explaining the number. */
+  group_lead_floor_sources: LeadFloorSource[];
+}
+
+/** One device's contribution to the send-ahead floor. */
+export interface LeadFloorSource {
+  node_name: string;
+  name: string;
+  /** The codec it's streaming — its requirement changes with this. */
+  codec: string;
+  /** What the device itself asked for, if its firmware reports anything. */
+  min_buffer_ms?: number;
+  /** The add-on's own minimum for that codec, used when the device is silent. */
+  codec_minimum_ms: number;
+  /** Its speaker delay: it plays this much early, so audio must be sent that much
+   * sooner or its chunks arrive already late and get dropped. */
+  static_delay_ms: number;
+  /** Its effective per-speaker send-ahead: the larger of the two, plus the delay. */
+  required_ms: number;
+  /** 'reported' or 'codec-minimum'. */
+  reason: string;
 }
 
 /** General, daemon-wide app settings (settings_store.rs) — the Settings page. */
