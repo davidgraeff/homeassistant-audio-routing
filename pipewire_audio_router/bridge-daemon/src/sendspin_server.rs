@@ -242,7 +242,7 @@ impl SendspinServerHandle {
     /// 1. **The devices are told.** `Drop` aborts the supervisor tasks, so each
     ///    player's socket dies *while it has an active stream* and it has to work that
     ///    out for itself — the suspected cause of the multi-second silence after a
-    ///    group restart (docs/sendspin-group-churn-plan.md H6).
+    ///    group restart (docs/old/sendspin-group-churn-plan.md H6).
     /// 2. **The port is really free.** `abort()` only requests cancellation; the bound
     ///    listener lives inside the accept task's future until the runtime drops it.
     ///    Awaiting the aborted handle is what makes rebinding the same port on the
@@ -1018,7 +1018,7 @@ pub fn device_supports(device_codecs: &[String], codec: &str) -> bool {
 /// and counting unknown as PCM-only meant routing one more speaker into a live Opus
 /// group dropped the *whole group* to PCM, restarted it, then restarted it again the
 /// moment the newcomer said it decodes Opus (measured: two restarts 914 ms apart, see
-/// docs/sendspin-group-churn-plan.md §2b). Assuming the group's codec instead costs at
+/// docs/old/sendspin-group-churn-plan.md §2b). Assuming the group's codec instead costs at
 /// most one restart, and only for hardware that really can't decode it:
 /// `report_format_support` nudges a reconcile as soon as the device's `client/hello`
 /// proves otherwise. Per-device *display* of what a codec is worth stays honest —
@@ -1406,7 +1406,7 @@ mod tests {
         // ...but for *stream selection* an unknown member imposes nothing: routing one
         // more speaker into a live Opus group must not downgrade everyone to PCM and
         // restart the group twice while the newcomer's client/hello is still in flight
-        // (docs/sendspin-group-churn-plan.md §2b, H2).
+        // (docs/old/sendspin-group-churn-plan.md §2b, H2).
         let unknown: Vec<String> = Vec::new();
         let capable = codecs(&["pcm", "opus"]);
         assert_eq!(resolve_codec(SendspinCodec::Auto, [&capable, &unknown].into_iter()), "opus");

@@ -2304,7 +2304,7 @@ async fn set_sendspin_delay_handler(
     // for it to take. Scoped to THIS device's connection on the next reconcile
     // (`force_device_reconnect`): its groupmates' streams are unaffected by its delay,
     // and restarting the group's server for them cost every speaker in the room tens
-    // of seconds of silence (docs/sendspin-group-churn-plan.md §4.10). The one
+    // of seconds of silence (docs/old/sendspin-group-churn-plan.md §4.10). The one
     // genuinely group-wide case — a delay large enough to raise the group's send-ahead
     // high-water mark — is picked up by the reconciler's ordinary stream-config check.
     // Skipped entirely when `sendspin_delay_live` is on (firmware that honors a live

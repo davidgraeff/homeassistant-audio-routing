@@ -160,7 +160,7 @@ struct RunningGroup {
     /// calibration dropped every member — 219 ms of daemon work, but each
     /// reconnected speaker then went silent for tens of seconds (firmware-side), so
     /// a one-device tweak caused a group-wide outage
-    /// (docs/sendspin-group-churn-plan.md §4.10, the same shape as the membership
+    /// (docs/old/sendspin-group-churn-plan.md §4.10, the same shape as the membership
     /// bug §4.1 fixed).
     ///
     /// The one case that genuinely IS group-wide — a delay big enough to raise the
@@ -1230,7 +1230,7 @@ impl GroupReconciler {
             //    `Group` on the live timeline, so a join needs nothing torn down.
             //    Restarting for a join instead cost every *existing* member a full
             //    reconnect — 813 ms of it measured end-to-end, and every device's
-            //    stream re-anchored (docs/sendspin-group-churn-plan.md §2b, H1).
+            //    stream re-anchored (docs/old/sendspin-group-churn-plan.md §2b, H1).
             //
             //    A restart, when the config really did change, is still only the
             //    server — never the anchor — so AP2/RAOP outputs fed from the same
@@ -1372,7 +1372,7 @@ impl GroupReconciler {
             }
 
             // c3. Per-device forced reconnect — the static-delay path
-            //     (docs/sendspin-group-churn-plan.md §4.10). ESPHome firmware reads
+            //     (docs/old/sendspin-group-churn-plan.md §4.10). ESPHome firmware reads
             //     `SetStaticDelay` at stream start, so a live push doesn't shift a
             //     running stream and the device has to reconnect; nothing about its
             //     *groupmates'* streams changes, so only it does.
@@ -1644,7 +1644,7 @@ struct SendspinServerState {
 /// PipeWire graph — and because "which changes restart a group" is exactly the
 /// thing that regressed: membership used to be part of the identity, so routing one
 /// more speaker into a live group made every other member reconnect
-/// (docs/sendspin-group-churn-plan.md §2b).
+/// (docs/old/sendspin-group-churn-plan.md §2b).
 ///
 /// There is deliberately no "a caller asked for a reconnect" input any more. The one
 /// caller that did — a per-device static-delay edit — now recycles just that device's

@@ -1,5 +1,13 @@
 # Adding a device silences the whole group — analysis plan
 
+> **ARCHIVED 2026-07-29. Closed — the cause was ours.** Kept for the measurements, the
+> hypotheses and how each of them died; several conclusions in here were *wrong* and are
+> struck through in place rather than deleted, because the wrong turns are the useful part.
+> **Still-open work has moved to
+> [../sendspin-open-items.md](../sendspin-open-items.md)** — read that first if you are
+> looking for something to do. Start at §4.14 for the answer, §2d for the measurement that
+> made it checkable.
+
 **Symptom (reported 2026-07-28).** With a source playing to AP2 **and** sendspin
 outputs, routing one *more* sendspin device into the group makes **every sendspin
 device stop**, and it takes **>10 s** before audio is back everywhere.
@@ -254,12 +262,12 @@ through the restart — not one silent window.
 > `largest packet` proxy measures the *source's* audio content, not the speaker's. The
 > Bluetooth source has its own unrelated silence fault (full-rate aptX decoding to
 > zeros — see
-> [rtp-input-dropouts-plan.md](rtp-input-dropouts-plan.md)), and the first run of this
+> [rtp-input-dropouts-plan.md](../rtp-input-dropouts-plan.md)), and the first run of this
 > test showed ~50 s of `3 B` immediately after the restart, which reads exactly like a
 > restart-induced outage and is not one. **Any group-churn measurement over the BT
 > source must independently confirm the source has audio for the whole window** — join
 > the multicast group and check the RTP payload peak
-> ([`firmware/pi-bridge/bluetooth-testing-app/`](../../firmware/pi-bridge/bluetooth-testing-app/README.md)
+> ([`firmware/pi-bridge/bluetooth-testing-app/`](../../../firmware/pi-bridge/bluetooth-testing-app/README.md)
 > does this live). The re-run with the source confirmed at peak 12k–18k is result 3.
 
 **4 · Clock-sync exchanges are far slower than assumed — the mechanism candidate.**

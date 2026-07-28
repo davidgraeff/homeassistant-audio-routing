@@ -22,3 +22,6 @@ pipewire_audio_router/bridge-daemon/assets/generate_with_key.sh
 
 # Vendored path-dep crates: keep their sources, never their build output.
 pipewire_audio_router/bridge-daemon/vendor/*/target/
+
+# Agent worktrees (created by tooling, never committed)
+.claude/
