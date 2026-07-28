@@ -60,6 +60,14 @@ pub struct AppState {
     /// On-demand source peak meters (metering.rs); taps live only while a
     /// routing-matrix WS client is connected.
     pub meters: crate::metering::SharedMeters,
+    /// Per-node xrun counts from the PipeWire profiler (profiler.rs), written by
+    /// the PipeWire thread while profiling is armed and read into the routing
+    /// snapshot. Empty when the routing UI is closed.
+    pub xruns: crate::profiler::SharedXruns,
+    /// Count of open routing-matrix WebSockets. The first arms profiling
+    /// (`PwCommand::SetProfiling(true)`), the last disarms it — same "pay only
+    /// while watched" gating as the peak meters.
+    pub profiler_watchers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Live mDNS-discovered sendspin devices (sendspin_discovery.rs), surfaced
     /// as virtual routing outputs.
     pub sendspin_devices: SharedSendspinDevices,
@@ -125,6 +133,7 @@ pub fn router(
     airplay: SharedAirplay,
     airplay_clients: AirplayClientStore,
     meters: crate::metering::SharedMeters,
+    xruns: crate::profiler::SharedXruns,
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
     pw_targets: crate::pw_target_discovery::SharedPwTargets,
@@ -150,6 +159,8 @@ pub fn router(
         airplay,
         airplay_clients,
         meters,
+        xruns,
+        profiler_watchers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sendspin_devices,
         ap2_devices,
         pw_targets,

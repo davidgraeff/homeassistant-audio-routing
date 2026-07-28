@@ -33,6 +33,7 @@ use pipewire::properties::PropertiesBox;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -78,6 +79,13 @@ pub enum PwCommand {
     /// shared snapshot, same division of labor as `DestroyLinks`). Missing/
     /// already-gone ids are fine, same reasoning as `DestroyLinks`.
     DestroySinkNode { node_id: u32, reply: oneshot::Sender<Result<(), String>> },
+    /// Turn per-node xrun profiling on/off. On `true`, bind the `module-profiler`
+    /// global and start populating the shared xrun map; on `false`, drop the
+    /// subscription (so an idle install with the routing UI closed pays nothing —
+    /// profiler.rs). Fire-and-forget: the routing WS toggles it on the first/last
+    /// matrix watcher, mirroring the peak-meter gating. No-op if the profiler
+    /// global isn't present (module not loaded).
+    SetProfiling(bool),
 }
 
 /// Send end of the command channel, handed to the axum side. Cheap to clone;
@@ -140,9 +148,10 @@ pub type SharedState = Arc<Mutex<RegistryState>>;
 pub type ChangeNotifier = tokio::sync::broadcast::Sender<()>;
 
 /// Spawns the PipeWire thread and returns the shared state handle, its change
-/// notifier, and the command sender immediately; the thread connects and
-/// starts populating the state in the background.
-pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender)> {
+/// notifier, the command sender, and the shared xrun map (populated by the
+/// profiler while profiling is enabled — profiler.rs) immediately; the thread
+/// connects and starts populating the state in the background.
+pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender, crate::profiler::SharedXruns)> {
     let state: SharedState = Arc::new(Mutex::new(RegistryState::default()));
     // Capacity is a lag buffer, not a queue depth requirement: subscribers
     // only ever care about "something changed, re-fetch the snapshot," so
@@ -150,17 +159,19 @@ pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender)>
     // is fine — this is not an event log.
     let (changes, _) = tokio::sync::broadcast::channel(16);
     let (cmd_tx, cmd_rx) = pw::channel::channel::<PwCommand>();
+    let xruns = crate::profiler::new_xruns();
     let state_for_thread = state.clone();
     let changes_for_thread = changes.clone();
+    let xruns_for_thread = xruns.clone();
     std::thread::Builder::new().name("pipewire".into()).spawn(move || {
-        if let Err(e) = run(state_for_thread, changes_for_thread, cmd_rx) {
+        if let Err(e) = run(state_for_thread, changes_for_thread, cmd_rx, xruns_for_thread) {
             tracing::error!("pipewire thread exited with error: {e:#}");
         }
     })?;
-    Ok((state, changes, cmd_tx))
+    Ok((state, changes, cmd_tx, xruns))
 }
 
-fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receiver<PwCommand>) -> anyhow::Result<()> {
+fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receiver<PwCommand>, xruns: crate::profiler::SharedXruns) -> anyhow::Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -173,9 +184,24 @@ fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receive
     let state_remove = state.clone();
     let changes_add = changes.clone();
     let changes_remove = changes.clone();
+    // The `module-profiler` global's id, learned from the registry, so the
+    // `SetProfiling` command can bind it on demand. And the live subscription
+    // (profiler.rs) while profiling is on — both `!Send`, on this thread only.
+    let profiler_id: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+    let profiler_listener: Rc<RefCell<Option<crate::profiler::ProfilerListener>>> = Rc::new(RefCell::new(None));
+    let profiler_id_add = profiler_id.clone();
+    let profiler_id_remove = profiler_id.clone();
+    let profiler_listener_remove = profiler_listener.clone();
     let _listener = registry
         .add_listener_local()
         .global(move |global| {
+            // The profiler global carries no node.name/port/link props we index
+            // below — record its id (for on-demand binding) and move on.
+            if global.type_ == pw::types::ObjectType::Profiler {
+                tracing::info!("discovered profiler global (id={})", global.id);
+                *profiler_id_add.borrow_mut() = Some(global.id);
+                return;
+            }
             let Some(props) = global.props else { return };
 
             if let Some(name) = props.get("node.name") {
@@ -215,6 +241,12 @@ fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receive
             }
         })
         .global_remove(move |id| {
+            // Profiler gone (module unloaded / server restart): forget its id and
+            // drop any live subscription so we don't hold a dead proxy.
+            if *profiler_id_remove.borrow() == Some(id) {
+                *profiler_id_remove.borrow_mut() = None;
+                profiler_listener_remove.borrow_mut().take();
+            }
             let mut state = state_remove.lock_recover();
             if let Some(removed) = state.nodes.remove(&id) {
                 tracing::info!("node removed: {} (id={id})", removed.node_name);
@@ -237,6 +269,7 @@ fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receive
     let core_for_cmds = core.clone();
     let registry_for_cmds = registry.clone();
     let state_for_cmds = state.clone();
+    let xruns_for_cmds = xruns.clone();
     let _cmd_receiver = cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
         PwCommand::Load { node_name, module_name, args, reply } => {
             let mut modules = modules.borrow_mut();
@@ -278,6 +311,26 @@ fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receive
         PwCommand::DestroySinkNode { node_id, reply } => {
             let _ = registry_for_cmds.destroy_global(node_id);
             let _ = reply.send(Ok(()));
+        }
+        PwCommand::SetProfiling(enabled) => {
+            if enabled {
+                if profiler_listener.borrow().is_some() {
+                    return; // already profiling
+                }
+                match *profiler_id.borrow() {
+                    Some(id) => match crate::profiler::subscribe(&registry_for_cmds, id, xruns_for_cmds.clone()) {
+                        Some(listener) => {
+                            *profiler_listener.borrow_mut() = Some(listener);
+                            tracing::debug!("profiling enabled (bound profiler global {id})");
+                        }
+                        None => tracing::warn!("failed to bind profiler global {id}"),
+                    },
+                    None => tracing::debug!("SetProfiling(true) but no profiler global present (module-profiler not loaded)"),
+                }
+            } else if profiler_listener.borrow_mut().take().is_some() {
+                xruns_for_cmds.lock_recover().clear();
+                tracing::debug!("profiling disabled");
+            }
         }
     });
 

@@ -71,6 +71,22 @@ pub struct RoutingNode {
     /// for sources.
     #[serde(skip_serializing_if = "Option::is_none")]
     muted: Option<bool>,
+    /// Estimated buffering (ms) this node contributes to the end-to-end path —
+    /// the jitter/playout buffer configured for it, NOT a measured figure.
+    /// Sources: the ingest jitter buffer (RTP `sess.latency.msec` / AirPlay
+    /// producer prebuffer). Outputs: the playout lead (sendspin group send-ahead
+    /// + per-device static delay; AP2 render delay). The UI sums a route's
+    /// source + output estimates to show its rough latency. `None` when unknown
+    /// (e.g. an offline/unrecognized node). See build_matrix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u32>,
+    /// Cumulative xrun (dropped-cycle) count for this node from the PipeWire
+    /// profiler (profiler.rs) — the same figure as `pw-top`'s `ERR`. Present only
+    /// for real graph nodes while the matrix is being watched (profiling is armed
+    /// on-demand); `None` for virtual outputs (sendspin/AP2 have no graph node)
+    /// and whenever profiling is off. A rising value is where dropouts originate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xruns: Option<u32>,
 }
 
 #[derive(Serialize, Clone)]
@@ -82,6 +98,44 @@ pub struct RoutingMatrix {
     /// offline endpoint, shown grayed); reconcile() makes the live graph match
     /// for pairs whose endpoints are both present.
     links: Vec<RoutingLink>,
+}
+
+/// Configured (not measured) buffering figures used to estimate each node's
+/// contribution to end-to-end latency for the routing-graph readout. All in ms.
+pub struct LatencyConfig {
+    /// Per-source input buffer (ms) keyed by the source's PipeWire node name:
+    /// an AirPlay receiver's producer prebuffer or an RTP receiver's jitter
+    /// buffer. Covers every configured source instance (built from the source
+    /// store), so it isn't tied to any fixed node name.
+    pub source_latencies: std::collections::HashMap<String, u32>,
+    /// Sendspin group presentation lead (`group_lead_ms`) — the base playout
+    /// buffer every sendspin device rides on.
+    pub group_lead_ms: u32,
+    /// Per-sendspin-device static delay (added on top of the group lead).
+    pub sendspin_delays: std::collections::BTreeMap<String, u16>,
+    /// Per-AP2-device render delay; the default applies when a device has no
+    /// override.
+    pub ap2_delays: std::collections::BTreeMap<String, u16>,
+    /// Default AP2 render delay when a device has no per-device override.
+    pub ap2_default_ms: u32,
+}
+
+/// Estimated buffering (ms) a node contributes, from config. `None` when we
+/// have no figure for the node (offline/unknown, or an output kind whose buffer
+/// we don't model, e.g. pw-sink). See [`RoutingNode::latency_ms`].
+fn node_latency_ms(node_name: &str, lat: &LatencyConfig) -> Option<u32> {
+    // Any configured source (AirPlay or RTP), by its node name.
+    if let Some(ms) = lat.source_latencies.get(node_name) {
+        return Some(*ms);
+    }
+    if node_name.starts_with(SENDSPIN_DEV_PREFIX) {
+        let extra = lat.sendspin_delays.get(node_name).copied().unwrap_or(0);
+        return Some(lat.group_lead_ms + u32::from(extra));
+    }
+    if node_name.starts_with(AP2_DEV_PREFIX) {
+        return Some(lat.ap2_delays.get(node_name).map(|ms| u32::from(*ms)).unwrap_or(lat.ap2_default_ms));
+    }
+    None
 }
 
 fn is_output_node(node_name: &str) -> bool {
@@ -120,6 +174,8 @@ fn build_matrix(
     sendspin_mutes: &std::collections::HashMap<String, bool>,
     ap2_volumes: &std::collections::HashMap<String, f32>,
     ap2_mutes: &std::collections::HashMap<String, bool>,
+    lat: &LatencyConfig,
+    xruns: &std::collections::HashMap<String, u32>,
 ) -> RoutingMatrix {
     use std::collections::BTreeSet;
 
@@ -200,6 +256,8 @@ fn build_matrix(
                 } else {
                     None
                 },
+                latency_ms: node_latency_ms(&name, lat),
+                xruns: xruns.get(&name).copied(),
                 node_name: name,
                 peak: 0.0, // outputs aren't metered
             }
@@ -215,7 +273,9 @@ fn build_matrix(
             // source instance, not just a fixed-name AirPlay/RTP source.
             let display_name = source_labels.get(&name).cloned().unwrap_or_else(|| name.clone());
             let peak = meters.peak(&name);
-            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name, peak, volume: None, muted: None }
+            let latency_ms = node_latency_ms(&name, lat);
+            let node_xruns = xruns.get(&name).copied();
+            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name, peak, volume: None, muted: None, latency_ms, xruns: node_xruns }
         })
         .collect();
 
@@ -246,15 +306,36 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let intent = routing_store::snapshot(&state.routing);
     let devices = state.sendspin_devices.lock_recover().clone();
     let ap2_devices = state.ap2_devices.lock_recover().clone();
-    // Per-source display label, keyed by node name, for every configured source
-    // instance (AirPlay or RTP) — not just a fixed-name one.
     let pw_targets = state.pw_targets.lock_recover().clone();
-    let source_labels: std::collections::HashMap<String, String> = {
+    let (lat, source_labels) = {
+        use crate::sources_store::SourceConfig;
         let sources = state.sources.lock_recover();
-        sources.list().into_iter().map(|entry| (entry.node_name(), entry.label.clone())).collect()
+        let sync = state.sync_settings.lock_recover();
+        // Per-source input buffer + label, keyed by node name, for every
+        // configured source instance (AirPlay or RTP).
+        let mut source_latencies = std::collections::HashMap::new();
+        let mut source_labels = std::collections::HashMap::new();
+        for entry in sources.list() {
+            let node_name = entry.node_name();
+            let ms = match &entry.config {
+                SourceConfig::Airplay(c) => c.latency_msec,
+                SourceConfig::Rtp(c) => c.latency_msec,
+            };
+            source_latencies.insert(node_name.clone(), ms);
+            source_labels.insert(node_name, entry.label.clone());
+        }
+        let lat = LatencyConfig {
+            source_latencies,
+            group_lead_ms: sync.group_lead_ms(),
+            sendspin_delays: sync.sendspin_delays(),
+            ap2_delays: sync.ap2_latencies(),
+            ap2_default_ms: crate::ap2_server::AP2_RENDER_DELAY_MS,
+        };
+        (lat, source_labels)
     };
+    let xruns = state.xruns.lock_recover().clone();
     let reg = state.pw.lock_recover();
-    build_matrix(&reg, &devices, &ap2_devices, &pw_targets, &source_labels, &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes)
+    build_matrix(&reg, &devices, &ap2_devices, &pw_targets, &source_labels, &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes, &lat, &xruns)
 }
 
 /// Present source nodes as `(node_name, node_id)` — the set the meter hub taps
@@ -530,11 +611,19 @@ pub async fn routing_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    use std::sync::atomic::Ordering;
     let mut changes = state.changes.subscribe();
     // A watching client turns on source peak metering (turned off when the last
     // client leaves — see MeterHub). reconcile_sources on each registry change
     // keeps the tapped set matching the present sources.
     state.meters.watch();
+    // Same "pay only while watched" gating for the profiler: the first client to
+    // open the matrix arms per-node xrun profiling, the last to leave disarms it
+    // (profiler.rs / pw_thread's SetProfiling). `fetch_add` returns the previous
+    // count, so `== 0` means we're the first.
+    if state.profiler_watchers.fetch_add(1, Ordering::SeqCst) == 0 {
+        let _ = state.pw_cmd.send(PwCommand::SetProfiling(true));
+    }
 
     // Peak levels change continuously, but the registry `changes` channel only
     // fires on graph changes — so also push a fresh snapshot on a timer while
@@ -543,10 +632,19 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Tear-down shared by every exit path: drop the meter watch and, if we were
+    // the last matrix watcher, disarm profiling.
+    let teardown = |state: &AppState| {
+        state.meters.unwatch();
+        if state.profiler_watchers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ = state.pw_cmd.send(PwCommand::SetProfiling(false));
+        }
+    };
+
     let matrix = build_snapshot(&state).await;
     state.meters.reconcile_sources(&present_source_meters(&matrix));
     if send_matrix(&mut socket, &matrix).await.is_err() {
-        state.meters.unwatch();
+        teardown(&state);
         return;
     }
     loop {
@@ -580,7 +678,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             }
         }
     }
-    state.meters.unwatch();
+    teardown(&state);
 }
 
 async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(), axum::Error> {

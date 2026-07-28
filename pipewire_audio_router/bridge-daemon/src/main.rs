@@ -21,6 +21,7 @@ mod metering;
 mod overlay_mixer;
 mod per_device_spike;
 mod player;
+mod profiler;
 mod pw_module;
 mod pw_sink;
 mod pw_sink_liveness;
@@ -232,7 +233,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let pw_targets: pw_target_discovery::SharedPwTargets =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
-    let (pw_state, changes, pw_cmd) = pw_thread::spawn()?;
+    let (pw_state, changes, pw_cmd, xruns) = pw_thread::spawn()?;
 
     // mDNS auto-discovery (sendspin devices + AirPlay-2 receivers), runtime
     // toggleable from the Settings page (discovery_supervisor.rs). Discovery only
@@ -418,6 +419,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             airplay.clone(),
             airplay_clients,
             meters,
+            xruns,
             sendspin_devices,
             ap2_devices,
             pw_targets,
