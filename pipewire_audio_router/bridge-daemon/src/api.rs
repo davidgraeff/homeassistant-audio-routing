@@ -6,7 +6,7 @@ use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
 use crate::ap2_discovery::SharedAp2Devices;
 use airplay_core::features::Features;
 use crate::ap2_ptp::SharedAp2Ptp;
-use crate::config::{AP2_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
+use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
@@ -66,6 +66,10 @@ pub struct AppState {
     /// Live mDNS-discovered AirPlay-2 receivers (ap2_discovery.rs), surfaced as
     /// virtual routing outputs (`ap2-dev-*`). The RAOP-output replacement.
     pub ap2_devices: SharedAp2Devices,
+    /// Live mDNS-discovered pw-sink targets (pw_target_discovery.rs) — remote
+    /// PipeWire hosts running `module-rtp-session`, surfaced as virtual routing
+    /// outputs (`pwsink-dev-*`) and driven by per-target AppleMIDI senders.
+    pub pw_targets: crate::pw_target_discovery::SharedPwTargets,
     /// The daemon's single host-global AirPlay-2 PTP grandmaster (ap2_ptp.rs),
     /// reused by the AP2 tone spike (ap2_spike.rs) so it shares 319/320 rather
     /// than double-binding.
@@ -123,6 +127,7 @@ pub fn router(
     meters: crate::metering::SharedMeters,
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
+    pw_targets: crate::pw_target_discovery::SharedPwTargets,
     ap2_ptp: SharedAp2Ptp,
     routing: SharedRouting,
     sendspin_control: crate::sendspin_volume::SharedSendspinControl,
@@ -147,6 +152,7 @@ pub fn router(
         meters,
         sendspin_devices,
         ap2_devices,
+        pw_targets,
         ap2_ptp,
         routing,
         sendspin_control,
@@ -193,6 +199,7 @@ pub fn router(
         .route("/api/spike/multi-device", post(spike_multi_device_start).delete(spike_per_device_stop))
         .route("/api/spike/overlay", post(spike_overlay_start).delete(spike_overlay_stop))
         .route("/api/spike/ap2", post(spike_ap2_start).delete(spike_ap2_stop))
+        .route("/api/spike/pw-sink", post(spike_pwsink_start).delete(spike_pwsink_stop))
         .route("/api/announce", post(ag_announce))
         .route("/api/groups/music", get(list_music_groups).post(create_music_group))
         .route("/api/groups/music/{id}", put(update_music_group).delete(delete_music_group))
@@ -512,6 +519,12 @@ struct OutputInfo {
     /// group lead raised to the largest member requirement.
     #[serde(skip_serializing_if = "Option::is_none")]
     sendspin_send_ahead_ms: Option<u32>,
+    /// pw-sink only: is a remote `module-rtp-session` receiver actually connected
+    /// and being streamed to right now (the AppleMIDI handshake completed)?
+    /// `Some(false)` = discovered + routed but the receiver hasn't connected yet;
+    /// `None` = not a pw-sink output. Distinct from `present` (mDNS visibility).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwsink_streaming: Option<bool>,
 }
 
 /// One entry in a sendspin output's codec picker.
@@ -624,6 +637,7 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             sendspin_min_buffer_ms: min_buffer_ms,
             sendspin_required_lead_ms: required_lead_ms,
             sendspin_send_ahead_ms: Some(send_ahead_ms),
+            pwsink_streaming: None,
             node_name,
         });
     }
@@ -724,6 +738,54 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             sendspin_min_buffer_ms: None,
             sendspin_required_lead_ms: None,
             sendspin_send_ahead_ms: None,
+            pwsink_streaming: None,
+            node_name,
+        });
+    }
+
+    // Discovered pw-sink targets (present) + offline ones still referenced by
+    // saved routing intent. Like sendspin/AP2 they're virtual (no local PipeWire
+    // node) and always auto-discovered; the audio path is a per-target AppleMIDI
+    // sender (pwsink_server.rs). `present` = mDNS-visible; `pwsink_streaming` =
+    // a receiver has actually completed the handshake (pw_sink_liveness.rs).
+    let pw_targets = state.pw_targets.lock_recover().clone();
+    let mut pwsink_names: BTreeSet<String> = pw_targets.keys().cloned().collect();
+    pwsink_names.extend(state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(PWSINK_DEV_PREFIX)));
+    for node_name in pwsink_names {
+        let tgt = pw_targets.get(&node_name);
+        let present = tgt.map(|t| t.present).unwrap_or(false);
+        let name = tgt
+            .map(|t| t.display_name.clone())
+            .unwrap_or_else(|| node_name.strip_prefix(PWSINK_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
+        let addr = tgt.and_then(|t| t.addr);
+        // Streaming status only meaningful while present + a sender is running.
+        let streaming = crate::pw_sink_liveness::PwSinkLiveness::global().get(&node_name).map(|s| s.established);
+        outputs.push(OutputInfo {
+            kind: "pwsink",
+            present,
+            configured: false, // pw-sink targets are always auto-discovered
+            name,
+            ip: addr.map(|a| a.to_string()),
+            port: None, // the control port is internal/dynamic (pwsink_server.rs)
+            encryption: Some("None".to_string()), // L16 RTP is unencrypted
+            latency_ms: None,
+            ptp_locked: None,
+            ptp_lock_age_s: None,
+            ptp_supported: None,
+            ptp_relevant: None,
+            ap2_features: None,
+            ap2_rate_mode: None,
+            ap2_rate: None,
+            ap2_volume: None,
+            ap2_muted: None,
+            sendspin_codec: None,
+            sendspin_codec_active: None,
+            sendspin_codec_options: None,
+            sendspin_min_buffer_ms: None,
+            sendspin_required_lead_ms: None,
+            sendspin_send_ahead_ms: None,
+            // present-but-not-connected reads as Some(false); streaming = Some(true).
+            pwsink_streaming: if present { Some(streaming.unwrap_or(false)) } else { None },
             node_name,
         });
     }
@@ -1620,6 +1682,46 @@ async fn spike_ap2_start(
 async fn spike_ap2_stop() -> (StatusCode, Json<OutputOpResponse>) {
     let msg = crate::ap2_spike::stop().await;
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg }))
+}
+
+/// pw-sink transport spike (pw_sink_spike.rs). Streams a self-driving test tone
+/// to a remote PipeWire host via native rtp-sink + rtp-sap — the real-LAN A/B
+/// oracle for the pw-sink output backend. No user interaction; the remote host
+/// (running rtp-sap in discover mode) auto-creates a source and plays it.
+#[derive(Deserialize)]
+struct PwSinkSpikeRequest {
+    /// Target remote host, unicast IPv4 (required — rtp-sink unicasts to it).
+    target_ip: String,
+    /// Tone frequency in Hz (default 440).
+    #[serde(default)]
+    freq: Option<f32>,
+    /// Optional LAN interface name to pin egress/advert to (default `end0` on
+    /// the HA host — avoids host-network multi-iface fan-out).
+    #[serde(default)]
+    ifname: Option<String>,
+}
+
+async fn spike_pwsink_start(
+    State(state): State<AppState>,
+    Json(req): Json<PwSinkSpikeRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if req.target_ip.parse::<std::net::IpAddr>().is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OutputOpResponse { ok: false, message: format!("invalid target_ip '{}'", req.target_ip) }),
+        );
+    }
+    let freq = req.freq.unwrap_or(440.0);
+    let ifname = req.ifname.as_deref().or(Some("end0"));
+    match crate::pw_sink_spike::start(&state.pw, &state.pw_cmd, &req.target_ip, freq, ifname).await {
+        Ok(info) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: info.message })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+    }
+}
+
+async fn spike_pwsink_stop() -> (StatusCode, Json<OutputOpResponse>) {
+    crate::pw_sink_spike::stop().await;
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "pw-sink spike stopped".into() }))
 }
 
 /// Multi-device shared-timeline spike (S1): one anchor + one timeline driving one

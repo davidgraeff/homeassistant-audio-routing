@@ -25,7 +25,7 @@
 //! being hardcoded per source/output type.
 
 use crate::api::AppState;
-use crate::config::{AP2_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
+use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
 use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
@@ -89,7 +89,7 @@ fn is_output_node(node_name: &str) -> bool {
 }
 
 pub(crate) fn output_display_name(node_name: &str) -> String {
-    for prefix in [SENDSPIN_NODE_PREFIX, SENDSPIN_DEV_PREFIX, AP2_DEV_PREFIX] {
+    for prefix in [SENDSPIN_NODE_PREFIX, SENDSPIN_DEV_PREFIX, AP2_DEV_PREFIX, PWSINK_DEV_PREFIX] {
         if let Some(rest) = node_name.strip_prefix(prefix) {
             return rest.replace(['_', '-'], " ");
         }
@@ -112,6 +112,7 @@ fn build_matrix(
     reg: &RegistryState,
     devices: &BTreeMap<String, SendspinDevice>,
     ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
+    pw_targets: &BTreeMap<String, crate::pw_target_discovery::PwTarget>,
     source_labels: &std::collections::HashMap<String, String>,
     meters: &crate::metering::MeterHub,
     intent: &[RoutingLink],
@@ -148,6 +149,7 @@ fn build_matrix(
     let mut output_names: BTreeSet<String> = present_outputs.keys().cloned().collect();
     output_names.extend(devices.keys().cloned());
     output_names.extend(ap2_devices.keys().cloned());
+    output_names.extend(pw_targets.keys().cloned());
     output_names.extend(intent.iter().map(|l| l.output.clone()));
 
     let mut source_names: BTreeSet<String> = present_sources.keys().cloned().collect();
@@ -159,16 +161,21 @@ fn build_matrix(
             let node_id = present_outputs.get(&name).copied();
             let device = devices.get(&name);
             let ap2 = ap2_devices.get(&name);
+            let pwt = pw_targets.get(&name);
             let display_name = device
                 .map(|d| d.display_name.clone())
                 .or_else(|| ap2.map(|d| d.display_name.clone()))
+                .or_else(|| pwt.map(|t| t.display_name.clone()))
                 .unwrap_or_else(|| output_display_name(&name));
             RoutingNode {
-                // Present if live in the graph, or a discovered sendspin/AP2 device
-                // the liveness task still deems online. An offline device stays
-                // listed (grayed) until liveness removes it — an mDNS blip no
+                // Present if live in the graph, or a discovered sendspin/AP2/pw-sink
+                // endpoint the liveness task still deems online. An offline endpoint
+                // stays listed (grayed) until liveness removes it — an mDNS blip no
                 // longer makes it vanish.
-                present: node_id.is_some() || device.is_some_and(|d| d.present) || ap2.is_some_and(|d| d.present),
+                present: node_id.is_some()
+                    || device.is_some_and(|d| d.present)
+                    || ap2.is_some_and(|d| d.present)
+                    || pwt.is_some_and(|t| t.present),
                 node_id,
                 // Every output is now auto-discovered (sendspin + AP2); nothing is
                 // manually configured anymore (the RAOP store is gone).
@@ -241,12 +248,13 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let ap2_devices = state.ap2_devices.lock_recover().clone();
     // Per-source display label, keyed by node name, for every configured source
     // instance (AirPlay or RTP) — not just a fixed-name one.
+    let pw_targets = state.pw_targets.lock_recover().clone();
     let source_labels: std::collections::HashMap<String, String> = {
         let sources = state.sources.lock_recover();
         sources.list().into_iter().map(|entry| (entry.node_name(), entry.label.clone())).collect()
     };
     let reg = state.pw.lock_recover();
-    build_matrix(&reg, &devices, &ap2_devices, &source_labels, &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes)
+    build_matrix(&reg, &devices, &ap2_devices, &pw_targets, &source_labels, &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes)
 }
 
 /// Present source nodes as `(node_name, node_id)` — the set the meter hub taps
@@ -261,6 +269,29 @@ fn present_source_meters(matrix: &RoutingMatrix) -> Vec<(String, u32)> {
 /// if either node doesn't exist or no channel suffixes match on both sides.
 fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: u32) -> Vec<LinkSpec> {
     matched_port_specs_impl(state, source_node_id, output_node_id, false)
+}
+
+/// Like [`ensure_link_by_name`] but links the `source` node's **monitor** output
+/// ports (a sink's `monitor_*` tap) into `output`'s inputs. Used to fan a group
+/// anchor's monitor into a follower sink (e.g. an rtp-sink for the pw-sink
+/// backend) — the anchor is the steady QUANT-1024 driver, the follower pulls
+/// from its monitor at its own rate. Idempotency is handled by PipeWire (a
+/// duplicate link is rejected); callers re-invoke freely.
+pub async fn ensure_monitor_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, source: &str, output: &str) {
+    let ids = {
+        let st = pw.lock_recover();
+        node_id_for(&st, source).zip(node_id_for(&st, output))
+    };
+    let Some((source_id, output_id)) = ids else { return };
+    let specs = matched_port_specs_impl(pw, source_id, output_id, true);
+    if specs.is_empty() {
+        return;
+    }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
+        return;
+    }
+    let _ = reply_rx.await;
 }
 
 /// `want_monitor` selects which of the source node's output ports to match:
@@ -299,6 +330,22 @@ fn matched_port_specs_impl(state: &SharedState, source_node_id: u32, output_node
 /// wait_for_node_id.
 pub(crate) fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32> {
     state.nodes.values().filter(|n| n.node_name == node_name).map(|n| n.node_id).max()
+}
+
+/// All live `(node_id, node_name)` whose name contains `substr`, newest first.
+/// Used to find reactively-created nodes with auto-generated names (e.g.
+/// `module-rtp-session`'s `rtp_session.<sess>.<host>.local.ipv4` sink, which
+/// only appears once a receiver connects — pw_sink).
+pub fn nodes_matching(state: &SharedState, substr: &str) -> Vec<(u32, String)> {
+    let st = state.lock_recover();
+    let mut out: Vec<(u32, String)> = st
+        .nodes
+        .values()
+        .filter(|n| n.node_name.contains(substr))
+        .map(|n| (n.node_id, n.node_name.clone()))
+        .collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out
 }
 
 /// The set of sources feeding `output` in the intent (unique, sorted). Shared

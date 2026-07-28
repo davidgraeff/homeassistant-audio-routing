@@ -119,6 +119,8 @@ struct Inner {
     ap2_devices: SharedAp2Devices,
     /// Host-global AP2 PTP grandmaster — discovery registers each receiver as a peer.
     ap2_ptp: SharedAp2Ptp,
+    /// Discovered pw-sink targets (pw_target_discovery.rs).
+    pw_targets: crate::pw_target_discovery::SharedPwTargets,
     changes: ChangeNotifier,
 }
 
@@ -130,9 +132,10 @@ impl DiscoverySupervisor {
         devices: SharedSendspinDevices,
         ap2_devices: SharedAp2Devices,
         ap2_ptp: SharedAp2Ptp,
+        pw_targets: crate::pw_target_discovery::SharedPwTargets,
         changes: ChangeNotifier,
     ) -> Self {
-        Self(Arc::new(Mutex::new(Inner { running: None, devices, ap2_devices, ap2_ptp, changes })))
+        Self(Arc::new(Mutex::new(Inner { running: None, devices, ap2_devices, ap2_ptp, pw_targets, changes })))
     }
 
     pub fn is_running(&self) -> bool {
@@ -152,6 +155,7 @@ impl DiscoverySupervisor {
         let spawned = (|| -> anyhow::Result<()> {
             sendspin_discovery::spawn(&daemon, inner.devices.clone(), inner.changes.clone())?;
             ap2_discovery::spawn(&daemon, inner.ap2_devices.clone(), inner.changes.clone(), inner.ap2_ptp.clone())?;
+            crate::pw_target_discovery::spawn(&daemon, inner.pw_targets.clone(), inner.changes.clone())?;
             Ok(())
         })();
         if let Err(e) = spawned {

@@ -1,5 +1,6 @@
 mod airplay_clients;
 mod airplay_source;
+mod applemidi_sender;
 mod announce;
 mod announce_arbiter;
 mod ap2_discovery;
@@ -21,7 +22,12 @@ mod overlay_mixer;
 mod per_device_spike;
 mod player;
 mod pw_module;
+mod pw_sink;
+mod pw_sink_liveness;
+mod pw_sink_spike;
+mod pw_target_discovery;
 mod pw_thread;
+mod pwsink_server;
 mod resample;
 mod routing;
 mod routing_store;
@@ -220,6 +226,11 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let ap2_devices: ap2_discovery::SharedAp2Devices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let ap2_ptp = ap2_ptp::Ap2PtpService::new();
+    // Discovered pw-sink targets (pw_target_discovery.rs): remote PipeWire hosts
+    // running module-rtp-session, surfaced as virtual routing outputs
+    // (`pwsink-dev-*`) and driven by per-target AppleMIDI senders (pwsink_server.rs).
+    let pw_targets: pw_target_discovery::SharedPwTargets =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     let (pw_state, changes, pw_cmd) = pw_thread::spawn()?;
 
@@ -233,6 +244,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         sendspin_devices.clone(),
         ap2_devices.clone(),
         ap2_ptp.clone(),
+        pw_targets.clone(),
         changes.clone(),
     );
     if settings.lock_recover().discovery_enabled() {
@@ -322,6 +334,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             let ap2_control = ap2_control.clone();
             let settings = sync_settings.clone();
             let groups = groups.clone();
+            let pw_targets = pw_targets.clone();
             let mut rx = changes.subscribe();
             tokio::spawn(async move {
                 // routing::reconcile first (direct links for any real-node output),
@@ -330,7 +343,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                 // the next tick.
                 let lead = sync_settings::group_lead_us(&settings);
                 routing::reconcile(&pw, &cmd, &routing).await;
-                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control).await;
+                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets).await;
                 // Loops until the change channel closes (RecvError::Closed ends the
                 // `while let`); a Lagged wakeup reconciles just like a normal one.
                 use tokio::sync::broadcast::error::RecvError;
@@ -354,7 +367,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                     }
                     let lead = sync_settings::group_lead_us(&settings);
                     routing::reconcile(&pw, &cmd, &routing).await;
-                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control).await;
+                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets).await;
                 }
             });
         }
@@ -371,6 +384,11 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             }
         });
 
+        // Kept for the graceful-shutdown path below (the reconcile task's own
+        // Drop isn't guaranteed to run on process exit, so pw-sink sessions are
+        // torn down explicitly to send each receiver a clean BY).
+        let groups_for_shutdown = groups.clone();
+
         let app = api::router(
             pw_state,
             changes,
@@ -381,6 +399,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             meters,
             sendspin_devices,
             ap2_devices,
+            pw_targets,
             ap2_ptp.clone(),
             routing,
             sendspin_control,
@@ -403,6 +422,13 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // receiver cleanly (unregister its mDNS, close listeners). Sendspin
         // group servers and the RTP module tear down with the process.
         tracing::info!("shutting down; stopping AirPlay sources");
+        {
+            let mut groups = groups_for_shutdown.lock().await;
+            // End pw-sink sessions cleanly so remote module-rtp-session receivers get
+            // a BY and drop the session now, instead of holding a stale one until it
+            // times out (which otherwise blocks a prompt reconnect after restart).
+            groups.shutdown_pwsink();
+        }
         for (_id, handle) in std::mem::take(&mut *airplay.lock().await) {
             handle.stop().await;
         }

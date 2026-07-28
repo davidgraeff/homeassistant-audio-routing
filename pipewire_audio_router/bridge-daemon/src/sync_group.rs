@@ -31,8 +31,9 @@
 //! it), creates new anchors, and restarts a group's sendspin server / AP2 senders
 //! when their dialed set (or the AP2 wire rate) changes.
 
-use crate::config::SYNC_GRP_PREFIX;
+use crate::config::{PWSINK_DEV_PREFIX, SYNC_GRP_PREFIX};
 use crate::locks::LockRecover;
+use crate::pw_target_discovery::{PwTarget, SharedPwTargets};
 use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
@@ -46,6 +47,12 @@ use tokio::sync::oneshot;
 /// Ports for group servers' embedded sendspin listeners are allocated upward
 /// from here (distinct from any manual-output base so they never collide).
 const GROUP_BASE_PORT: u16 = 8930;
+
+/// Control ports for a group's pw-sink AppleMIDI sessions are allocated upward
+/// from here in steps of 2 (each session binds control + control+1 data). Well
+/// clear of GROUP_BASE_PORT (sendspin) and the AP2 port so the ranges never
+/// overlap.
+const PWSINK_BASE_PORT: u16 = 6200;
 
 /// Separator joining a sorted source-set into a group key (a control char that
 /// can't appear in a node name, so the join is unambiguous).
@@ -85,6 +92,12 @@ struct DesiredGroup {
     /// restart identity, so a rate change (e.g. a 48 kHz downgrade or a UI mode
     /// switch) restarts the senders + re-spawns the capture at the new rate.
     ap2_rate: u32,
+    /// PRESENT pw-sink targets (remote PipeWire hosts) in this group, by output
+    /// node name (`pwsink-dev-*`), sorted. Identity for "did the target set
+    /// change?" — each target's AppleMIDI session is fixed at start, so a
+    /// membership change is a drop-and-restart (only the pw-sink senders, never
+    /// the shared anchor).
+    pwsink_members: Vec<String>,
 }
 
 impl DesiredGroup {
@@ -97,6 +110,7 @@ impl DesiredGroup {
             sendspin_codec: "pcm",
             ap2_members: Vec::new(),
             ap2_rate: 48_000,
+            pwsink_members: Vec::new(),
         }
     }
 }
@@ -132,15 +146,30 @@ struct RunningGroup {
     /// The AP2 capture/wire rate (Hz) the running senders were started at — part
     /// of the restart identity alongside `ap2_members`.
     ap2_rate: u32,
+    /// Live pw-sink senders (pwsink_server.rs) for this group; drop = tear down
+    /// each target's advertised session. `None` when the group has no present
+    /// pw-sink targets.
+    pwsink_server: Option<crate::pwsink_server::PwSinkServerHandle>,
+    /// pw-sink target node names the running senders were started for — the
+    /// restart identity (a membership change drops + recreates the senders).
+    pwsink_members: Vec<String>,
+    /// Control ports assigned to the running pw-sink senders (data = +1); tracked
+    /// so port allocation avoids collisions across groups.
+    pwsink_ports: Vec<u16>,
 }
 
-/// A standalone per-device sender for an *ungrouped* (idle) sendspin device,
-/// kept alive in per-device mode so the device is always reachable — e.g. for an
-/// announcement to an idle speaker — without a cold start. It owns its own silent
-/// `null-audio-sink` (nothing routed in → its monitor is silence), captured and
-/// streamed to the one device; the overlay mixer replaces that silence with a
-/// ducked announcement when one is targeted at it. Superseded by the device's
-/// group sender the moment it's routed into a group.
+/// A standalone per-device sender for an *ungrouped* (idle) sendspin device, kept
+/// alive so the device is always reachable — an announcement, or a volume command,
+/// never pays a cold dial. It owns its own silent `null-audio-sink` (nothing routed
+/// in → its monitor is silence) whose monitor the overlay mixer turns into the
+/// announcement. Superseded by the device's group sender the moment it's routed
+/// into a group.
+///
+/// It runs under [`sendspin_server::StreamPolicy::WhenAnnounced`]: the connection
+/// stays up (dialed as `Discovery`, so it doesn't claim the device against another
+/// server) but carries **no audio** until an announcement is headed for the device.
+/// It used to `stream/start` on connect and push silence forever — see that enum
+/// for why that was both a claim on the device and ~1.5 Mbit/s per idle speaker.
 struct IdleSender {
     sink_node_name: String,
     sink_node_id: u32,
@@ -161,6 +190,28 @@ pub struct GroupReconciler {
 /// not `sendspin-dev-`/`ap2-dev-`/`sync-grp-` so routing never treats it as an
 /// output or anchor.
 const IDLE_SINK_PREFIX: &str = "idle-dev-";
+
+/// `n` free pw-sink control ports at/above [`PWSINK_BASE_PORT`], skipping any pair
+/// overlapping `taken` (each session binds `control` **and** `control + 1`), so the
+/// control/data pairs never collide. Pure, so the stepping is unit-testable.
+fn next_free_pwsink_ports(taken: impl IntoIterator<Item = u16>, n: usize) -> Vec<u16> {
+    let mut used: HashSet<u16> = HashSet::new();
+    for p in taken {
+        used.insert(p);
+        used.insert(p.saturating_add(1));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut port = PWSINK_BASE_PORT;
+    while out.len() < n && port < u16::MAX - 1 {
+        if !used.contains(&port) && !used.contains(&(port + 1)) {
+            out.push(port);
+            used.insert(port);
+            used.insert(port + 1);
+        }
+        port = port.saturating_add(2);
+    }
+    out
+}
 
 /// Shared handle so the alignment API (calibrate.rs) can read the live group
 /// layout the reconcile task owns.
@@ -198,6 +249,31 @@ impl GroupReconciler {
             }
         }
         false
+    }
+
+    /// Gracefully tear down every running group's pw-sink senders so each remote
+    /// `module-rtp-session` receiver gets a clean AppleMIDI `BY` (+ advert
+    /// withdraw) and drops its session immediately, rather than holding a stale
+    /// session until a timeout after the daemon restarts. Called from the process
+    /// shutdown path (main.rs): the async reconcile task's own `Drop` is not
+    /// guaranteed to run on exit, so the teardown is triggered explicitly here.
+    /// Best-effort and synchronous — `PwSinkServerHandle`/`AppleMidiSender` `Drop`
+    /// sends the `BY` inline before returning.
+    pub fn shutdown_pwsink(&mut self) {
+        let groups = self.running.values().filter(|g| g.pwsink_server.is_some()).count();
+        if groups == 0 {
+            return;
+        }
+        // Log BEFORE dropping: the container's stop-grace can SIGKILL us partway
+        // through the drop, so the tail of a post-drop log may never flush. The
+        // BY itself still escapes — `AppleMidiSender::Drop` withdraws the advert
+        // and sends BY *first*, before the worker-thread joins that a SIGKILL cuts.
+        tracing::info!("graceful shutdown: withdrawing advert + sending BY for {groups} pw-sink group session(s)");
+        for g in self.running.values_mut() {
+            g.pwsink_server = None; // drop → advert withdraw + BY to peers
+            g.pwsink_members.clear();
+            g.pwsink_ports.clear();
+        }
     }
 
     /// Snapshot every running group (anchor + members) for the alignment API.
@@ -238,6 +314,7 @@ fn compute_desired(
     devices: &BTreeMap<String, SendspinDevice>,
     ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
     ap2_latencies: &BTreeMap<String, u16>,
+    pw_targets: &BTreeMap<String, PwTarget>,
 ) -> BTreeMap<String, DesiredGroup> {
     let mut groups: BTreeMap<String, DesiredGroup> = BTreeMap::new();
 
@@ -268,9 +345,25 @@ fn compute_desired(
         g.ap2_members.push((dev_node.clone(), addr.ip(), ap2_latencies.get(dev_node).copied()));
     }
 
+    // Present pw-sink targets (remote PipeWire hosts) → members of their group.
+    // The audio path (per-target AppleMIDI sender) is built in reconcile step (e).
+    for (node, tgt) in pw_targets {
+        if !tgt.present {
+            continue;
+        }
+        let sources = routing::source_set_of(intent, node);
+        if sources.is_empty() {
+            continue;
+        }
+        let g = groups.entry(source_key(&sources)).or_insert_with(|| DesiredGroup::new(&sources));
+        g.pwsink_members.push(node.clone());
+    }
+
     for g in groups.values_mut() {
         g.sendspin_node_names.sort();
+        g.sendspin_members.sort();
         g.ap2_members.sort();
+        g.pwsink_members.sort();
     }
     groups
 }
@@ -294,6 +387,15 @@ impl GroupReconciler {
         port
     }
 
+    /// Allocate `n` control ports for a group's pw-sink AppleMIDI sessions (each
+    /// session also binds `control + 1` as its data port), avoiding every port a
+    /// running group's pw-sink senders already hold. Ports step by 2 from
+    /// PWSINK_BASE_PORT so the control/data pairs never overlap.
+    fn alloc_pwsink_ports(&self, n: usize) -> Vec<u16> {
+        let group_ports = self.running.values().flat_map(|g| g.pwsink_ports.iter().copied());
+        next_free_pwsink_ports(group_ports, n)
+    }
+
     /// `send_ahead_us` is the group presentation lead from the sync settings
     /// (sync_settings.rs), applied to every group's sendspin server.
     pub async fn reconcile(
@@ -308,12 +410,14 @@ impl GroupReconciler {
         ap2_ptp: &crate::ap2_ptp::SharedAp2Ptp,
         sync_settings: &crate::sync_settings::SharedSyncSettings,
         ap2_control: &crate::ap2_volume::SharedAp2Control,
+        pw_targets: &SharedPwTargets,
     ) {
         let intent = routing_store::snapshot(routing);
         let devices_map = devices.lock_recover().clone();
         let ap2_map = ap2_devices.lock_recover().clone();
         let ap2_latencies = sync_settings.lock_recover().ap2_latencies();
-        let mut desired = compute_desired(&intent, &devices_map, &ap2_map, &ap2_latencies);
+        let pw_targets_map = pw_targets.lock_recover().clone();
+        let mut desired = compute_desired(&intent, &devices_map, &ap2_map, &ap2_latencies, &pw_targets_map);
 
         // Resolve each group's AP2 capture/wire rate from the per-output rate mode
         // + learned capability cache (48000 iff every member's effective rate is
@@ -379,6 +483,7 @@ impl GroupReconciler {
                 );
                 drop(rg.server);
                 drop(rg.ap2_sender); // signals AP2 senders to TEARDOWN their receivers
+                drop(rg.pwsink_server); // tears down each pw-sink target session (BY + advert)
                 let (tx, rx) = oneshot::channel();
                 if pw_cmd.send(PwCommand::DestroySinkNode { node_id: rg.anchor_node_id, reply: tx }).is_ok() {
                     let _ = rx.await;
@@ -443,13 +548,16 @@ impl GroupReconciler {
                         ap2_sender: None,
                         ap2_members: Vec::new(),
                         ap2_rate: 48_000,
+                        pwsink_server: None,
+                        pwsink_members: Vec::new(),
+                        pwsink_ports: Vec::new(),
                     },
                 );
             }
 
             // Snapshot what we need so no borrow of `self.running` is held across
             // an await (the async link/server calls below).
-            let (anchor_name, anchor_id, port, prev_devices, prev_codec, prev_lead, prev_ap2, prev_ap2_rate) = {
+            let (anchor_name, anchor_id, port, prev_devices, prev_codec, prev_lead, prev_ap2, prev_ap2_rate, prev_pwsink) = {
                 let rg = self.running.get(key).expect("just inserted");
                 (
                     rg.anchor_node_name.clone(),
@@ -460,6 +568,7 @@ impl GroupReconciler {
                     rg.server_send_ahead_us,
                     rg.ap2_members.clone(),
                     rg.ap2_rate,
+                    rg.pwsink_members.clone(),
                 )
             };
 
@@ -575,6 +684,47 @@ impl GroupReconciler {
                             Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start AP2 senders: {e}"),
                         },
                         Err(e) => tracing::warn!("sync group '{anchor_name}': AP2 PTP grandmaster unavailable: {e}"),
+                    }
+                }
+            }
+
+            // e. (Re)start pw-sink senders when the target set changes. Each
+            //    target's AppleMIDI session (advert + bound ports) is fixed at
+            //    start, so a membership change is a drop-and-recreate — only the
+            //    pw-sink senders, never the shared anchor (so co-routed sendspin/AP2
+            //    outputs fed from the same anchor never blip). Fresh control ports
+            //    are allocated per restart; the receiver reconnects to the new
+            //    advertised session.
+            if d.pwsink_members != prev_pwsink {
+                if let Some(rg) = self.running.get_mut(key) {
+                    rg.pwsink_server = None; // drop → tear down old target sessions
+                    rg.pwsink_members = Vec::new();
+                    rg.pwsink_ports = Vec::new();
+                }
+                if !d.pwsink_members.is_empty() {
+                    let ports = self.alloc_pwsink_ports(d.pwsink_members.len());
+                    let members: Vec<crate::pwsink_server::PwSinkMember> = d
+                        .pwsink_members
+                        .iter()
+                        .zip(ports.iter())
+                        .map(|(node_name, port)| crate::pwsink_server::PwSinkMember {
+                            node_name: node_name.clone(),
+                            control_port: *port,
+                        })
+                        .collect();
+                    match crate::pwsink_server::start(members, anchor_id) {
+                        Ok(handle) => {
+                            tracing::info!(
+                                "sync group '{anchor_name}': pw-sink senders advertising {} target session(s)",
+                                d.pwsink_members.len()
+                            );
+                            if let Some(rg) = self.running.get_mut(key) {
+                                rg.pwsink_server = Some(handle);
+                                rg.pwsink_members = d.pwsink_members.clone();
+                                rg.pwsink_ports = ports;
+                            }
+                        }
+                        Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start pw-sink senders: {e}"),
                     }
                 }
             }

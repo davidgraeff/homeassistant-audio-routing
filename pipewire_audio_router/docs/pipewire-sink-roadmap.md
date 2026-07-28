@@ -33,7 +33,7 @@ announce/duck (§4 two-tier grouping) without re-adding a Rust hot path.
 | Sync (v1) | Fixed-offset alignment via a per-target jitter buffer (`sess.latency.msec`); separate-room use case |
 | Sync (v2, future) | Shared PTP clock — see §7 |
 | Announce/duck | **Native per-device mix bus** — a hard requirement, done in-graph, no Rust relay (§4 below) |
-| Discovery | mDNS `_workstation._tcp` candidates → user-approved → RTCP-confirmed liveness |
+| Discovery | mDNS `_workstation._tcp` candidates → user-approved → host-reachability liveness (RTCP ruled out — see §4 + spike-results) |
 | Volume | Native `Props`/`channelVolumes` on the sink node (§9) — free, no in-band protocol |
 
 **Non-goals (v1):** same-room sample-tight lock with an AP2 receiver (needs
@@ -113,6 +113,15 @@ Design notes:
 Mirrors the Sendspin philosophy — "mDNS is discovery-only; liveness is
 connection-driven" (§5.1).
 
+> **Spike correction (see [spike-results](pipewire-sink-spike-results.md)):**
+> **multicast SAP does not cross typical consumer LANs** (IGMP snooping drops the
+> group), and PipeWire's rtp-sap *receiver* can't cleanly take a unicast
+> announcement (connected socket). So the receiver is **not** rtp-sap discovery —
+> it is a **static `rtp-source`** with the daemon's fixed wire format
+> (L16/48k/2, `audio.format=S16BE`, `node.always-process=true`) on a known
+> per-target port. `_workstation._tcp` still drives *candidate* discovery of
+> reachable hosts; the SDP is not needed because the format is fixed.
+
 1. **Candidates** — browse `_workstation._tcp.local.` (Avahi's default
    advertisement; some distros ship it disabled — the help link covers that),
    optionally enriched by `_ssh._tcp` / `_device-info._tcp`. This yields
@@ -120,12 +129,14 @@ connection-driven" (§5.1).
    no standard "I am a PipeWire RTP sink" mDNS record.
 2. **User approval** — candidates surface as `unapproved`; approval is persisted
    to config. Unapproved hosts never receive audio.
-3. **Liveness = RTCP receiver reports** — there is no reliable TCP port to probe
-   for rtp-sap readiness (SAP is passive multicast; PipeWire's native transport
-   is a Unix socket). Instead, once the target's `rtp-source` actually consumes
-   the stream it sends RTCP RRs back to the sender — a true "this target is
-   receiving" signal, and the honest confirmation that the user set their box up
-   right. Mirrors `sendspin_liveness.rs`.
+3. **Liveness — RTCP ruled out (spike-results §4).** The original plan (RTCP
+   receiver reports) is **impossible**: PipeWire's RTP modules implement no RTCP
+   at all. There is also no reliable TCP port to probe (SAP is passive multicast;
+   PipeWire's native transport is a Unix socket). Revised options, **decision
+   deferred**: (a) host reachability — mDNS presence + periodic TCP/ICMP probe
+   ("host up", not "playing"); (b) a receiver-announced heartbeat SAP session the
+   daemon discovers (needs extra receiver config); (c) accept fire-and-forget and
+   surface "configured/announced" instead of "connected". Pick during P1.
 4. **Help button** in the discovery listing → docs for the *remote* setup: load
    `libpipewire-module-rtp-sap` in listen mode (a `pipewire.conf.d/` drop-in or
    `pactl load-module`). This is the only manual step, and it is on the remote —
@@ -160,7 +171,7 @@ Mirrors the established discovery/output pattern.
 | `config.rs` / `outputs_store.rs` | `PW_DEV_PREFIX`; persist approved targets + per-target `jb_msec`, dest IP/port | `RaopOutputConfig` |
 | `rtp_sink.rs` (new) | Load `rtp-sink` (+ SAP announce) as a real node via `pw_thread` `Load`/`Unload`; build the per-device mix bus (loopback + null-sink) | old `raop.rs` module-load; anchor `CreateSinkNode` |
 | `sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
-| `pw_target_liveness.rs` (new) | RTCP-RR-based liveness → output health | `sendspin_liveness.rs` |
+| `pw_target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `sendspin_liveness.rs` |
 | `api.rs` | Candidate list + `approve` endpoint + per-target JB setter + help URL; expose `pw-dev-*` as routable output & `media_player` | §9 outputs derivation |
 | `frontend/` (Svelte) | Discovery listing: approve + help button; per-target JB slider | existing admin console |
 
@@ -188,11 +199,13 @@ AP2 receiver, both ends must slave to one clock:
 
 ## 8. Phases
 
-- **P0 — Two-box transport spike (½–1 day).** On two Linux boxes: `rtp-sink` +
-  SAP announce → `rtp-sap` listener. Verify (a) a **unicast** SAP session is
-  instantiated **only** by its addressed target (per-target routing doesn't leak
-  to every listener), (b) exact module params for unicast + SAP + 48 kHz S16 +
-  configurable JB, (c) RTCP RRs flow back. Everything downstream hinges on this.
+- **P0 — Transport spike — DONE** (local mechanics + real-LAN `/api/spike/pw-sink`;
+  see [spike-results](pipewire-sink-spike-results.md)). Confirmed: SAP
+  announce→discover auto-creates the receiver source with session identity +
+  JB; per-target key is `rtp.destination.ip` and unicast media isolates targets;
+  exact params (S16LE/48k/2, `sess.name`, `sess.sap.announce`). Corrected: **no
+  RTCP** (liveness rethought, §4); single-box multicast/CLI can't drive audio
+  flow (real-LAN spike is the oracle).
 - **P1 — Routable output (~2–3 days).** Discovery browser + `SharedPwTargets` +
   approval + config persistence; `rtp_sink.rs` node load/unload; the
   follower-sink branch in `sync_group.rs`; expose in API + matrix + media_player;
@@ -215,3 +228,72 @@ Rough v1 (P0–P2): **~1 week**.
   small tee. (Sendspin/AP2 fan in Rust; here we fan by links.)
 - **Discovery noise**: `_workstation._tcp` lists *all* Avahi hosts, not just
   audio-capable ones — approval gating (§4) is what keeps the list meaningful.
+
+---
+
+## 10. Phase B — IMPLEMENTED (as-built, 2026-07-27)
+
+The backend is built and compiles/tests green. It **supersedes parts of §8's P1/P2
+plan** — the transport pivoted from `rtp-sink` + SAP to a custom **AppleMIDI/RTP
+audio sender** (the only mDNS-discoverable stock receiver, `module-rtp-session`,
+refuses plain RTP; SAP multicast doesn't cross consumer routers). The sender was
+proven end-to-end against a stock receiver (`E@440`; see
+[spike-results](pipewire-sink-spike-results.md) "PROVEN" section).
+
+**Files.** `applemidi_sender.rs` (transport, frozen interface — Task 1),
+`pw_target_discovery.rs` (discovery), `pwsink_server.rs` (per-group audio path),
+`pw_sink_liveness.rs` (status registry), plus wiring in `sync_group.rs`,
+`discovery_supervisor.rs`, `routing.rs`, `api.rs`, `main.rs`.
+
+**Data path.** Discovery browses `_pipewire-audio._udp` → `SharedPwTargets`
+(`pwsink-dev-<slug>`) → shown as a matrix column + `/api/outputs`. Routing a
+source to a target makes `sync_group` put it in the source-set's group; the group
+anchor's monitor is captured once (`sendspin_capture`, 48k/S16/stereo) and a
+`pwsink-relay` (SCHED_FIFO) fans it to one `AppleMidiSender` **per target**. Each
+sender advertises its own session `pwrouter-<slug>`; the target's
+`module-rtp-session` discovers it, runs the AppleMIDI handshake, and receives L16
+RTP. Liveness = `AppleMidiSender::status().established`, polled into
+`pw_sink_liveness` and surfaced as `/api/outputs` `pwsink_streaming`.
+
+**Decisions taken (were deferred to the implementer):**
+- **No approval / no store.** Unlike the old `_workstation._tcp` sketch (a generic
+  "any Linux host" signal that needed approval to filter noise), `_pipewire-audio.
+  _udp` is advertised *only* by a configured `module-rtp-session` host — a strong
+  signal — so targets are directly routable, exactly like sendspin/AP2 devices.
+  (§4/§8's approval + config-persistence steps are intentionally dropped.)
+- **Per-target sessions (not per-group).** One `AppleMidiSender` per target, each
+  fed a per-device-**mixed** copy of the capture via `overlay_mixer::mix_into`, so
+  per-device announce/duck (the must-have, §3/P2) works for free — the same shape
+  AP2's relay uses. A single shared session couldn't duck one member alone.
+- **Announce/duck reuses `overlay_mixer`** — no separate mix-bus topology needed
+  (§3's loopback/link plan is obsolete for this path).
+- **Announcing to an *unrouted* target works too (2026-07-28).** A target only
+  hears an overlay while a sender is feeding it, so an unrouted one used to get
+  nothing. It now gets an **on-demand announce session** — a private silent sink
+  plus one `pwsink_server` advertising `pwrouter-<slug>`, opened by
+  `GroupReconciler::ensure_announce_transport` before the clip and dropped after a
+  30 s lease (`BY` + advert withdraw). Not permanent, precisely *because* of the
+  discover-mode behaviour below: a standing advert per idle target would keep every
+  receiver on the LAN attached. The clip isn't consumed until the receiver attaches,
+  so it plays whole, a moment late. "Is it live?" reads `PwSinkLiveness`
+  `established` (not group membership), so a routed-but-unattached target is
+  reported honestly instead of swallowing the clip. Full mechanism:
+  [architecture.md §5.4](architecture.md#54-announcing-to-an-output-with-nothing-routed-into-it).
+  **Same cross-talk caveat**: with 2+ targets on one LAN, an announcement aimed at
+  one is heard by the others until session scoping exists.
+
+**Deferred (documented, not blocking single-room):**
+- **Multi-target routing scoping.** Stock `module-rtp-session` in discover mode
+  connects to *every* discovered session of the media type (no name filtering), so
+  2+ pw-sink targets on one LAN cross-connect (each receiver hears both sessions).
+  The single separate-room target (the primary use case) is unaffected. A scoping
+  mechanism (per-receiver session binding) is future work.
+- **Dedicated liveness probe.** mDNS removes are ignored (TTL-flap safe);
+  present-ness relies on re-resolve + handshake status. A TCP/timeout probe like
+  `sendspin_liveness`/`ap2_liveness` can be added if stale entries become an issue.
+- **PTP sample-lock** (§7) — unchanged, future.
+
+**Not yet done:** live end-to-end deploy validation (needs the Fedora box running
+`module-rtp-session` + a routing link created); frontend badge for
+`pwsink_streaming`; `media_player` exposure parity (outputs appear via
+`/api/outputs`; HA `media_player` bridging follows the sendspin/AP2 pattern).
