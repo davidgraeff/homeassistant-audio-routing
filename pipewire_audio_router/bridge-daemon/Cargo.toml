@@ -1,6 +1,6 @@
 [package]
 name = "bridge-daemon"
-version = "0.2.0"
+version = "0.3.20260728212654"
 edition = "2021"
 
 # This package is its own workspace root, and the `exclude` is load-bearing: a

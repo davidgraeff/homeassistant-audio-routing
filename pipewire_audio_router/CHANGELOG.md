@@ -21,6 +21,20 @@
   file — harmless).
 -->
 
+## 0.3.20260728212654
+
+_2026-07-28_
+
+- 048bf3b add-on(config): trim comments that point at the moved spikes/
+- 370e784 add-on: a changelog, and a release script that stamps it
+- 12f061c docs: drop the superseded PLAN.md
+- f90c453 docs(sendspin churn): the daemon was never the 30 s; the firmware is
+- a6d889c sendspin: stop reconnecting speakers, because a reconnect costs 30 s
+- e1243b0 pi-bridge: a testing console for the Bluetooth leg
+- 12415c7 RTP dropouts: the silence starts at the A2DP boundary; drop the IGMP watchdog
+- 3a9e527 chore(doc): Move spikes into old/ documentation directory
+- 05d6511 chore(sendspin): carry the fork as a submodule instead of a vendored copy
+
 ## 0.2.0
 
 _2026-07-26_
