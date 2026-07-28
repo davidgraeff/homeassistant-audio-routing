@@ -263,9 +263,16 @@ impl ClientManager {
         match tasks.get_mut(fullname) {
             Some(existing) if existing.url == url => {}
             Some(existing) => {
-                log::info!("[{fullname}] address changed ({} -> {url}), reconnecting", existing.url);
+                log::info!(
+                    "[{fullname}] address changed ({} -> {url}), reconnecting",
+                    existing.url
+                );
                 existing.url = url.to_string();
-                if existing.directive_tx.send(Directive::Dial(url.to_string())).is_err() {
+                if existing
+                    .directive_tx
+                    .send(Directive::Dial(url.to_string()))
+                    .is_err()
+                {
                     *existing = spawn_supervisor(
                         fullname.to_string(),
                         url.to_string(),
