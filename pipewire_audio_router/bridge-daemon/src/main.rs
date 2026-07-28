@@ -342,11 +342,6 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                 // then sync_group (which owns the sendspin + AP2 groups) — the group
                 // lead comes from the live sync settings so a change takes effect on
                 // the next tick.
-                let lead = sync_settings::group_lead_us(&settings);
-                routing::reconcile(&pw, &cmd, &routing).await;
-                groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets).await;
-                // Loops until the change channel closes (RecvError::Closed ends the
-                // `while let`); a Lagged wakeup reconciles just like a normal one.
                 use tokio::sync::broadcast::error::RecvError;
                 // Coalescing window: after a change wakes us, wait for a brief quiet
                 // period (draining any further changes) before reconciling, so a
@@ -356,7 +351,35 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                 // prior one is released. 400 ms is imperceptible for routing yet
                 // absorbs a rapid click-storm or liveness flap.
                 const RECONCILE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
-                while let Ok(()) | Err(RecvError::Lagged(_)) = rx.recv().await {
+                // How soon to come back when a pass left work undone (a sender that
+                // failed to start, a node that hadn't appeared yet, a device whose
+                // URL hadn't resolved). Without this the loop is purely change-driven,
+                // so a transient failure left a group silent until some unrelated
+                // event happened along — and the events that would have helped are
+                // exactly the ones a failing group doesn't produce.
+                const RECONCILE_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+                loop {
+                    let lead = sync_settings::group_lead_us(&settings);
+                    routing::reconcile(&pw, &cmd, &routing).await;
+                    let retry = {
+                        let mut g = groups.lock().await;
+                        g.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets).await;
+                        g.retry_wanted()
+                    };
+                    // Wait for the next change — or for the retry delay, whichever
+                    // comes first. Closed channel ends the task.
+                    if retry {
+                        match tokio::time::timeout(RECONCILE_RETRY, rx.recv()).await {
+                            Ok(Ok(())) | Ok(Err(RecvError::Lagged(_))) => {}
+                            Ok(Err(RecvError::Closed)) => return,
+                            Err(_elapsed) => continue, // retry now, nothing to coalesce
+                        }
+                    } else {
+                        match rx.recv().await {
+                            Ok(()) | Err(RecvError::Lagged(_)) => {}
+                            Err(RecvError::Closed) => return,
+                        }
+                    }
                     // Drain the burst: keep resetting the quiet timer while changes
                     // keep arriving; reconcile once it goes quiet. Exit if closed.
                     loop {
@@ -366,9 +389,6 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                             Err(_elapsed) => break, // quiet window elapsed
                         }
                     }
-                    let lead = sync_settings::group_lead_us(&settings);
-                    routing::reconcile(&pw, &cmd, &routing).await;
-                    groups.lock().await.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets).await;
                 }
             });
         }
@@ -442,8 +462,9 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 
         // On SIGTERM/SIGINT (run.sh's trap / container stop), stop every AirPlay
-        // receiver cleanly (unregister its mDNS, close listeners). Sendspin
-        // group servers and the RTP module tear down with the process.
+        // receiver cleanly (unregister its mDNS, close listeners). The RTP module
+        // tears down with the process; everything that a *device* holds state for is
+        // closed deliberately below.
         tracing::info!("shutting down; stopping AirPlay sources");
         {
             let mut groups = groups_for_shutdown.lock().await;
@@ -456,6 +477,10 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             // out, which is what makes the first connect after a restart fail. Awaits
             // the RTSP TEARDOWNs (bounded), unlike a plain drop.
             groups.shutdown_ap2().await;
+            // And sendspin: a device whose socket is killed mid-stream answers the
+            // next daemon's reconnect with tens of seconds of silence (2026-07-28
+            // hardware test), which is most of why a restart used to be so audible.
+            groups.shutdown_sendspin().await;
         }
         for (_id, handle) in std::mem::take(&mut *airplay.lock().await) {
             handle.stop().await;

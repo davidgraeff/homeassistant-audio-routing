@@ -124,18 +124,37 @@ struct RunningGroup {
     /// Live sendspin server (dropping it stops capture/dial but leaves the
     /// anchor intact); `None` when the group has no present sendspin devices.
     server: Option<SendspinServerHandle>,
-    /// Snapshot of the sendspin device set the running server was started for.
+    /// The sendspin device set currently in the group. Bookkeeping for the API/UI
+    /// and the alignment wizard — deliberately NOT part of the server's restart
+    /// identity (see the reconcile step that maintains it).
     server_devices: Vec<String>,
-    /// The `(fullname, url)` set last pushed to the running server. A membership change
-    /// restarts the server; a mere *address* change only needs a re-supervise, which is
-    /// why this is tracked separately from `server_devices`.
+    /// The `(fullname, url)` set last pushed to the running server. Both a
+    /// membership change and a mere *address* change are applied to the running
+    /// server (supervise / stop_device), so this is what that diff is taken against.
     server_members: Vec<(String, String)>,
-    /// The wire codec the running sendspin server was started with — part of its
+    /// The wire codec the running sendspin server was started with — half of its
     /// restart identity (a codec change needs a fresh `stream/start`).
     server_codec: &'static str,
     /// The send-ahead the running sendspin server was started with (µs) — the other
-    /// part of that identity, since the timeline fixes it at construction.
+    /// half of that identity, since the timeline fixes it at construction.
+    ///
+    /// Compared **one-way**: it is a high-water mark, so only a *higher* requirement
+    /// restarts the server. The send-ahead is a floor the spec asks us to clear ("the
+    /// maximum per-player send-ahead across grouped players") and it is derived from
+    /// membership — so a device leaving lowers it, and honouring that lower value
+    /// would reconnect every remaining member to buy 50 ms of latency back. On real
+    /// ESPHome firmware a reconnect costs tens of seconds of silence (2026-07-28
+    /// hardware test), so a stale-but-larger lead is enormously the cheaper of the
+    /// two. Reset to 0 when the server stops, so the next one starts from the real
+    /// requirement rather than a departed device's.
     server_send_ahead_us: i64,
+    /// Set by [`GroupReconciler::force_server_restart`] to make the next reconcile
+    /// restart this group's sendspin server even though its stream config is
+    /// unchanged — the static-delay path, where a reconnect is the *point* (current
+    /// ESPHome firmware reads `SetStaticDelay` at stream start, not live). A flag
+    /// rather than dropping the handle on the spot, so the teardown still goes
+    /// through the graceful path.
+    force_restart: bool,
     /// Live AP2 senders (ap2_server.rs) for this group; drop = TEARDOWN each
     /// receiver session. `None` when the group has no present AP2 receivers.
     ap2_sender: Option<crate::ap2_server::Ap2ServerHandle>,
@@ -175,7 +194,10 @@ struct IdleSender {
     sink_node_name: String,
     sink_node_id: u32,
     port: u16,
-    _server: SendspinServerHandle,
+    /// Torn down via `shutdown().await` when the device is grouped or leaves, so
+    /// the connection is really gone before its group server dials the same
+    /// device — not merely dropped.
+    server: SendspinServerHandle,
 }
 
 /// An **on-demand** sender for an *unrouted* output, opened so an announcement can
@@ -230,6 +252,12 @@ pub struct GroupReconciler {
     /// On-demand announce sessions for unrouted AP2 receivers / pw-sink targets,
     /// keyed by output node name (`ap2-dev-*` / `pwsink-dev-*`).
     announce_sessions: HashMap<String, AnnounceSession>,
+    /// Something this pass wanted to do didn't take (a sender failed to start, an
+    /// anchor didn't appear, a device had no resolved URL yet) and only a *retry*
+    /// will fix it. The reconcile task is change-driven with no periodic tick, so
+    /// without this a transient failure left a group silent until an unrelated
+    /// event happened along — see [`Self::retry_wanted`].
+    retry_wanted: bool,
 }
 
 /// Distinctive sink-name prefix for an idle device's private sink. Deliberately
@@ -362,21 +390,61 @@ pub struct GroupSnapshot {
 
 impl GroupReconciler {
     /// Force the sendspin server of the group containing `sendspin_node_name` to
-    /// restart on the next reconcile, by dropping its handle and clearing the
-    /// remembered dialed set (so the `sendspin_node_names != prev_devices` check
-    /// fires). The devices reconnect and re-apply their static delay on connect
-    /// — the only way current ESPHome firmware picks up a delay change (it reads
-    /// `SetStaticDelay` at stream start, not live). Returns true if a group was
-    /// found; the caller must nudge a reconcile (ChangeNotifier) afterwards.
+    /// restart on the next reconcile. The devices reconnect and re-apply their
+    /// static delay on connect — the only way current ESPHome firmware picks up a
+    /// delay change (it reads `SetStaticDelay` at stream start, not live). Returns
+    /// true if a group was found; the caller must nudge a reconcile
+    /// (ChangeNotifier) afterwards.
+    ///
+    /// Sets a flag instead of dropping the handle here: membership is no longer part
+    /// of the restart identity, so clearing the remembered device set would not
+    /// restart anything — and the teardown belongs on the reconcile path, which can
+    /// `await` the graceful shutdown (`stream/end` before the socket goes).
     pub fn force_server_restart(&mut self, sendspin_node_name: &str) -> bool {
         for g in self.running.values_mut() {
             if g.server_devices.iter().any(|d| d == sendspin_node_name) {
-                g.server = None;
-                g.server_devices.clear();
+                g.force_restart = true;
                 return true;
             }
         }
         false
+    }
+
+    /// Gracefully tear down every sendspin server — group senders and idle senders
+    /// alike — so each device gets a `stream/end` before the process goes away.
+    ///
+    /// Without this the add-on's SIGTERM just kills the sockets under devices that
+    /// have an active stream, and the 2026-07-28 hardware test says that is expensive:
+    /// after an abrupt teardown a Voice PE stayed silent for **tens of seconds** once
+    /// the new daemon reconnected it, while AP2 receivers on the same anchor were back
+    /// in ~5 s. The old comment here — "sendspin group servers tear down with the
+    /// process" — was true and was the problem.
+    ///
+    /// Bounded: each `shutdown()` carries its own `GRACEFUL_END` timeout, and they run
+    /// concurrently, so the total wait is the slowest single one rather than their sum.
+    pub async fn shutdown_sendspin(&mut self) {
+        let mut handles: Vec<SendspinServerHandle> = Vec::new();
+        for g in self.running.values_mut() {
+            if let Some(h) = g.server.take() {
+                handles.push(h);
+                g.server_devices.clear();
+                g.server_members.clear();
+                g.server_send_ahead_us = 0;
+            }
+        }
+        // Idle senders are connected too (that is their whole point), and an idle
+        // sender mid-announcement has an active stream like any other.
+        for (_dev, s) in std::mem::take(&mut self.idle_senders) {
+            handles.push(s.server);
+        }
+        if handles.is_empty() {
+            return;
+        }
+        tracing::info!("graceful shutdown: stream/end + close for {} sendspin server(s)", handles.len());
+        let tasks: Vec<_> = handles.into_iter().map(|h| tokio::spawn(async move { h.shutdown().await })).collect();
+        for t in tasks {
+            let _ = t.await;
+        }
     }
 
     /// Gracefully tear down every running group's pw-sink senders so each remote
@@ -840,6 +908,13 @@ impl GroupReconciler {
         Self::default()
     }
 
+    /// Did the last [`Self::reconcile`] leave work undone that only a retry can
+    /// finish? The reconcile task uses this to wake itself again after a short
+    /// delay instead of waiting for the next unrelated change (main.rs).
+    pub fn retry_wanted(&self) -> bool {
+        self.retry_wanted
+    }
+
     /// Lowest free port at/above the base not used by a running group or idle
     /// sender. `extra` lets a caller reserve ports it's about to assign in the
     /// same reconcile pass (before they land in `running`/`idle_senders`).
@@ -885,6 +960,9 @@ impl GroupReconciler {
         ap2_control: &crate::ap2_volume::SharedAp2Control,
         pw_targets: &SharedPwTargets,
     ) {
+        // Re-earned every pass: whatever failed last time either succeeds now or
+        // sets this again.
+        self.retry_wanted = false;
         let intent = routing_store::snapshot(routing);
         let devices_map = devices.lock_recover().clone();
         let ap2_map = ap2_devices.lock_recover().clone();
@@ -954,7 +1032,12 @@ impl GroupReconciler {
                     rg.server_devices.len(),
                     rg.ap2_members.len()
                 );
-                drop(rg.server);
+                if let Some(server) = rg.server {
+                    // `stream/end` to each member before its socket goes, same as a
+                    // config-change restart — an unrouted speaker should be told the
+                    // stream is over, not left to notice a dead connection.
+                    server.shutdown().await;
+                }
                 drop(rg.ap2_sender); // signals AP2 senders to TEARDOWN their receivers
                 drop(rg.pwsink_server); // tears down each pw-sink target session (BY + advert)
                 let (tx, rx) = oneshot::channel();
@@ -976,7 +1059,11 @@ impl GroupReconciler {
         for dev in drop_idle {
             if let Some(s) = self.idle_senders.remove(&dev) {
                 tracing::info!("idle sender '{}' torn down (device grouped or gone)", s.sink_node_name);
-                drop(s._server);
+                // Awaited, not dropped: this runs immediately before the group
+                // server below dials the same device, so the old connection must be
+                // gone first — and if an announcement was playing through this
+                // sender, the device is told the stream ended.
+                s.server.shutdown().await;
                 let (tx, rx) = oneshot::channel();
                 if pw_cmd.send(PwCommand::DestroySinkNode { node_id: s.sink_node_id, reply: tx }).is_ok() {
                     let _ = rx.await;
@@ -1028,13 +1115,15 @@ impl GroupReconciler {
                 match rx.await {
                     Ok(Ok(())) => {}
                     _ => {
-                        tracing::warn!("failed to create sync anchor '{anchor_node_name}'");
+                        tracing::warn!("failed to create sync anchor '{anchor_node_name}' — retrying shortly");
+                        self.retry_wanted = true;
                         continue;
                     }
                 }
                 let Some(anchor_node_id) = wait_for_node(pw, &anchor_node_name).await else {
-                    tracing::warn!("sync anchor '{anchor_node_name}' did not appear in the graph in time");
-                    continue; // a later reconcile retries once it shows up
+                    tracing::warn!("sync anchor '{anchor_node_name}' did not appear in the graph in time — retrying shortly");
+                    self.retry_wanted = true;
+                    continue;
                 };
                 let port = self.alloc_port(&HashSet::new());
                 tracing::info!("created sync anchor '{anchor_node_name}' (id {anchor_node_id}) for source(s) {:?}", d.sources);
@@ -1049,6 +1138,7 @@ impl GroupReconciler {
                         server_members: Vec::new(),
                         server_codec: "pcm",
                         server_send_ahead_us: 0,
+                        force_restart: false,
                         ap2_sender: None,
                         ap2_members: Vec::new(),
                         ap2_rate: 48_000,
@@ -1061,15 +1151,29 @@ impl GroupReconciler {
 
             // Snapshot what we need so no borrow of `self.running` is held across
             // an await (the async link/server calls below).
-            let (anchor_name, anchor_id, port, prev_devices, prev_codec, prev_lead, prev_ap2, prev_ap2_rate, prev_pwsink) = {
+            let (
+                anchor_name,
+                anchor_id,
+                port,
+                prev_members,
+                prev_codec,
+                prev_lead,
+                prev_force,
+                have_server,
+                prev_ap2,
+                prev_ap2_rate,
+                prev_pwsink,
+            ) = {
                 let rg = self.running.get(key).expect("just inserted");
                 (
                     rg.anchor_node_name.clone(),
                     rg.anchor_node_id,
                     rg.port,
-                    rg.server_devices.clone(),
+                    rg.server_members.clone(),
                     rg.server_codec,
                     rg.server_send_ahead_us,
+                    rg.force_restart,
+                    rg.server.is_some(),
                     rg.ap2_members.clone(),
                     rg.ap2_rate,
                     rg.pwsink_members.clone(),
@@ -1081,75 +1185,154 @@ impl GroupReconciler {
                 routing::ensure_link_by_name(pw, pw_cmd, source, &anchor_name).await;
             }
 
-            // c. (Re)start the group's sendspin server when its dialed-device set
-            //    changes. Each device is its own single-member sender sharing one
-            //    timeline off the anchor capture, so a device can be ducked/overlaid
-            //    independently while staying in sync (see sendspin_server). The dial
-            //    filter is fixed at start, so a membership change means drop-and-
-            //    recreate — the server only, not the anchor, so RAOP outputs fed
-            //    from the same anchor never blip.
-            if d.sendspin_node_names != prev_devices || d.sendspin_codec != prev_codec || d.sendspin_send_ahead_us != prev_lead {
-                if let Some(rg) = self.running.get_mut(key) {
-                    rg.server = None; // drop old server (stops its capture/dial)
-                    rg.server_devices = Vec::new();
-                }
-                if !d.sendspin_node_names.is_empty() {
-                    match sendspin_server::start_server_per_device(
-                        &anchor_name,
-                        &group_display(d),
-                        port,
-                        anchor_id,
-                        d.sendspin_members.clone(),
-                        d.sendspin_send_ahead_us,
-                        control.clone(),
-                        devices.clone(),
-                        sendspin_server::StreamPolicy::Always,
-                        d.sendspin_codec,
-                    )
-                    .await
-                    {
-                        Ok(handle) => {
-                            tracing::info!(
-                                "sync group '{anchor_name}': per-device senders on port {port} dialing {} device(s), codec {}, send-ahead {} ms{}",
-                                d.sendspin_node_names.len(),
-                                d.sendspin_codec,
-                                d.sendspin_send_ahead_us / 1000,
-                                if d.sendspin_send_ahead_us > send_ahead_us {
-                                    // Say which rule raised it: a member's own request, our
-                                    // codec floor, and/or its static delay (which the device
-                                    // subtracts from every timestamp, so the server must send
-                                    // that much further ahead or its chunks land in the past).
-                                    format!(
-                                        " (raised from the configured {} ms to cover a member's buffer requirement + its static delay)",
-                                        send_ahead_us / 1000
-                                    )
-                                } else {
-                                    String::new()
-                                }
-                            );
-                            if let Some(rg) = self.running.get_mut(key) {
-                                rg.server = Some(handle);
-                                rg.server_devices = d.sendspin_node_names.clone();
-                                rg.server_members = d.sendspin_members.clone();
-                                rg.server_codec = d.sendspin_codec;
-                                rg.server_send_ahead_us = d.sendspin_send_ahead_us;
-                            }
+            // c. The group's sendspin server. Each device is its own single-member
+            //    sender sharing one timeline off the anchor capture, so a device can
+            //    be ducked/overlaid independently while staying in sync (see
+            //    sendspin_server).
+            //
+            //    Its restart identity is the **stream config** — the codec and the
+            //    send-ahead, i.e. what `stream/start` carries and what the shared
+            //    timeline fixes at construction. Membership is deliberately NOT part
+            //    of it: `ClientManager::supervise` adds a device to a running server
+            //    and the membership task gives any newly-connected client its own
+            //    `Group` on the live timeline, so a join needs nothing torn down.
+            //    Restarting for a join instead cost every *existing* member a full
+            //    reconnect — 813 ms of it measured end-to-end, and every device's
+            //    stream re-anchored (docs/sendspin-group-churn-plan.md §2b, H1).
+            //
+            //    A restart, when the config really did change, is still only the
+            //    server — never the anchor — so AP2/RAOP outputs fed from the same
+            //    anchor don't blip.
+            let action = sendspin_server_action(SendspinServerState {
+                routed: !d.sendspin_node_names.is_empty(),
+                have_server,
+                // Codec: any change. Send-ahead: only a RAISE — see
+                // `server_send_ahead_us`, it is a high-water mark.
+                config_changed: d.sendspin_codec != prev_codec || d.sendspin_send_ahead_us > prev_lead,
+                force_restart: prev_force,
+            });
+            let restart = action == ServerAction::Start;
+            if matches!(action, ServerAction::Start | ServerAction::Stop) {
+                // Graceful and awaited: the members are told their stream ended
+                // instead of having the socket pulled from under them, and the
+                // listener is really gone before the new server binds the same port
+                // below (see `SendspinServerHandle::shutdown`).
+                if let Some(server) = self.running.get_mut(key).and_then(|rg| rg.server.take()) {
+                    tracing::info!(
+                        "sync group '{anchor_name}': stopping sendspin server ({}) — every member reconnects, and real firmware answers a reconnect with seconds of silence",
+                        if action == ServerAction::Stop {
+                            "no sendspin devices routed here any more".to_string()
+                        } else if prev_force {
+                            "a static-delay change needs a reconnect".to_string()
+                        } else if d.sendspin_codec != prev_codec {
+                            format!("wire codec {prev_codec} -> {}", d.sendspin_codec)
+                        } else {
+                            format!(
+                                "a member needs a longer send-ahead than the running {} ms ({} ms)",
+                                prev_lead / 1000,
+                                d.sendspin_send_ahead_us / 1000
+                            )
                         }
-                        Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start sendspin server: {e}"),
+                    );
+                    server.shutdown().await;
+                }
+                if let Some(rg) = self.running.get_mut(key) {
+                    rg.server_devices = Vec::new();
+                    rg.server_members = Vec::new();
+                    rg.force_restart = false;
+                    rg.server_send_ahead_us = 0; // the high-water mark dies with its server
+                }
+            }
+            if restart {
+                match sendspin_server::start_server_per_device(
+                    &anchor_name,
+                    &group_display(d),
+                    port,
+                    anchor_id,
+                    d.sendspin_members.clone(),
+                    d.sendspin_send_ahead_us,
+                    control.clone(),
+                    devices.clone(),
+                    sendspin_server::StreamPolicy::Always,
+                    d.sendspin_codec,
+                )
+                .await
+                {
+                    Ok(handle) => {
+                        tracing::info!(
+                            "sync group '{anchor_name}': per-device senders on port {port} dialing {} device(s), codec {}, send-ahead {} ms{}",
+                            d.sendspin_members.len(),
+                            d.sendspin_codec,
+                            d.sendspin_send_ahead_us / 1000,
+                            if d.sendspin_send_ahead_us > send_ahead_us {
+                                // Say which rule raised it: a member's own request, our
+                                // codec floor, and/or its static delay (which the device
+                                // subtracts from every timestamp, so the server must send
+                                // that much further ahead or its chunks land in the past).
+                                format!(
+                                    " (raised from the configured {} ms to cover a member's buffer requirement + its static delay)",
+                                    send_ahead_us / 1000
+                                )
+                            } else {
+                                String::new()
+                            }
+                        );
+                        if let Some(rg) = self.running.get_mut(key) {
+                            rg.server = Some(handle);
+                            rg.server_codec = d.sendspin_codec;
+                            rg.server_send_ahead_us = d.sendspin_send_ahead_us;
+                        }
+                    }
+                    Err(e) => {
+                        // Nothing else will nudge us: the reconcile task is
+                        // change-driven, so without an explicit retry this group
+                        // would have no sendspin output until an unrelated event
+                        // happened along.
+                        tracing::warn!("sync group '{anchor_name}': failed to start sendspin server: {e} — retrying shortly");
+                        self.retry_wanted = true;
                     }
                 }
             }
 
-            // c2. Same server, new address: a device that re-resolved elsewhere needs its
-            //     supervisor redirected. Idempotent, so this is a no-op in the common case
-            //     — and it replaces what the per-server mDNS browser used to do before it
-            //     turned out to be stealing every other server's subscription.
-            if let Some(rg) = self.running.get_mut(key) {
-                if rg.server.is_some() && rg.server_members != d.sendspin_members {
-                    if let Some(server) = &rg.server {
-                        tracing::info!("sync group '{anchor_name}': re-supervising {} sendspin device(s) at new address(es)", d.sendspin_members.len());
-                        server.supervise(&d.sendspin_members);
+            // c2. Membership on the RUNNING server — the part that used to cost a
+            //     restart. Three cases, all applied in place:
+            //
+            //     * a device joined → `supervise` dials it; the membership task puts
+            //       it in its own group on the live timeline when it reports
+            //       `client/state`, and its groupmates never notice;
+            //     * a device left → `stop_device` ends *its* stream and stops *its*
+            //       supervisor, gracefully;
+            //     * a device re-resolved at a new address → `supervise` is idempotent
+            //       per fullname, so an unchanged URL costs nothing and a changed one
+            //       redials. (This is what the per-server mDNS browser used to do,
+            //       before it turned out to be stealing every other server's
+            //       subscription.)
+            if !restart && prev_members != d.sendspin_members {
+                let departed: Vec<String> = prev_members
+                    .iter()
+                    .map(|(fullname, _)| fullname.clone())
+                    .filter(|fullname| !d.sendspin_members.iter().any(|(f, _)| f == fullname))
+                    .collect();
+                let arrived = d.sendspin_members.iter().filter(|(f, _)| !prev_members.iter().any(|(pf, _)| pf == f)).count();
+                if let Some(server) = self.running.get(key).and_then(|rg| rg.server.as_ref()) {
+                    for fullname in &departed {
+                        server.stop_device(fullname).await;
                     }
+                    server.supervise(&d.sendspin_members);
+                    tracing::info!(
+                        "sync group '{anchor_name}': sendspin membership now {} device(s) (+{arrived}/-{}) — no restart, the stream keeps running",
+                        d.sendspin_members.len(),
+                        departed.len()
+                    );
+                }
+            }
+
+            // Bookkeeping for the API/UI and the alignment wizard. Tracked whether or
+            // not anything restarted, so a join that the running server absorbed is
+            // still visible to `groups_snapshot`.
+            if let Some(rg) = self.running.get_mut(key) {
+                if rg.server.is_some() {
+                    rg.server_devices = d.sendspin_node_names.clone();
                     rg.server_members = d.sendspin_members.clone();
                 }
             }
@@ -1185,9 +1368,15 @@ impl GroupReconciler {
                                     rg.ap2_rate = d.ap2_rate;
                                 }
                             }
-                            Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start AP2 senders: {e}"),
+                            Err(e) => {
+                                tracing::warn!("sync group '{anchor_name}': failed to start AP2 senders: {e} — retrying shortly");
+                                self.retry_wanted = true;
+                            }
                         },
-                        Err(e) => tracing::warn!("sync group '{anchor_name}': AP2 PTP grandmaster unavailable: {e}"),
+                        Err(e) => {
+                            tracing::warn!("sync group '{anchor_name}': AP2 PTP grandmaster unavailable: {e} — retrying shortly");
+                            self.retry_wanted = true;
+                        }
                     }
                 }
             }
@@ -1228,7 +1417,10 @@ impl GroupReconciler {
                                 rg.pwsink_ports = ports;
                             }
                         }
-                        Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start pw-sink senders: {e}"),
+                        Err(e) => {
+                            tracing::warn!("sync group '{anchor_name}': failed to start pw-sink senders: {e} — retrying shortly");
+                            self.retry_wanted = true;
+                        }
                     }
                 }
             }
@@ -1270,19 +1462,22 @@ impl GroupReconciler {
             match rx.await {
                 Ok(Ok(())) => {}
                 _ => {
-                    tracing::warn!("idle sender: failed to create sink '{sink_node_name}'");
+                    tracing::warn!("idle sender: failed to create sink '{sink_node_name}' — retrying shortly");
+                    self.retry_wanted = true;
                     continue;
                 }
             }
             let Some(sink_node_id) = wait_for_node(pw, &sink_node_name).await else {
-                tracing::warn!("idle sender: sink '{sink_node_name}' did not appear");
+                tracing::warn!("idle sender: sink '{sink_node_name}' did not appear — retrying shortly");
+                self.retry_wanted = true;
                 continue;
             };
             let port = self.alloc_port(&HashSet::new());
             // One member, from the registry — the URL is what the single daemon-wide
             // browser resolved (an idle sender doesn't browse either).
             let Some(idle_url) = devices_map.get(dev).and_then(|d| d.url.clone()) else {
-                tracing::debug!("idle sender for '{dev}': no resolved URL yet; retrying on a later reconcile");
+                tracing::debug!("idle sender for '{dev}': no resolved URL yet; retrying shortly");
+                self.retry_wanted = true;
                 continue;
             };
             let members = vec![(fullname, idle_url)];
@@ -1304,10 +1499,11 @@ impl GroupReconciler {
             {
                 Ok(server) => {
                     tracing::info!("idle sender for '{dev}' up on port {port} (silence until announced)");
-                    self.idle_senders.insert(dev.clone(), IdleSender { sink_node_name, sink_node_id, port, _server: server });
+                    self.idle_senders.insert(dev.clone(), IdleSender { sink_node_name, sink_node_id, port, server });
                 }
                 Err(e) => {
-                    tracing::warn!("idle sender for '{dev}': failed to start: {e}");
+                    tracing::warn!("idle sender for '{dev}': failed to start: {e} — retrying shortly");
+                    self.retry_wanted = true;
                     let (t, r) = oneshot::channel();
                     if pw_cmd.send(PwCommand::DestroySinkNode { node_id: sink_node_id, reply: t }).is_ok() {
                         let _ = r.await;
@@ -1315,6 +1511,51 @@ impl GroupReconciler {
                 }
             }
         }
+    }
+}
+
+/// What a reconcile pass should do with one group's sendspin server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerAction {
+    /// Nothing routed here and nothing running.
+    Idle,
+    /// Keep the running server exactly as it is. Membership and address changes
+    /// land here — they're applied to the live server instead.
+    KeepRunning,
+    /// (Re)start it, tearing down any existing one first.
+    Start,
+    /// Tear it down: no sendspin device is routed to this group any more.
+    Stop,
+}
+
+/// The inputs that decide it.
+struct SendspinServerState {
+    /// Is any sendspin device routed to this group at all? (Not "dialable" — a
+    /// device whose URL hasn't resolved yet still wants the server up, and gets
+    /// supervised the moment it resolves.)
+    routed: bool,
+    have_server: bool,
+    /// Did the **stream config** change — the codec or the send-ahead? That is the
+    /// server's whole restart identity, because it's what `stream/start` carries and
+    /// what the shared timeline fixes at construction.
+    config_changed: bool,
+    /// A caller asked for a reconnect for its own reasons
+    /// ([`GroupReconciler::force_server_restart`], the static-delay path).
+    force_restart: bool,
+}
+
+/// Decide it. Extracted from `reconcile` so the rule is testable without a live
+/// PipeWire graph — and because "which changes restart a group" is exactly the
+/// thing that regressed: membership used to be part of the identity, so routing one
+/// more speaker into a live group made every other member reconnect
+/// (docs/sendspin-group-churn-plan.md §2b).
+fn sendspin_server_action(s: SendspinServerState) -> ServerAction {
+    match (s.routed, s.have_server) {
+        (false, false) => ServerAction::Idle,
+        (false, true) => ServerAction::Stop,
+        (true, false) => ServerAction::Start,
+        (true, true) if s.config_changed || s.force_restart => ServerAction::Start,
+        (true, true) => ServerAction::KeepRunning,
     }
 }
 
@@ -1352,6 +1593,7 @@ mod tests {
             server_members: Vec::new(),
             server_codec: "pcm",
             server_send_ahead_us: 0,
+            force_restart: false,
             ap2_sender: None,
             ap2_members: ap2.iter().map(|s| s.to_string()).collect(),
             ap2_rate: 48_000,
@@ -1359,6 +1601,36 @@ mod tests {
             pwsink_members: pwsink.iter().map(|s| s.to_string()).collect(),
             pwsink_ports: Vec::new(),
         }
+    }
+
+    /// The rule the 2026-07-28 churn report came down to: adding or removing a
+    /// speaker must not restart the group's server, because a restart costs every
+    /// *other* member a full reconnect and a re-anchored stream.
+    #[test]
+    fn membership_alone_does_not_restart_the_sendspin_server() {
+        let running = |config_changed, force_restart| {
+            sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed, force_restart })
+        };
+        // A join or a departure changes neither the codec nor the send-ahead, so the
+        // stream config is unchanged — and the server keeps running.
+        assert_eq!(running(false, false), ServerAction::KeepRunning);
+        // A codec or send-ahead change is a genuinely different `stream/start`; the
+        // shared timeline fixes both at construction, so this one has to restart.
+        assert_eq!(running(true, false), ServerAction::Start);
+        // ...as does an explicitly forced reconnect (the static-delay path, where the
+        // reconnect IS the point — firmware reads SetStaticDelay at stream start).
+        assert_eq!(running(false, true), ServerAction::Start);
+    }
+
+    #[test]
+    fn the_server_follows_whether_anything_is_routed() {
+        let state = |routed, have_server| SendspinServerState { routed, have_server, config_changed: false, force_restart: false };
+        // First device routed here ⇒ stand a server up.
+        assert_eq!(sendspin_server_action(state(true, false)), ServerAction::Start);
+        // Last device unrouted ⇒ take it down (and release its port + advert).
+        assert_eq!(sendspin_server_action(state(false, true)), ServerAction::Stop);
+        // Nothing either way ⇒ nothing to do; a group can be AP2-only.
+        assert_eq!(sendspin_server_action(state(false, false)), ServerAction::Idle);
     }
 
     #[test]

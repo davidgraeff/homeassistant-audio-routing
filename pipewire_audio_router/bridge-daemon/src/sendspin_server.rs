@@ -104,6 +104,19 @@ const READY_GRACE: Duration = Duration::from_secs(3);
 /// still sitting in its buffer.
 const ANNOUNCE_DRAIN: Duration = Duration::from_millis(1500);
 
+/// How long a deliberate teardown may spend telling devices their stream ended
+/// before it stops waiting and closes anyway ([`SendspinServerHandle::shutdown`],
+/// [`SendspinServerHandle::stop_device`]).
+///
+/// `broadcast_stream_end` awaits the write reaching each member's socket, and a
+/// device that vanished mid-stream (powered off, WiFi gone) may not fail that write
+/// for as long as the kernel's TCP retransmit budget — minutes. The teardown runs on
+/// the reconcile task, which holds the group lock, so an unbounded wait there would
+/// freeze all routing. A healthy device acks in well under a millisecond (the writer
+/// task is local), so this is generous for the case it serves and cheap for the case
+/// it guards against.
+const GRACEFUL_END: Duration = Duration::from_millis(300);
+
 /// Fixed by the spec for real deployments (matches sendspin-rs's own
 /// convention and this daemon's other sendspin-adjacent code).
 const SENDSPIN_PATH: &str = "/sendspin";
@@ -189,13 +202,85 @@ impl SendspinServerHandle {
             self.client_manager.supervise(fullname, url);
         }
     }
+
+    /// Take one device out of the stream deliberately: `stream/end` first, so the
+    /// player knows its stream is over and can idle cleanly, then `stop_client`,
+    /// which closes the connection and ends its reconnect loop.
+    ///
+    /// This is what a member *leaving* a group costs now. Previously the only way to
+    /// stop supervising one device was to drop the whole server — which yanked every
+    /// other member's socket mid-stream as collateral.
+    ///
+    /// The `Disconnected` event that follows does the rest of the bookkeeping
+    /// (`pending`/`ready`/`client_to_node` and the volume registration), so this only
+    /// has to remove the group — before the await, so the relay stops fanning audio
+    /// at it immediately.
+    pub async fn stop_device(&self, fullname: &str) {
+        let node_name = resolve_node_name(&self.devices, fullname);
+        let client_id = self.client_to_node.lock().unwrap().iter().find(|(_, n)| **n == node_name).map(|(id, _)| id.clone());
+        if let Some(client_id) = client_id {
+            let group = self.groups.lock_recover().remove(&client_id);
+            if let Some(group) = group {
+                // `broadcast_stream_end`, not `end_stream`: this group SHARES the
+                // server's timeline, so resetting the anchor would desync the members
+                // that are staying.
+                if tokio::time::timeout(GRACEFUL_END, group.broadcast_stream_end()).await.is_err() {
+                    tracing::warn!("sendspin '{node_name}': stream/end did not reach it within {GRACEFUL_END:?}; closing anyway");
+                }
+            }
+        }
+        tracing::info!("sendspin '{node_name}': left the group — stream ended and supervision stopped");
+        self.client_manager.stop_client(fullname);
+    }
+
+    /// Tear the whole server down deliberately, in the order the devices need:
+    /// `stream/end` to everyone, then close every connection, then wait for the
+    /// listener to actually be gone.
+    ///
+    /// Two reasons this exists rather than just dropping the handle:
+    ///
+    /// 1. **The devices are told.** `Drop` aborts the supervisor tasks, so each
+    ///    player's socket dies *while it has an active stream* and it has to work that
+    ///    out for itself — the suspected cause of the multi-second silence after a
+    ///    group restart (docs/sendspin-group-churn-plan.md H6).
+    /// 2. **The port is really free.** `abort()` only requests cancellation; the bound
+    ///    listener lives inside the accept task's future until the runtime drops it.
+    ///    Awaiting the aborted handle is what makes rebinding the same port on the
+    ///    very next line safe (`SO_REUSEADDR` does not permit two live listeners).
+    ///
+    /// Residual: the close is a TCP close, not a WebSocket Close frame — the
+    /// connection is owned by the supervisor task, which has no "close politely"
+    /// directive. The `stream/end` is the part the player acts on.
+    pub async fn shutdown(mut self) {
+        // Take the groups out first: the relay fans audio to whatever is in this map,
+        // so emptying it stops the stream before we announce that it ended.
+        let groups: Vec<Group<SharesTimeline>> = std::mem::take(&mut *self.groups.lock_recover()).into_values().collect();
+        let ending = async {
+            for group in &groups {
+                group.broadcast_stream_end().await;
+            }
+        };
+        if tokio::time::timeout(GRACEFUL_END, ending).await.is_err() {
+            tracing::warn!("sendspin server: stream/end did not reach every member within {GRACEFUL_END:?}; closing anyway");
+        }
+        for fullname in self.client_manager.supervised() {
+            self.client_manager.stop_client(&fullname);
+        }
+        for task in [self.accept_task.take(), self.event_task.take(), self.arm_task.take()].into_iter().flatten() {
+            task.abort();
+            let _ = task.await;
+        }
+        // Dropping `self` here releases the capture, the advertisement and the
+        // ClientManager (whose own Drop aborts any supervisor that outlived its Stop).
+    }
 }
 
 impl Drop for SendspinServerHandle {
+    /// The fallback path: everything stops, but nothing is announced to the devices
+    /// and nothing is awaited. Prefer [`Self::shutdown`] wherever the teardown is
+    /// deliberate.
     fn drop(&mut self) {
-        self.accept_task.abort();
-        self.event_task.abort();
-        if let Some(t) = &self.arm_task {
+        for t in [&self.accept_task, &self.event_task, &self.arm_task].into_iter().flatten() {
             t.abort();
         }
         // `_capture`'s own Drop stops the capture thread, which drops the PCM
@@ -288,6 +373,12 @@ async fn apply_reported_state(
 #[derive(Default)]
 struct RelayStats {
     blocks: u64,
+    /// Chunks discarded because a device's write backlog was full, per device node
+    /// name. A device that stops draining its socket gets nothing while every
+    /// whole-group number stays perfect, so without this the log can show a healthy
+    /// stream at the exact moment one speaker is receiving none of it — which is what
+    /// "the group plays but that one speaker is silent" looks like from here.
+    dropped_by_device: HashMap<String, u64>,
     /// Capture chunks that yielded more than one block (expected when the codec's
     /// block size doesn't divide the capture quantum — 20 ms Opus vs ~21.3 ms).
     bursts: u64,
@@ -324,6 +415,12 @@ impl RelayStats {
         self.packet_max = self.packet_max.max(largest_packet);
     }
 
+    /// Did any device lose audio this interval? Worth logging even for PCM, where
+    /// the block stats below are otherwise skipped.
+    fn any_dropped(&self) -> bool {
+        !self.dropped_by_device.is_empty()
+    }
+
     fn log(&self, server: &str, codec: &str, elapsed: Duration) {
         tracing::info!(
             "sendspin relay '{server}' [{codec}]: {} blocks in {:.1}s ({:.1}/s), ts gap {}..{} µs, lead {}..{} ms, largest packet {} B, {} multi-block chunk(s)",
@@ -337,6 +434,14 @@ impl RelayStats {
             self.packet_max,
             self.bursts,
         );
+        if self.any_dropped() {
+            let mut per_device: Vec<String> = self.dropped_by_device.iter().map(|(node, n)| format!("{node} x{n}")).collect();
+            per_device.sort();
+            tracing::warn!(
+                "sendspin relay '{server}': audio DISCARDED because the device's write backlog was full — {}. That device is not draining its socket, so it is receiving none of this stream while the numbers above stay healthy.",
+                per_device.join(", ")
+            );
+        }
     }
 }
 
@@ -724,7 +829,10 @@ pub async fn start_server_per_device(
                             // same as a full backlog — rather than sending garbage.
                             if let Some(payload) = encoder.encode(src) {
                                 largest_packet = largest_packet.max(payload.len());
-                                group.push_at(ts, payload);
+                                if group.push_at(ts, payload).dropped > 0 {
+                                    let node = c2n.get(client_id).cloned().unwrap_or_else(|| client_id.clone());
+                                    *stats.dropped_by_device.entry(node).or_default() += 1;
+                                }
                             }
                         }
                         // Prune encoders whose member left, so a long-lived server
@@ -742,7 +850,7 @@ pub async fn start_server_per_device(
                     if emitted_this_chunk > 1 {
                         stats.bursts += 1;
                     }
-                    if block_frames.is_some() && stats_since.elapsed() >= STATS_INTERVAL {
+                    if (block_frames.is_some() || stats.any_dropped()) && stats_since.elapsed() >= STATS_INTERVAL {
                         stats.log(&relay_node_name, &relay_codec, stats_since.elapsed());
                         stats = RelayStats::default();
                         stats_since = std::time::Instant::now();
@@ -769,8 +877,11 @@ pub async fn start_server_per_device(
         _advertisement: advertisement,
         client_manager,
         _capture: capture_handle,
-        accept_task,
-        event_task,
+        groups: Arc::clone(&groups),
+        client_to_node: Arc::clone(&client_to_node),
+        devices: devices.clone(),
+        accept_task: Some(accept_task),
+        event_task: Some(event_task),
         arm_task,
         _relay_thread: relay_thread,
     })
