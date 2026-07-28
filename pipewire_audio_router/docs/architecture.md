@@ -208,10 +208,119 @@ PTP peer); the reconcile loop coalesces change bursts behind a 400 ms quiet
 window; and `connect_one` retries once after ~1.5 s on a pairing failure
 (receiver hadn't released the prior session).
 
+**Graceful shutdown.** On SIGTERM the shutdown path *awaits* the RTSP TEARDOWNs
+(`GroupReconciler::shutdown_ap2` → `Ap2ServerHandle::shutdown`, ~3 s per group,
+groups concurrently) instead of only dropping the handles — a dropped handle just
+signals its task, and on process exit nothing polls that task again. This is the
+other half of the retry above: a receiver holds an unclosed session until *it*
+times out, so an unclean exit is precisely what makes the next start's first
+connect fail, and leaves the receiver's one AirPlay input busy for phones in
+between. `run.sh` (PID 1) waits up to ~8 s for the daemon before stopping
+PipeWire, so the bound fits inside the supervisor's ~10 s stop grace.
+
 **Alignment.** An AP2 group is alignable on the Align page (`calibrate.rs`):
 members are muted/soloed via `ap2_control` (device-authoritative mute) and
 each one's offset is tuned by ear with its **live render delay** — there is
 no node-volume path (AP2 outputs are virtual).
+
+### 5.3 One mDNS browse per service type — a shared daemon can't be shared for browsing
+
+The daemon runs **one** `mdns_sd::ServiceDaemon` for the whole process (that
+consolidation is what fixed the multicast CPU storm), and exactly **one browse per
+service type**: `sendspin_discovery` owns `_sendspin._tcp`, `ap2_discovery` owns
+`_airplay._tcp`, `pw_target_discovery` owns `_pipewire-audio._udp`. That is not
+tidiness — it is required:
+
+> mdns-sd keeps `service_queriers: HashMap<String, Sender<ServiceEvent>>`, one listener
+> per type. Its own comment: *"If there is already a `listener`, it will be updated,
+> i.e. overwritten."*
+
+So a second `browse()` for a type **silently unsubscribes the first**. sendspin-rs's
+`ClientManager::start` browses internally, and we run one manager per sync group plus
+one per idle device — so each new server used to steal the subscription from every
+earlier one *and* from our own registry. The consequences were invisible rather than
+loud: a group server never learned its devices existed, so it **never dialed them and
+logged nothing**, while the registry stopped seeing presence and capability updates.
+On hardware this looked like "two speakers get no audio, and which two changes".
+
+The servers therefore do **not** browse: `ClientManager::start_without_discovery` +
+`supervise(fullname, url)`, fed the URLs `sendspin_discovery` resolved (it stores each
+device's `ws://ip:port<path>`), re-asserted on every reconcile so an address change
+redirects the supervisor without restarting the server. Upstream note + suggested fix:
+`pull_request_docs/sendspin-89-shared-mdns-daemon-steals-browse-subscription.md`.
+
+**Corollary for the log:** the vendored crate reports its whole dial loop through the
+`log` crate, so `sendspin=info` belongs in the `EnvFilter` (main.rs). Without that
+target, every dial, failure, retry and goodbye is dropped — which is what made the
+above take a day to find instead of a minute.
+
+### 5.4 Announcing to an output with nothing routed into it
+
+An announcement is only audible while **some per-device relay is consuming
+that output's overlay slot** — `mix_into` is what turns a clip into audio, and
+it runs *inside* a sender's capture-forward loop. So "can this output be
+announced to?" reduces to "does it have a running sender?", and the answer
+differs per backend:
+
+- **Sendspin: connection always, audio on demand.** An ungrouped device keeps an
+  **idle sender** (`sync_group.rs`, `IdleSender`) on its own silent
+  `null-audio-sink`, so an announcement (or a volume command) never pays a cold
+  dial. But the connection carries **no audio** while idle
+  (`StreamPolicy::WhenAnnounced`): the device isn't in a group, so it gets no
+  `stream/start` and no chunks, and an arm task (100 ms tick) puts it in one
+  exactly while a clip is playing on or queued for it, then ends the stream after
+  a 1.5 s drain so the send-ahead tail still renders.
+
+  This matters for two reasons the spec makes explicit. Several servers may be
+  connected to one device and **the device** decides which to keep, weighing each
+  server's `connection_reason`; an idle sender that dialed `Playback` and pushed
+  silence forever looked exactly like the active server, so it could stop the
+  device switching to one the user asked to play. An idle sender therefore dials
+  `Discovery` — the spec's own "discovery/announcement" case. And the wire format
+  is PCM 48 kHz/16-bit/stereo, so the silence stream cost **~1.5 Mbit/s per idle
+  device** and kept it out of WiFi power-save.
+- **The dialed backends (AirPlay-2, pw-sink): on demand.** Neither can be held
+  open like an idle sender — an AP2 receiver accepts **one session at a time**
+  (a permanent one would block the household's phones and park AVRs on their
+  AirPlay input), and a pw-sink session is an **advertised** mDNS service that
+  stock `module-rtp-session` in discover mode attaches to on sight (a permanent
+  advert per idle target would keep every receiver on the LAN attached to
+  sessions it has no reason to be in). So an unrouted endpoint of either kind
+  gets an **`AnnounceSession`** only while it's being announced to:
+  `GroupReconciler::ensure_announce_transport` (called by `POST /api/announce`
+  **before** the clip starts) creates a private silent sink and starts a
+  single-member `ap2_server` (also publishing its wire rate to the mixer so the
+  clip is rate-matched, §8) or `pwsink_server` (binding + advertising one
+  `pwrouter-<slug>` session). The clip is *not* consumed while the endpoint
+  connects — `mix_into` only runs for a registered sender/feed — so it still
+  plays whole, a few seconds late: AP2 pays pair + SETUP + its render delay,
+  pw-sink pays the target noticing the advert and initiating the AppleMIDI
+  handshake. The session then lingers on a **lease** (30 s, never shorter than
+  an AP2 render delay + 2 s so buffered audio renders), refreshed while a clip
+  is playing *or queued* for that output, and a 1 s ticker
+  (`poll_announce_sessions`) hands it back when the lease expires. `reconcile`
+  drops the on-demand session as soon as the endpoint *is* routed — before the
+  group senders dial/advertise for it — so the two never collide.
+
+  Same caveat as routed pw-sink streaming: with 2+ pw-sink targets on one LAN,
+  discover-mode receivers attach to *every* advertised session, so an
+  announcement aimed at one can be heard by the others (the deferred
+  session-scoping decision, `docs/pipewire-sink-roadmap.md` §4/§10).
+
+**"Live" means connected, not dialed.** For both dialed backends, group
+membership only says what the group *dialed*: `has_live_sender` therefore reads
+`Ap2Control::connected` (its sender registered a command channel) and
+`PwSinkLiveness` `established` (a receiver completed the handshake). A routed
+endpoint that never came up is reported as such instead of counting as playable.
+
+**Nothing is silently swallowed.** Two mechanisms make that true: the API
+answers with what will actually carry each target (targets nothing can carry are
+dropped from the announcement and named in the response, so the UI toast is
+honest), and the mixer runs a **stall watchdog** — `reap_stalled` drops an
+overlay whose cursor hasn't moved for its grace (5 s normally, 40 s while an
+on-demand session connects) and `announce.rs` completes it in the scheduler.
+Without that, a clip nothing consumes would hold the output occupied forever and
+every later announcement to it would queue behind a clip that can never finish.
 
 ## 6. The two clocks, cleanly separated
 
@@ -264,6 +373,40 @@ and PipeWire does the SRC in-graph on its RT thread.
 
 - **Internal bus (anchor + `SharedTimeline` + `OverlayMixer` + announce
   assets) = 48 kHz** (Sendspin's native rate and the overlay format).
+- **Sendspin send-ahead has a device-driven floor.** A player reports
+  `min_buffer_ms` (+ `required_lead_time_ms`) in `client/state`, and the spec makes
+  the first one binding: "servers must schedule timestamps so each player's queued
+  audio duration stays at or above its `min_buffer_ms`", with a group using "the
+  maximum per-player send-ahead across grouped players". So a group's send-ahead is
+  `max(configured group lead, max over members of (min_buffer_ms + that member's
+  static delay))` (`sendspin_server::required_send_ahead_us`), and it is part of the
+  server's **restart identity** — the timeline fixes its send-ahead at construction.
+  `required_lead_time_ms` is deliberately not folded in: the spec says to extend
+  toward it only for buffered sources, and this is a live stream. A player may raise
+  its requirement for "codec init, decode warmup", so **the floor moves with the wire
+  codec** — the UI reads it back after a codec change, and `/api/sync-settings`
+  exposes `group_lead_floor_ms` / `group_lead_effective_ms` plus which device set it,
+  so a value typed below the floor is shown as having no effect rather than silently
+  ignored.
+- **Sendspin wire codec is negotiated per group** (`sendspin_codec.rs`): PCM,
+  **Opus** (vendored libopus via `opusic-sys`) or **FLAC** (pure-Rust `flacenc`) —
+  the spec requires a server to support all three. The rate/depth stay at the
+  capture format, so only the *framing* changes: encoding runs inline on the
+  `sendspin-relay` SCHED_FIFO thread with every buffer pre-allocated and reused,
+  one encoder **per member** (Opus/FLAC are predictive, and an announced-to device's
+  audio diverges from its groupmates'). A `Reblocker` re-cuts capture quanta into
+  legal blocks — Opus 20 ms, FLAC 1024 frames, both inside the spec's 15–150 ms
+  chunk bounds — and the timeline is stamped once per *emitted block*, so members
+  stay sample-coincident. The choice is per output (`SendspinCodec`, Auto = Opus
+  when every member decodes it, else PCM) narrowed to what all members support;
+  it's part of the server's restart identity, and FLAC's `codec_header` (base64
+  `fLaC` + STREAMINFO) rides on `stream/start`. **Opus's encoder delay is
+  compensated**: libopus's decoded output lags its input by `OPUS_GET_LOOKAHEAD`
+  (~6.5 ms at 48 kHz) and sendspin has no pre-skip field to declare that, so the
+  sender shifts its timestamps back by it (`codec_delay_us`) — without that, every
+  Opus chunk is heard ~6.5 ms after the instant it asked for, a permanent error
+  outside the spec's ±1 ms accuracy floor that the player's correction loop then
+  fights continuously. PCM and FLAC have no such delay.
 - **Wire rates are per-group and negotiated (AP2).** PipeWire bridges the
   one 48 kHz anchor to each per-device capture: Sendspin @ 48 kHz (no
   conversion); AP2 @ its group rate — **48 kHz** when every member accepts it
