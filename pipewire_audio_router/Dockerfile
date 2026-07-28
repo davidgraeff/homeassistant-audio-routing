@@ -99,6 +99,22 @@ RUN set -eux; \
     rustup target add "$triple"; \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /build
+# The sendspin submodule. `bridge-daemon/Cargo.toml` reaches it as
+# `../submodules/sendspin`, which from WORKDIR /build resolves to
+# /submodules/sendspin — so it must be copied to an absolute path outside /build,
+# not into it. It lives above bridge-daemon/ in the source tree so rustfmt's
+# upward config search never reaches bridge-daemon/rustfmt.toml and reformats a
+# third-party crate into our style.
+#
+# Copied before bridge-daemon/ because it changes far less often: an edit under
+# bridge-daemon/ then still hits this layer's cache.
+COPY submodules/ /submodules/
+# An uninitialised submodule otherwise fails deep inside cargo as "failed to read
+# /submodules/sendspin/Cargo.toml", which doesn't name the cause.
+RUN test -f /submodules/sendspin/Cargo.toml || { \
+        echo "ERROR: submodules/sendspin is empty — run 'git submodule update --init --recursive'" >&2; \
+        exit 1; \
+    }
 COPY bridge-daemon/ .
 # BuildKit cache mounts make this incremental. Without them every deploy
 # recompiled all ~600 dependency crates (plus bundled libopus via cmake and

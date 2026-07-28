@@ -12,6 +12,9 @@
 **/node_modules
 **/dist
 **/*.tsbuildinfo
+# This also drops the submodule's `.git` *file* (the gitlink pointing back into
+# the superproject's .git/modules). Deliberate: cargo builds a path dependency
+# from its files alone and never consults git.
 **/.git
 
 # Not referenced by any COPY: docs/ is developer documentation, and

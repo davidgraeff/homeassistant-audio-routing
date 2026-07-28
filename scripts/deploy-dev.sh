@@ -30,6 +30,16 @@ HA_HOST="${HA_HOST:-homeassistant.local}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADDON_SLUG="local_pipewire_audio_router"
 ADDON_NAME="pipewire_audio_router"     # dir under repo root and image suffix
+
+# The sendspin server role is a git submodule (pipewire_audio_router/submodules/
+# sendspin), so a clone without --recursive leaves it empty. Fail here rather than
+# deep inside cargo, which reports only "failed to read .../Cargo.toml".
+if [ ! -f "$REPO_ROOT/pipewire_audio_router/submodules/sendspin/Cargo.toml" ]; then
+  echo "ERROR: the sendspin submodule is not checked out." >&2
+  echo "       Run: git submodule update --init --recursive" >&2
+  exit 1
+fi
+
 GHCR_OWNER="${GHCR_OWNER:-davidgraeff}" # ghcr.io/<owner>/<arch>-addon-<name>
 BUILDER="ha-addon-builder"             # dedicated buildx builder (see below)
 DEV_TAGS_KEEP=3                        # how many dev image tags to retain on GHCR

@@ -1,0 +1,4 @@
+[submodule "sendspin"]
+	path = pipewire_audio_router/submodules/sendspin
+	url = https://github.com/davidgraeff/sendspin-rs.git
+	branch = revise/server-role

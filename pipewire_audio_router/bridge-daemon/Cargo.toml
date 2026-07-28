@@ -3,6 +3,16 @@ name = "bridge-daemon"
 version = "0.1.0"
 edition = "2021"
 
+# This package is its own workspace root, and the `exclude` is load-bearing: a
+# path dependency living *inside* the workspace directory automatically becomes a
+# member, which put the vendored crates under `cargo fmt --all` and
+# `cargo clippy --workspace`. They are third-party trees with their own style —
+# reformatting them destroys the diff against upstream and buries our patches.
+# `vendor/libairptp` needs no entry (C, no Cargo.toml), and neither does sendspin,
+# which is a submodule above this directory and so can never join.
+[workspace]
+exclude = ["vendor/airplay2-sender", "vendor/shairplay"]
+
 [dependencies]
 pipewire = "0.10"
 tokio = { version = "1", features = ["full"] }
@@ -43,12 +53,25 @@ rtrb = "0.3"
 # Embedded Sendspin server role (replaces the sendspin-adapter.py subprocess
 # wrapping aiosendspin[server], removing ~212MB of av/numpy/pillow from the
 # runtime image and the last continuous shellout, pw-record, from the audio
-# path — see docs/decisions.md). Pinned to a commit, not a branch: this is
-# our own fork's server-role-prototype branch, not yet merged upstream (only
-# the client/receiver role exists there); a branch reference could move out
-# from under a build. Depends transitively on mdns-sd 0.20, now unified with
-# this crate's own mdns-sd 0.20 (used by discovery.rs for RAOP).
-sendspin = { git = "https://github.com/davidgraeff/sendspin-rs.git", rev = "1594c06cf6ace1bee95dde6f2beb088669ca56d6" }
+# path — see docs/decisions.md). Our own fork's server role, not yet merged
+# upstream (only the client/receiver role exists there), carried as a git
+# SUBMODULE at ../submodules/sendspin.
+#
+# A plain path dep, not a git dep plus a `[patch]` override to a local copy.
+# That arrangement pinned the same crate twice — a `rev` here and the contents
+# of the local copy — and the two silently disagreed, so the recorded `rev` said
+# nothing about what was actually built. The superproject's submodule gitlink is
+# now the single pin, and it is exact.
+#
+# It lives *above* bridge-daemon/ on purpose: rustfmt searches for config by
+# walking up, so a checkout under this directory inherits our rustfmt.toml and
+# `cargo fmt` silently reformats the whole third-party crate into our style,
+# destroying the diff against upstream.
+#
+# Depends transitively on mdns-sd 0.20, unified with this crate's own mdns-sd
+# 0.20 (used by discovery.rs for RAOP) — and re-exported by sendspin, so the two
+# cannot drift apart silently.
+sendspin = { path = "../submodules/sendspin" }
 
 # Native AirPlay (RAOP) receiver — a pure-Rust, clean-room AP1+AP2 server that
 # hands us decoded f32 PCM via a callback (spike-validated end-to-end). Replaces
@@ -69,14 +92,6 @@ airplay-client = { path = "vendor/airplay2-sender/crates/airplay-client" }
 airplay-core = { path = "vendor/airplay2-sender/crates/airplay-core" }
 opusic-sys = "0.7.4"
 flacenc = { version = "0.5.1", default-features = false, features = ["log"] }
-
-# Override the sendspin git dep with a vendored copy patched to expose the
-# dialed mDNS fullname on ClientEvent::Connected (upstream only forwards the
-# client_id, which for ESPHome devices is an opaque MAC that doesn't match the
-# advertised name — we need the fullname to map a connection to its discovered
-# device for per-device volume). Upstream this and drop the patch later.
-[patch."https://github.com/davidgraeff/sendspin-rs.git"]
-sendspin = { path = "vendor/sendspin" }
 
 # Compiles the vendored libairptp C (vendor/libairptp/) — OwnTone's MIT
 # AirPlay-2 gPTP grandmaster — into the daemon for the AP2 sender's PTP.

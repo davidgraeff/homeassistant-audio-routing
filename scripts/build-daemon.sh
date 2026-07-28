@@ -28,6 +28,16 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADDON_DIR="$REPO_ROOT/pipewire_audio_router"
 OUT="${OUT:-$ADDON_DIR/bridge-daemon/dist}"
+
+# The sendspin server role is a git submodule (pipewire_audio_router/submodules/
+# sendspin), so a clone without --recursive leaves it empty. Fail here rather than
+# deep inside cargo, which reports only "failed to read .../Cargo.toml".
+if [ ! -f "$REPO_ROOT/pipewire_audio_router/submodules/sendspin/Cargo.toml" ]; then
+  echo "ERROR: the sendspin submodule is not checked out." >&2
+  echo "       Run: git submodule update --init --recursive" >&2
+  exit 1
+fi
+
 TAG="pipewire-bridge-daemon-build:local"
 
 # Engine: honor $ENGINE if set, else prefer podman (rootless), else docker.
