@@ -13,41 +13,34 @@ change.
 Read [architecture.md §4](architecture.md#4-the-anchor--per-device-sender-model) and
 [§5.1](architecture.md#51-sendspin-esphome-speakers-eg-ha-voice-pe) first.
 
-> **Status (2026-07-28, after the second hardware test — §2d).** The daemon side is now
-> measured five separate ways and is never the problem: it has the whole group
-> reconnected and streaming in **205 ms – 1 s**, and the relay is continuous at a
-> healthy lead from the first block. The remaining tens of seconds are **inside the
-> firmware, after a reconnect**.
+> **Status (2026-07-29 — ROOT CAUSE FOUND, §4.14).** The tens-of-seconds silence was
+> **our own server**, not the firmware and not WiFi. We rate-limited and coalesced the
+> client's `client/time` requests — a 50 ms silent drop plus a single-slot reply channel —
+> against a spec that puts the cadence entirely in the client's hands and requires a reply
+> to each. The ESPHome player is one-request-in-flight with a 10 s timeout and no
+> retransmit, and it decodes **nothing** until its opening 8-message burst completes, so
+> every dropped request bought 10 s of total silence and every reconnect paid again. The
+> arithmetic reproduces §2d's per-device spread (4.06 / 4.10 / 5.1 / 7.1 s per exchange)
+> without invoking WiFi at all. **Fixed** in the submodule with a regression test; **not
+> yet confirmed on hardware.**
 >
-> **§4.8's instrumentation plus a read of the client's C++ have moved the mechanism**
-> (§2d, §4.9-A). Measured: a reconnect resets the device's clock-sync exchange count to
-> 1, and exchanges then accrue at only **one per ~4–7 s** (ten took 40.6 / 41.0 / 50.6 /
-> 70.7 s across the four devices) — not the ~1 Hz §2c assumed. But the code says there
-> is **no playback gate on sync convergence at all**; what gates audio is a hard-sync
-> loop that starts armed on every fresh stream and only settles once alignment is inside
-> **500 µs**, computed from a Kalman estimate that is still moving. And the client
-> *intends* 8 exchanges every 10 s (~0.8/s), so the observed 0.2/s is a **4×
-> discrepancy** that is itself now the sharpest open question. §4.9 has the detail.
+> The daemon side was never the problem and is now measured five ways: it has the whole
+> group reconnected and streaming in **205 ms – 1 s**, with the relay continuous at a
+> healthy lead from the first block.
 >
-> Fixed since: membership no longer restarts the server (§4.1), teardown is graceful
-> and bounded (§4.2), an unknown-capability member no longer downgrades the group
-> (§4.3), a failed start retries (§4.4), the send-ahead is a high-water mark so a
-> *departing* member can't force a reconnect either (§4.6), and the process no longer
-> dies with devices mid-stream (§4.7). `cargo test`: 126 daemon + 140 submodule
-> passed. §4.1–§4.8 are **deployed** as of `0.2.20260728200055`. Four items are open and
-> *not* fixed: a per-device static-delay change still restarts the whole group (§4.10),
-> the deploy script restarts the add-on redundantly (§4.11), **the speakers' firmware is
-> pinned to an abandoned pre-library snapshot from 2026-03-23 and is eleven
-> `sendspin-cpp` releases behind (§4.12 — now the largest available lever)**, and our
-> Rust server has never been checked against the protocol spec (§4.13).
+> Why it took so long is worth recording: `time exchange(s)` counted only the requests we
+> *answered*, so our own drops were invisible and the resulting "4× discrepancy" was
+> attributed to WiFi loss. §4.8's instrumentation pointed at the firmware because it was
+> placed one line too late. The log now prints **received and replied**.
 >
-> §4.12 also **closes the loop on the exchange-rate gap**: the pin predates
-> esphome#17133 ("Suppress WiFi roam scanning while playing"), the Satellite1 config
-> dropped its WiFi/LWIP buffer tuning (Satellite1-ESPHome#520, open), and the pinned
-> commit's own message says the 10 s time-message timeout exists because WiFi scans drop
-> and delay those messages. WiFi loss → slow time exchanges → an estimate that never
-> settles → `hard_syncing` never clears is an end-to-end chain in which every link now
-> has independent evidence.
+> Shipped and deployed (`0.2.20260728200055`): §4.1 membership no longer restarts the
+> server, §4.2 graceful bounded teardown, §4.3 unknown-capability members, §4.4 retry,
+> §4.6 send-ahead high-water mark, §4.7 no death with devices mid-stream, §4.8
+> instrumentation. Fixed since, **not yet deployed**: §4.10 a static-delay change touches
+> only its own device, §4.11 the deploy script no longer double-restarts, **§4.14 the root
+> cause**. Still open: §4.12 the firmware pin (now **demoted** — v0.7.0 keeps the same
+> burst design, so it does not address §4.14), §4.13's remaining conformance gaps, §4.15
+> config-change-without-reconnect, and §4.9's firmware questions (largely moot).
 
 ---
 
@@ -441,10 +434,11 @@ without a live PipeWire graph (§5).
 
 Two consequences worth knowing:
 
-- `force_server_restart` (the static-delay path, where the reconnect *is* the point) can no
-  longer work by clearing the remembered device set — that set is not the identity any more.
-  It sets a `force_restart` flag that the next reconcile honours, which also means its
-  teardown goes through the graceful path.
+- the static-delay path, where the reconnect *is* the point, can no longer work by
+  clearing the remembered device set — that set is not the identity any more. It records
+  intent for the next reconcile to honour, which also means its teardown goes through the
+  graceful path. (It recorded a whole-group `force_restart` flag at first; §4.10 narrowed
+  that to a set of *devices*, and `ServerAction` lost the input entirely.)
 - The H3 correction is now moot: a discovered-but-unresolved device no longer restarts
   anything, because it is not in the identity at all. It gets supervised when its URL
   resolves, and until then it only sets the retry flag (§4.4).
@@ -508,8 +502,11 @@ starts from the real requirement. And because it is a high-water mark, the repor
 remove-then-add sequence now restarts **nothing at all**: the mark stays at 300 ms, so
 re-adding the device matches it.
 
-A deliberate static-delay change still takes effect, because that path calls
-`force_server_restart` explicitly — which is the one place a reconnect is the *point*.
+A deliberate static-delay change still takes effect, because that path asks for a
+reconnect explicitly — which is the one place a reconnect is the *point*. Since §4.10 it
+asks for it per *device* (`force_device_reconnect`), and the only part of a delay change
+that reaches the whole group is the one that belongs to it: a delay big enough to raise
+this very high-water mark.
 
 The restart log now says which of the four reasons fired, and says out loud what it costs.
 
@@ -558,9 +555,11 @@ for ten exchanges) explains why the silence is a different length on each speake
 
 Both of §2c's checks are now discharged:
 
-1. **Does anything still reconnect?** Yes — a **static-delay change** does, and it
-   restarts the whole group (§2d result 2, §4.10). Membership changes no longer do
-   (§4.1), so the user-facing trigger has moved rather than disappeared.
+1. **Does anything still reconnect?** Yes — a **static-delay change** does. It used to
+   restart the whole group (§2d result 2); since §4.10 it reconnects only the edited
+   device, unless its new delay raises the group's send-ahead. Membership changes no
+   longer reconnect anything (§4.1), so the user-facing trigger has narrowed rather than
+   disappeared: calibrating one speaker still costs *that* speaker its ~30 s.
 2. **The startup case, from the log.** Done: exchanges are ~0.2 Hz, no drops, relay
    continuous. That is the "clock convergence in the player" branch — with the caveat
    that the cadence is far slower than the spec's ~1 Hz, which is itself worth
@@ -596,12 +595,18 @@ Four findings, all from that source (code reading — **not** runtime-verified).
 > anyone on 0.7.0. They are still the right description of the speakers as they run
 > *today*.
 
-1. **There is no playback gate on clock-sync convergence.** `get_covariance()` is never
-   called outside `sendspin_time_filter.cpp`, and `TIME_FILTER_MIN_SAMPLES = 100` is the
-   *forgetting-factor* threshold (`min_samples_for_forgetting_`), not a readiness test.
-   **So §2c's and §2d's leading candidate — "the player waits for the filter to
-   converge before scheduling audio" — is not supported by the code.** Nothing consults
-   the sync uncertainty before playing.
+1. ~~**There is no playback gate on clock-sync convergence.**~~ **WRONG — corrected in
+   §4.14.** It is true that `get_covariance()` is never called outside
+   `sendspin_time_filter.cpp` and that `TIME_FILTER_MIN_SAMPLES = 100` is the
+   *forgetting-factor* threshold rather than a readiness test. The error was concluding
+   "no gate" from the absence of *those* symbols: the gate is one level coarser and
+   strictly worse. `sync_handle_load_chunk_` returns early decoding **nothing** while
+   `!is_time_synced()`, and `is_time_synced()` == `has_update()` == `count_ >= 1`
+   (`sendspin_media_source.cpp:571`, `sendspin_connection.h:129`,
+   `sendspin_time_filter.cpp:172`) — all-or-nothing on the *first* accepted measurement,
+   which arrives only when the opening burst completes. §2c's instinct was right; this
+   subsection's grep was aimed at the wrong symbol. **Lesson worth keeping: "I grepped
+   for the consumers and found none" is not the same as "there is no gate".**
 
 2. **What does gate it is a hard-sync alignment loop**, and it starts armed on every
    fresh stream (`sendspin_media_source.h:76`, `bool hard_syncing{true}` — "Starts true
@@ -620,7 +625,9 @@ Four findings, all from that source (code reading — **not** runtime-verified).
    inside 500 µs until the estimate stops moving".** Same practical consequence, but a
    different place to look and a different fix.
 
-3. **The intended exchange cadence is 4× faster than what we observe.**
+3. **The intended exchange cadence is 4× faster than what we observe.** *(Cause found —
+   §4.14: the gap was our own silent drops, and the counter used to measure it only
+   counted requests we chose to answer. Not WiFi loss.)*
    `sendspin_time_burst.h`: `BURST_SIZE = 8`, `BURST_INTERVAL_MS = 10000` — eight
    exchanges, then 10 s from burst *completion*, i.e. ~0.8 exchanges/s. Our server saw
    **10 exchanges in 40.6–70.7 s (~0.2/s)** (§2d result 4). Something is delaying or
@@ -640,8 +647,23 @@ Four findings, all from that source (code reading — **not** runtime-verified).
    client's audio path, so §4.2's graceful teardown should not be credited with fixing
    this symptom (consistent with §2c, which measured exactly that).
 
-**B · Get the device's own log — the level is the problem, and it is a smaller one than
-§2d assumed.** satellite1 already runs `logger: level: debug`
+**B · Get the device's own log — blocked by tooling, not just log level.**
+
+> **Update 2026-07-29.** Two further findings, and together they mean an empty device log
+> proves nothing. First, `--strip-ansi-escapes` **does not exist** in the venv's
+> `aioesphomeapi-logs` (it errors with a usage message); it only exists in the
+> `~/.local/bin` install, so part of §2d's "empty log" was a tooling failure — the
+> command in this document only works with the latter. Second, with the flag removed the
+> capture handshakes fine and still delivers **zero** lines in 150 s across a full stream
+> stop/start, including no reply to the `dump_config` sent at
+> `LOG_LEVEL_VERY_VERBOSE`, and a capture left running for ~2 h printed nothing even
+> across a reboot that should have produced a boot banner. **The API log subscription is
+> not delivering, for a reason not yet determined.** Since the pinned firmware's timeout
+> path logs at `ESP_LOGW` — which `debug` would pass — a working subscription would test
+> §4.14's mechanism directly from the device side. Fix the delivery before drawing any
+> inference from silence in the log.
+
+The original reasoning, still valid as far as it goes: satellite1 already runs `logger: level: debug`
 (`satellite1-c4150c.yaml:145`), so §2d result 5's "level too low" is only half right:
 the normal time-sync line is `ESP_LOGV(TAG, "Sent time message %u/%u")` — **VERBOSE**,
 which `debug` suppresses. What is needed is `level: VERBOSE` (globally or just for the
@@ -683,29 +705,64 @@ group-wide restart, or that the lead/identity computation made reconnects more
 frequent. `git log -S force_server_restart` and the §4.6 send-ahead history are the
 places to look.
 
-### 4.10 A per-device static-delay change restarts the whole group ⬜
+### 4.10 A static-delay change is scoped to the one device ✅
 
-Measured (§2d result 2): changing **one** device's static delay stops the group's
-single sendspin server, so all four members drop and reconnect — and by §4.9 each one
-then pays tens of seconds of silence. The daemon cost is only 219 ms; the user cost is
-a group-wide outage for a one-device calibration tweak, which is the same shape as the
-bug §4.1 fixed for membership.
+Measured (§2d result 2): changing **one** device's static delay stopped the group's
+single sendspin server, so all four members dropped and reconnected — and by §4.9 each
+one then pays tens of seconds of silence. The daemon cost was only 219 ms; the user cost
+was a group-wide outage for a one-device calibration tweak, which is the same shape as
+the bug §4.1 fixed for membership.
 
-The restart is deliberate — `api.rs` notes the firmware reads the static delay only at
-stream start, so a live push doesn't shift a running stream — but the blast radius is
-not. Two directions:
+The restart itself is deliberate — `api.rs` notes the firmware reads the static delay
+only at stream start, so a live push doesn't shift a running stream — but the blast
+radius was not. **Option A is implemented: the reconnect is scoped to the device whose
+delay changed.** Its delay is a property of its own per-device sender; the other
+members' timeline, codec, send-ahead and timestamps are all unchanged, so there is
+nothing for them to re-arm. This is the §4.1 argument applied to the delay path.
 
-- **Scope the restart to the one device.** Its delay is a property of its own sender;
-  the other members' streams do not change. This is the §4.1 argument applied to the
-  delay path.
-- **Prefer the live push where the firmware supports it.** The `sendspin_delay_live`
-  setting already skips the restart for firmware that honours a live `SetStaticDelay`;
-  finding out whether current firmware does (a §4.9-A question) may remove the restart
-  entirely.
+`GroupReconciler::force_server_restart` became `force_device_reconnect(node_name)`,
+which marks that one device in its group's `force_device_reconnect` set instead of
+flagging the whole server. `ServerAction` lost its `force_restart` input entirely —
+there is no caller left that wants a whole-group re-arm for its own reasons.
 
-Note the group *lead* genuinely is group-wide (it is a high-water mark over members —
-§4.6), so a delay change that raises the floor must still re-arm everyone. A change
-that does **not** move `group_lead_effective_ms` should not.
+**The group lead is the one part that really is group-wide**, and it is handled by the
+machinery that already existed rather than by a second rule: a member's static delay
+feeds `required_send_ahead_us`, so a delay big enough to push the group's requirement
+past the running server's high-water mark shows up as a *stream config* change
+(`sendspin_config_changed`) and takes the ordinary restart path — correct, because the
+shared timeline fixes the send-ahead at construction. Anything smaller leaves the
+config unchanged and only the edited device reconnects.
+
+Two implementation details worth knowing:
+
+- **The reconnect takes two reconcile passes**, deliberately. The first ends that
+  device's stream (`stop_device` — graceful `stream/end`) and drops it from the
+  remembered member set; the retry pass (§4.4, ≤3 s) sees the member set differ from
+  what's desired and re-supervises it through the ordinary membership path (§4.1's
+  step c2), which redials. Doing `stop_device` + `supervise` back-to-back would race:
+  `stop_client` only *signals* the old supervisor, which then emits `Disconnected`,
+  while `supervise` immediately spawns a fresh one for the same fullname — and both
+  feed one serial event loop, so a `Disconnected` landing after the new `Connected`
+  would remove the new connection's `pending`/`groups`/`client_to_node` entries and
+  unregister its control sender. That is the connected-but-silent failure §4.8 needed
+  instrumentation to see. The dial takes ~130 ms so the ordering is *likely* fine and
+  not *guaranteed*; splitting the passes makes it structural. The ≤3 s is free against
+  the tens of seconds the speaker's own resync costs, and only that speaker waits.
+- **"Does the lead move" is judged against the running server's high-water mark**, not
+  against the freshly-computed `group_lead_effective_ms` that `GET /api/sync/settings`
+  reports. Those diverge after a member with a large requirement leaves (§4.6: the API's
+  number drops, the mark stays). So a delay edit can change the *reported* effective lead
+  and still — deliberately — not re-arm the group. That is the §4.6 trade, not a new
+  approximation.
+
+Option B is **not** implemented and is still open: **prefer the live push where the
+firmware supports it.** The `sendspin_delay_live` setting already skips the reconnect
+entirely for firmware that honours a live `SetStaticDelay`, and it is left working as
+it was; whether current firmware does is a §4.9-A / §4.12 question (see #29 and #17 in
+§4.12's table). If the answer is yes, this whole path becomes a no-op — but scoping was
+worth doing regardless, because it is right even on firmware that needs the reconnect.
+
+Not deployed / not measured on hardware.
 
 ### 4.11 The deploy script restarted the add-on twice ✅
 
@@ -767,7 +824,7 @@ Two related observations from the same log, both worth keeping in mind when judg
   `0.2.20260728193511`, which predates §4.7. The earliest §4.7 can be judged is the
   *next* restart after it lands.
 
-### 4.12 The firmware is pinned to an abandoned pre-library snapshot ⬜
+### 4.12 The firmware pin — phase 1 done, migration assessed and demoted ◐
 
 This is now the **largest single lever** available, and it was invisible until the pin
 was dated.
@@ -797,7 +854,7 @@ they touch; issue numbers are sendspin-cpp PRs unless noted.
 | Observability we lack | **#67 "Report error state when out of sync"** (v0.7.0) — the device would *tell* us, instead of us inferring it from exchange counts |
 | Task priority / starvation (§4.9-A finding 3's other candidate) | #34 sync task priority 18 (v0.4.0) · #66 httpd priority 17 → 5 (v0.7.0) · #89 bit-gated `loop()` drains (v0.7.0) |
 | **Static delay (§4.10)** | #29 "static delay no longer applied when not adjustable" (v0.3.1) · #17 "Expose static delay setting to sendspin server" (v0.2.0) — these may decide whether `sendspin_delay_live` can be turned on and the restart dropped entirely |
-| Defaults that affect *our* server | #61: `server_max_connections` **2 → 4**; `client_id` now falls back to the interface MAC, new `mac_address` field (#65) — cf. esphome#16331 "Fix client_id MAC mismatch with ethernet" |
+| Defaults that affect *our* server | `server_max_connections` **2 → 4** (v0.7.0's breaking-changes summary attributes this to #65/#61; #61 itself is titled "Make WebSocket server port configurable", `server_port` default 8928, so check the config struct rather than the PR title); `client_id` now falls back to the interface MAC, new `mac_address` field (#65) — cf. esphome#16331 "Fix client_id MAC mismatch with ethernet" |
 
 **And the WiFi chain, which closes §4.9-A finding 3.** Three independent pieces agree:
 
@@ -811,8 +868,10 @@ they touch; issue numbers are sendspin-cpp PRs unless noted.
    tuning**, leaving tiny LWIP/WiFi buffers — "unstable Wi-Fi and unreliable OTA …
    device intermittently drops off the network". The owner independently reports seeing
    WiFi drops.
-3. **esphome#17133 "Suppress WiFi roam scanning while playing"** (merged 2026-07-10) —
-   the upstream fix for the roam-scan half. The pin predates it by four months.
+3. **esphome#17133 "Suppress WiFi roam scanning while playing"** (merged 2026-07-08) —
+   the upstream fix for the roam-scan half. The pin predates it by four months. Note it
+   is **already in ESPHome 2026.7.0**, i.e. available a release *earlier* than the
+   sendspin-cpp 0.7.0 pin, so the roam-scan half can be had without the full ladder.
 
 Which gives an end-to-end chain in which every link now has its own evidence:
 
@@ -841,12 +900,137 @@ Two of the three fixes already exist upstream. **Suggested order:**
 > instrumentation idea in §4.9-B is only worth it if the upgrade is deferred, and #50/#67
 > may make it unnecessary anyway.
 
-### 4.13 Our Rust server has never been checked against the spec ⬜
+#### Phase 1 executed (2026-07-29): PR #520 applied, flashed, measured
+
+**Applied and flashed successfully.** `config/common/core_board.yaml` only, verbatim from
+`gh pr diff 520` — the LWIP/WiFi/SPIRAM sdkconfig restoration (TCP buffers 65535, recv
+mboxes 64, AMPDU RX/TX with 32-slot BA windows, RX buffers 16/128, TX 64, SPIRAM
+placement for wifi+lwip+mDNS). Compile 203 s; the generated
+`sdkconfig.satellite1-c4150c*` was **spot-checked to confirm the keys actually landed**
+rather than being silently ignored. OTA 3.3 MB in 14.5 s; device answered ping 6 s after
+reboot and re-attached ~25 s later. No USB recovery needed. Not committed.
+
+**Result: null, exactly as predicted once §4.14 was found.** Seconds to reach 10
+exchanges after a reconnect — and note three devices were left unflashed as a **control
+group**, which is what makes this readable:
+
+| Device | firmware | pre-flash | post-flash |
+|---|---|---|---|
+| satellite1 `98:A3:…` | **reflashed** | 21.8, 61.0 | 41.2, 61.1, 51.4, 61.0 |
+| 093ca8 | old (control) | 41.5, 31.7 | 31.6, 41.5 |
+| 096287 | old (control) | 31.6, 31.6 | 31.7, 31.9 |
+| 0966f3 | old (control) | 21.4, 41.6 | 21.7, 41.6 |
+
+Neither the flashed device nor the controls moved. **Keep #520 anyway** — it compiles,
+the sdkconfig verifiably applies, and the owner's independent WiFi-drop and
+OTA-reliability reports justify it on its own merits. It is simply not this symptom.
+
+**But the measurement produced one unambiguous positive finding, and it is the strongest
+independent evidence for §4.14.** All **18** reconnect samples land on
+**`k × 10 s + 1.0–1.9 s`**, with k ∈ {2,3,4,5,6} — 21.4/21.7/21.8, 31.6/31.6/31.6/31.7/
+31.7/31.9, 41.2/41.5/41.5/41.6/41.6, 51.4, 61.0/61.0/61.1 — **zero exceptions**, with
+steady state occasionally reaching 12.2 s (k=1, the healthy floor). A cadence limited by
+*WiFi loss* would be continuously distributed. A cadence quantised to exact 10 s steps is
+a **discrete count of 10 s response timeouts** — i.e. requests that were never answered.
+That is §4.14's mechanism measured from the outside, without reading any code.
+
+**Caveat that bounds what this test proved: the source was not merely silent, it was
+absent.** The phone is disconnected at the Pi, so `bt-bridge-rtp` emitted **no packets at
+all** (observer: `pkts=0 peak=0` for every one of 3 525 s; relay `largest packet 3 B`
+throughout). So these numbers come from an *unloaded* WiFi path — ~150 B/s of Opus
+silence instead of ~26 kB/s of music. Consequences: the before/after is internally valid
+(identical conditions both sides, plus the control group), but it is **not comparable to
+§2d's 40.6/41.0/50.6/70.7**, and it **under-tests PR #520 specifically**, since buffer
+starvation is what a *loaded* RX path causes. Redo it with the phone connected. (Two
+workarounds — injecting a format-identical RTP stream, and connecting a dev box's own
+Bluetooth to the Pi's sink — were attempted and correctly refused as out of scope.)
+
+#### ⚠️ The flash left a lasting artifact — and it is not #520's doing
+
+The speaker's identity changed: `satellite1-c4150c` → **`satellite1-c4150c-c4150c`**
+(proven by the pre- and post-flash API handshakes naming each). The cause is **the
+owner's own uncommitted rename reaching hardware for the first time**, not the PR:
+`common/satellite1.base.yaml:42` sets `name_add_mac_suffix: true`, and the new untracked
+`config/satellite1-c4150c.yaml:53` sets `name: satellite1-c4150c` explicitly — so the MAC
+suffix now doubles it. The deleted `satellite1.yaml` set no explicit name, so the device
+was `satellite1` + suffix.
+
+Live consequences, confirmed against `/api/outputs`: the daemon lists **both**
+`sendspin-dev-satellite1_c4150c` and `sendspin-dev-satellite1_c4150c_c4150c` for
+192.168.178.99. The old (stale-mDNS-cached) entry holds the working connection and is the
+sync-group member; the new one is unrouted, carries a phantom idle Opus relay burning
+~500 blocks/10 s of encode, and re-dials ~0.5×/min with occasional
+`Connection reset without closing handshake`. The host absorbs it (87.5 % idle).
+
+**The risk is deferred, and it is a landmine:** on the next daemon restart the cached old
+entry disappears and the sync group loses satellite1 until the new name is adopted. Fix
+is one line in the untracked config — drop the explicit `name:`, or set
+`name_add_mac_suffix: false` — plus a reflash. Left for the owner, since the file is
+theirs and mid-edit.
+
+#### Migration assessment: **do not do it for this symptom**
+
+Verified against v0.7.0 sources, not release notes: `time_burst.h` still has
+`burst_size_{8}`, `DEFAULT_RESPONSE_TIMEOUT_MS = 10000`,
+`DEFAULT_BURST_INTERVAL_MS = 10000`; a timed-out message is still *skipped, never
+retransmitted*; `is_time_synced()` is still `time_filter_->has_update()`, with
+`sync_task.cpp`'s `handle_load_chunk()` decoding nothing while false. **And it is worse
+than the pinned snapshot in one respect:** `time_filter->update()` runs only at burst
+*completion*, so all 8 slots must resolve — worst case **8 × 10 s ≈ 80 s** of gated
+silence per reconnect. v0.7.0 does newly expose `time_burst_size` /
+`time_burst_interval_ms` / `time_burst_response_timeout_ms` in `SendspinClientConfig`, but
+**ESPHome does not surface them in YAML**, so tuning needs an upstream PR or a patched
+component.
+
+The dominant cost is **the version ladder, not sendspin**: the component shipped in
+ESPHome **2026.5.0**, **2026.7.0 pins sendspin-cpp 0.6.1**, and **0.7.0 is only on `dev`**
+(esphome#17781, so ≥2026.8). The box runs **2026.4.5**, so getting 0.7.0 means moving the
+*entire* Satellite1 config forward — XMOS flasher, `fusb302b`, `tas2780`,
+`satellite1_radar`, the `http_request` pin and a local TAS2780 boot patch. Docs still
+label the component experimental.
+
+On the plus side the YAML mostly *shrinks*: the whole `external_components:` block and
+`http_request:` go away, and `const` / `media_source` / `speaker_source` already exist
+natively in 2026.4.5 — so the current fork pin is overriding two components for no
+reason. Behavioural changes to absorb: repeat/shuffle move to controller state (#45),
+`stream/clear` handled in-library (#54), `static_delay_ms` now reports the *effective*
+value and 0 when not adjustable (#29 — directly relevant to §4.10/§4.15), `client_id`
+defaults to the interface MAC with a `mac_address` override (#65).
+
+### 4.13 Our Rust server checked against the spec — audit done ◐
 
 The daemon's sendspin server was written by converting a Python library's behaviour, not
-by reading the protocol specification — so conformance is unverified by construction,
-and a non-conformant server is a live candidate for firmware-side symptoms we have been
+by reading the protocol specification — so conformance was unverified by construction,
+and a non-conformant server was a live candidate for firmware-side symptoms we had been
 attributing to the firmware.
+
+> **Audit done 2026-07-29 against `Sendspin/spec` HEAD `aa752f6`.** That suspicion was
+> exactly right: the audit found the root cause (**§4.14**, fixed). Five further
+> deviations were found and each was checked against the *pinned firmware* rather than
+> assumed — all are currently **inert**, so they are correctness debt, not live bugs:
+>
+> | | Deviation | Live impact today |
+> |---|---|---|
+> | F3 | `server_transmitted` missing from `stream/start` / `stream/end` / `stream/clear` (spec makes it non-optional, and `roles/player/v1.md` defines the lead budget against it) | none — this firmware only requires it on `server/time` |
+> | F4 | `ClientSyncState` has no `Error` variant and no `#[serde(other)]`, so a `client/state` with `state: "error"` fails to parse and the **whole message** is discarded — volume, mute and static-delay deltas with it | none yet, **but** it would silently discard sendspin-cpp #67 "report error state when out of sync", which §4.12 lists as the upgrade's headline observability win |
+> | F5 | We add a client to `ready` for *any* `client/state`, so an `external_source` device is streamed to anyway and never gets `stream/end` (spec: MUST NOT) | none — these devices report `synchronized` |
+> | F7 | `buffer_capacity` is parsed and never read; our `MAX_QUEUED_AUDIO_FRAMES = 32` is a local invention where the spec supplies a negotiated number | none — the Voice PE advertises far more than we use |
+> | F8 | `required_lead_time_ms` excluded from the send-ahead — correct against spec HEAD, a violation against the era spec | none — this firmware reports neither field; **becomes live on upgrade** |
+>
+> Also checked and **compliant**: `stream/end` used only for genuine termination, chunk
+> duration bounds (≤150 ms / ≥15 ms) including Opus re-blocking, late joiners getting
+> future timestamps with no timeline re-anchor, `server/time` stamped immediately before
+> the write, handshake ordering, `active_roles`, `connection_reason`, PCM endianness and
+> the audio frame layout.
+>
+> One thing the audit *cleared*: our readiness gate keys on the **arrival** of
+> `client/state`, not its value, which is what the spec licenses. It is only the log
+> string that implied convergence — and that phrasing is what sent §2c down the
+> convergence path. (On the pinned firmware `synchronized` is a compile-time default
+> published unconditionally at handshake, so it asserts nothing about the clock.)
+>
+> F4 is worth fixing before §4.12, since it would silently eat the signal that upgrade is
+> being bought for.
 
 There is an authoritative source, and it is not the Python library:
 
@@ -873,6 +1057,144 @@ document chases:
   gate is reading a field that does not mean what we think.
 - **Timestamp/presentation semantics for the send-ahead**, against §4.6's high-water mark.
 
+### 4.14 ROOT CAUSE: our server silently dropped the client's clock-sync requests ✅
+
+**This is the answer.** It was ours, not the firmware's, and every hypothesis in this
+document looked in the wrong direction because the one instrument we trusted could not
+see it. Found by auditing our Rust server against
+[Sendspin/spec](https://github.com/Sendspin/spec) (§4.13) after §2d had already measured
+the symptom precisely enough to check the arithmetic against.
+
+**What the spec says.** Every revision, including all our server could have been written
+against: *"The frequency of these messages is determined by the client based on network
+conditions and clock stability"* and *"Once received, the server responds with a
+`server/time` message."* The cadence is the client's choice; a reply to each is the
+server's obligation. The spec grants a server **no** licence to rate-limit, coalesce or
+ignore `client/time` — the only such licence anywhere is for a player's *timing updates*
+in `client/state`, a different message. The reference implementation the spec points at
+sends **8 back-to-back, each awaiting its reply**.
+
+**What we did.** Two independent defects, both of which had to be fixed:
+
+1. `MIN_TIME_REPLY_INTERVAL_US = 50_000` in `writer.rs`, with `connection.rs` doing a
+   bare `continue` — **no reply at all** — for any request arriving within 50 ms of the
+   previous one. Its comment justified this with *"the spec's cadence is about one
+   `client/time` per second"*, which the spec has never said. Not present in upstream
+   `Sendspin/sendspin-rs` (0 hits): our fork's invention.
+2. The reply travelled a **single-slot `watch` channel**, documented as *"a correctness
+   property, not an optimisation"* on the grounds that a reply derived from the latest
+   request makes earlier ones redundant. Same mistake in a second place: the client
+   matches each reply to its request by `client_transmitted` and derives that
+   measurement's `max_error` from that specific round trip, so a superseded request is
+   not answered redundantly — it is **not answered at all**.
+
+**Why it cost tens of seconds.** Every link verified in the firmware source on disk:
+
+```
+our 50 ms drop / single-slot coalesce
+  → client is one-request-in-flight, RESPONSE_TIMEOUT_MS = 10000, NO retransmit
+    → each unanswered request costs the client a full 10 s
+      → time_filter->update() runs only when the whole 8-message burst completes
+        → is_time_synced() == has_update() == count_ >= 1  → false until then
+          → sync_handle_load_chunk_ returns early, decoding NOTHING
+            → total silence for k x 10 s
+              → init_time_filter() runs per connection, so every reconnect pays again
+```
+
+The arithmetic reproduces §2d result 4 quantitatively. With an answered fraction `f`,
+seconds per *logged* exchange ≈ `(1/f − 1)·10 + 10/(8f)`:
+
+| f | predicted s/exchange | measured (§2d) |
+|---|---|---|
+| 0.80 | 4.06 | 093ca8 **4.06**, 096287 **4.10** |
+| 0.72 | 5.2 | satellite1 **5.1** |
+| 0.66 | 7.1 | 0966f3 **7.1** |
+
+i.e. 1.6–2.7 dropped requests per burst → a first burst of 16–27 s. **The per-device
+spread needs no WiFi explanation**: it is each device's main-loop turnaround straddling
+our 50 ms threshold differently. That also explains the intermittency, and why the
+symptom never depended on how the previous session ended (§2c).
+
+**Independent confirmation, from outside the code (§4.12's phase-1 measurement).** Across
+**18** reconnect samples on four devices, every single one landed on
+**`k × 10 s + 1.0–1.9 s`** with k ∈ {2,3,4,5,6}, with steady state occasionally reaching
+12.2 s (k=1, the floor). **Zero exceptions.** WiFi loss would give a continuous
+distribution; quantisation to exact 10 s steps is a *discrete count of 10 s response
+timeouts* — unanswered requests, counted. That measurement was taken before this fix was
+deployed and without reference to the code, so it is genuinely independent of the audit
+that found the cause.
+
+**Why our instrumentation could not see it (§4.8's blind spot).** The
+`time exchange(s)` counter incremented *after* the drop check, so it counted only the
+requests we chose to answer. §2d's "0.2/s observed vs 0.8/s intended, a 4×
+discrepancy" was therefore measuring **our own replies**, and the gap was our drops —
+not the packet loss it was attributed to. A counter placed one line earlier would have
+ended this in an afternoon.
+
+**Fixed.** In the submodule:
+
+- `MIN_TIME_REPLY_INTERVAL_US` and the silent-drop branch are **gone**; every
+  `client/time` is answered.
+- The time lane is a **bounded queue** (`MAX_QUEUED_TIME_REPLIES = 32`) instead of a
+  single slot. The writer still takes exactly **one reply per loop pass**, so the
+  starvation concern the old comment raised is handled by bounding the queue rather than
+  collapsing it — the time lane still cannot hold more than one frame's worth of
+  priority over audio.
+- Overflow is a **logged WARN**, never a silent drop, and does not increment `replied`.
+- The log now prints **received and replied**: `N time exchange(s) (received M)`. They
+  should stay equal; a divergence is now visible in one line instead of requiring a code
+  read to rule out.
+
+Regression guard: `tests/server_listener.rs::every_client_time_is_answered_even_back_to_back`
+sends 8 requests with no pacing and asserts 8 replies, each echoing its own
+`client_transmitted`. **It failed against the rate-limit removal alone** — which is how
+the single-slot coalescing (defect 2) was caught, after it had been reasoned away as
+harmless on the grounds that the real client is one-in-flight. Worth remembering: the
+real client's politeness was hiding half the bug.
+
+`cargo test`: submodule **312 passed / 0 failed**, daemon **129 passed / 0 failed**,
+no new warnings.
+
+#### Confirmed on hardware (2026-07-29, `0.3.20260728232459`) ✅
+
+The owner reports reconnecting is now **fast**. The log agrees, and the prediction was
+exact:
+
+| | before (§2d / §4.12) | after |
+|---|---|---|
+| 10 exchanges after a reconnect | 40.6 / 41.0 / 50.6 / 70.7 s | **10.1 / 10.2 / 10.4 / 10.5 / 10.6 s** |
+| effective cadence | 0.14–0.25 /s | **~0.93 /s** |
+| per-device spread | 1.7× | **gone** (10.1–10.6 s across all four) |
+| `replied` vs `received` | not measurable | **equal in every sample, 0 divergences** |
+| `time-reply queue full` warnings | — | **0** |
+
+Three things worth drawing out:
+
+1. **~0.93 exchanges/s is the firmware's intended cadence**, not merely "better":
+   `BURST_SIZE = 8` every `BURST_INTERVAL_MS = 10000` predicts 10 exchanges per ~10.7 s,
+   and that is what the log shows. The client was never slow; we were not answering it.
+2. **The per-device spread vanished.** That spread (1.7×) was the whole reason this looked
+   like a per-device firmware bug — it was each device's main-loop turnaround straddling
+   our 50 ms window differently. Remove the window and four different devices become
+   indistinguishable. That is the cleanest possible confirmation of the mechanism.
+3. **The `k × 10 s` quantisation is gone.** §4.12's 18-for-18 quantised samples were a
+   count of 10 s response timeouts; there are now none to count.
+
+So §4.14 is closed end to end: spec → code → arithmetic → prediction → measurement.
+
+### 4.15 Next: stop reconnecting for a config change at all ⬜
+
+§4.13's F2. The spec's `stream/start` explicitly supports re-configuring a live stream:
+*"If sent for a role that already has an active stream, **updates the stream
+configuration without clearing buffers**."* Nothing in the protocol asks a server to drop
+the WebSocket to change codec, format or lead.
+
+Our only `stream/start` path is `Group::add_member` on a freshly-dialled connection, so
+every config change becomes a reconnect. With §4.14 fixed a reconnect is cheap again, so
+this is no longer urgent — but it is still the right shape, and it would reduce §4.10's
+remaining single-device gap to zero. Sequence it after §4.14 is confirmed on hardware, so
+the two changes are measured separately.
+
 ### Not a fix
 
 Lowering the send-ahead to shorten the refill. The floor is protocol- and hardware-driven
@@ -891,6 +1213,19 @@ a membership change restarts nothing at all, so there is nothing left to coalesc
   reconnect each yield `Start`.
 - `sync_group::tests::the_server_follows_whether_anything_is_routed`: first device routed
   ⇒ `Start`, last device unrouted ⇒ `Stop`, neither ⇒ `Idle` (an AP2-only group).
+- `sync_group::tests::a_static_delay_change_within_the_running_lead_touches_only_that_device`
+  (§4.10): composes the real `required_send_ahead_us` for a two-member Opus group and
+  shows that giving one member 40 ms leaves the group's send-ahead — and therefore
+  `sendspin_config_changed` and `ServerAction` — untouched, so the server keeps running;
+  plus that `force_device_reconnect` marks that device and *only* that device. Also pins
+  §4.6's one-way rule from this angle: a delay *reduction* can't re-arm anything either.
+- `sync_group::tests::a_static_delay_change_that_raises_the_group_lead_re_arms_every_member`
+  (§4.10, the other side): 250 ms on the same member pushes its requirement past the
+  group floor, so the config *has* changed and every member must re-arm — the guard that
+  stops the scoping above from being applied too eagerly.
+- `sync_group::tests::a_forced_reconnect_is_scoped_to_one_device_and_one_group`: a delay
+  edit doesn't disturb a co-existing group (different source-set, own anchor and server),
+  and a device no running group has returns false rather than silently marking something.
 - `sendspin_server::tests::an_unknown_member_does_not_drag_the_group_off_its_codec`: an
   unknown member imposes nothing, a member that *has* spoken and lacks the codec still
   vetoes it, and an explicit pick is unaffected either way. This is the one that would have
