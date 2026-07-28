@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # PipeWire Audio Router — Home Assistant add-on.
 #
 # Three stages: build the Svelte web UI (frontend/), build the Rust bridge
@@ -99,9 +100,31 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY bridge-daemon/ .
-RUN . /build-env.sh && cargo build --release
-# Copy to a fixed path so the runtime stage's COPY doesn't need the triple.
-RUN . /build-env.sh && cp "target/${CARGO_BUILD_TARGET}/release/bridge-daemon" /bridge-daemon
+# BuildKit cache mounts make this incremental. Without them every deploy
+# recompiled all ~600 dependency crates (plus bundled libopus via cmake and
+# libairptp via build.rs) from scratch, because ANY edit under bridge-daemon/
+# invalidates the COPY above and therefore this RUN's layer cache — a layer
+# cache can only be hit or missed whole, it can't be partially reused. The
+# cache mounts live outside the layer graph, so cargo still finds last build's
+# target/ fingerprints and rebuilds only what actually changed. The target
+# cache is keyed by $TARGETARCH so an amd64 and an arm64 build never fight
+# over the same artifacts.
+#
+# The `cp` MUST stay in this same RUN: /build/target is a cache mount, so it
+# is NOT captured in the resulting layer — a separate `RUN cp` would find the
+# directory empty. /bridge-daemon is outside the mount, so it does persist.
+# (Fixed path so the runtime stage's COPY doesn't need the triple.)
+#
+# Caveat: cache mounts are builder-local (they live in the ha-addon-builder
+# container's volume) and are not exported by --cache-to. `docker buildx rm
+# ha-addon-builder` or `docker builder prune` throws them away and the next
+# build is a full one again.
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=bridge-daemon-target-${TARGETARCH},target=/build/target,sharing=locked \
+    . /build-env.sh \
+    && cargo build --release \
+    && cp "target/${CARGO_BUILD_TARGET}/release/bridge-daemon" /bridge-daemon
 
 FROM ubuntu:26.04
 # systemd-standalone-sysusers: `pipewire`'s Depends is `systemd |

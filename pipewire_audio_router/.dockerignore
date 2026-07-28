@@ -1,8 +1,19 @@
-# Build-context excludes (context = pipewire_audio_router/). Keeps the host's
-# node_modules/dist and the root-owned Rust target out of the image build — the
-# frontend stage runs its own `npm ci`, and the Rust stage its own `cargo build`.
-frontend/node_modules
-frontend/dist
-bridge-daemon/target
+# Build-context excludes (context = pipewire_audio_router/). The frontend stage
+# runs its own `npm ci` and the Rust stage its own `cargo build`, so no build
+# output from the host belongs in the context at all.
+#
+# Patterns are UNANCHORED (**/) on purpose: a bare `bridge-daemon/target`
+# matches only that one path and silently let the nested vendored build caches
+# through — bridge-daemon/vendor/{sendspin,airplay2-sender,shairplay}/target
+# are ~8.6G of host-arch Rust artifacts that cargo inside the container never
+# reads (path deps build into the root /build/target). That made the context
+# ~8.8G, uploaded to the buildx builder on every single deploy.
+**/target
+**/node_modules
+**/dist
 **/*.tsbuildinfo
-.git
+**/.git
+
+# Not referenced by any COPY: docs/ is developer documentation, and
+# bridge-daemon/dist/ is a locally built binary from scripts/build-daemon.sh.
+docs

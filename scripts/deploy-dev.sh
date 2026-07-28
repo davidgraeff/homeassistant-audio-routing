@@ -197,9 +197,15 @@ deploy_addon() {
   echo "--- rsyncing add-on metadata to $HA_HOST:/addons/$ADDON_NAME/ ---"
   # Supervisor needs config.yaml (and the other add-on metadata) present to
   # know the add-on and its image ref; it does NOT build from this tree.
-  # bridge-daemon/target/ is a huge gitignored build cache — never sync it.
-  rsync -az --delete \
-    --exclude 'bridge-daemon/target/' \
+  # So exclude every build cache: an anchored 'bridge-daemon/target/' misses
+  # the nested bridge-daemon/vendor/*/target/ dirs, which are ~8.6G of Rust
+  # artifacts — that turns a 15M metadata sync into an hours-long transfer
+  # that also nearly fills the Pi's disk. Unanchored patterns match at any
+  # depth, which is what we want here.
+  rsync -az --delete --info=stats1 \
+    --exclude 'target/' \
+    --exclude 'node_modules/' \
+    --exclude 'dist/' \
     "$REPO_ROOT/$ADDON_NAME/" "root@$HA_HOST:/addons/$ADDON_NAME/"
 
   echo "--- pinning local add-on to dev version $dev_version ---"
