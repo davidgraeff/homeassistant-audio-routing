@@ -1,45 +1,29 @@
-// ABOUTME: server role: streams a WAV file to whatever Sendspin device(s) connect
+// ABOUTME: Example server that streams a WAV file to connected Sendspin devices
+// ABOUTME: Handles both dial-in clients and clients discovered/dialed over mDNS
 //
 // Usage:
 //   cargo run --example play_wav -- path/to/clip.wav
 //   cargo run --example play_wav -- --dial ws://192.168.1.42:8928/sendspin clip.wav
 //   cargo run --example play_wav -- --bind 0.0.0.0:8927 --no-advertise clip.wav
 //
-// Real Sendspin hardware splits into two connection topologies, and this
-// tool drives both concurrently:
-//   - Clients that dial in: accepted via ServerListener, discoverable via
-//     this tool's own `_sendspin-server._tcp.local.` mDNS advertisement.
-//   - Clients that only run their own embedded WebSocket server and never
-//     dial out — this is the primary topology for real embedded hardware
-//     (e.g. ESPHome's `sendspin:` component / Home Assistant Voice PE, via
-//     sendspin-cpp), confirmed by reading esphome/esphome's sendspin_hub.cpp:
-//     its setup() only ever calls start_server(), never an outbound connect.
-//     These advertise themselves as `_sendspin._tcp.local.`; this tool
-//     discovers and dials them automatically by default via ClientManager,
-//     which also retries with backoff on disconnect and re-dials if a
-//     device reappears at a new address — a reboot or WiFi drop mid-test
-//     doesn't need this tool restarted. Giving --dial switches discovery
-//     off (isolating the test to just the address(es) you named, dialed
-//     once with no retry) unless you also pass --also-discover.
-//
-// Waits for at least one client from either path, gives a short grace period
-// for additional clients to join for a multi-room sync test, then streams
-// the file to every connected client as one synchronized Group, printing
-// every client/state, client/command, and client/goodbye it receives along
-// the way — that traffic is exactly what you want to see when a real device
-// behaves unexpectedly.
+// Streams the file to every connected client as one synchronized group, and
+// prints the client/state, client/command, and client/goodbye messages it
+// receives. Handles both connection directions: clients that dial in
+// (accepted via ServerListener, discoverable through this tool's mDNS
+// advertisement) and clients that only run their own embedded server
+// (discovered and dialed via ClientManager). `--dial` targets specific
+// clients and disables discovery unless `--also-discover` is given.
 //
 // Only plain PCM WAV (fmt tag 1) is supported. Re-encode anything else first,
 // e.g.: ffmpeg -i in.mp3 -ar 48000 -ac 2 -acodec pcm_s16le out.wav
 
 use clap::Parser;
 use sendspin::protocol::messages::Message;
-use sendspin::server::{dial_client, Advertisement, ClientEvent, ClientManager, Group};
+use sendspin::server::{Advertisement, ClientEvent, ClientManager, Group, ServerRole};
 use sendspin::{DefaultClock, ServerConnection, ServerListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 #[command(name = "play_wav")]
@@ -190,9 +174,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             / (wav.sample_rate as f64 * wav.channels as f64 * (wav.bit_depth as f64 / 8.0))
     );
 
-    let listener = ServerListener::bind(&args.bind, &args.server_id, &args.name)
-        .await?
-        .path(&args.path);
+    // One role, reused for the listener, the dials and the manager, so this tool's
+    // identity and connection settings are stated once.
+    let role =
+        ServerRole::new(&args.server_id, &args.name).clock(Arc::new(DefaultClock::default()));
+    let listener = role.bind(&args.bind).await?.path(&args.path);
     let port = listener.local_addr()?.port();
     println!(
         "listening on {} (path {}), for clients that dial in",
@@ -215,39 +201,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let group = Arc::new(Mutex::new(
+    let group = Arc::new(
         Group::new(Arc::new(DefaultClock::default()))
             .with_send_ahead_us(args.send_ahead_ms as i64 * 1000),
-    ));
+    );
 
     spawn_accept_loop(listener, Arc::clone(&group));
     // Kept alive for main()'s whole lifetime — dropping it would stop
     // discovery and abort every reconnect loop it's supervising.
     let _manager = if discover {
-        Some(spawn_manager_loop(
-            Arc::clone(&group),
-            args.server_id.clone(),
-            args.name.clone(),
-        )?)
+        Some(spawn_manager_loop(Arc::clone(&group), role.clone())?)
     } else {
         None
     };
     for url in &args.dial_urls {
-        dial_one(&group, url, &args.server_id, &args.name).await;
+        dial_one(&group, url, &role).await;
     }
 
     println!("waiting for at least one client (inbound accept, mDNS discovery, or --dial)...");
     wait_for_first_member(&group).await;
 
     if args.wait_secs > 0 {
-        println!(
-            "waiting up to {}s for additional clients (connect more devices now for a multi-room test)...",
-            args.wait_secs
-        );
+        println!("waiting up to {}s for additional clients (connect more devices now for a multi-room test)...", args.wait_secs);
         tokio::time::sleep(Duration::from_secs(args.wait_secs)).await;
     }
 
-    let member_count = group.lock().await.len();
+    let member_count = group.len();
     println!("starting playback to {member_count} client(s)");
 
     let chunk_bytes = (wav.sample_rate as u64 * args.chunk_ms / 1000) as usize
@@ -257,48 +236,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("computed chunk size is zero — check --chunk-ms and the WAV format".into());
     }
 
-    {
-        let mut group = group.lock().await;
-        group
-            .start_stream(sendspin::protocol::messages::StreamPlayerConfig {
-                codec: "pcm".to_string(),
-                sample_rate: wav.sample_rate,
-                channels: wav.channels,
-                bit_depth: wav.bit_depth,
-                codec_header: None,
-            })
-            .await;
+    group
+        .start_stream(sendspin::protocol::messages::StreamPlayerConfig {
+            codec: "pcm".to_string(),
+            sample_rate: wav.sample_rate,
+            channels: wav.channels,
+            bit_depth: wav.bit_depth,
+            codec_header: None,
+        })
+        .await;
 
-        // A fixed post-send sleep drifts: each push_audio() call itself takes
-        // real time (it awaits every member's actual socket write
-        // completing, see ServerSender::send_audio_chunk), so
-        // "sleep(chunk_ms) after sending" paces slightly *slower* than
-        // real-time. Over a few hundred chunks that accumulates into
-        // seconds of lag, which starves clients' playback buffers —
-        // reproduced as audible stuttering that got worse over a track's
-        // length. `interval` anchors ticks to a fixed absolute schedule
-        // instead of restarting the clock after each send, so occasional
-        // slow sends don't compound; `Delay` (vs the default `Burst`) means
-        // a slow tick shifts the schedule rather than firing a rapid-fire
-        // burst of catch-up sends once whatever caused the slowdown clears.
-        let mut ticker = tokio::time::interval(Duration::from_millis(args.chunk_ms));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        let total_chunks = wav.data.len().div_ceil(chunk_bytes);
-        for (i, chunk) in wav.data.chunks(chunk_bytes).enumerate() {
-            ticker.tick().await;
-            let timestamp_us = group.push_audio(chunk).await;
-            if i % 10 == 0 || i + 1 == total_chunks {
-                println!(
-                    "chunk {}/{total_chunks} (timestamp {timestamp_us}us)",
-                    i + 1
-                );
-            }
+    // push_audio enqueues without blocking and the Group anchors its own
+    // timeline, so playback timing no longer depends on the exact push cadence
+    // — a plain per-chunk sleep is enough to pace roughly real-time and keep
+    // each member's send queue shallow. Nothing here holds a lock on the group,
+    // so clients arriving mid-stream (via the accept or discovery loops) are
+    // added concurrently and join the playback in progress.
+    let total_chunks = wav.data.len().div_ceil(chunk_bytes);
+    for (i, chunk) in wav.data.chunks(chunk_bytes).enumerate() {
+        let timestamp_us = group.push_audio(chunk);
+        if i % 10 == 0 || i + 1 == total_chunks {
+            println!(
+                "chunk {}/{total_chunks} (timestamp {timestamp_us}us)",
+                i + 1
+            );
         }
-
-        println!("done sending audio, ending stream");
-        group.end_stream().await;
+        tokio::time::sleep(Duration::from_millis(args.chunk_ms)).await;
     }
+
+    println!("done sending audio, ending stream");
+    group.end_stream().await;
 
     // Give the last chunks time to actually finish playing before hanging up.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -307,9 +274,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn wait_for_first_member(group: &Arc<Mutex<Group>>) {
+async fn wait_for_first_member(group: &Arc<Group>) {
     loop {
-        if !group.lock().await.is_empty() {
+        if !group.is_empty() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -317,7 +284,7 @@ async fn wait_for_first_member(group: &Arc<Mutex<Group>>) {
 }
 
 /// Accept clients that dial in to us.
-fn spawn_accept_loop(listener: ServerListener, group: Arc<Mutex<Group>>) {
+fn spawn_accept_loop(listener: ServerListener, group: Arc<Group>) {
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -339,30 +306,40 @@ fn spawn_accept_loop(listener: ServerListener, group: Arc<Mutex<Group>>) {
     });
 }
 
-/// Discover clients that only run their own embedded server (the primary
-/// topology for real hardware, see the module docs above), dial them, and
-/// keep them connected — ClientManager retries with backoff on disconnect
-/// and re-dials automatically if a device reappears at a new address, so a
-/// device rebooting or dropping WiFi mid-test doesn't need this tool
-/// restarted to pick it back up.
+/// Discover clients that only run their own embedded server, dial them, and
+/// keep them connected via ClientManager (which retries with backoff on
+/// disconnect and re-dials if a device reappears at a new address).
 fn spawn_manager_loop(
-    group: Arc<Mutex<Group>>,
-    server_id: String,
-    name: String,
+    group: Arc<Group>,
+    role: ServerRole,
 ) -> Result<ClientManager, Box<dyn std::error::Error>> {
-    let (manager, mut events) =
-        ClientManager::start(server_id, name, Arc::new(DefaultClock::default()))?;
+    let (manager, mut events) = ClientManager::start(&role, |_fullname| true, None)?;
     println!("discovering Sendspin clients via mDNS (_sendspin._tcp.local.)...");
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
                 ClientEvent::Connected {
                     client_id,
+                    fullname,
                     active_roles,
+                    hello,
                     sender,
                 } => {
-                    println!("[{client_id}] connected (dialed): roles={active_roles:?}");
-                    if let Err(e) = group.lock().await.add_member(client_id, sender).await {
+                    println!(
+                        "[{client_id}] connected (dialed via {fullname}): roles={active_roles:?}"
+                    );
+                    // What the device says it can decode. Printing it is half the
+                    // point of pointing this tool at real hardware: this tool
+                    // streams the WAV's own format unchanged, so a mismatch here
+                    // is why a device connects and then plays nothing.
+                    match hello.player_v1_support.as_ref() {
+                        Some(p) => println!(
+                            "[{client_id}] player@v1: buffer_capacity={} formats={:?}",
+                            p.buffer_capacity, p.supported_formats
+                        ),
+                        None => println!("[{client_id}] declared no player@v1 support"),
+                    }
+                    if let Err(e) = group.add_member(client_id, sender).await {
                         println!("failed to add member to group: {e}");
                     }
                 }
@@ -374,7 +351,7 @@ fn spawn_manager_loop(
                 },
                 ClientEvent::Disconnected { client_id } => {
                     println!("[{client_id}] connection closed, will retry in the background");
-                    group.lock().await.remove_member(&client_id);
+                    group.remove_member(&client_id);
                 }
             }
         }
@@ -383,12 +360,12 @@ fn spawn_manager_loop(
 }
 
 /// Dial one specific URL given via `--dial`, once, at startup.
-async fn dial_one(group: &Arc<Mutex<Group>>, url: &str, server_id: &str, name: &str) {
-    dial_and_add(group, url, server_id, name).await;
+async fn dial_one(group: &Arc<Group>, url: &str, role: &ServerRole) {
+    dial_and_add(group, url, role).await;
 }
 
-async fn dial_and_add(group: &Arc<Mutex<Group>>, url: &str, server_id: &str, name: &str) {
-    match dial_client(url, server_id, name, Arc::new(DefaultClock::default())).await {
+async fn dial_and_add(group: &Arc<Group>, url: &str, role: &ServerRole) {
+    match role.dial(url).await {
         Ok(conn) => {
             println!(
                 "[{url}] client connected (dialed): id={} name={:?} roles={:?}",
@@ -402,11 +379,11 @@ async fn dial_and_add(group: &Arc<Mutex<Group>>, url: &str, server_id: &str, nam
     }
 }
 
-async fn add_and_drain(group: &Arc<Mutex<Group>>, conn: ServerConnection) {
+async fn add_and_drain(group: &Arc<Group>, conn: ServerConnection) {
     let client_id = conn.client_id().to_string();
     let sender = conn.sender();
     spawn_message_drain(client_id.clone(), conn);
-    if let Err(e) = group.lock().await.add_member(client_id, sender).await {
+    if let Err(e) = group.add_member(client_id, sender).await {
         println!("failed to add member to group: {e}");
     }
 }

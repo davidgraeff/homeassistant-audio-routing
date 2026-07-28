@@ -7,7 +7,7 @@ mod common;
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::ServiceInfo;
 use sendspin::protocol::messages::Message;
-use sendspin::server::{dial_client, ClientBrowser};
+use sendspin::server::{ClientBrowser, Discovered, ServerRole};
 use sendspin::DefaultClock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +50,10 @@ async fn run_fake_embedded_client(port: u16) -> Message {
 
 #[tokio::test]
 async fn discovers_and_dials_a_self_advertising_client() {
+    if !common::net_tests_enabled() {
+        eprintln!("skipping: set SENDSPIN_NET_TESTS=1 to run mDNS multicast tests");
+        return;
+    }
     // Real mDNS multicast timing (see tests/common/mod.rs) — retry rather
     // than let one transient hiccup fail CI.
     common::retry_flaky(3, discovers_and_dials_a_self_advertising_client_impl).await;
@@ -93,7 +97,13 @@ async fn discovers_and_dials_a_self_advertising_client_impl() {
     let browser = ClientBrowser::new().expect("browser");
     let url = timeout(Duration::from_secs(15), async {
         loop {
-            let url = browser.next_client_url().await?;
+            // `next_event` rather than a URL-only accessor: the fullname is the
+            // stable device identity, and discarding it here is what made the
+            // convenience accessor a trap.
+            let url = match browser.next_event().await? {
+                Discovered::Found { url, .. } => url,
+                Discovered::Removed { .. } => continue,
+            };
             if url.contains(&port.to_string()) {
                 return Some(url);
             }
@@ -107,14 +117,11 @@ async fn discovers_and_dials_a_self_advertising_client_impl() {
         "unexpected discovered URL: {url}"
     );
 
-    let conn = dial_client(
-        &url,
-        "test-dial-server",
-        "Test Dial Server",
-        Arc::new(DefaultClock::default()),
-    )
-    .await
-    .expect("dial_client failed");
+    let conn = ServerRole::new("test-dial-server", "Test Dial Server")
+        .clock(Arc::new(DefaultClock::default()))
+        .dial(&url)
+        .await
+        .expect("dial failed");
     assert_eq!(conn.client_id(), "fake-embedded-client");
     assert_eq!(conn.active_roles(), ["player@v1".to_string()]);
 

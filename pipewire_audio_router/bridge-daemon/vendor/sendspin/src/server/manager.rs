@@ -1,11 +1,10 @@
 // ABOUTME: Continuous discovery + reconnect-with-backoff supervision for clients
 // ABOUTME: that only run their own embedded server (the supervised form of dial_client)
 
-use crate::protocol::messages::Message;
+use crate::protocol::messages::{ClientHello, Message};
 use crate::server::connection::{ServerConnection, ServerSender};
-use crate::server::dial::dial_client;
 use crate::server::discovery::{ClientBrowser, Discovered};
-use crate::sync::raw_clock::Clock;
+use crate::server::role::ServerRole;
 use mdns_sd::ServiceDaemon;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,7 +32,9 @@ enum Directive {
     /// (Re)dial the client at this URL. A new URL for an already-connected
     /// client makes the supervisor drop the current connection and redial.
     Dial(String),
-    /// Stop supervising — the device's mDNS advertisement was removed.
+    /// Stop supervising this client and end its task. Sent only by
+    /// [`ClientManager::stop_client`] — an mDNS removal is a possible power-save
+    /// lapse rather than proof of departure, so it does not imply this.
     Stop,
 }
 
@@ -56,6 +57,15 @@ pub enum ClientEvent {
         fullname: String,
         /// Roles this server granted the client.
         active_roles: Vec<String>,
+        /// The client's own `client/hello` — its advertised capabilities
+        /// (`player@v1_support.supported_formats`, buffer capacity, supported
+        /// commands) and `device_info`. Forwarded because the manager owns the
+        /// connection internally, so a caller that never sees the
+        /// [`crate::server::ServerConnection`] would otherwise have no way to read
+        /// them — and without them a server cannot negotiate a codec/rate the
+        /// device actually supports (it can only guess). Boxed to keep the event
+        /// enum small.
+        hello: Box<ClientHello>,
         /// Sender for pushing stream/audio/command messages to this client.
         sender: ServerSender,
     },
@@ -68,9 +78,10 @@ pub enum ClientEvent {
         /// The message itself.
         message: Box<Message>,
     },
-    /// The client disconnected. If it's still discoverable, a reconnect
-    /// attempt is already running in the background — this just tells the
-    /// caller to stop treating `client_id` as a live group member for now.
+    /// The client disconnected. A reconnect attempt is already running in the
+    /// background — unconditionally, since supervision outlives an mDNS lapse — so
+    /// this just tells the caller to stop treating `client_id` as a live group
+    /// member for now.
     Disconnected {
         /// The client that disconnected.
         client_id: String,
@@ -85,59 +96,48 @@ struct ManagedClient {
 
 /// Discovers Sendspin clients that only run their own embedded server and keeps
 /// each one connected: dials on discovery, retries with capped exponential
-/// backoff on failure or disconnect, re-dials promptly if a device reappears at
-/// a new address, and stops supervising once a device's mDNS advertisement is
-/// removed.
+/// backoff on failure or disconnect, and re-dials promptly if a device reappears
+/// at a new address. A device whose mDNS advertisement lapses keeps its supervisor
+/// — see `Discovered::Removed` in the browse loop for why — so supervision ends
+/// only when the caller asks for it ([`ClientManager::stop_client`]) or the manager
+/// is dropped.
 pub struct ClientManager {
     tasks: Arc<Mutex<HashMap<String, ManagedClient>>>,
-    browse_handle: JoinHandle<()>,
+    /// `None` for a manager started with [`ClientManager::start_without_discovery`],
+    /// which has no browser of its own.
+    browse_handle: Option<JoinHandle<()>>,
+    /// Kept so [`ClientManager::supervise`] can spawn supervisors with the same
+    /// identity/timeouts/connection-reason the manager was started with.
+    role: ServerRole,
+    event_tx: UnboundedSender<ClientEvent>,
 }
 
 impl ClientManager {
-    /// Start discovering and managing every Sendspin client this process can
-    /// see on the network. Returns immediately; events arrive on the
-    /// returned receiver as they happen. Drop the returned `ClientManager`
-    /// to stop discovery and every reconnect loop it's running.
+    /// Start discovering and managing Sendspin clients using `role`'s identity and
+    /// connection settings. Returns immediately; events arrive on the returned
+    /// receiver as they happen. Drop the returned `ClientManager` to stop discovery
+    /// and every reconnect loop it is running.
     ///
-    /// This is unfiltered: on a LAN where other servers already serve some of
-    /// these clients, you will compete with them for those devices. Use
-    /// [`Self::start_filtered`] to scope discovery to a known set of devices.
+    /// `allow` scopes discovery by mDNS instance full name (e.g.
+    /// `my-device._sendspin._tcp.local.`). Accepting everything is rarely what you
+    /// want on a LAN where other servers already serve some of those clients — you
+    /// will compete with them for the devices.
+    ///
+    /// `daemon` lets an embedder share one mDNS `ServiceDaemon` (see
+    /// [`ClientBrowser::with_daemon`]) across all of its mDNS rather than adding a
+    /// daemon thread — and, under host networking, its multicast amplification —
+    /// per manager. `None` spawns a private one.
     pub fn start(
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
-        clock: Arc<dyn Clock>,
-    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
-        Self::start_filtered(server_id, server_name, clock, |_fullname| true)
-    }
-
-    /// Like [`Self::start`], but only discovers and manages clients whose
-    /// mDNS instance full name (e.g. `my-device._sendspin._tcp.local.`)
-    /// satisfies `allow`.
-    pub fn start_filtered(
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
-        clock: Arc<dyn Clock>,
-        allow: impl Fn(&str) -> bool + Send + 'static,
-    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
-        Self::start_filtered_with_daemon(server_id, server_name, clock, allow, None)
-    }
-
-    /// Like [`Self::start_filtered`], but browses on a **caller-provided** mDNS
-    /// daemon (see [`ClientBrowser::with_daemon`]) instead of spawning its own —
-    /// so an embedder can share one interface-restricted daemon across all of
-    /// its mDNS instead of adding a `mDNS_daemon` thread (and, under
-    /// host-networking, its multicast amplification) per manager. Passing `None`
-    /// is exactly [`Self::start_filtered`].
-    pub fn start_filtered_with_daemon(
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
-        clock: Arc<dyn Clock>,
+        role: &ServerRole,
         allow: impl Fn(&str) -> bool + Send + 'static,
         daemon: Option<ServiceDaemon>,
     ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
-        let server_id = server_id.into();
-        let server_name = server_name.into();
+        // Two clones survive the browse task: the manager keeps them so
+        // `supervise` can spawn supervisors with the same identity later.
+        let role_for_manager = role.clone();
+        let role = role.clone();
         let (event_tx, event_rx) = unbounded_channel();
+        let event_tx_for_manager = event_tx.clone();
         let tasks: Arc<Mutex<HashMap<String, ManagedClient>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -175,9 +175,7 @@ impl ClientManager {
                                     *existing = spawn_supervisor(
                                         fullname.clone(),
                                         url,
-                                        server_id.clone(),
-                                        server_name.clone(),
-                                        Arc::clone(&clock),
+                                        role.clone(),
                                         event_tx.clone(),
                                     );
                                 }
@@ -186,9 +184,7 @@ impl ClientManager {
                                 let managed = spawn_supervisor(
                                     fullname.clone(),
                                     url,
-                                    server_id.clone(),
-                                    server_name.clone(),
-                                    Arc::clone(&clock),
+                                    role.clone(),
                                     event_tx.clone(),
                                 );
                                 tasks.insert(fullname, managed);
@@ -198,9 +194,9 @@ impl ClientManager {
                     // The device's mDNS advertisement went away. This is NOT proof
                     // the device left: WiFi power-saving speakers (e.g. Home Assistant
                     // Voice PE) routinely let their record lapse (TTL expiry) while
-                    // still online, then re-announce. Stopping supervision here meant a
-                    // brief mDNS flap permanently dropped the device — it never resumed
-                    // playing. So KEEP the supervisor: its dial loop already retries
+                    // still online, then re-announce. Stopping supervision here would let
+                    // a brief mDNS flap silence the device permanently — nothing would
+                    // redial it. So KEEP the supervisor: its dial loop already retries
                     // with backoff (1s→5min), so it reconnects the moment the device is
                     // reachable again, no dependency on a fresh mDNS announcement. A
                     // genuinely-gone device is removed by the host's own liveness layer
@@ -217,16 +213,117 @@ impl ClientManager {
         Ok((
             Self {
                 tasks,
-                browse_handle,
+                browse_handle: Some(browse_handle),
+                role: role_for_manager,
+                event_tx: event_tx_for_manager,
             },
             event_rx,
         ))
+    }
+
+    /// Start a manager that does **no discovery of its own**: the caller supplies
+    /// which clients to keep connected, with [`Self::supervise`].
+    ///
+    /// Use this when the embedder already browses `_sendspin._tcp` itself, and
+    /// especially when it runs **several** managers over one shared
+    /// [`ClientBrowser::with_daemon`] daemon — because mdns-sd keeps exactly one
+    /// listener per service type ("If there is already a `listener`, it will be
+    /// updated, i.e. overwritten"), so every manager that browses steals the
+    /// subscription from the one before it. All but the newest then go deaf: they
+    /// never see their devices and never dial, silently. One browse in the embedder,
+    /// feeding N caller-driven managers, has no such failure mode — and costs one
+    /// less multicast querier per manager.
+    ///
+    /// Everything after the dial is unchanged: the same supervisor loop, the same
+    /// `Connected`/`Message`/`Disconnected` events, the same capped-backoff retry.
+    pub fn start_without_discovery(role: &ServerRole) -> (Self, UnboundedReceiver<ClientEvent>) {
+        let (event_tx, event_rx) = unbounded_channel();
+        (
+            Self {
+                tasks: Arc::new(Mutex::new(HashMap::new())),
+                browse_handle: None,
+                role: role.clone(),
+                event_tx,
+            },
+            event_rx,
+        )
+    }
+
+    /// Keep the client at `url` connected, dialing it now and retrying with capped
+    /// backoff for as long as this manager lives (or until
+    /// [`Self::stop_client`]).
+    ///
+    /// Idempotent per `fullname`, which is what makes it safe to call on every pass
+    /// of an embedder's own reconcile loop: an unchanged URL is a no-op, a changed
+    /// one redirects the running supervisor (it closes the current connection, emits
+    /// [`ClientEvent::Disconnected`], and redials the new address) exactly as a
+    /// re-resolve through the browser would.
+    pub fn supervise(&self, fullname: &str, url: &str) {
+        let mut tasks = self.tasks();
+        match tasks.get_mut(fullname) {
+            Some(existing) if existing.url == url => {}
+            Some(existing) => {
+                log::info!("[{fullname}] address changed ({} -> {url}), reconnecting", existing.url);
+                existing.url = url.to_string();
+                if existing.directive_tx.send(Directive::Dial(url.to_string())).is_err() {
+                    *existing = spawn_supervisor(
+                        fullname.to_string(),
+                        url.to_string(),
+                        self.role.clone(),
+                        self.event_tx.clone(),
+                    );
+                }
+            }
+            None => {
+                let managed = spawn_supervisor(
+                    fullname.to_string(),
+                    url.to_string(),
+                    self.role.clone(),
+                    self.event_tx.clone(),
+                );
+                tasks.insert(fullname.to_string(), managed);
+            }
+        }
+    }
+
+    /// Stop supervising one client and end its reconnect loop, gracefully — a live
+    /// connection emits [`ClientEvent::Disconnected`] as it goes.
+    ///
+    /// This is the counterpart to the manager's deliberate refusal to give up on a
+    /// device whose mDNS record merely lapsed: because a missed announcement is not
+    /// evidence a device left, deciding it *has* left is the caller's call, and this
+    /// is how they say so. Without it an embedder must drop and rebuild the whole
+    /// manager — every other device's connection included — to stop supervising one.
+    ///
+    /// Returns whether that client was being supervised.
+    pub fn stop_client(&self, fullname: &str) -> bool {
+        match self.tasks().remove(fullname) {
+            Some(managed) => {
+                log::info!("[{fullname}] supervision stopped by the caller");
+                let _ = managed.directive_tx.send(Directive::Stop);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// mDNS instance full names of every client currently supervised.
+    pub fn supervised(&self) -> Vec<String> {
+        self.tasks().keys().cloned().collect()
+    }
+
+    fn tasks(&self) -> std::sync::MutexGuard<'_, HashMap<String, ManagedClient>> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
 impl Drop for ClientManager {
     fn drop(&mut self) {
-        self.browse_handle.abort();
+        if let Some(h) = &self.browse_handle {
+            h.abort();
+        }
         for (_, managed) in self.tasks.lock().unwrap().drain() {
             managed.handle.abort();
         }
@@ -236,20 +333,11 @@ impl Drop for ClientManager {
 fn spawn_supervisor(
     fullname: String,
     url: String,
-    server_id: String,
-    server_name: String,
-    clock: Arc<dyn Clock>,
+    role: ServerRole,
     event_tx: UnboundedSender<ClientEvent>,
 ) -> ManagedClient {
     let (directive_tx, directive_rx) = watch::channel(Directive::Dial(url.clone()));
-    let handle = tokio::spawn(supervise(
-        fullname,
-        directive_rx,
-        server_id,
-        server_name,
-        clock,
-        event_tx,
-    ));
+    let handle = tokio::spawn(supervise(fullname, directive_rx, role, event_tx));
     ManagedClient {
         handle,
         directive_tx,
@@ -264,9 +352,7 @@ fn spawn_supervisor(
 async fn supervise(
     fullname: String,
     mut directive_rx: watch::Receiver<Directive>,
-    server_id: String,
-    server_name: String,
-    clock: Arc<dyn Clock>,
+    role: ServerRole,
     event_tx: UnboundedSender<ClientEvent>,
 ) {
     let mut backoff = MIN_BACKOFF;
@@ -276,7 +362,10 @@ async fn supervise(
             Directive::Stop => return,
         };
 
-        match dial_client(&url, &server_id, &server_name, Arc::clone(&clock)).await {
+        // Dialing is not selected against `directive_rx` because it is bounded:
+        // the handshake has its own deadline, so a silent peer can delay this loop
+        // by at most that, not indefinitely.
+        match role.dial(&url).await {
             Ok(conn) => {
                 // A Stop that arrived during the dial: don't announce a
                 // connection we're about to tear down.
@@ -290,6 +379,7 @@ async fn supervise(
                     client_id: client_id.clone(),
                     fullname: fullname.clone(),
                     active_roles: conn.active_roles().to_vec(),
+                    hello: Box::new(conn.hello().clone()),
                     sender: conn.sender(),
                 });
 

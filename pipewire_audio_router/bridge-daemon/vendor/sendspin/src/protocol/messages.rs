@@ -132,7 +132,7 @@ pub struct PlayerV1Support {
 }
 
 /// Audio format specification
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioFormatSpec {
     /// Codec name (e.g., "pcm", "opus", "flac")
     pub codec: String,
@@ -142,6 +142,36 @@ pub struct AudioFormatSpec {
     pub sample_rate: u32,
     /// Bit depth per sample
     pub bit_depth: u8,
+}
+
+impl PlayerV1Support {
+    /// Does the client accept exactly this format?
+    ///
+    /// Codec names are compared case-insensitively (the spec's names are
+    /// lowercase, but a client that shouts "PCM" still means pcm); everything else
+    /// must match exactly, since a player advertises the discrete formats it can
+    /// decode, not ranges.
+    pub fn supports(&self, format: &AudioFormatSpec) -> bool {
+        self.supported_formats.iter().any(|f| {
+            f.codec.eq_ignore_ascii_case(&format.codec)
+                && f.channels == format.channels
+                && f.sample_rate == format.sample_rate
+                && f.bit_depth == format.bit_depth
+        })
+    }
+
+    /// The first of `preferred` this client supports — the server-side codec/rate
+    /// negotiation the protocol's `supported_formats` exists for. Order `preferred`
+    /// best-first (e.g. a compressed format ahead of PCM to save WiFi airtime, or
+    /// PCM first to avoid encode cost); `None` means nothing offered fits, and the
+    /// caller must not start a stream the device can't decode.
+    ///
+    /// Formats are per *stream*, and one stream can serve a whole group, so a
+    /// server streaming to several clients must intersect across all of them —
+    /// call this per client and keep a format every member supports.
+    pub fn pick_format(&self, preferred: &[AudioFormatSpec]) -> Option<AudioFormatSpec> {
+        preferred.iter().find(|f| self.supports(f)).cloned()
+    }
 }
 
 /// Artwork@v1 capabilities
@@ -678,3 +708,58 @@ pub enum GoodbyeReason {
 /// Legacy type alias for backwards compatibility
 #[deprecated(note = "Use PlayerV1Support instead")]
 pub type PlayerSupport = PlayerV1Support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fmt(codec: &str, sample_rate: u32, bit_depth: u8) -> AudioFormatSpec {
+        AudioFormatSpec {
+            codec: codec.to_string(),
+            channels: 2,
+            sample_rate,
+            bit_depth,
+        }
+    }
+
+    fn support(formats: Vec<AudioFormatSpec>) -> PlayerV1Support {
+        PlayerV1Support {
+            supported_formats: formats,
+            buffer_capacity: 16,
+            supported_commands: vec![],
+        }
+    }
+
+    #[test]
+    fn supports_matches_the_whole_format_not_just_the_codec() {
+        let s = support(vec![fmt("pcm", 48_000, 16)]);
+        assert!(s.supports(&fmt("pcm", 48_000, 16)));
+        assert!(
+            s.supports(&fmt("PCM", 48_000, 16)),
+            "codec names compare case-insensitively"
+        );
+        // A rate/depth the client never advertised must not pass just because the
+        // codec matches — sending it would be undecodable audio.
+        assert!(!s.supports(&fmt("pcm", 44_100, 16)));
+        assert!(!s.supports(&fmt("pcm", 48_000, 24)));
+        assert!(!s.supports(&fmt("opus", 48_000, 16)));
+    }
+
+    #[test]
+    fn pick_format_takes_the_first_preference_the_client_can_decode() {
+        let s = support(vec![fmt("pcm", 48_000, 16), fmt("opus", 48_000, 16)]);
+        // Compressed first (saves airtime) — chosen because this client decodes it.
+        assert_eq!(
+            s.pick_format(&[fmt("opus", 48_000, 16), fmt("pcm", 48_000, 16)]),
+            Some(fmt("opus", 48_000, 16))
+        );
+        // A client without opus falls through to the PCM fallback.
+        let pcm_only = support(vec![fmt("pcm", 48_000, 16)]);
+        assert_eq!(
+            pcm_only.pick_format(&[fmt("opus", 48_000, 16), fmt("pcm", 48_000, 16)]),
+            Some(fmt("pcm", 48_000, 16))
+        );
+        // Nothing in common: the caller must not start a stream at all.
+        assert_eq!(pcm_only.pick_format(&[fmt("flac", 48_000, 16)]), None);
+    }
+}

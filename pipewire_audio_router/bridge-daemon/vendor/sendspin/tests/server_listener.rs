@@ -5,7 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use sendspin::protocol::messages::{
     ClientHello, ClientState, ClientSyncState, ClientTime, Message, StreamPlayerConfig,
 };
-use sendspin::ServerListener;
+use sendspin::server::ServerRole;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -25,7 +25,8 @@ fn test_hello(client_id: &str) -> ClientHello {
 
 #[tokio::test]
 async fn accept_drives_handshake_and_grants_player_role() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+    let listener = ServerRole::new("test-server", "Test Server")
+        .bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -63,7 +64,8 @@ async fn accept_drives_handshake_and_grants_player_role() {
 
 #[tokio::test]
 async fn client_without_player_role_gets_no_active_roles() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+    let listener = ServerRole::new("test-server", "Test Server")
+        .bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -89,7 +91,8 @@ async fn client_without_player_role_gets_no_active_roles() {
 
 #[tokio::test]
 async fn time_sync_echo_reflects_client_transmitted_and_orders_timestamps() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+    let listener = ServerRole::new("test-server", "Test Server")
+        .bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -139,7 +142,8 @@ async fn time_sync_echo_reflects_client_transmitted_and_orders_timestamps() {
 
 #[tokio::test]
 async fn pushed_audio_and_stream_lifecycle_reach_the_client_intact() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+    let listener = ServerRole::new("test-server", "Test Server")
+        .bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -197,7 +201,7 @@ async fn pushed_audio_and_stream_lifecycle_reach_the_client_intact() {
     let sender = conn.sender();
 
     sender
-        .send_stream_start(StreamPlayerConfig {
+        .queue_stream_start(StreamPlayerConfig {
             codec: "pcm".to_string(),
             sample_rate: 44100,
             channels: 2,
@@ -211,7 +215,7 @@ async fn pushed_audio_and_stream_lifecycle_reach_the_client_intact() {
         .send_audio_chunk(42_000, &payload)
         .await
         .expect("send_audio_chunk");
-    sender.send_stream_end().await.expect("send_stream_end");
+    sender.queue_stream_end().await.expect("stream/end");
 
     let chunk = timeout(Duration::from_secs(5), peer)
         .await

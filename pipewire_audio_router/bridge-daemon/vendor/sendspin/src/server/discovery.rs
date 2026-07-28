@@ -34,7 +34,7 @@ pub struct Advertisement {
 impl Advertisement {
     /// Advertise a running server on a freshly-created, private mDNS daemon
     /// (shut down when this `Advertisement` drops). `server_id` should be the
-    /// same stable identifier passed to [`crate::server::ServerListener::bind`]
+    /// same stable identifier passed to [`crate::server::ServerRole::bind`]
     /// — it becomes both the mDNS instance name and the advertised hostname.
     /// `path` is the HTTP path clients should connect to (the spec fixes this
     /// to `/sendspin` for real deployments).
@@ -87,7 +87,11 @@ impl Advertisement {
         daemon
             .register(service)
             .map_err(|e| Error::Connection(format!("mDNS register failed: {e}")))?;
-        Ok(Self { daemon, fullname, owns_daemon })
+        Ok(Self {
+            daemon,
+            fullname,
+            owns_daemon,
+        })
     }
 }
 
@@ -108,7 +112,7 @@ impl Drop for Advertisement {
 }
 
 /// Discovers Sendspin clients that advertise themselves over mDNS instead of
-/// dialing out (see [`CLIENT_SERVICE_TYPE`]'s docs for why real hardware
+/// dialing out (see `_sendspin._tcp.local.`'s docs for why real hardware
 /// routinely needs this).
 pub struct ClientBrowser {
     daemon: ServiceDaemon,
@@ -143,7 +147,11 @@ impl ClientBrowser {
         let receiver = daemon
             .browse(CLIENT_SERVICE_TYPE)
             .map_err(|e| Error::Connection(format!("mDNS browse failed: {e}")))?;
-        Ok(Self { daemon, receiver, owns_daemon })
+        Ok(Self {
+            daemon,
+            receiver,
+            owns_daemon,
+        })
     }
 
     /// Wait for the next discovery event: a client resolving at a usable URL,
@@ -169,23 +177,6 @@ impl ClientBrowser {
         }
         None
     }
-
-    /// Wait for the next resolved client, returning its mDNS instance full name
-    /// (stable identity across address changes) and WebSocket URL (ready to
-    /// hand to [`crate::server::dial_client`]). Removal events are skipped.
-    pub async fn next_client(&self) -> Option<(String, String)> {
-        loop {
-            match self.next_event().await? {
-                Discovered::Found { fullname, url } => return Some((fullname, url)),
-                Discovered::Removed { .. } => continue,
-            }
-        }
-    }
-
-    /// Like [`Self::next_client`], but returns only the WebSocket URL.
-    pub async fn next_client_url(&self) -> Option<String> {
-        self.next_client().await.map(|(_fullname, url)| url)
-    }
 }
 
 /// An event from [`ClientBrowser::next_event`].
@@ -195,7 +186,7 @@ pub enum Discovered {
     Found {
         /// mDNS instance full name — stable identity across address changes.
         fullname: String,
-        /// WebSocket URL, ready to hand to [`crate::server::dial_client`].
+        /// WebSocket URL, ready to hand to [`crate::server::ServerRole::dial`].
         url: String,
     },
     /// A previously-advertised client's service was removed from mDNS.

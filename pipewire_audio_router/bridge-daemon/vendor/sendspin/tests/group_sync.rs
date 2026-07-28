@@ -2,54 +2,20 @@
 // ABOUTME: correctness property: every member receives the identical audio
 // ABOUTME: bytes tagged with the identical timestamp for a given push.
 
-use futures_util::{SinkExt, StreamExt};
+mod common;
+
+use common::{bind_test_listener, connect_peer, pcm_config};
+use futures_util::StreamExt;
 use sendspin::protocol::client::AudioChunk;
-use sendspin::protocol::messages::{
-    ClientHello, Message, PlayerCommand, PlayerCommandType, StreamPlayerConfig,
-};
+use sendspin::protocol::messages::{Message, PlayerCommand, PlayerCommandType};
 use sendspin::server::Group;
-use sendspin::ServerListener;
 use std::time::Duration;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
-
-fn test_hello(client_id: &str) -> ClientHello {
-    ClientHello {
-        client_id: client_id.to_string(),
-        name: "Test Player".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    }
-}
-
-/// Connects a bare peer that plays the client role manually: sends
-/// client/hello, discards server/hello, then hands back the read half so the
-/// test can assert on whatever the server sends next.
-async fn connect_peer(
-    url: &str,
-    client_id: &str,
-) -> futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
-    let (ws, _) = connect_async(url).await.expect("ws connect");
-    let (mut write, mut read) = ws.split();
-    let hello = serde_json::to_string(&Message::ClientHello(test_hello(client_id))).unwrap();
-    write.send(WsMessage::Text(hello.into())).await.unwrap();
-    read.next().await.expect("no server/hello").unwrap(); // discard server/hello
-    read
-}
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[tokio::test]
 async fn two_members_receive_identical_timestamped_audio() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let url = format!("ws://{addr}");
+    let (listener, url) = bind_test_listener().await;
 
     let peer_a = tokio::spawn({
         let url = url.clone();
@@ -80,15 +46,7 @@ async fn two_members_receive_identical_timestamped_audio() {
         .unwrap();
     assert_eq!(group.len(), 2);
 
-    group
-        .start_stream(StreamPlayerConfig {
-            codec: "pcm".to_string(),
-            sample_rate: 48000,
-            channels: 2,
-            bit_depth: 16,
-            codec_header: None,
-        })
-        .await;
+    group.start_stream(pcm_config()).await;
     let sent_timestamp = group.push_audio(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
     let mut read_a = peer_a.await.unwrap();
@@ -126,11 +84,7 @@ async fn two_members_receive_identical_timestamped_audio() {
 /// what the doc comment claims.
 #[tokio::test]
 async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let url = format!("ws://{addr}");
+    let (listener, url) = bind_test_listener().await;
 
     let peer_a = tokio::spawn({
         let url = url.clone();
@@ -146,15 +100,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
         .await
         .unwrap();
 
-    group
-        .start_stream(StreamPlayerConfig {
-            codec: "pcm".to_string(),
-            sample_rate: 48000,
-            channels: 2,
-            bit_depth: 16,
-            codec_header: None,
-        })
-        .await;
+    group.start_stream(pcm_config()).await;
     // Sent before the late joiner exists — it must never see this.
     group.push_audio(&[0xAA; 8]);
 
@@ -243,11 +189,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
 
 #[tokio::test]
 async fn a_dead_member_is_pruned_without_blocking_the_survivor() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let url = format!("ws://{addr}");
+    let (listener, url) = bind_test_listener().await;
 
     let peer_a = tokio::spawn({
         let url = url.clone();
@@ -318,11 +260,11 @@ async fn a_dead_member_is_pruned_without_blocking_the_survivor() {
     }
 }
 
-/// The O-B invariant (per-device senders on a shared timeline): two *separate*
+/// Per-device senders on a shared timeline: two *separate*
 /// groups — each standing in for one independently-addressable device — that
 /// share a single `SharedTimeline` emit an identical timestamp for the same
 /// chunk when the caller stamps the timeline once and fans the result to each
-/// group via `push_encoded`. This is the property that lets per-device senders
+/// group via `push_at`. This is the property that lets per-device senders
 /// stay sample-accurately coincident while being ducked/overlaid/routed on
 /// their own. It also proves the two senders can carry *different* bytes at
 /// that one shared timestamp (the per-device overlay/duck primitive).
@@ -331,11 +273,7 @@ async fn separate_groups_sharing_a_timeline_stamp_identically() {
     use sendspin::server::SharedTimeline;
     use std::sync::Arc;
 
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let url = format!("ws://{addr}");
+    let (listener, url) = bind_test_listener().await;
 
     let peer_a = tokio::spawn({
         let url = url.clone();
@@ -355,7 +293,9 @@ async fn separate_groups_sharing_a_timeline_stamp_identically() {
         .unwrap();
 
     // One timeline, two independent single-member groups (one per "device").
-    let timeline = Arc::new(SharedTimeline::new(Arc::new(sendspin::DefaultClock::default())));
+    let timeline = Arc::new(SharedTimeline::new(Arc::new(
+        sendspin::DefaultClock::default(),
+    )));
     let group_a = Group::with_timeline(Arc::clone(&timeline));
     let group_b = Group::with_timeline(Arc::clone(&timeline));
     group_a
@@ -367,15 +307,14 @@ async fn separate_groups_sharing_a_timeline_stamp_identically() {
         .await
         .unwrap();
 
-    let config = StreamPlayerConfig {
-        codec: "pcm".to_string(),
-        sample_rate: 48000,
-        channels: 2,
-        bit_depth: 16,
-        codec_header: None,
-    };
-    group_a.start_stream(config.clone()).await;
-    group_b.start_stream(config).await;
+    let config = pcm_config();
+    // The shared-timeline contract: the *coordinator* owns the timeline's
+    // config/anchor, and each group only announces the stream to its own members.
+    // `start_stream` would re-anchor the shared timeline from inside one group and
+    // desync the other, so a `Group<SharesTimeline>` does not have it at all.
+    timeline.set_config(config.clone());
+    group_a.broadcast_stream_start(config.clone()).await;
+    group_b.broadcast_stream_start(config).await;
 
     // Stamp ONCE for this chunk, then hand that single ts to each group. Device
     // B gets a different payload (as an overlay/duck would produce) at the very
@@ -383,8 +322,8 @@ async fn separate_groups_sharing_a_timeline_stamp_identically() {
     let bytes_a = [1u8, 2, 3, 4, 5, 6, 7, 8];
     let bytes_b = [9u8, 9, 9, 9, 9, 9, 9, 9];
     let shared_ts = timeline.stamp(bytes_a.len());
-    group_a.push_encoded(shared_ts, &bytes_a);
-    group_b.push_encoded(shared_ts, &bytes_b);
+    group_a.push_at(shared_ts, &bytes_a);
+    group_b.push_at(shared_ts, &bytes_b);
 
     let mut read_a = peer_a.await.unwrap();
     let mut read_b = peer_b.await.unwrap();

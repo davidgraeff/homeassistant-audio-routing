@@ -35,6 +35,7 @@ pub struct SharedTimeline {
     state: Mutex<TimelineState>,
 }
 
+#[derive(Debug)]
 struct TimelineState {
     /// The format currently streaming, used to derive each chunk's duration.
     /// `None` before the first `start`/after `clear`.
@@ -45,6 +46,30 @@ struct TimelineState {
     /// Carry for the sub-microsecond part of a chunk's duration (numerator over
     /// the sample rate), so advancing the timeline doesn't accumulate drift.
     residue: i64,
+}
+
+impl std::fmt::Debug for SharedTimeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Arc<dyn Clock>` isn't Debug, and the clock's identity is not what a
+        // reader of this wants anyway.
+        f.debug_struct("SharedTimeline")
+            .field("send_ahead_us", &self.send_ahead_us)
+            .field("state", &*self.state())
+            .finish()
+    }
+}
+
+impl SharedTimeline {
+    /// The timeline state, recovering from a poisoned lock rather than propagating
+    /// the panic — see the equivalent on `Group`. The state is an `Option<config>`
+    /// plus two integers, and the only damage a half-finished mutation can do is a
+    /// stale anchor, which the re-anchor branch in [`Self::stamp`] heals on the next
+    /// chunk. Killing the audio path to protect that would be a bad trade.
+    fn state(&self) -> std::sync::MutexGuard<'_, TimelineState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl SharedTimeline {
@@ -87,7 +112,7 @@ impl SharedTimeline {
     /// Set the streaming format and re-anchor the timeline. Call when a stream
     /// starts (or its format changes).
     pub fn set_config(&self, config: StreamPlayerConfig) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.config = Some(config);
         state.next_ts_us = None;
         state.residue = 0;
@@ -96,12 +121,12 @@ impl SharedTimeline {
     /// The format currently streaming, if any — used to (re)issue `stream/start`
     /// to a late-joining member.
     pub fn config(&self) -> Option<StreamPlayerConfig> {
-        self.state.lock().unwrap().config.clone()
+        self.state().config.clone()
     }
 
     /// Clear the streaming format and reset the timeline (stream ended).
     pub fn clear_config(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.config = None;
         state.next_ts_us = None;
         state.residue = 0;
@@ -109,7 +134,7 @@ impl SharedTimeline {
 
     /// Reset the anchor without touching the format (e.g. after a clear/seek).
     pub fn reset(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.next_ts_us = None;
         state.residue = 0;
     }
@@ -127,8 +152,12 @@ impl SharedTimeline {
     /// mark, giving hysteresis so steady real-time pacing doesn't re-anchor
     /// every chunk.
     pub fn stamp(&self, pcm_len: usize) -> i64 {
-        let mut state = self.state.lock().unwrap();
+        // Read the clock before taking the lock. `now` only feeds the re-anchor
+        // comparison below, so a slightly staler reading can only make that
+        // decision more conservative — and on some targets this is a syscall, which
+        // has no business inside a lock a real-time producer contends for.
         let now = self.clock.now_micros();
+        let mut state = self.state();
 
         let ts = match state.next_ts_us {
             Some(t) if t >= now + self.send_ahead_us / 2 => t,
@@ -199,8 +228,8 @@ mod tests {
 
     #[test]
     fn two_readers_of_one_timeline_agree_when_stamped_once_per_chunk() {
-        // The O-B invariant at the unit level: one stamp() per chunk is the
-        // single source of truth; the caller fans that one ts to N senders.
+        // One stamp() per chunk is the single source of truth: the caller fans
+        // that one timestamp out to every sender.
         let tl = Arc::new(SharedTimeline::new(Arc::new(DefaultClock::default())));
         tl.set_config(pcm_config());
         let a = Arc::clone(&tl);

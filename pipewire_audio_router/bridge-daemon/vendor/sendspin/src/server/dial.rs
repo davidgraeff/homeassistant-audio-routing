@@ -3,39 +3,28 @@
 // ABOUTME: themselves) — discovered via discovery::ClientBrowser, dialed here.
 
 use crate::error::Error;
-use crate::protocol::messages::ConnectionReason;
 use crate::server::connection::ServerConnection;
-use crate::sync::raw_clock::Clock;
-use std::sync::Arc;
-use tokio_tungstenite::connect_async;
+use crate::server::listener::transport_config;
+use crate::server::role::ServerRole;
+use tokio_tungstenite::connect_async_with_config;
 
-/// Dial a Sendspin client's own WebSocket server (e.g. a URL discovered via
-/// [`crate::server::ClientBrowser`]) and drive the server-role handshake over
-/// the resulting connection.
+/// Dial `url` and drive the server-role handshake over the connection.
 ///
-/// The protocol-level roles are identical regardless of which side initiated
-/// the TCP connection — the client still sends `client/hello` first, this
-/// still replies `server/hello` — so this is otherwise exactly
-/// [`crate::server::ServerListener::accept`]'s handshake, just dialed instead
-/// of accepted. `sendspin-rs`'s own `protocol::listener::ProtocolListener` is
-/// the client-role mirror of this for the reverse case (a client accepting a
-/// server that dials in).
-pub async fn dial_client(
-    url: &str,
-    server_id: &str,
-    server_name: &str,
-    clock: Arc<dyn Clock>,
-) -> Result<ServerConnection, Error> {
-    let (ws, _response) = connect_async(url)
+/// Reached through [`ServerRole::dial`], which is where the identity, the
+/// deadlines and the announced [`crate::protocol::messages::ConnectionReason`]
+/// come from.
+pub(crate) async fn dial(role: &ServerRole, url: &str) -> Result<ServerConnection, Error> {
+    let (ws, _response) = connect_async_with_config(url, Some(transport_config()), false)
         .await
         .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
-    // The server dialed out to stream to this client, so announce Playback.
     ServerConnection::drive(
         ws,
-        server_id,
-        server_name,
-        ConnectionReason::Playback,
-        clock,
+        &role.server_id,
+        &role.server_name,
+        role.connection_reason.clone(),
+        std::sync::Arc::clone(&role.clock),
+        role.write_timeout,
+        role.handshake_timeout,
     )
     .await
 }
