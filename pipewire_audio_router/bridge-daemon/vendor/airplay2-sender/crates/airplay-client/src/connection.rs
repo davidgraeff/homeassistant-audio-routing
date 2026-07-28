@@ -202,6 +202,13 @@ pub struct Connection {
     streamer: Option<AudioStreamer>,
     playback_state: PlaybackState,
     volume: f32,
+    /// Whether to push `volume` to the receiver when streaming starts. Upstream
+    /// always did this ("ensure HomePod is not muted"), which forces 0 dB = MAX on
+    /// connect. That is unsafe for a device-authoritative sender driving a powerful
+    /// AVR (it blasts the amp and clobbers the receiver's real level). Default
+    /// `true` preserves the original behavior; a caller that treats the receiver's
+    /// own volume as authoritative sets this `false` to leave it untouched.
+    send_volume_on_start: bool,
     stream_config: StreamConfig,
     timing_offset: Option<ClockOffset>,
     timing_tx: Option<watch::Sender<ClockOffset>>,
@@ -341,6 +348,7 @@ impl Connection {
             streamer: None,
             playback_state: PlaybackState::Stopped,
             volume: 1.0,
+            send_volume_on_start: true,
             stream_config: config,
             timing_offset: None,
             timing_tx: None,
@@ -510,6 +518,7 @@ impl Connection {
             streamer: None,
             playback_state: PlaybackState::Stopped,
             volume: 1.0,
+            send_volume_on_start: true,
             stream_config: config,
             timing_offset: None,
             timing_tx: None,
@@ -715,6 +724,7 @@ impl Connection {
             streamer: None,
             playback_state: PlaybackState::Stopped,
             volume: 1.0,
+            send_volume_on_start: true,
             stream_config: config,
             timing_offset: None,
             timing_tx: None,
@@ -1145,10 +1155,15 @@ impl Connection {
         // RECORD was sent at the end of setup(), just update state
         self.session.start_playing()?;
 
-        // Send SET_PARAMETER volume to ensure HomePod is not muted
-        tracing::info!("Sending SET_PARAMETER volume");
-        if let Err(e) = self.set_volume(self.volume).await {
-            tracing::warn!("Failed to set volume: {}", e);
+        // Send SET_PARAMETER volume to ensure HomePod is not muted. Skipped when the
+        // caller treats the receiver's own volume as authoritative (see
+        // `send_volume_on_start`) — imposing 0 dB = MAX on connect is unsafe for a
+        // powerful AVR and clobbers the level the read-back is meant to learn.
+        if self.send_volume_on_start {
+            tracing::info!("Sending SET_PARAMETER volume");
+            if let Err(e) = self.set_volume(self.volume).await {
+                tracing::warn!("Failed to set volume: {}", e);
+            }
         }
 
         // Spawn control channel on a dedicated blocking thread for low-latency
@@ -1317,10 +1332,14 @@ impl Connection {
 
         self.session.start_playing()?;
 
-        // Set volume
-        tracing::info!("Sending SET_PARAMETER volume");
-        if let Err(e) = self.set_volume(self.volume).await {
-            tracing::warn!("Failed to set volume: {}", e);
+        // Set volume — skipped when the receiver's own volume is authoritative (see
+        // `send_volume_on_start`); forcing 0 dB = MAX on connect is unsafe for a
+        // powerful AVR and clobbers the level the read-back is meant to learn.
+        if self.send_volume_on_start {
+            tracing::info!("Sending SET_PARAMETER volume");
+            if let Err(e) = self.set_volume(self.volume).await {
+                tracing::warn!("Failed to set volume: {}", e);
+            }
         }
 
         // Spawn control channel for retransmit handling
@@ -1511,6 +1530,15 @@ impl Connection {
     }
 
     /// Set volume.
+    /// Control whether streaming start pushes `volume` to the receiver. Default is
+    /// `true` (push, to un-mute a HomePod). Set `false` to leave the receiver's own
+    /// volume untouched on connect — required for a device-authoritative sender that
+    /// reads the receiver's level rather than imposing one (and won't blast an AVR).
+    /// Must be called before `start_streaming`/`start_streaming_live`.
+    pub fn set_send_volume_on_start(&mut self, enabled: bool) {
+        self.send_volume_on_start = enabled;
+    }
+
     pub async fn set_volume(&mut self, volume: f32) -> Result<()> {
         let clamped = volume.clamp(0.0, 1.0);
         self.volume = clamped;

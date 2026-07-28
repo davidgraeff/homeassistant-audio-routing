@@ -245,6 +245,12 @@ async fn try_connect_once(
     };
     // Inject the daemon's grandmaster clock id BEFORE setup so PT=87 carries it.
     conn.set_ptp_clock_id(clock_id);
+    // The receiver's OWN volume is authoritative (ap2_volume.rs): never impose one on
+    // connect. Suppress the vendored client's default connect-time volume push, which
+    // otherwise forces 0 dB = MAX — blasting a powerful AVR and clobbering the level
+    // `get_volume()` reads back below. User intent is re-applied post-connect via the
+    // control's command channel (`register`), not here.
+    conn.set_send_volume_on_start(false);
     // Render buffer (anchor shifted into the future) — applied by start_streaming_live.
     conn.set_render_delay_ms(render_delay_ms);
     // SETUP now also fails on a bad RECORD (the receiver never acknowledged the
