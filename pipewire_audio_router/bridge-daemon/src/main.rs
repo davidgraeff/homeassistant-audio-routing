@@ -25,6 +25,7 @@ mod pw_thread;
 mod resample;
 mod routing;
 mod routing_store;
+mod rtp_membership;
 mod rtp_source;
 mod sendspin_capture;
 mod sendspin_codec;
@@ -262,6 +263,13 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
         // — the rest still start and it can be re-enabled live.
         spawn_stored_sources(&sources, &airplay, &airplay_clients, &pw_state, pw_cmd.clone()).await;
+
+        // Self-heal the multicast RTP source: the stock module can silently drop
+        // its IGMP group join after a sender pause and never rejoin (audio goes
+        // silent with the node idle). This watchdog holds its own group
+        // membership and reloads the module when it sees audio arriving that the
+        // module isn't picking up. No-op for a unicast/disabled source.
+        rtp_membership::spawn(pw_state.clone(), pw_cmd.clone(), sources.clone());
 
         // Own sendspin device online/offline (and eventual removal) from the
         // live connection state + an active TCP probe — mDNS only ever adds.
