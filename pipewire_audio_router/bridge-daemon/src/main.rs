@@ -32,7 +32,6 @@ mod pwsink_server;
 mod resample;
 mod routing;
 mod routing_store;
-mod rtp_membership;
 mod rtp_source;
 mod sendspin_capture;
 mod sendspin_codec;
@@ -277,12 +276,13 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // — the rest still start and it can be re-enabled live.
         spawn_stored_sources(&sources, &airplay, &airplay_clients, &pw_state, pw_cmd.clone()).await;
 
-        // Self-heal the multicast RTP source: the stock module can silently drop
-        // its IGMP group join after a sender pause and never rejoin (audio goes
-        // silent with the node idle). This watchdog holds its own group
-        // membership and reloads the module when it sees audio arriving that the
-        // module isn't picking up. No-op for a unicast/disabled source.
-        rtp_membership::spawn(pw_state.clone(), pw_cmd.clone(), sources.clone());
+        // NOTE: a multicast-IGMP self-heal watchdog used to run here
+        // (`rtp_membership.rs`, removed 2026-07-28). `module-rtp-source` does this
+        // itself since PipeWire 1.6.2 — `on_igmp_recovery_timer_event` checks every
+        // 5 s (`DEFAULT_IGMP_CHECK_INTERVAL_SEC`) whether ≥30 s have passed since
+        // its last packet (`DEFAULT_IGMP_DEADLINE_SEC`) and, if so, re-joins by
+        // DROP+ADD_MEMBERSHIP on its own socket — no module reload, no audible gap.
+        // See docs/rtp-input-dropouts-plan.md §5.
 
         // Own sendspin device online/offline (and eventual removal) from the
         // live connection state + an active TCP probe — mDNS only ever adds.
