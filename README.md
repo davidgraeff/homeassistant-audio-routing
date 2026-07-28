@@ -58,10 +58,6 @@ setup flow, are in each component's own README linked above.
   and more), not preferences.
 - [**docs/api-reference.md**](docs/api-reference.md) — the bridge
   daemon's REST/WebSocket API.
-- [**docs/roadmap.md**](docs/roadmap.md) — phase-by-phase status and
-  acceptance criteria.
-- [**spikes/**](spikes/) — the empirical write-up behind every claim in
-  `decisions.md`: what was tried, what broke, what fixed it.
 - [**tests/**](tests/) — the runnable scripts backing those write-ups;
   nothing here is "verified" without one. All of it — the Rust daemon
   (rustfmt/clippy/tests), the web UI (svelte-check/build), the HA
@@ -77,8 +73,6 @@ custom_components/pipewire_audio_router/   HA integration (Python)
 firmware/bt-bridge/                   ESPHome firmware for the Bluetooth bridge box
 container/                            throwaway bare-PipeWire dev sandbox — not the real add-on
 docs/                                 architecture, decisions, API reference, roadmap
-spikes/                               per-experiment write-ups
 tests/                                verification scripts
 scripts/                              dev tooling (e.g. arm64 cross-build)
-PLAN.md                               historical planning document, superseded by docs/
 ```
