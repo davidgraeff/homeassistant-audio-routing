@@ -8,6 +8,66 @@ both talk to — there is no other way to control the router.
 
 All request/response bodies are JSON unless noted.
 
+## Endpoint index
+
+The complete route table, as registered in `bridge-daemon/src/api.rs`. Sections below
+document the common paths in detail; the rest are listed here with their purpose and
+handler name, which is the authoritative place to check the exact body shape.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | plain-text liveness |
+| `GET` | `/api/nodes` | raw PipeWire node/port snapshot |
+| `GET` | `/api/status` | daemon status summary (`get_status`) |
+| `GET`/`PUT` | `/api/settings` | daemon settings (`get_settings` / `set_settings`) |
+| `GET`/`PUT` | `/api/sync/settings` | group lead + per-device delays (`get_sync_settings` / `set_sync_settings`) |
+| `GET` | `/api/outputs` | every discovered output + live state |
+| `PUT` | `/api/outputs/{node_name}/latency` | per-output latency |
+| `PUT` | `/api/outputs/{node_name}/ap2-rate` | AirPlay-2 rate mode |
+| `PUT` | `/api/outputs/{node_name}/sendspin-codec` | sendspin codec choice |
+| `GET`/`POST` | `/api/sources` | list / create a source |
+| `GET`/`PUT`/`DELETE` | `/api/sources/{id}` | read / update / remove a source |
+| `GET` | `/api/sources/{id}/clients` | connected senders (AirPlay) |
+| `POST` | `/api/sources/{id}/clients/ban` | ban / unban a sender |
+| `POST` | `/api/sources/{id}/clients/disconnect` | kick a sender |
+| `POST` | `/api/sources/{id}/clients/forget` | drop a remembered sender |
+| `POST` | `/api/sources/{id}/clients/priority` | set a sender's priority |
+| `PUT` | `/api/sources/{id}/policy` | anti-takeover policy |
+| `GET` | `/api/sendspin/volumes` | all sendspin volumes |
+| `PUT` | `/api/sendspin/volume` | set one sendspin volume |
+| `PUT` | `/api/sendspin/mute` | mute one sendspin device |
+| `GET` | `/api/sendspin/delays` | per-device sendspin delays |
+| `PUT` | `/api/sendspin/delay` | set one sendspin delay |
+| `PUT` | `/api/ap2/volume` | set an AirPlay-2 receiver's volume |
+| `PUT` | `/api/ap2/mute` | mute an AirPlay-2 receiver |
+| `POST` | `/api/links` | low-level port link |
+| `GET` | `/api/routing` | routing matrix |
+| `POST` | `/api/routing/link` / `/api/routing/unlink` | edit the matrix |
+| `DELETE` | `/api/routing/entity/{node_name}` | forget an entity |
+| `GET` | `/api/routing/ws` | matrix change WebSocket |
+| `POST` | `/api/announce` | announce to explicit targets |
+| `GET`/`POST` | `/api/groups/music` | list / create a Music group |
+| `PUT`/`DELETE` | `/api/groups/music/{id}` | edit / delete a Music group |
+| `POST`/`DELETE` | `/api/groups/music/{id}/route` | route / unroute a Music group |
+| `GET`/`POST` | `/api/groups/announcement` | list / create an Announcement group |
+| `PUT`/`DELETE` | `/api/groups/announcement/{id}` | edit / delete an Announcement group |
+| `GET` | `/api/align/groups` | groups available for alignment |
+| `GET`/`DELETE` | `/api/align` | alignment status / stop |
+| `POST` | `/api/align/start` | begin the alignment wizard |
+| `POST` | `/api/align/select` | pick the device being aligned |
+| `POST` | `/api/align/volume` | set the alignment reference volume |
+| `POST`/`DELETE` | `/api/spike/per-device` | dev-only spike harness |
+| `POST`/`DELETE` | `/api/spike/multi-device` | dev-only spike harness |
+| `POST`/`DELETE` | `/api/spike/overlay` | dev-only spike harness |
+| `POST`/`DELETE` | `/api/spike/ap2` | dev-only spike harness |
+| `POST`/`DELETE` | `/api/spike/pw-sink` | dev-only spike harness |
+
+> **Two-tier groups (`/api/groups/*`) and the alignment wizard (`/api/align/*`) are not
+> yet documented in detail here.** They are the newest subsystems; see
+> `bridge-daemon/src/api.rs` for their bodies and
+> [architecture.md](../pipewire_audio_router/docs/architecture.md) for the concepts.
+> The `/api/spike/*` routes are development harnesses, not a supported interface.
+
 ## Health & inspection
 
 ### `GET /health`
@@ -19,64 +79,72 @@ filtering, no HA-specific concepts.
 
 ```json
 {
-  "nodes": [ { "node_id": 42, "node_name": "raop-out-pioneer", "media_class": "Audio/Sink" } ],
+  "nodes": [ { "node_id": 42, "node_name": "ap2-dev-pioneer_vsx_934_f11b89", "media_class": "Audio/Sink" } ],
   "ports": [ { "port_id": 7, "node_id": 42, "port_name": "playback_FL", "direction": "in" } ]
 }
 ```
 
-## Outputs (RAOP, hot-reloadable)
+## Outputs (discovered, not configured)
 
-RAOP (AirPlay) outputs are managed live here — adding or removing one
-loads/unloads a `libpipewire-module-raop-sink` module in the daemon's
-own PipeWire context, with no restart and no disturbance to audio on the
-other outputs (see
-[decisions.md](decisions.md#loading-pipewire-modules-at-runtime)). The
-set is persisted to a daemon-owned store (`/data/raop-outputs.json`) that
-starts empty on a fresh install — there is no `options.json` seeding; this
-API (and mDNS auto-discovery) is the only way outputs get created. The
-AirPlay-receive source, RTP source, and sendspin outputs are configured
-the same way (runtime API, persisted, no seeding) — see
-[Sources & sendspin outputs](#sources--sendspin-outputs).
+> **RAOP outputs are gone.** Earlier versions of this API let you `POST`/`DELETE`
+> `libpipewire-module-raop-sink` outputs by hand. AirPlay output is now the native
+> **AirPlay 2** sender, and there are no create/delete endpoints left: outputs are
+> **auto-discovered over mDNS** and appear on their own. `raop_migration.rs` rewrites
+> any surviving `raop-out-*` names in the routing and groups stores on startup.
+
+Three output backends are discovered and reported here, all as virtual routing
+outputs:
+
+| `kind` | What it is | Discovery |
+|---|---|---|
+| `sendspin` | ESPHome sendspin speakers (e.g. HA Voice PE) | mDNS (`sendspin_discovery.rs`) |
+| `airplay2` | native AirPlay-2 receivers | mDNS (`ap2_discovery.rs`) |
+| `pwsink` | remote PipeWire hosts | mDNS |
+
+Per-output *settings* are persisted; the outputs themselves are not created here.
 
 ### `GET /api/outputs`
-Every configured RAOP output, plus whether its module is loaded right now
-(its node is present in the live registry).
+Every discovered output with its live state. Common fields: `node_name`, `name`,
+`kind`, `present` (in the live registry now), `configured` (has persisted settings),
+`ip`, `port`, `encryption`, `latency_ms`. Each backend adds its own:
 
 ```json
 [
-  { "name": "Pioneer VSX-934", "ip": "192.168.178.35", "port": 7000,
-    "encryption": "auth_setup", "node_name": "raop-out-pioneer_vsx_934", "loaded": true }
+  { "node_name": "sendspin-dev-home_assistant_voice_093ca8", "name": "home-assistant-voice-093ca8",
+    "kind": "sendspin", "present": true, "configured": false,
+    "ip": "192.168.178.52", "port": 8928, "encryption": "None", "latency_ms": null,
+    "sendspin_codec": "opus", "sendspin_codec_active": "opus",
+    "sendspin_codec_options": [ { "codec": "auto", "available": true } ],
+    "sendspin_send_ahead_ms": 250 },
+
+  { "node_name": "ap2-dev-pioneer_vsx_934_f11b89", "name": "Pioneer VSX-934 F11B89",
+    "kind": "airplay2", "present": true, "configured": false,
+    "ip": "192.168.178.35", "port": 7000, "encryption": "HomeKit", "latency_ms": 200,
+    "ptp_locked": true, "ptp_lock_age_s": 0, "ptp_supported": true, "ptp_relevant": true,
+    "ap2_features": { "raw": "0x445F8A00,0x1C340", "ptp": true,
+                      "buffered_audio": true, "transient_pairing": true },
+    "ap2_rate_mode": "auto", "ap2_rate": 44100, "ap2_volume": 0.44, "ap2_muted": false },
+
+  { "node_name": "pwsink-dev-david_local", "name": "david-local", "kind": "pwsink",
+    "present": true, "configured": false, "ip": "192.168.178.21", "port": null,
+    "encryption": "None", "latency_ms": null, "pwsink_streaming": false }
 ]
 ```
 
-### `POST /api/outputs`
-Add an output and load it live. Body is one output config — the same
-shape as an `outputs` entry in the add-on config; `port` defaults to
-`7000` and `encryption` to `auth_setup` if omitted.
+`ptp_locked` is **runtime** state, not a capability — a receiver can advertise PTP and
+sit unlocked without anything being wrong outside a multi-room group.
 
-```json
-// Request
-{ "name": "Pioneer VSX-934", "ip": "192.168.178.35", "port": 7000, "encryption": "auth_setup" }
-// Response (201)
-{ "ok": true, "message": "added output 'raop-out-pioneer_vsx_934'" }
-```
+### `PUT /api/outputs/{node_name}/latency`
+Per-output latency in ms. Persisted, applied to the running sender.
 
-The module is loaded first; only on success is the output persisted, so
-a failed load leaves no stale store entry. Failure modes: an output with
-the same node name (the slugified display name) already exists → 409;
-libpipewire refuses the load → 502; the PipeWire thread is unreachable,
-or the load succeeded but couldn't be persisted → 500.
+### `PUT /api/outputs/{node_name}/ap2-rate`
+AirPlay-2 rate mode for one receiver — `auto` or a fixed rate (e.g. `fixed_44100`),
+mirroring the `ap2_rate_mode` / `ap2_rate` fields above.
 
-### `DELETE /api/outputs/:node_name`
-Remove an output by its `node_name` (e.g. `raop-out-pioneer_vsx_934`) and
-unload its module live.
-
-```json
-{ "ok": true, "message": "removed output 'raop-out-pioneer_vsx_934'" }
-```
-
-Unknown `node_name` → 404. The unload is idempotent, so once the output
-existed it's gone afterward regardless of registry-timing races.
+### `PUT /api/outputs/{node_name}/sendspin-codec`
+Pick a sendspin device's codec from its `sendspin_codec_options` (`auto`, `opus`,
+`flac`, `pcm`). `sendspin_codec` is the request; `sendspin_codec_active` is what the
+device actually negotiated.
 
 > **Per-output diagnostics.** The Outputs tab's **Play tone** / **Play
 > announcement** buttons don't use a per-output endpoint; they post to the
@@ -99,98 +167,157 @@ existed it's gone afterward regardless of registry-timing races.
 
 ## Sources
 
-Config for the non-RAOP sources, persisted in a daemon-owned store
-(`/data/sources.json`) that starts empty on a fresh install (no
-`options.json` seeding) and is managed live here with no restart
-(`sources_store.rs`). Both sources run **natively in-process** — there are
-no supervised subprocesses:
+Full CRUD over the router's inputs, persisted in a daemon-owned store
+(`/data/sources.json`) that starts empty on a fresh install (no `options.json`
+seeding) and is managed live here with no restart (`sources_store.rs`).
 
-- the **AirPlay-receive source** is a native, embedded RAOP receiver (a
-  vendored+patched pure-Rust `shairplay` crate, `airplay_source.rs`) — not
-  a `shairport-sync` subprocess;
-- the **RTP source** is a native `libpipewire-module-rtp-source` (see below).
+> **These endpoints replaced the singular `/api/source/rtp` and
+> `/api/source/airplay`**, which no longer exist. The router now supports **several
+> concurrent sources of each kind**, so every source has an `id` and its own config,
+> and there is one uniform collection API instead of two hard-coded singletons.
 
-(Sendspin devices are auto-discovered, not configured here — see
-[Sendspin devices](#sendspin-devices).)
+Two kinds exist, both running **natively in-process** — no supervised subprocesses:
 
-### `GET /api/source/airplay`
+| `kind` | Implementation |
+|---|---|
+| `airplay` | native embedded AirPlay/RAOP **receiver** (vendored+patched pure-Rust `shairplay`, `airplay_source.rs`) — not a `shairport-sync` subprocess |
+| `rtp` | native `libpipewire-module-rtp-source` (`rtp_source.rs`), e.g. the [Bluetooth bridge](../firmware/pi-bridge/README.md) |
+
+Creating or updating a source loads/starts it immediately; deleting one unloads it.
+Sendspin, AirPlay-2 and pw-sink **outputs** are auto-discovered, not configured — see
+[Outputs](#outputs-discovered-not-configured).
+
+### `GET /api/sources`
+Every configured source, with the kind-specific config **nested** under `airplay` or
+`rtp` (exactly one is non-null) plus the derived `node_name` and the live `present`
+flag.
+
 ```json
-{ "name": "PipeWire Router", "running": true, "latency_msec": 150 }
-```
-`name` is `null` when the source is disabled; `running` is whether the
-embedded receiver is up right now; `latency_msec` is the producer jitter
-buffer (higher = fewer stutters, more latency).
-
-### `PUT /api/source/airplay`
-```json
-// Request  (empty string disables the source; latency_msec optional)
-{ "name": "Living Room", "latency_msec": 150 }
-// Response
-{ "ok": true, "message": "AirPlay source set to 'Living Room'" }
-```
-Persists the advertised AirPlay name + jitter buffer, then (re)starts the
-embedded receiver with it (an empty/whitespace name stops it and disables
-the source). Saved *before* the receiver is reconciled, so if it fails to
-start the setting still persists and the response is `ok: false` with the
-reason (502). The receiver advertises unencrypted ALAC (`et=0`, `cn=1`);
-see [decisions.md](decisions.md#native-airplay-receive-source-vendored-shairplay-not-shairport-sync)
-for why that combination is what PipeWire senders actually drive.
-
-### `DELETE /api/source/airplay`
-Disables the source — stops the process and clears the stored name.
-```json
-{ "ok": true, "message": "AirPlay source disabled" }
+{ "sources": [
+  { "id": "bt-bridge-rtp", "label": "Bluetooth Bridge", "kind": "rtp",
+    "present": true, "node_name": "bt-bridge-rtp", "airplay": null,
+    "rtp": { "port": 46000, "latency_msec": 100, "source_addr": "239.255.42.42",
+             "ignore_ssrc": true, "rate": 48000 } },
+  { "id": "airplay-in", "label": "Music Now 2", "kind": "airplay",
+    "present": true, "node_name": "airplay-in", "rtp": null,
+    "airplay": { "latency_msec": 150, "auth_setup": false,
+                 "prevent_takeover": true, "port": 5000 } }
+] }
 ```
 
-### RTP source (Bluetooth bridge) — a module, not a process
-The RTP source that receives the [Bluetooth bridge firmware](../firmware/bt-bridge/README.md)'s
-audio stream is a native `libpipewire-module-rtp-source`, loaded into the
-daemon's own context at runtime like a RAOP sink — **not** a supervised
-subprocess. So its liveness is `loaded` (its `bt-bridge-rtp` node is in the
-live registry), the same signal `/api/outputs` reports, rather than
-`running`. Everything but the listen port is fixed to match the firmware's
-wire format (native-endian `S16LE`, 44100 Hz stereo, `sess.ignore-ssrc`);
-see `bridge-daemon/src/rtp_source.rs`.
+`present` means a node called `node_name` is in the live PipeWire registry right now —
+it generalizes the old singular `loaded` (RTP) and `running` (AirPlay) flags.
 
-### `GET /api/source/rtp`
-```json
-{ "enabled": true, "port": 46000, "latency_msec": 200, "source_addr": "0.0.0.0", "ignore_ssrc": true, "loaded": true }
-```
-`enabled` is whether it's on in the store; `port` is the stored UDP port (or
-the `46000` default when disabled); `latency_msec` is the receiver jitter
-buffer (raise on a weak link to trade latency for fewer dropouts);
-`source_addr` is the bind address — `0.0.0.0` for a normal unicast target, or
-a multicast group so several receivers share one bridge stream; `ignore_ssrc`
-is `sess.ignore-ssrc` (`true` accepts any sender on the port; `false` latches
-onto the first SSRC and rejects the rest — the "only one client" corruption
-guard, safe now the firmware sends a stable MAC-derived SSRC); `loaded` is
-whether the `bt-bridge-rtp` node is present in the live graph right now.
+### `POST /api/sources`
+Create a source. `label` and `kind` are required; the matching config object carries
+partial fields (each has a serde default) and may be **omitted entirely** to accept all
+defaults.
 
-### `PUT /api/source/rtp`
 ```json
-// Request  (the daemon replaces the whole config; omitted fields default)
-{ "port": 46000, "latency_msec": 200, "source_addr": "239.255.42.42", "ignore_ssrc": true }
-// Response
-{ "ok": true, "message": "RTP source enabled on 239.255.42.42:46000 (200 ms jitter buffer, any sender)" }
+// Request
+{ "label": "Bluetooth Bridge", "kind": "rtp",
+  "rtp": { "port": 46000, "source_addr": "239.255.42.42" } }
+// Response (201) — the created SourceView
+{ "id": "bluetooth-bridge", "label": "Bluetooth Bridge", "kind": "rtp",
+  "present": true, "node_name": "bluetooth-bridge", "airplay": null, "rtp": { "...": "..." } }
 ```
-Enables the source (or changes it): persists the config, then reloads the
-module (unload-then-load, so a change is a clean reload). Saved *before* the
-module is reconciled — if the load fails the setting still persists and the
-response is `ok: false` with the reason (502). Set `source_addr` to a
-multicast group (and point the firmware's RTP host at the same group) to fan
-one bridge stream out to several PipeWire hosts. Set `ignore_ssrc` to `false`
-to reject every sender but the first one seen (`true`, the default, accepts
-any). The add-on's web UI folds these two knobs into one "Source" radio —
-*Accept all senders* (`0.0.0.0`, `ignore_ssrc` true), *Only one client*
-(`0.0.0.0`, `ignore_ssrc` false), *Multicast group* (the group, `ignore_ssrc`
-true).
 
-### `DELETE /api/source/rtp`
-Disables the source — unloads the module (its node disappears live) and clears
-the stored config.
+The store validates first (e.g. an RTP **port collision** with another source) → 400.
+On success the source is loaded/started immediately, then routing and groups are
+nudged. `id` is derived from `label` (slugified, with collision suffixing).
+
+### `GET /api/sources/{id}`
+One source, same `SourceView` shape as above. Unknown `id` → 404.
+
+### `PUT /api/sources/{id}`
+Update a source. Every field is optional: `label` renames it, and an `airplay`/`rtp`
+object **replaces** that source's config. `kind` is immutable — sending the config
+object of the wrong kind is rejected. Omitting both config objects is a label-only
+update.
+
 ```json
-{ "ok": true, "message": "RTP source disabled" }
+// Request — switch this RTP source to unicast and a longer jitter buffer
+{ "rtp": { "port": 46000, "latency_msec": 200, "source_addr": "0.0.0.0",
+           "ignore_ssrc": true, "rate": 48000 } }
 ```
+
+The config is persisted first, then the source is reconciled (for RTP that is an
+unload-then-load, so a change is a clean reload). If the reload fails the setting still
+persists and the response carries the reason.
+
+### `DELETE /api/sources/{id}`
+Remove a source: stops/unloads it (its node disappears live) and drops the stored
+entry. Unknown `id` → 404.
+
+### RTP source config (`rtp`)
+
+| Field | Meaning |
+|---|---|
+| `port` | UDP listen port (default `46000`) |
+| `latency_msec` | receiver jitter buffer; raise on a weak link to trade latency for fewer dropouts (default `200`) |
+| `source_addr` | bind address — `0.0.0.0` for a plain unicast listener, or an IPv4 **multicast group** (e.g. `239.255.42.42`) so several receivers share one sender's stream |
+| `ignore_ssrc` | `true` (default) accepts **any** sender on the port; `false` latches onto the first SSRC seen and rejects every other — the "only one client" corruption guard |
+| `rate` | sample rate, **default `48000`** — must match what the sender transmits |
+
+Everything else is fixed to match the bridge's wire format: native-endian **`S16LE`**
+(*not* RFC 3551's big-endian `L16`), stereo. See `bridge-daemon/src/rtp_source.rs`.
+
+> **Leave `ignore_ssrc` at `true` unless you specifically want single-sender locking.**
+> With `true` the module never rejects a packet on SSRC grounds, so a sender that
+> reboots with a fresh SSRC is picked up seamlessly. Setting it `false` *adds* the only
+> SSRC rejection path there is. See
+> [rtp-input-dropouts-plan.md §4](../pipewire_audio_router/docs/rtp-input-dropouts-plan.md)
+> for the measurements behind this.
+
+### AirPlay source config (`airplay`)
+
+| Field | Meaning |
+|---|---|
+| `latency_msec` | producer jitter buffer (higher = fewer stutters, more latency) |
+| `port` | RTSP listen port (e.g. `5000`) |
+| `auth_setup` | perform the `auth-setup` handshake |
+| `prevent_takeover` | refuse a second sender while one is streaming |
+
+The receiver advertises unencrypted ALAC (`et=0`, `cn=1`).
+
+## Source clients (AirPlay senders)
+
+Which senders are connected to a source, and control over them. `key` identifies a
+client as reported by `GET .../clients`.
+
+### `GET /api/sources/{id}/clients`
+The senders this source has seen, as a JSON array of client info.
+
+### `POST /api/sources/{id}/clients/ban`
+```json
+{ "key": "<client key>", "banned": true }
+```
+Ban (or unban) a sender so it cannot connect.
+
+### `POST /api/sources/{id}/clients/disconnect`
+```json
+{ "key": "<client key>" }
+```
+Kick a currently-connected sender.
+
+### `POST /api/sources/{id}/clients/forget`
+```json
+{ "key": "<client key>" }
+```
+Drop a remembered sender from the list.
+
+### `POST /api/sources/{id}/clients/priority`
+```json
+{ "key": "<client key>", "priority": 10 }
+```
+Set a sender's priority, used when several compete for the source.
+
+### `PUT /api/sources/{id}/policy`
+```json
+{ "prevent_takeover": true }
+```
+Toggle one AirPlay source's anti-takeover policy: persisted into that source's config
+and applied to the running receiver live, with no restart.
 
 ## Sendspin devices
 
@@ -222,6 +349,32 @@ Sends the volume to the device in-band and stores it (re-applied on the
 device's next reconnect). If the device isn't connected the value is still
 stored (`"saved … (device not connected)"`).
 
+### `PUT /api/sendspin/mute`
+Mute or unmute one sendspin device, same addressing as the volume call
+(`set_sendspin_mute`).
+
+### `GET /api/sendspin/delays` / `PUT /api/sendspin/delay`
+Per-device playback delay in ms, used to time-align speakers within a group (a device
+with no entry has no extra delay). `GET` returns the sparse map keyed by device node
+name; `PUT` sets one entry. A delay edit is applied without restarting the group's
+server — see [`/api/sync/settings`](#endpoint-index) for the group-wide lead.
+
+## AirPlay-2 receiver volume
+
+AirPlay-2 receivers carry volume in-band over RTSP like sendspin devices do, so they
+get their own pair of endpoints rather than a PipeWire node volume. Current values are
+reported as `ap2_volume` / `ap2_muted` by [`GET /api/outputs`](#get-apioutputs).
+
+### `PUT /api/ap2/volume`
+Set one receiver's volume (`set_ap2_volume`).
+
+### `PUT /api/ap2/mute`
+Mute or unmute one receiver (`set_ap2_mute`).
+
+> The daemon deliberately **does not impose** a volume on connect — an earlier version
+> force-sent maximum volume when a session opened, which made a receiver's real level
+> (e.g. −67 dB on a Pioneer) disagree with the UI slider after a restart.
+
 ## Linking
 
 ### `POST /api/links`
@@ -230,7 +383,7 @@ Caller is responsible for pairing FL/FR etc. themselves.
 
 ```json
 // Request
-{ "from_port": "airplay-in:output_FL", "to_port": "raop-out-pioneer:playback_FL" }
+{ "from_port": "airplay-in:output_FL", "to_port": "ap2-dev-pioneer_vsx_934_f11b89:playback_FL" }
 // Response
 { "ok": true, "message": "linked ... -> ..." }
 ```
@@ -250,33 +403,35 @@ See "Routing matrix" below.
 ## Media players
 
 ### `GET /api/media_players`
-Returns the **live RAOP output** nodes (`raop-out-*`) with their state +
-node-level volume. It's the RAOP volume/state overlay the HA integration
-layers on top of the routing matrix.
+Returns the live **sendspin** nodes (`sendspin-dev-*`) with their state +
+node-level volume — the volume/state overlay the HA integration layers on top of the
+routing matrix.
 
 ```json
 [
-  { "node_id": 42, "node_name": "raop-out-pioneer", "state": "playing", "volume": 0.62 }
+  { "node_id": 42, "node_name": "sendspin-dev-home_assistant_voice_093ca8",
+    "state": "playing", "volume": 0.62 }
 ]
 ```
 
-`state` is `"playing"` if any link currently feeds the node, else
-`"idle"`. `volume` is read natively from the node's SPA `Props` param
-(`channelVolumes`, `volume.rs`); `null` if the node exposes no volume
-control. Sendspin devices are **not** here — they're virtual (no PipeWire
-node); the integration sources them from the routing matrix and gets their
-volume from [`/api/sendspin/volumes`](#sendspin-devices). The HA integration
-creates one `media_player` per routing-matrix **output** (RAOP + sendspin),
-not from this list directly.
+`state` is `"playing"` if any link currently feeds the node, else `"idle"`. `volume` is
+read natively from the node's SPA `Props` param (`channelVolumes`, `volume.rs`); `null`
+if the node exposes no volume control.
 
-### `GET /api/media_players/:node_id/volume`
+> **This list is sendspin-only.** `list_media_players` filters the registry on the
+> `sendspin-dev-` prefix, so AirPlay-2 and pw-sink outputs are **not** here — their
+> volume is in-band, via [`/api/ap2/volume`](#put-apiap2volume) and reported by
+> [`GET /api/outputs`](#get-apioutputs). The HA integration creates one `media_player`
+> per routing-matrix **output** across all backends, not from this list directly.
+
+### `GET /api/media_players/{node_id}/volume`
 ```json
 { "volume": 0.62, "message": null }
 ```
 `volume: null` with a `message` when the node has no volume control (200);
 `volume: null` + `message` with 500 if the read failed outright.
 
-### `POST /api/media_players/:node_id/volume`
+### `POST /api/media_players/{node_id}/volume`
 ```json
 // Request
 { "volume": 0.5 }
@@ -287,7 +442,7 @@ not from this list directly.
 `V` is written to the node's `channelVolumes` as `V³` (linear gain), so it
 reads back identically to what `wpctl` would show.
 
-### `POST /api/media_players/:node_id/announce`
+### `POST /api/media_players/{node_id}/announce`
 Ducks every source currently linked into the target, plays a clip, then
 unconditionally restores original volumes (even on failure). Full design
 rationale in [decisions.md](decisions.md#ttsannounce-ducking-url-based-v1-and-wyoming-based-v2-additive).
@@ -309,7 +464,7 @@ Exactly one of `url` or `wyoming` must be present:
 `duck_volume` defaults to `0.25` if omitted. Response:
 
 ```json
-{ "ok": true, "message": "announced on raop-out-pioneer, ducked 1 source(s)" }
+{ "ok": true, "message": "announced on ap2-dev-pioneer_vsx_934_f11b89, ducked 1 source(s)" }
 ```
 
 Playback is native — a `pw::stream` targeting the sink node (`player.rs`),
@@ -340,10 +495,10 @@ currently-offline endpoint are kept and reapplied when it returns.
     { "node_name": "bt-bridge-rtp", "display_name": "BT Bridge (RTP)", "present": true, "configured": true, "node_id": 44, "peak": 0.0 }
   ],
   "outputs": [
-    { "node_name": "raop-out-pioneer", "display_name": "Pioneer", "present": true, "configured": false, "node_id": 42, "peak": 0.0 },
+    { "node_name": "ap2-dev-pioneer_vsx_934_f11b89", "display_name": "Pioneer", "present": true, "configured": false, "node_id": 42, "peak": 0.0 },
     { "node_name": "sendspin-dev-voice_kitchen", "display_name": "Voice Kitchen", "present": true, "configured": false, "node_id": null, "peak": 0.0 }
   ],
-  "links": [ { "source": "airplay-in", "output": "raop-out-pioneer" } ]
+  "links": [ { "source": "airplay-in", "output": "ap2-dev-pioneer_vsx_934_f11b89" } ]
 }
 ```
 - Each node carries its stable `node_name`, an ephemeral `node_id`
@@ -359,7 +514,7 @@ currently-offline endpoint are kept and reapplied when it returns.
 
 ### `POST /api/routing/link` / `POST /api/routing/unlink`
 ```json
-{ "source": "airplay-in", "output": "raop-out-pioneer" }
+{ "source": "airplay-in", "output": "ap2-dev-pioneer_vsx_934_f11b89" }
 ```
 By stable **name**. `link` records the intent and, if both endpoints are
 present, pairs every non-monitor output port on the source with the matching
@@ -368,7 +523,7 @@ all match as `FL`) and creates those links natively; the intent is reapplied
 automatically if an endpoint (re)appears later. `unlink` removes the intent
 and any live links and returns `ok: true` even if there were none.
 
-### `DELETE /api/routing/entity/:node_name`
+### `DELETE /api/routing/entity/{node_name}`
 Forget an offline endpoint entirely — drops its saved routing intent so it
 stops appearing (grayed) in the matrix. A real device that later reappears
 comes back unrouted.
