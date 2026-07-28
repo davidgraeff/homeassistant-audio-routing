@@ -168,8 +168,14 @@
 <FlowGraph />
 
 <div class="card">
-  <details>
-    <summary><h2 style="display:inline; margin:0">Raw PipeWire graph</h2></summary>
+  <details class="collapsible">
+    <summary>
+      <!-- Same disclosure affordance as an output card (OutputsTab.svelte): a
+           28px chevron box that rotates when open. Kept as <details>/<summary>
+           so open/close stays native — the span only borrows the styling. -->
+      <span class="collapse-toggle" aria-hidden="true"><span class="chevron">▶</span></span>
+      <h2>PipeWire Nodes</h2>
+    </summary>
     <p class="card-sub">
       Every node in the live audio graph right now — sources, sinks, and internal plumbing. Grayed rows are internal
       nodes (drivers, unclassified) that aren't routing endpoints; they're shown for diagnostics only.
@@ -207,9 +213,42 @@
     font-size: 1.1rem;
     font-weight: 500;
   }
-  summary {
+  /* Disclosure header: chevron + title on one row, no native marker. */
+  .collapsible > summary {
+    display: flex;
+    align-items: center;
+    gap: 12px;
     cursor: pointer;
-    list-style-position: outside;
+    list-style: none;
+    user-select: none;
+  }
+  .collapsible > summary::-webkit-details-marker {
+    display: none;
+  }
+  .collapsible > summary h2 {
+    margin: 0;
+  }
+  .collapse-toggle {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    color: var(--secondary-text-color);
+  }
+  .collapsible > summary:hover .collapse-toggle {
+    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+    color: var(--primary-color);
+  }
+  .chevron {
+    font-size: 0.7rem;
+    line-height: 1;
+    transition: transform 0.15s ease;
+  }
+  .collapsible[open] > summary .chevron {
+    transform: rotate(90deg);
   }
   tr.internal {
     opacity: 0.45;

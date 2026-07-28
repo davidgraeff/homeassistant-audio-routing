@@ -23,6 +23,16 @@ export interface RoutingNode {
   /** Current mute state for outputs whose mute the daemon tracks out-of-band
    * (sendspin devices), pushed live over the routing WS. Absent otherwise. */
   muted?: boolean | null;
+  /** Estimated buffering (ms) this node adds to the path — the configured
+   * jitter/playout buffer, not a measured value. Sources: ingest jitter buffer
+   * (RTP / AirPlay). Outputs: playout lead (sendspin group send-ahead + static
+   * delay, or AP2 render delay). Absent when unknown. */
+  latency_ms?: number | null;
+  /** Cumulative xrun (dropped-cycle) count from the PipeWire profiler — the same
+   * figure as `pw-top`'s ERR. Present only for real graph nodes while the graph
+   * page is open (profiling is armed on demand); absent for virtual outputs and
+   * when profiling is off. A rising value marks where dropouts originate. */
+  xruns?: number | null;
 }
 
 export interface RoutingLink {
