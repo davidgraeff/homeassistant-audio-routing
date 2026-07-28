@@ -169,6 +169,7 @@ pub fn router(
         .route("/api/outputs", get(list_outputs))
         .route("/api/outputs/{node_name}/latency", put(set_output_latency))
         .route("/api/outputs/{node_name}/ap2-rate", put(set_ap2_rate_mode))
+        .route("/api/outputs/{node_name}/sendspin-codec", put(set_sendspin_codec))
         .route("/api/source/airplay", get(get_airplay_source).put(set_airplay_source).delete(delete_airplay_source))
         .route("/api/source/airplay/clients", get(list_airplay_clients))
         .route("/api/source/airplay/clients/forget", post(forget_airplay_client))
@@ -482,12 +483,83 @@ struct OutputInfo {
     /// AirPlay-2 only: mute state (`true` = muted). `None` for non-AP2.
     #[serde(skip_serializing_if = "Option::is_none")]
     ap2_muted: Option<bool>,
+    /// sendspin only: the stored wire-codec choice — `"auto"` (Opus when usable,
+    /// else PCM), or a pinned `"pcm"`/`"opus"`/`"flac"`. `None` for other kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sendspin_codec: Option<&'static str>,
+    /// sendspin only: the codec the stream will actually use — the choice narrowed by
+    /// what the daemon can encode and what the device advertised. Differs from
+    /// `sendspin_codec` whenever the choice isn't currently usable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sendspin_codec_active: Option<&'static str>,
+    /// sendspin only: every codec the picker offers, with whether it can be selected
+    /// and — when it can't — why not. Drives the greyed-out entries in the UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sendspin_codec_options: Option<Vec<CodecOption>>,
+    /// sendspin only: the buffer this device asks us to keep queued (`min_buffer_ms`
+    /// from its `client/state`), in ms. `None` until it has connected and reported one.
+    /// **It can change with the wire codec** — a player may raise it for "codec init,
+    /// decode warmup" — which is why a codec change makes the UI re-read this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sendspin_min_buffer_ms: Option<u32>,
+    /// sendspin only: the startup lead it would like (`required_lead_time_ms`).
+    /// Surfaced for diagnostics; the spec says to extend toward it only for buffered
+    /// sources, and this is a live stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sendspin_required_lead_ms: Option<u32>,
+    /// sendspin only: the send-ahead its stream actually uses (ms) — the configured
+    /// group lead raised to the largest member requirement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sendspin_send_ahead_ms: Option<u32>,
+}
+
+/// One entry in a sendspin output's codec picker.
+#[derive(Serialize)]
+struct CodecOption {
+    /// `"auto"`, `"pcm"`, `"opus"`, `"flac"`.
+    codec: &'static str,
+    /// Selectable? False ⇒ the UI greys it out (and rejects it if posted anyway).
+    available: bool,
+    /// Why it isn't selectable — shown as the option's tooltip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
 struct OutputOpResponse {
     ok: bool,
     message: String,
+}
+
+/// Build a sendspin output's codec picker: the stored choice, what it resolves to
+/// right now, and per-codec availability.
+///
+/// Two independent reasons a codec can be unavailable, and the UI needs to say
+/// which: **we can't encode it yet** (no encoder in the daemon — currently
+/// everything but PCM) or **the device didn't advertise it** at our wire format.
+/// `Auto` is always selectable; it just resolves to the best usable option.
+fn sendspin_codec_info(
+    node_name: &str,
+    device_codecs: &[String],
+    settings: &crate::sync_settings::SyncSettings,
+) -> (&'static str, &'static str, Vec<CodecOption>) {
+    let mode = settings.sendspin_codec(node_name);
+    let active = crate::sendspin_server::resolve_codec(mode, std::iter::once(&device_codecs.to_vec()));
+    let mut options = vec![CodecOption { codec: "auto", available: true, reason: None }];
+    for codec in crate::sendspin_server::OFFERED_CODECS {
+        let encodable = crate::sendspin_server::can_encode(codec);
+        let supported = crate::sendspin_server::device_supports(device_codecs, codec);
+        let reason = match (encodable, supported) {
+            (true, true) => None,
+            (false, _) => Some(format!("the add-on can't encode {codec} yet")),
+            (true, false) if device_codecs.is_empty() => {
+                Some("not known yet — the device hasn't connected, so it hasn't told us what it decodes".to_string())
+            }
+            (true, false) => Some(format!("this device doesn't advertise {codec} at 48 kHz/16-bit/stereo")),
+        };
+        options.push(CodecOption { codec, available: reason.is_none(), reason });
+    }
+    (mode.as_str(), active, options)
 }
 
 async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
@@ -510,6 +582,23 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
         // IPv4 address resolves). Sendspin has no transport encryption, so the
         // column is a constant "None" rather than an absent value.
         let addr = dev.and_then(|d| d.addr);
+        let device_codecs = dev.map(|d| d.supported_codecs.clone()).unwrap_or_default();
+        let (codec_mode, codec_active, codec_options) =
+            sendspin_codec_info(&node_name, &device_codecs, &state.sync_settings.lock_recover());
+        // What this device asked for, and the send-ahead its stream ends up with — the
+        // same computation sync_group feeds the server, so the UI can't disagree with
+        // the audio path.
+        let (min_buffer_ms, required_lead_ms) = dev.map(|d| (d.min_buffer_ms, d.required_lead_time_ms)).unwrap_or((None, None));
+        let send_ahead_ms = {
+            let ss = state.sync_settings.lock_recover();
+            let static_delay = ss.sendspin_delays().get(&node_name).copied().unwrap_or(0);
+            let us = crate::sendspin_server::required_send_ahead_us(
+                ss.group_lead_us(),
+                codec_active,
+                std::iter::once((min_buffer_ms, static_delay)),
+            );
+            (us / 1000) as u32
+        };
         outputs.push(OutputInfo {
             kind: "sendspin",
             present,
@@ -528,6 +617,12 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             ap2_rate: None,
             ap2_volume: None,
             ap2_muted: None,
+            sendspin_codec: Some(codec_mode),
+            sendspin_codec_active: Some(codec_active),
+            sendspin_codec_options: Some(codec_options),
+            sendspin_min_buffer_ms: min_buffer_ms,
+            sendspin_required_lead_ms: required_lead_ms,
+            sendspin_send_ahead_ms: Some(send_ahead_ms),
             node_name,
         });
     }
@@ -622,6 +717,12 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             ap2_rate: Some(rate),
             ap2_volume: ap2_vols.get(&node_name).copied(),
             ap2_muted: Some(ap2_mutes.get(&node_name).copied().unwrap_or(false)),
+            sendspin_codec: None,
+            sendspin_codec_active: None,
+            sendspin_codec_options: None,
+            sendspin_min_buffer_ms: None,
+            sendspin_required_lead_ms: None,
+            sendspin_send_ahead_ms: None,
             node_name,
         });
     }
@@ -1103,7 +1204,10 @@ async fn set_sendspin_volume(
     State(state): State<AppState>,
     Json(req): Json<SetSendspinVolumeRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    let reached = state.sendspin_control.lock().await.set_volume(&req.node_name, req.volume).await;
+    // Two statements: the control guard must drop before the send is awaited
+    // (see sendspin_volume::PendingCommands).
+    let pending = state.sendspin_control.lock().await.set_volume(&req.node_name, req.volume);
+    let reached = pending.apply().await;
     let message = if reached {
         format!("set '{}' to {}%", req.node_name, req.volume.min(100))
     } else {
@@ -1125,7 +1229,8 @@ async fn set_sendspin_mute(
     State(state): State<AppState>,
     Json(req): Json<SetSendspinMuteRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    let reached = state.sendspin_control.lock().await.set_muted(&req.node_name, req.muted).await;
+    let pending = state.sendspin_control.lock().await.set_muted(&req.node_name, req.muted);
+    let reached = pending.apply().await;
     let verb = if req.muted { "muted" } else { "unmuted" };
     let message = if reached {
         format!("{verb} '{}'", req.node_name)
@@ -1195,8 +1300,81 @@ async fn set_ap2_mute(
 
 #[derive(Serialize)]
 struct SyncSettingsInfo {
-    /// Group presentation lead in ms (sendspin `send_ahead`).
+    /// Group presentation lead in ms (sendspin `send_ahead`) as configured here.
     group_lead_ms: u32,
+    /// The largest buffering requirement across present sendspin devices
+    /// (`min_buffer_ms` + that device's static delay), in ms. The daemon raises every
+    /// group's send-ahead to at least this — the spec makes it mandatory, not advisory
+    /// — so configuring less than this has no effect. 0 when no device has reported one
+    /// (a device only reports after it connects, and it may report a *different* value
+    /// per wire codec, since decode warmup differs).
+    group_lead_floor_ms: u32,
+    /// What the daemon actually uses: `max(group_lead_ms, group_lead_floor_ms)`.
+    group_lead_effective_ms: u32,
+    /// Which device(s) set the floor, for a UI that has to explain why the value it
+    /// shows is higher than the one the user typed.
+    group_lead_floor_sources: Vec<LeadFloorSource>,
+}
+
+/// One device's contribution to the send-ahead floor.
+#[derive(Serialize)]
+struct LeadFloorSource {
+    node_name: String,
+    name: String,
+    /// The codec it's streaming — its requirement changes with this.
+    codec: &'static str,
+    /// What the device itself asked for (excluding its static delay), if it reported
+    /// anything. `None` for firmware that never sends `min_buffer_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_buffer_ms: Option<u32>,
+    /// The add-on's own minimum for that codec, used when the device is silent.
+    codec_minimum_ms: u32,
+    /// Its static delay, which the server adds on top per the spec.
+    static_delay_ms: u16,
+    /// Its effective per-player send-ahead — the larger of the two, plus the delay.
+    required_ms: u32,
+    /// `"reported"` (the device asked for it) or `"codec-minimum"` (it didn't, so the
+    /// add-on's floor for its codec applies). Lets the UI explain the number honestly.
+    reason: &'static str,
+}
+
+/// The send-ahead floor across present sendspin devices, plus the per-device detail
+/// behind it. Mirrors what `sync_group` feeds each group, so the UI shows the same
+/// number the audio path uses.
+fn lead_floor(state: &AppState) -> (u32, Vec<LeadFloorSource>) {
+    let devices = state.sendspin_devices.lock_recover().clone();
+    let ss = state.sync_settings.lock_recover();
+    let delays = ss.sendspin_delays();
+    let mut sources: Vec<LeadFloorSource> = devices
+        .iter()
+        .filter(|(_, d)| d.present)
+        .map(|(node_name, d)| {
+            let static_delay_ms = delays.get(node_name).copied().unwrap_or(0);
+            let codec =
+                crate::sendspin_server::resolve_codec(ss.sendspin_codec(node_name), std::iter::once(&d.supported_codecs));
+            // Same rule the audio path uses: what the device asked for, else our floor
+            // for its codec — and the device's static delay on top either way.
+            let codec_minimum_ms = (crate::sendspin_codec::min_send_ahead_us(codec) / 1000) as u32;
+            let (base_ms, reason) = match d.min_buffer_ms {
+                Some(m) => (m, "reported"),
+                None => (codec_minimum_ms, "codec-minimum"),
+            };
+            LeadFloorSource {
+                node_name: node_name.clone(),
+                name: d.display_name.clone(),
+                codec,
+                min_buffer_ms: d.min_buffer_ms,
+                codec_minimum_ms,
+                static_delay_ms,
+                required_ms: base_ms + u32::from(static_delay_ms),
+                reason,
+            }
+        })
+        .filter(|s| s.required_ms > 0)
+        .collect();
+    // Largest first: the head is the one that actually sets the floor.
+    sources.sort_by_key(|s| std::cmp::Reverse(s.required_ms));
+    (sources.first().map(|s| s.required_ms).unwrap_or(0), sources)
 }
 
 #[derive(Deserialize)]
@@ -1205,7 +1383,14 @@ struct SetSyncSettingsRequest {
 }
 
 async fn get_sync_settings(State(state): State<AppState>) -> Json<SyncSettingsInfo> {
-    Json(SyncSettingsInfo { group_lead_ms: state.sync_settings.lock_recover().group_lead_ms() })
+    let configured = state.sync_settings.lock_recover().group_lead_ms();
+    let (floor, sources) = lead_floor(&state);
+    Json(SyncSettingsInfo {
+        group_lead_ms: configured,
+        group_lead_floor_ms: floor,
+        group_lead_effective_ms: configured.max(floor),
+        group_lead_floor_sources: sources,
+    })
 }
 
 async fn set_sync_settings(
@@ -1218,7 +1403,21 @@ async fn set_sync_settings(
     // Nudge the reconciler; it re-reads the lead each tick and restarts group
     // servers so the new value takes effect promptly.
     let _ = state.changes.send(());
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("group lead set to {} ms", req.group_lead_ms) }))
+    // The daemon raises the lead to the device-reported floor regardless, so a value
+    // below it is stored but not used — say so rather than letting the UI imply it took.
+    let (floor, sources) = lead_floor(&state);
+    let message = match sources.first() {
+        Some(top) if floor > req.group_lead_ms && top.reason == "reported" => format!(
+            "group lead set to {} ms, but {} ms is used — '{}' asks for that much buffer with {}",
+            req.group_lead_ms, floor, top.name, top.codec
+        ),
+        Some(top) if floor > req.group_lead_ms => format!(
+            "group lead set to {} ms, but {} ms is used — {} needs that much head start to decode in time on '{}'",
+            req.group_lead_ms, floor, top.codec, top.name
+        ),
+        _ => format!("group lead set to {} ms", req.group_lead_ms),
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
 
 /// General app settings (settings_store.rs) — the Settings page's General
@@ -1932,7 +2131,8 @@ async fn set_sendspin_delay_handler(
     if let Err(e) = state.sync_settings.lock_recover().set_sendspin_delay(&req.node_name, req.delay_ms) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist delay: {e}") }));
     }
-    let reached = state.sendspin_control.lock().await.set_delay(&req.node_name, req.delay_ms).await;
+    let pending = state.sendspin_control.lock().await.set_delay(&req.node_name, req.delay_ms);
+    let reached = pending.apply().await;
     let ms = req.delay_ms.min(5000);
 
     // Current ESPHome firmware reads the static delay only at stream start, so a
@@ -2018,6 +2218,61 @@ struct SetAp2RateModeRequest {
 /// Set an AP2 output's wire-rate mode (persisted in sync_settings.rs) and nudge the
 /// reconciler so the group re-negotiates + restarts at the new rate. Choosing `auto`
 /// also clears any learned 44.1k cap so 48 kHz is re-probed.
+/// Per-sendspin-output wire codec (`{"codec": "auto"|"pcm"|"opus"|"flac"}`).
+///
+/// Rejects a codec that isn't currently selectable — the daemon can't encode it, or
+/// the device didn't advertise it — with the same reason the picker shows, instead of
+/// storing a choice that would silently fall back to PCM. The stream carries one
+/// format for a whole group, so the change takes effect by restarting that group's
+/// sendspin server (the codec is part of its restart identity).
+#[derive(Deserialize)]
+struct SetSendspinCodecRequest {
+    codec: String,
+}
+
+async fn set_sendspin_codec(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+    Json(req): Json<SetSendspinCodecRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    if !node_name.starts_with(SENDSPIN_DEV_PREFIX) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not a sendspin output") }),
+        );
+    }
+    let Some(codec) = crate::sync_settings::SendspinCodec::parse(&req.codec) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OutputOpResponse { ok: false, message: format!("unknown codec '{}' (use auto, pcm, opus or flac)", req.codec) }),
+        );
+    };
+    // An explicit pick must be usable right now; `auto` always is.
+    if let Some(name) = codec.explicit_codec() {
+        let device_codecs = state.sendspin_devices.lock_recover().get(&node_name).map(|d| d.supported_codecs.clone()).unwrap_or_default();
+        let (_, _, options) = sendspin_codec_info(&node_name, &device_codecs, &state.sync_settings.lock_recover());
+        if let Some(opt) = options.iter().find(|o| o.codec == name) {
+            if !opt.available {
+                let why = opt.reason.clone().unwrap_or_else(|| "not available".into());
+                return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("{name} is not available: {why}") }));
+            }
+        }
+    }
+    if let Err(e) = state.sync_settings.lock_recover().set_sendspin_codec(&node_name, codec) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist codec: {e}") }),
+        );
+    }
+    // Codec is part of the sendspin server's restart identity → the group restarts
+    // and sends a fresh stream/start with the new format.
+    let _ = state.changes.send(());
+    (
+        StatusCode::OK,
+        Json(OutputOpResponse { ok: true, message: format!("codec for '{node_name}' set to {}", codec.as_str()) }),
+    )
+}
+
 async fn set_ap2_rate_mode(
     State(state): State<AppState>,
     Path(node_name): Path<String>,

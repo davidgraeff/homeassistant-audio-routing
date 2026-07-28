@@ -58,8 +58,22 @@ struct DesiredGroup {
     /// PRESENT sendspin device node names (sorted). Identity for "did the dialed
     /// set change?" (the server's dial filter is fixed at start).
     sendspin_node_names: Vec<String>,
-    /// PRESENT sendspin device mDNS fullnames — the server's dial filter.
-    sendspin_fullnames: HashSet<String>,
+    /// PRESENT sendspin devices as `(mDNS fullname, ws URL)` — what the server
+    /// supervises. URLs come from the discovery registry (the daemon's single
+    /// `_sendspin._tcp` browser), because a browser per server steals the shared mDNS
+    /// daemon's one listener per type and silently blinds the others.
+    sendspin_members: Vec<(String, String)>,
+    /// Send-ahead this group's sendspin stream must use (µs): the user's configured
+    /// group lead raised to the largest per-member requirement (`min_buffer_ms` +
+    /// that member's static delay), which the spec makes mandatory rather than
+    /// advisory. Part of the restart identity — the timeline's send-ahead is fixed at
+    /// construction, so a change means a fresh server.
+    sendspin_send_ahead_us: i64,
+    /// Wire codec for this group's sendspin stream: the per-output choices narrowed
+    /// by what the daemon can encode and what EVERY member decodes (one stream, one
+    /// format). Part of the server's restart identity, like `ap2_rate` — changing it
+    /// means a new `stream/start`, so the server is dropped and recreated.
+    sendspin_codec: &'static str,
     /// PRESENT AP2 receivers in this group: (output node_name, resolved IP,
     /// per-output render delay override in ms — `None` = sender default), sorted
     /// by node_name. Identity for "did the receiver set *or its delay* change?"
@@ -78,7 +92,9 @@ impl DesiredGroup {
         Self {
             sources: sources.iter().map(|s| s.to_string()).collect(),
             sendspin_node_names: Vec::new(),
-            sendspin_fullnames: HashSet::new(),
+            sendspin_members: Vec::new(),
+            sendspin_send_ahead_us: 0,
+            sendspin_codec: "pcm",
             ap2_members: Vec::new(),
             ap2_rate: 48_000,
         }
@@ -95,6 +111,16 @@ struct RunningGroup {
     server: Option<SendspinServerHandle>,
     /// Snapshot of the sendspin device set the running server was started for.
     server_devices: Vec<String>,
+    /// The `(fullname, url)` set last pushed to the running server. A membership change
+    /// restarts the server; a mere *address* change only needs a re-supervise, which is
+    /// why this is tracked separately from `server_devices`.
+    server_members: Vec<(String, String)>,
+    /// The wire codec the running sendspin server was started with — part of its
+    /// restart identity (a codec change needs a fresh `stream/start`).
+    server_codec: &'static str,
+    /// The send-ahead the running sendspin server was started with (µs) — the other
+    /// part of that identity, since the timeline fixes it at construction.
+    server_send_ahead_us: i64,
     /// Live AP2 senders (ap2_server.rs) for this group; drop = TEARDOWN each
     /// receiver session. `None` when the group has no present AP2 receivers.
     ap2_sender: Option<crate::ap2_server::Ap2ServerHandle>,
@@ -223,7 +249,11 @@ fn compute_desired(
         }
         let g = groups.entry(source_key(&sources)).or_insert_with(|| DesiredGroup::new(&sources));
         g.sendspin_node_names.push(dev_node.clone());
-        g.sendspin_fullnames.insert(dev.fullname.clone());
+        // A device with no resolved URL yet can't be dialed; it joins on a later
+        // reconcile once mDNS has resolved it (the reconciler is nudged then).
+        if let Some(url) = &dev.url {
+            g.sendspin_members.push((dev.fullname.clone(), url.clone()));
+        }
     }
 
     // Present AP2 receivers (with a resolved address) → members of their group.
@@ -294,6 +324,44 @@ impl GroupReconciler {
             for d in desired.values_mut() {
                 if !d.ap2_members.is_empty() {
                     d.ap2_rate = ss.ap2_group_rate(d.ap2_members.iter().map(|(n, _, _)| n.as_str()));
+                }
+                // Sendspin wire codec: one stream serves the whole group, so the
+                // per-output choices are narrowed to something EVERY member decodes
+                // (and the daemon can encode). A conflict resolves to PCM, which
+                // every player must handle.
+                if !d.sendspin_node_names.is_empty() {
+                    let member_codecs: Vec<Vec<String>> = d
+                        .sendspin_node_names
+                        .iter()
+                        .map(|n| devices_map.get(n).map(|dev| dev.supported_codecs.clone()).unwrap_or_default())
+                        .collect();
+                    // The group's mode is the least-permissive member choice: an
+                    // explicit pick anywhere wins over Auto, and PCM wins over the
+                    // rest (a member pinned to PCM must not be sent Opus).
+                    let mode = d
+                        .sendspin_node_names
+                        .iter()
+                        .map(|n| ss.sendspin_codec(n))
+                        .min_by_key(|m| match m {
+                            crate::sync_settings::SendspinCodec::Pcm => 0,
+                            crate::sync_settings::SendspinCodec::Flac => 1,
+                            crate::sync_settings::SendspinCodec::Opus => 2,
+                            crate::sync_settings::SendspinCodec::Auto => 3,
+                        })
+                        .unwrap_or_default();
+                    d.sendspin_codec = sendspin_server::resolve_codec(mode, member_codecs.iter());
+                    // Send-ahead floor, resolved AFTER the codec because a compressed
+                    // stream needs more decode headroom than PCM: whichever is larger of
+                    // what each member reported and its codec's own minimum, plus that
+                    // member's static delay.
+                    let delays = ss.sendspin_delays();
+                    d.sendspin_send_ahead_us = sendspin_server::required_send_ahead_us(
+                        send_ahead_us,
+                        d.sendspin_codec,
+                        d.sendspin_node_names.iter().map(|n| {
+                            (devices_map.get(n).and_then(|dev| dev.min_buffer_ms), delays.get(n).copied().unwrap_or(0))
+                        }),
+                    );
                 }
             }
         }
@@ -369,6 +437,9 @@ impl GroupReconciler {
                         port,
                         server: None,
                         server_devices: Vec::new(),
+                        server_members: Vec::new(),
+                        server_codec: "pcm",
+                        server_send_ahead_us: 0,
                         ap2_sender: None,
                         ap2_members: Vec::new(),
                         ap2_rate: 48_000,
@@ -378,9 +449,18 @@ impl GroupReconciler {
 
             // Snapshot what we need so no borrow of `self.running` is held across
             // an await (the async link/server calls below).
-            let (anchor_name, anchor_id, port, prev_devices, prev_ap2, prev_ap2_rate) = {
+            let (anchor_name, anchor_id, port, prev_devices, prev_codec, prev_lead, prev_ap2, prev_ap2_rate) = {
                 let rg = self.running.get(key).expect("just inserted");
-                (rg.anchor_node_name.clone(), rg.anchor_node_id, rg.port, rg.server_devices.clone(), rg.ap2_members.clone(), rg.ap2_rate)
+                (
+                    rg.anchor_node_name.clone(),
+                    rg.anchor_node_id,
+                    rg.port,
+                    rg.server_devices.clone(),
+                    rg.server_codec,
+                    rg.server_send_ahead_us,
+                    rg.ap2_members.clone(),
+                    rg.ap2_rate,
+                )
             };
 
             // b. Wire each source into the anchor (idempotent).
@@ -395,7 +475,7 @@ impl GroupReconciler {
             //    filter is fixed at start, so a membership change means drop-and-
             //    recreate — the server only, not the anchor, so RAOP outputs fed
             //    from the same anchor never blip.
-            if d.sendspin_node_names != prev_devices {
+            if d.sendspin_node_names != prev_devices || d.sendspin_codec != prev_codec || d.sendspin_send_ahead_us != prev_lead {
                 if let Some(rg) = self.running.get_mut(key) {
                     rg.server = None; // drop old server (stops its capture/dial)
                     rg.server_devices = Vec::new();
@@ -406,25 +486,58 @@ impl GroupReconciler {
                         &group_display(d),
                         port,
                         anchor_id,
-                        d.sendspin_fullnames.clone(),
-                        send_ahead_us,
+                        d.sendspin_members.clone(),
+                        d.sendspin_send_ahead_us,
                         control.clone(),
                         devices.clone(),
+                        sendspin_server::StreamPolicy::Always,
+                        d.sendspin_codec,
                     )
                     .await
                     {
                         Ok(handle) => {
                             tracing::info!(
-                                "sync group '{anchor_name}': per-device senders on port {port} dialing {} device(s)",
-                                d.sendspin_node_names.len()
+                                "sync group '{anchor_name}': per-device senders on port {port} dialing {} device(s), codec {}, send-ahead {} ms{}",
+                                d.sendspin_node_names.len(),
+                                d.sendspin_codec,
+                                d.sendspin_send_ahead_us / 1000,
+                                if d.sendspin_send_ahead_us > send_ahead_us {
+                                    // Say which rule raised it: a member's own request, our
+                                    // codec floor, and/or its static delay (which the device
+                                    // subtracts from every timestamp, so the server must send
+                                    // that much further ahead or its chunks land in the past).
+                                    format!(
+                                        " (raised from the configured {} ms to cover a member's buffer requirement + its static delay)",
+                                        send_ahead_us / 1000
+                                    )
+                                } else {
+                                    String::new()
+                                }
                             );
                             if let Some(rg) = self.running.get_mut(key) {
                                 rg.server = Some(handle);
                                 rg.server_devices = d.sendspin_node_names.clone();
+                                rg.server_members = d.sendspin_members.clone();
+                                rg.server_codec = d.sendspin_codec;
+                                rg.server_send_ahead_us = d.sendspin_send_ahead_us;
                             }
                         }
                         Err(e) => tracing::warn!("sync group '{anchor_name}': failed to start sendspin server: {e}"),
                     }
+                }
+            }
+
+            // c2. Same server, new address: a device that re-resolved elsewhere needs its
+            //     supervisor redirected. Idempotent, so this is a no-op in the common case
+            //     — and it replaces what the per-server mDNS browser used to do before it
+            //     turned out to be stealing every other server's subscription.
+            if let Some(rg) = self.running.get_mut(key) {
+                if rg.server.is_some() && rg.server_members != d.sendspin_members {
+                    if let Some(server) = &rg.server {
+                        tracing::info!("sync group '{anchor_name}': re-supervising {} sendspin device(s) at new address(es)", d.sendspin_members.len());
+                        server.supervise(&d.sendspin_members);
+                    }
+                    rg.server_members = d.sendspin_members.clone();
                 }
             }
 
@@ -478,6 +591,22 @@ impl GroupReconciler {
             let Some(fullname) = devices_map.get(dev).map(|d| d.fullname.clone()) else {
                 continue;
             };
+            // Single-device stream, so the codec is just this device's choice
+            // narrowed by what it advertised (and what we can encode).
+            let (idle_codec, idle_lead_us) = {
+                let ss = sync_settings.lock_recover();
+                let caps = devices_map.get(dev).map(|d| d.supported_codecs.clone()).unwrap_or_default();
+                let codec = sendspin_server::resolve_codec(ss.sendspin_codec(dev), std::iter::once(&caps));
+                let lead = sendspin_server::required_send_ahead_us(
+                    send_ahead_us,
+                    codec,
+                    std::iter::once((
+                        devices_map.get(dev).and_then(|d| d.min_buffer_ms),
+                        ss.sendspin_delays().get(dev).copied().unwrap_or(0),
+                    )),
+                );
+                (codec, lead)
+            };
             let suffix = dev.strip_prefix(crate::config::SENDSPIN_DEV_PREFIX).unwrap_or(dev);
             let sink_node_name = format!("{IDLE_SINK_PREFIX}{suffix}");
             let (tx, rx) = oneshot::channel();
@@ -496,16 +625,26 @@ impl GroupReconciler {
                 continue;
             };
             let port = self.alloc_port(&HashSet::new());
-            let filter = std::collections::HashSet::from([fullname]);
+            // One member, from the registry — the URL is what the single daemon-wide
+            // browser resolved (an idle sender doesn't browse either).
+            let Some(idle_url) = devices_map.get(dev).and_then(|d| d.url.clone()) else {
+                tracing::debug!("idle sender for '{dev}': no resolved URL yet; retrying on a later reconcile");
+                continue;
+            };
+            let members = vec![(fullname, idle_url)];
             match sendspin_server::start_server_per_device(
                 &sink_node_name,
                 &format!("idle: {}", routing::output_display_name(dev)),
                 port,
                 sink_node_id,
-                filter,
-                send_ahead_us,
+                members,
+                idle_lead_us,
                 control.clone(),
                 devices.clone(),
+                // Idle: stay connected (warm + controllable) but stream nothing
+                // until an announcement is actually headed for this device.
+                sendspin_server::StreamPolicy::WhenAnnounced,
+                idle_codec,
             )
             .await
             {

@@ -323,19 +323,30 @@ impl AlignManager {
     /// the device-authoritative mute (`ap2_control`; we deliberately do NOT
     /// impose a volume on AP2 — its level stays device-authoritative).
     async fn apply_audibility(&self, members: &[AlignMember], reference: Option<&str>, target: Option<&str>, volume: u8) {
+        // Collect every sendspin push first, then release the control lock before
+        // awaiting any of them: holding it across a loop of per-device sends let one
+        // unreachable speaker freeze the whole wizard *and* the volume API.
+        let mut pending = Vec::new();
+        {
+            let mut c = self.sendspin.lock().await;
+            for m in members {
+                if m.kind != MemberKind::Sendspin {
+                    continue;
+                }
+                let audible = reference == Some(m.node_name.as_str()) || target == Some(m.node_name.as_str());
+                pending.push(c.set_mute(&m.node_name, !audible));
+                if audible {
+                    pending.push(c.set_volume(&m.node_name, volume));
+                }
+            }
+        }
+        for p in pending {
+            p.apply().await;
+        }
         for m in members {
-            let audible = reference == Some(m.node_name.as_str()) || target == Some(m.node_name.as_str());
-            match m.kind {
-                MemberKind::Sendspin => {
-                    let mut c = self.sendspin.lock().await;
-                    c.set_mute(&m.node_name, !audible).await;
-                    if audible {
-                        c.set_volume(&m.node_name, volume).await;
-                    }
-                }
-                MemberKind::Airplay2 => {
-                    self.ap2.lock().await.set_muted(&m.node_name, !audible).await;
-                }
+            if m.kind == MemberKind::Airplay2 {
+                let audible = reference == Some(m.node_name.as_str()) || target == Some(m.node_name.as_str());
+                self.ap2.lock().await.set_muted(&m.node_name, !audible).await;
             }
         }
     }
@@ -345,16 +356,20 @@ impl AlignManager {
     /// receiver to its device-authoritative level.)
     async fn teardown(&self, session: Session) {
         session.stop.store(true, Ordering::Relaxed);
+        let mut pending = Vec::new();
         {
             let mut c = self.sendspin.lock().await;
             for m in &session.members {
                 if m.kind == MemberKind::Sendspin {
-                    c.set_mute(&m.node_name, false).await;
+                    pending.push(c.set_mute(&m.node_name, false));
                 }
             }
             for (n, v) in &session.saved_sendspin {
-                c.set_volume(n, *v).await;
+                pending.push(c.set_volume(n, *v));
             }
+        }
+        for p in pending {
+            p.apply().await;
         }
         {
             let mut c = self.ap2.lock().await;

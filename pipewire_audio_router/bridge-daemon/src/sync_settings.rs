@@ -55,6 +55,10 @@ struct SyncConfig {
     /// misbehave at 48 kHz).
     #[serde(default)]
     ap2_rate_mode: BTreeMap<String, Ap2RateMode>,
+    /// Per-sendspin-device wire codec choice, keyed by sendspin node name. Absent
+    /// ⇒ [`SendspinCodec::Auto`].
+    #[serde(default)]
+    sendspin_codec: BTreeMap<String, SendspinCodec>,
     /// Per-AP2-device LEARNED capability cache (Hz), keyed by AP2 node name: the
     /// last successfully-negotiated rate, or 44100 if a 48 kHz SETUP was rejected.
     /// Absent ⇒ untested (Auto optimistically tries 48 kHz). Persisted so we don't
@@ -79,6 +83,67 @@ impl Default for Ap2RateMode {
     }
 }
 
+/// Per-sendspin-output wire codec choice.
+///
+/// Sendspin negotiates: a device advertises the `{codec, rate, depth, channels}`
+/// combinations it decodes, and one stream serves a whole group — so the *effective*
+/// codec is this choice narrowed by what the daemon can encode and what every member
+/// of the group supports (`sendspin_server::resolve_codec`). An unusable choice falls
+/// back to PCM rather than sending a stream nothing can decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendspinCodec {
+    /// Best available: Opus when the daemon can encode it and every member decodes
+    /// it (≈10× less WiFi airtime), else PCM. The default.
+    Auto,
+    /// Force uncompressed PCM — zero encode/decode cost, ~1.5 Mbit/s per stream.
+    Pcm,
+    /// Force Opus (lossy, ~10-15× smaller).
+    Opus,
+    /// Force FLAC (lossless, ~40-50% smaller). Never chosen by `Auto`: it's a
+    /// deliberate "lossless, and I'll pay the bandwidth" decision.
+    Flac,
+}
+
+impl Default for SendspinCodec {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl SendspinCodec {
+    /// The codec name this mode pins, or `None` for [`Self::Auto`].
+    pub fn explicit_codec(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Pcm => Some("pcm"),
+            Self::Opus => Some("opus"),
+            Self::Flac => Some("flac"),
+        }
+    }
+
+    /// The wire/API name of this mode (`"auto"`, `"pcm"`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Pcm => "pcm",
+            Self::Opus => "opus",
+            Self::Flac => "flac",
+        }
+    }
+
+    /// Parse an API/wire name; `None` if it isn't a known mode.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "pcm" => Some(Self::Pcm),
+            "opus" => Some(Self::Opus),
+            "flac" => Some(Self::Flac),
+            _ => None,
+        }
+    }
+}
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
@@ -86,6 +151,7 @@ impl Default for SyncConfig {
             sendspin_delays: BTreeMap::new(),
             ap2_latency: BTreeMap::new(),
             ap2_rate_mode: BTreeMap::new(),
+            sendspin_codec: BTreeMap::new(),
             ap2_rate_cap: BTreeMap::new(),
         }
     }
@@ -164,6 +230,28 @@ impl SyncSettings {
     }
 
     // ---- AP2 sample rate (mode + learned cache) --------------------------
+
+    /// The user-chosen wire codec for a sendspin output (default
+    /// [`SendspinCodec::Auto`]).
+    pub fn sendspin_codec(&self, node_name: &str) -> SendspinCodec {
+        self.config.sendspin_codec.get(node_name).copied().unwrap_or_default()
+    }
+
+    /// Every stored sendspin codec choice, by node name (for the API listing).
+    pub fn sendspin_codecs(&self) -> BTreeMap<String, SendspinCodec> {
+        self.config.sendspin_codec.clone()
+    }
+
+    /// Set (and persist) a sendspin output's codec choice. `Auto` clears the entry so
+    /// the default keeps following any future change to what `Auto` means.
+    pub fn set_sendspin_codec(&mut self, node_name: &str, codec: SendspinCodec) -> anyhow::Result<()> {
+        if codec == SendspinCodec::Auto {
+            self.config.sendspin_codec.remove(node_name);
+        } else {
+            self.config.sendspin_codec.insert(node_name.to_string(), codec);
+        }
+        self.persist()
+    }
 
     /// The user-chosen rate mode for an AP2 output (default [`Ap2RateMode::Auto`]).
     pub fn ap2_rate_mode(&self, node_name: &str) -> Ap2RateMode {

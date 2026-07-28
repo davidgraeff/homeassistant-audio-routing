@@ -150,6 +150,14 @@ impl AnnounceScheduler {
         Self { active: Vec::new(), queue: Vec::new(), max_queue, next_seq: 0 }
     }
 
+    /// Every output an announcement is currently playing on **or waiting for**.
+    /// The audio path keeps a transport it opened on demand alive for these: a
+    /// queued clip has no overlay slot yet, so the mixer alone can't tell that the
+    /// output still has something coming.
+    pub fn outputs_in_flight(&self) -> BTreeSet<Output> {
+        self.active.iter().chain(self.queue.iter()).flat_map(|e| e.req.targets.iter().cloned()).collect()
+    }
+
     /// Outputs currently occupied by a playing announcement → its id.
     fn occupancy(&self) -> HashMap<Output, AnnouncementId> {
         let mut m = HashMap::new();

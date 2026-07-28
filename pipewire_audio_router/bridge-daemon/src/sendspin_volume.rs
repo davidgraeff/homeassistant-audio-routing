@@ -21,6 +21,49 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Player commands pulled out of [`SendspinControl`] but not yet sent.
+///
+/// Every mutator here returns one of these instead of awaiting the send itself,
+/// so the caller can drop the (process-global) control lock *before* awaiting.
+/// Awaiting under the lock made one unreachable device able to freeze every
+/// volume/mute/delay endpoint and the liveness poller: a write to a device whose
+/// socket has stopped draining takes until the sendspin write timeout, and the
+/// lock was held for all of it.
+///
+/// Use it as two statements, never one — `control.lock().await.set_volume(..).apply().await`
+/// keeps the guard alive as a temporary for the whole statement, which is exactly
+/// the bug this type exists to prevent.
+#[must_use = "the command is only sent when `apply` is awaited"]
+pub struct PendingCommands {
+    node_name: String,
+    /// `None` when the device isn't connected — the desired state is stored for
+    /// its next register and there's nothing to push.
+    sender: Option<ServerSender>,
+    commands: Vec<PlayerCommand>,
+}
+
+impl PendingCommands {
+    fn none(node_name: &str) -> Self {
+        Self { node_name: node_name.to_string(), sender: None, commands: Vec::new() }
+    }
+
+    /// Send the commands. Returns true if they reached a live device (false =
+    /// no live connection, or the send failed and was logged).
+    pub async fn apply(self) -> bool {
+        let Some(sender) = self.sender else {
+            return false;
+        };
+        let mut reached = !self.commands.is_empty();
+        for command in self.commands {
+            if let Err(e) = sender.queue_player_command(command.clone()).await {
+                tracing::warn!("failed to apply {:?} to '{}': {e}", command.command, self.node_name);
+                reached = false;
+            }
+        }
+        reached
+    }
+}
+
 /// Shared handle to the volume control (API + every group server hold a clone).
 /// A device with no entry in `desired` is at full scale (100) — the UI shows
 /// sliders at 100 for those.
@@ -80,6 +123,14 @@ impl SendspinControl {
         self.change_notifier = Some(changes);
     }
 
+    /// Nudge the reconciler/UI — used when a device's *capabilities* change (its
+    /// advertised codecs land on the first connect), so its group can re-resolve the
+    /// wire codec instead of staying on the conservative PCM guess until the next
+    /// unrelated reconcile.
+    pub fn notify_reconcile(&self) {
+        self.notify_changed();
+    }
+
     fn notify_changed(&self) {
         if let Some(changes) = &self.change_notifier {
             let _ = changes.send(());
@@ -107,24 +158,25 @@ impl SendspinControl {
     /// Register a freshly-connected device (by its virtual node name) and
     /// (re)apply its stored volume + static delay so a reconnect restores what
     /// the user set.
-    pub async fn register(&mut self, node_name: String, sender: ServerSender) {
+    ///
+    /// Synchronous by design: the returned [`PendingCommands`] must be applied by
+    /// the caller *after* releasing the control lock. This runs on the accept and
+    /// client-event loops, which are serial — awaiting a stalled device's socket
+    /// here used to stop every other device's connect/disconnect handling too.
+    pub fn register(&mut self, node_name: String, sender: ServerSender) -> PendingCommands {
         tracing::info!("sendspin device connected: {node_name}");
+        let mut commands = Vec::new();
         if let Some(&vol) = self.desired.get(&node_name) {
-            if let Err(e) = sender.send_player_command(volume_cmd(vol)).await {
-                tracing::warn!("failed to apply stored volume {vol} to '{node_name}': {e}");
-            }
+            commands.push(volume_cmd(vol));
         }
         if let Some(&ms) = self.desired_delay.get(&node_name) {
-            if let Err(e) = sender.send_player_command(delay_cmd(ms)).await {
-                tracing::warn!("failed to apply stored delay {ms}ms to '{node_name}': {e}");
-            }
+            commands.push(delay_cmd(ms));
         }
         if let Some(&muted) = self.desired_muted.get(&node_name) {
-            if let Err(e) = sender.send_player_command(mute_cmd(muted)).await {
-                tracing::warn!("failed to apply stored mute {muted} to '{node_name}': {e}");
-            }
+            commands.push(mute_cmd(muted));
         }
-        self.senders.insert(node_name, sender);
+        self.senders.insert(node_name.clone(), sender.clone());
+        PendingCommands { node_name, sender: Some(sender), commands }
     }
 
     /// Seed desired per-device delays at startup from the persisted sync
@@ -136,21 +188,15 @@ impl SendspinControl {
         }
     }
 
-    /// Set a device's desired static delay (ms) and push it to the device if
-    /// connected. `0` clears it. Returns true if it reached a live device.
-    pub async fn set_delay(&mut self, node_name: &str, ms: u16) -> bool {
+    /// Set a device's desired static delay (ms), returning the push for the
+    /// caller to apply outside the control lock. `0` clears it.
+    pub fn set_delay(&mut self, node_name: &str, ms: u16) -> PendingCommands {
         if ms == 0 {
             self.desired_delay.remove(node_name);
         } else {
             self.desired_delay.insert(node_name.to_string(), ms.min(5000));
         }
-        if let Some(sender) = self.senders.get(node_name) {
-            match sender.send_player_command(delay_cmd(ms)).await {
-                Ok(()) => return true,
-                Err(e) => tracing::warn!("failed to set delay for '{node_name}': {e}"),
-            }
-        }
-        false
+        self.pending(node_name, delay_cmd(ms))
     }
 
     /// Snapshot of the desired per-device delays by node name (for the UI).
@@ -163,9 +209,9 @@ impl SendspinControl {
         self.senders.remove(node_name);
     }
 
-    /// Set a device's desired volume and push it to the device if connected.
-    /// Returns true if it reached a live device (false = stored for reconnect).
-    pub async fn set_volume(&mut self, node_name: &str, volume: u8) -> bool {
+    /// Set a device's desired volume, returning the push for the caller to apply
+    /// outside the control lock.
+    pub fn set_volume(&mut self, node_name: &str, volume: u8) -> PendingCommands {
         let volume = volume.min(100);
         let changed = self.desired.insert(node_name.to_string(), volume) != Some(volume);
         if changed {
@@ -173,13 +219,7 @@ impl SendspinControl {
             // has the value optimistically, so this is for the second client.
             self.notify_changed();
         }
-        if let Some(sender) = self.senders.get(node_name) {
-            match sender.send_player_command(volume_cmd(volume)).await {
-                Ok(()) => return true,
-                Err(e) => tracing::warn!("failed to set volume for '{node_name}': {e}"),
-            }
-        }
-        false
+        self.pending(node_name, volume_cmd(volume))
     }
 
     /// Snapshot of the desired volumes by node name (for the UI sliders).
@@ -192,18 +232,12 @@ impl SendspinControl {
     /// volume. Returns true if it reached a live device. Unlike the transient
     /// [`Self::set_mute`] (alignment wizard), this is the user-facing mute the UI
     /// toggle drives and the matrix reflects.
-    pub async fn set_muted(&mut self, node_name: &str, muted: bool) -> bool {
+    pub fn set_muted(&mut self, node_name: &str, muted: bool) -> PendingCommands {
         let changed = self.desired_muted.insert(node_name.to_string(), muted) != Some(muted);
         if changed {
             self.notify_changed();
         }
-        if let Some(sender) = self.senders.get(node_name) {
-            match sender.send_player_command(mute_cmd(muted)).await {
-                Ok(()) => return true,
-                Err(e) => tracing::warn!("failed to set mute for '{node_name}': {e}"),
-            }
-        }
-        false
+        self.pending(node_name, mute_cmd(muted))
     }
 
     /// Record a **device-reported** mute state (from an inbound `client/state`
@@ -228,15 +262,16 @@ impl SendspinControl {
     /// keep volume and mute independent, and some ignore a 0 volume). Does NOT
     /// touch the stored desired volume, so unmuting restores the prior level.
     /// Used by the alignment wizard to solo the reference + target speaker.
-    /// Returns true if it reached a live device.
-    pub async fn set_mute(&self, node_name: &str, muted: bool) -> bool {
-        if let Some(sender) = self.senders.get(node_name) {
-            match sender.send_player_command(mute_cmd(muted)).await {
-                Ok(()) => return true,
-                Err(e) => tracing::warn!("failed to set mute for '{node_name}': {e}"),
-            }
+    pub fn set_mute(&self, node_name: &str, muted: bool) -> PendingCommands {
+        self.pending(node_name, mute_cmd(muted))
+    }
+
+    /// Bundle one command for a device with its live sender, if any.
+    fn pending(&self, node_name: &str, command: PlayerCommand) -> PendingCommands {
+        match self.senders.get(node_name) {
+            Some(sender) => PendingCommands { node_name: node_name.to_string(), sender: Some(sender.clone()), commands: vec![command] },
+            None => PendingCommands::none(node_name),
         }
-        false
     }
 
     /// Whether a device currently has a live server connection — the
@@ -254,7 +289,8 @@ mod tests {
     #[tokio::test]
     async fn set_volume_persists_desired_even_with_no_live_device() {
         let mut c = SendspinControl::default();
-        assert!(!c.set_volume("sendspin-dev-kitchen", 40).await);
+        let pending = c.set_volume("sendspin-dev-kitchen", 40);
+        assert!(!pending.apply().await);
         assert_eq!(c.volumes().get("sendspin-dev-kitchen").copied(), Some(40));
     }
 

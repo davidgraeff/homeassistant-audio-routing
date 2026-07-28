@@ -27,6 +27,7 @@ mod routing;
 mod routing_store;
 mod rtp_source;
 mod sendspin_capture;
+mod sendspin_codec;
 mod sendspin_discovery;
 mod sendspin_liveness;
 mod sendspin_server;
@@ -85,7 +86,11 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "bridge_daemon=info,shairplay=info,airplay_client=info,airplay_audio=info,libairptp=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| // `sendspin=info` matters more than it looks: the vendored server role logs its
+            // dial loop (attempt, failure, retry backoff, goodbye reason) through the `log`
+            // crate, and without its target enabled every one of those lines is dropped —
+            // which left "why is this speaker not connected?" unanswerable from the log.
+            "bridge_daemon=info,sendspin=info,shairplay=info,airplay_client=info,airplay_audio=info,libairptp=info".into()),
         )
         .init();
 

@@ -40,6 +40,19 @@ RUN npm run build
 # (-levent/-levent_pthreads). Unlike libasound2, libevent IS reachable at runtime
 # (libairptp actively runs its event loop), so the runtime image installs the
 # matching shared lib below.
+#
+# cmake + make: `opusic-sys` (the Opus encoder for the sendspin wire codec — see
+# src/sendspin_codec.rs) builds its BUNDLED libopus, and its build script drives
+# that build through CMake (`bundled` is its default feature, `bundled =
+# ["dep:cmake"]`). `make` is needed too — this base is `rust:1-slim-*`, which ships
+# no make, and CMake's default "Unix Makefiles" generator fails with
+# "CMAKE_MAKE_PROGRAM is not set" without it. The cmake crate handles the cross case
+# itself (it passes CMAKE_C_COMPILER=<triple>-gcc + CMAKE_SYSTEM_PROCESSOR), so no
+# toolchain file is required. Vendoring libopus is deliberate: it ends up statically
+# linked, so the runtime image needs no libopus .so and can't drift in version.
+# Build-time only, like libasound2-dev. NOTE: `scripts/build-arm64.sh` cannot catch a
+# missing build dep here — it builds container/Dockerfile, which has no Rust build
+# stage at all; only `scripts/deploy-dev.sh addon` (or CI) exercises this stage.
 FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
 ARG TARGETARCH
 ARG BUILDARCH
@@ -57,7 +70,7 @@ RUN set -eux; \
     if [ "$TARGETARCH" = "$BUILDARCH" ]; then \
         apt-get update; \
         apt-get install -y --no-install-recommends \
-            pkg-config clang libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libevent-dev; \
+            pkg-config clang cmake make libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libevent-dev; \
     else \
         dpkg --add-architecture "$TARGETARCH"; \
         apt-get update; \
@@ -71,7 +84,7 @@ RUN set -eux; \
         # e.g. fdk-aac-sys. Without it the AAC build dies with "cannot execute
         # 'cc1plus'". (Native builds get g++ from the base image's build tools.)
         apt-get install -y --no-install-recommends \
-            pkg-config clang "gcc-${gnu}" "g++-${gnu}" "libc6-dev:$TARGETARCH" \
+            pkg-config clang cmake make "gcc-${gnu}" "g++-${gnu}" "libc6-dev:$TARGETARCH" \
             "libpipewire-0.3-dev:$TARGETARCH" "libspa-0.2-dev:$TARGETARCH" "libasound2-dev:$TARGETARCH" \
             "libevent-dev:$TARGETARCH"; \
         up_triple="$(echo "$triple" | tr 'a-z-' 'A-Z_')"; \

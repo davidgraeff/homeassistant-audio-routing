@@ -161,10 +161,12 @@ pub async fn start(
         &display,
         SPIKE_PORT,
         sink_node_id,
-        filter,
+        spike_members(devices, &filter),
         send_ahead_us,
         control.clone(),
         devices.clone(),
+        sendspin_server::StreamPolicy::Always,
+        "pcm", // spike: fixed, uncompressed — not the user's per-output choice
     )
     .await
     {
@@ -286,10 +288,12 @@ pub async fn start_multi(
         &display,
         MULTI_PORT,
         sink_node_id,
-        fullnames.clone(),
+        spike_members(devices, &fullnames),
         send_ahead_us,
         control.clone(),
         devices.clone(),
+        sendspin_server::StreamPolicy::Always,
+        "pcm", // spike: fixed, uncompressed — not the user's per-output choice
     )
     .await
     {
@@ -378,4 +382,21 @@ fn restore_links(routing: &SharedRouting, changes: &ChangeNotifier, freed: &[(St
         }
     }
     let _ = changes.send(());
+}
+
+
+/// The `(fullname, url)` pairs a spike server should supervise, from the discovery
+/// registry — the same source the group reconciler uses (see sendspin_server: the
+/// servers no longer browse for themselves).
+fn spike_members(
+    devices: &crate::sendspin_discovery::SharedSendspinDevices,
+    fullnames: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
+    use crate::locks::LockRecover;
+    devices
+        .lock_recover()
+        .values()
+        .filter(|d| fullnames.contains(&d.fullname))
+        .filter_map(|d| d.url.clone().map(|url| (d.fullname.clone(), url)))
+        .collect()
 }

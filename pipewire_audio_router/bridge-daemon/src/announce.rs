@@ -104,6 +104,13 @@ impl AnnounceCoordinator {
         admission
     }
 
+    /// Outputs with an announcement playing or queued — see
+    /// [`AnnounceScheduler::outputs_in_flight`]. Read by the on-demand transport
+    /// lease (sync_group.rs) so a session isn't handed back before its clip's turn.
+    pub fn outputs_in_flight(&self) -> std::collections::BTreeSet<String> {
+        self.inner.lock().unwrap().sched.outputs_in_flight()
+    }
+
     /// Periodic tick: complete finished overlays (start next queued / end duck)
     /// and expire stale queued announcements. Driven from main.rs.
     pub fn poll(&self) {

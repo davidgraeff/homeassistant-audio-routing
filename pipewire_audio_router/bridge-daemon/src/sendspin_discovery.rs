@@ -42,6 +42,44 @@ pub struct SendspinDevice {
     /// device left. The liveness task owns demotion (`present = false`) and
     /// eventual removal, from the live connection state + an active TCP probe.
     pub present: bool,
+    /// The device's WebSocket URL (`ws://<ip>:<port><path>`), built from its resolved
+    /// address and the `path` TXT property it advertises. `None` until an IPv4
+    /// resolves or if it advertises no path.
+    ///
+    /// Stored here because **this registry is the daemon's only browser** of
+    /// `_sendspin._tcp`: mdns-sd keeps one listener per service type, so a second
+    /// browse (one per sendspin server, as `ClientManager::start` would do) silently
+    /// steals the subscription and leaves every earlier browser — including this
+    /// registry — deaf. So the servers are handed URLs from here instead of
+    /// discovering for themselves (`ClientManager::start_without_discovery`).
+    pub url: Option<String>,
+    /// Codecs this device advertised that it can decode **at our wire format**
+    /// (48 kHz / 16-bit / stereo), lowercase, e.g. `["pcm", "flac", "opus"]`.
+    ///
+    /// Not from mDNS: it comes from the device's `client/hello`
+    /// (`player@v1_support.supported_formats`), so it's only known once a server has
+    /// connected to it at least once — `sendspin_server` writes it here on connect.
+    /// Empty means "not seen yet" (assume PCM), NOT "supports nothing". Filtered to
+    /// our format because a codec the device only decodes at another rate/depth is
+    /// not usable for us.
+    pub supported_codecs: Vec<String>,
+    /// The ongoing buffer this device asks us to keep it stocked with, in ms
+    /// (`min_buffer_ms` from its `client/state` player object). `None` until it
+    /// reports one.
+    ///
+    /// The spec makes this a **requirement, not a hint**: "servers must schedule
+    /// timestamps so each player's queued audio duration stays at or above its
+    /// `min_buffer_ms`", and for a group the send-ahead is "the maximum per-player
+    /// send-ahead across grouped players". A player may raise it for "codec init,
+    /// decode warmup" — so it can change when the wire codec changes, which is why
+    /// the group's lead is recomputed (and its server restarted) when this moves.
+    /// Excludes `static_delay_ms`, which the server adds per player.
+    pub min_buffer_ms: Option<u32>,
+    /// Startup lead this device would like (`required_lead_time_ms`), to keep the
+    /// beginning of a stream from being cut off. A *hint* the spec says to honour
+    /// only "when doing so adds no latency, i.e. for buffered sources but not live
+    /// streams" — ours is live, so it's surfaced for diagnostics and not enforced.
+    pub required_lead_time_ms: Option<u32>,
 }
 
 /// Live discovered devices, keyed by their virtual output node name
@@ -56,6 +94,18 @@ pub fn device_node_name(display_name: &str) -> String {
 
 /// The resolved server address (first IPv4 + advertised port), or `None` if no
 /// IPv4 has resolved yet. Used by the liveness probe.
+/// The device's dial URL from its resolved service, mirroring what sendspin-rs's own
+/// `ClientBrowser` builds: first non-loopback IPv4, its port, and the `path` TXT it
+/// advertises (a device without one isn't dialable).
+fn url_from_service(info: &ResolvedService) -> Option<String> {
+    let ip = info.get_addresses_v4().into_iter().find(|a| !a.is_loopback() && !a.is_link_local())?;
+    let path = info.get_property_val_str("path")?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some(format!("ws://{ip}:{}{path}", info.get_port()))
+}
+
 fn addr_from_service(info: &ResolvedService) -> Option<std::net::SocketAddr> {
     let ip = info.get_addresses_v4().into_iter().next()?;
     Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), info.get_port()))
@@ -88,6 +138,7 @@ pub fn spawn(daemon: &ServiceDaemon, devices: SharedSendspinDevices, changes: Ch
                     let node_name = device_node_name(&display_name);
                     let fullname = info.get_fullname().to_string();
                     let addr = addr_from_service(&info);
+                    let url = url_from_service(&info);
 
                     let mut devs = devices.lock_recover();
                     let notify = match devs.get_mut(&node_name) {
@@ -101,6 +152,12 @@ pub fn spawn(daemon: &ServiceDaemon, devices: SharedSendspinDevices, changes: Ch
                             if addr.is_some() {
                                 dev.addr = addr;
                             }
+                            // A re-resolve at a new address must reach the servers, so
+                            // they can redirect their supervisors (`supervise` is
+                            // idempotent and treats a changed URL as a redial).
+                            if url.is_some() && dev.url != url {
+                                dev.url = url.clone();
+                            }
                             if came_online {
                                 tracing::info!("sendspin device '{display_name}' back online ({node_name})");
                             }
@@ -109,7 +166,18 @@ pub fn spawn(daemon: &ServiceDaemon, devices: SharedSendspinDevices, changes: Ch
                         None => {
                             devs.insert(
                                 node_name.clone(),
-                                SendspinDevice { fullname, display_name: display_name.clone(), addr, present: true },
+                                SendspinDevice {
+                                    fullname,
+                                    display_name: display_name.clone(),
+                                    addr,
+                                    present: true,
+                                    // Filled in by sendspin_server from the device's own
+                                    // client/hello + client/state, not from mDNS.
+                                    url,
+                                    supported_codecs: Vec::new(),
+                                    min_buffer_ms: None,
+                                    required_lead_time_ms: None,
+                                },
                             );
                             tracing::info!("discovered sendspin device '{display_name}' ({node_name})");
                             true

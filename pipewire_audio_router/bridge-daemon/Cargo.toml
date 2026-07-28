@@ -67,6 +67,8 @@ airplay-client = { path = "vendor/airplay2-sender/crates/airplay-client" }
 # Core types (Device/Features/StreamConfig/TimingProtocol/PtpMode) the sender's
 # Connection needs but airplay-client doesn't re-export. Same vendored workspace.
 airplay-core = { path = "vendor/airplay2-sender/crates/airplay-core" }
+opusic-sys = "0.7.4"
+flacenc = { version = "0.5.1", default-features = false, features = ["log"] }
 
 # Override the sendspin git dep with a vendored copy patched to expose the
 # dialed mDNS fullname on ClientEvent::Connected (upstream only forwards the
