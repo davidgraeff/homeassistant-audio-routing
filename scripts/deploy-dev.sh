@@ -126,10 +126,13 @@ except Exception:
 PY
 }
 
-# Keep only the newest $DEV_TAGS_KEEP dev tags on GHCR. Dev tags are the
-# 4-segment "<base>.<epoch>" versions this script pushes (release tags are
-# 3-segment and left untouched, as is the 'buildcache' entry). Best-effort:
-# a missing/under-scoped token just skips pruning with a warning.
+# Keep only the newest $DEV_TAGS_KEEP dev tags on GHCR. Dev and release tags now
+# have the *same* shape — MAJOR.MINOR.<14-digit timestamp> — so, unlike the old
+# 3-vs-4-segment scheme, segment count can no longer tell them apart. Instead we
+# treat every version listed in the add-on's CHANGELOG.md as a release and never
+# delete it; anything else with a timestamp revision is a dev build. 'latest',
+# 'buildcache' and any other non-version tag never match and are left alone.
+# Best-effort: a missing/under-scoped token just skips pruning with a warning.
 prune_dev_tags() {
   local ha_arch="$1" token
   token="$(ghcr_token)"
@@ -137,15 +140,25 @@ prune_dev_tags() {
     echo "--- skip prune: no GHCR token (set GHCR_TOKEN or run 'gh auth login' with delete:packages)" >&2
     return 0
   fi
-  GHCR_API_TOKEN="$token" python3 - "$GHCR_OWNER" "${ha_arch}-addon-${ADDON_NAME}" "$DEV_TAGS_KEEP" <<'PY'
+  GHCR_API_TOKEN="$token" python3 - "$GHCR_OWNER" "${ha_arch}-addon-${ADDON_NAME}" "$DEV_TAGS_KEEP" \
+      "$REPO_ROOT/$ADDON_NAME/CHANGELOG.md" <<'PY'
 import os, sys, re, json, urllib.request
 token, owner, pkg, keep = os.environ["GHCR_API_TOKEN"], sys.argv[1], sys.argv[2], int(sys.argv[3])
+changelog = sys.argv[4]
 base = f"https://api.github.com/users/{owner}/packages/container/{pkg}/versions"
 def api(url, method="GET"):
     req = urllib.request.Request(url, method=method)
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/vnd.github+json")
     return urllib.request.urlopen(req)
+# Released versions are protected. If the changelog is unreadable, protect
+# nothing rather than guessing — but say so, since that could delete a release.
+released = set()
+try:
+    with open(changelog) as f:
+        released = set(re.findall(r"^#+ (\d+\.\d+\.\d+)[ \t]*$", f.read(), re.M))
+except OSError as e:
+    print(f"--- prune: cannot read {changelog} ({e}); no releases protected", file=sys.stderr)
 try:
     versions = json.load(api(base + "?per_page=100"))
 except Exception as e:
@@ -153,10 +166,13 @@ except Exception as e:
 devs = []
 for v in versions:
     for t in v.get("metadata", {}).get("container", {}).get("tags", []):
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", t):
-            devs.append((int(t.rsplit(".", 1)[1]), v["id"], t)); break
-devs.sort(reverse=True)  # newest epoch first
-for _epoch, vid, tag in devs[keep:]:
+        m = re.match(r"^(\d+)\.(\d+)\.(\d{14})$", t)
+        if m and t not in released:
+            devs.append((tuple(int(g) for g in m.groups()), t, v["id"])); break
+# Sort on the numeric triple, not the string: "0.9.x" > "0.10.x" lexically, so a
+# string sort would prune the newer minor's builds first once minor hits 10.
+devs.sort(reverse=True)
+for _key, tag, vid in devs[keep:]:
     try:
         api(f"{base}/{vid}", method="DELETE"); print(f"--- pruned old dev image tag {tag}")
     except Exception as e:
@@ -180,13 +196,25 @@ deploy_addon() {
 
   # Supervisor only re-pulls when the version increases, and for a local
   # add-on the "latest" version is whatever config.yaml in /addons says. So we
-  # stamp a unique, monotonically-increasing dev version per deploy — the
-  # committed base version with an epoch as a 4th segment (e.g. 0.1.0.175...)
-  # — and tag the image to match. 4-segment > the 3-segment base, and later
-  # epochs > earlier ones, so `ha addons update` always fires and pulls. The
-  # committed config.yaml is never touched; only the rsync'd /addons copy is.
+  # stamp a unique, monotonically-increasing dev version per deploy and tag the
+  # image to match, so `ha apps update` always fires and pulls.
+  #
+  # Versions are MAJOR.MINOR.REVISION with REVISION abused as a build timestamp
+  # in UTC ISO-8601 basic form minus the T separator (YYYYMMDDHHMMSS) — see
+  # scripts/release.py for why the T can't be there (Cargo needs a numeric patch
+  # segment). A dev deploy keeps the committed MAJOR.MINOR and *replaces* the
+  # revision with the current timestamp, which is necessarily larger than the
+  # revision stamped at release time, so the version always goes up. UTC, not
+  # local time, so a DST fall-back can't produce a lower revision than the
+  # previous deploy. The committed config.yaml is never touched; only the
+  # rsync'd /addons copy is.
   base_version="$(grep '^version:' "$REPO_ROOT/$ADDON_NAME/config.yaml" | head -1 | sed -E 's/^version: *"?([^"]+)"?.*/\1/')"
-  dev_version="${base_version}.$(date +%H%M)"
+  case "$base_version" in
+    *.*.*) ;;
+    *) echo "ERROR: config.yaml version '$base_version' is not MAJOR.MINOR.REVISION" >&2; exit 1 ;;
+  esac
+  dev_version="${base_version%.*}.$(date -u +%Y%m%d%H%M%S)"
+  echo "=== deploying dev version $dev_version (from committed $base_version) ==="
 
   preflight_ghcr
   ensure_builder "$platform"
@@ -243,8 +271,39 @@ deploy_addon() {
   echo "--- pruning old dev image tags on GHCR (keeping newest $DEV_TAGS_KEEP) ---"
   prune_dev_tags "$ha_arch"
 
-  echo "--- starting (or restarting) $ADDON_SLUG ---"
-  ssh "root@$HA_HOST" "ha apps restart $ADDON_SLUG"
+  # Start only if it isn't already running. `ha apps update` restarts an add-on
+  # that *was* running, so the supervisor has already started the new container
+  # by now; `ha apps install` leaves it stopped, so a first install still needs
+  # a start. An unconditional `ha apps restart` here produced a **second**
+  # stop/start 0.6 s after the supervisor's own update-triggered start —
+  # doubling the disruption per deploy, and making the add-on log unreadable
+  # for exactly the restart questions this repo keeps debugging (the new
+  # container gets killed ~0.5 s into its startup, mid-handshake with the
+  # sendspin speakers). See
+  # pipewire_audio_router/docs/sendspin-group-churn-plan.md §4.11.
+  echo "--- ensuring $ADDON_SLUG is running ---"
+  # `|| true` because this is a plain assignment under `set -e`: unlike the
+  # `if [ "$(…)" ]` form used for the install check above, a failing command
+  # substitution here would abort the deploy. Falling back to `unknown` sends us
+  # down the start path, which is the safe default when we can't tell.
+  state="$(ssh "root@$HA_HOST" "ha apps info $ADDON_SLUG --raw-json 2>/dev/null | jq -r '.data.state'" || true)"
+  state="${state:-unknown}"
+  case "$state" in
+    started | startup)
+      # `startup` is the transient state between the supervisor's start and the
+      # app reporting ready; treat it as running rather than racing it.
+      echo "    already running (state=$state) — no restart needed"
+      ;;
+    *)
+      echo "    state=$state — starting"
+      ssh "root@$HA_HOST" "ha apps start $ADDON_SLUG"
+      ;;
+  esac
+
+  # Repeated here because the build/push/pull output above is long enough that
+  # the version printed at the start has scrolled away by now — and this is the
+  # string to match against the daemon's startup log line below.
+  echo "=== deployed dev version $dev_version ==="
 
   echo "--- tailing logs (Ctrl-C to stop) ---"
   ssh "root@$HA_HOST" "ha apps logs $ADDON_SLUG"
