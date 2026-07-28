@@ -18,6 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import app  # noqa: E402
 import btstat  # noqa: E402
 import capture  # noqa: E402
 import pwctl  # noqa: E402
@@ -60,33 +61,277 @@ class TestBlockAnalysis(unittest.TestCase):
 
 
 class TestSilenceTracker(unittest.TestCase):
-    def test_streak_grows_while_silent_and_resets_on_audio(self):
-        t = capture.SilenceTracker()
-        t.update(True, 10.0)
-        self.assertAlmostEqual(t.streak(12.0), 2.0)
-        t.update(False, 12.0)
-        self.assertEqual(t.streak(13.0), 0.0)
+    """Silence must be *measured*, never inferred from the clock.
 
-    def test_episode_logged_once_silence_ends(self):
+    Every test here maps to a way the first version fabricated the exact symptom
+    the app exists to detect — see capture.py's module docstring.
+    """
+
+    BLK = capture.BLOCK_S  # 0.02
+
+    def feed(self, t, n, silent, start=0.0, trusted=True, step=None):
+        """n consecutive blocks, one BLOCK_S apart. Returns the next stamp."""
+        step = self.BLK if step is None else step
+        now = start
+        for _ in range(n):
+            t.update(silent, now, trusted=trusted)
+            now += step
+        return now
+
+    def test_streak_is_block_derived_and_does_not_grow_on_the_clock(self):
+        """The headline bug: an 8-minute 'silence' with a frozen block cursor."""
+        t = capture.SilenceTracker()
+        self.feed(t, 50, True)                      # 50 blocks = 1.0 s of silence
+        self.assertAlmostEqual(t.streak, 1.0)
+        # No further blocks. Time passing must not extend the claim.
+        self.assertAlmostEqual(t.streak, 1.0)
+        self.assertTrue(t.stalled(now=1000.0))
+
+    def test_streak_resets_on_audio(self):
+        t = capture.SilenceTracker()
+        nxt = self.feed(t, 10, True)
+        self.assertGreater(t.streak, 0)
+        t.update(False, nxt)
+        self.assertEqual(t.streak, 0.0)
+
+    def test_episode_logged_once_silence_ends_with_block_derived_duration(self):
         t = capture.SilenceTracker(min_episode_s=0.5)
-        for now in (0.0, 1.0, 2.0):
-            t.update(True, now)
+        nxt = self.feed(t, 100, True)               # 2.0 s
         self.assertEqual(len(t.episodes), 0, "not logged until it ends")
-        t.update(False, 3.0)
+        t.update(False, nxt)
         self.assertEqual(len(t.episodes), 1)
-        self.assertAlmostEqual(t.episodes[0].duration, 3.0)
+        self.assertAlmostEqual(t.episodes[0].duration, 2.0)
 
     def test_short_blip_is_not_an_episode(self):
         t = capture.SilenceTracker(min_episode_s=0.5)
-        t.update(True, 0.0)
-        t.update(False, 0.1)
+        nxt = self.feed(t, 5, True)                 # 0.1 s
+        t.update(False, nxt)
         self.assertEqual(len(t.episodes), 0)
+
+    def test_a_stall_is_not_billed_as_silence(self):
+        """One zero block + a 149 s stall used to be logged as a 149 s dropout."""
+        t = capture.SilenceTracker(min_episode_s=0.5)
+        t.update(True, 0.0)                         # a single silent block
+        t.update(False, 149.0)                      # ...then the reader came back
+        self.assertEqual(len(t.episodes), 0, "the gap was never observed as silence")
+        self.assertEqual(len(t.stalls), 1)
+        self.assertAlmostEqual(t.stalls[0].duration, 149.0 - capture.BLOCK_S, places=6)
+        self.assertAlmostEqual(t.lost_s, 149.0 - capture.BLOCK_S, places=6)
+
+    def test_stall_splits_a_silent_run_instead_of_merging_it(self):
+        t = capture.SilenceTracker(min_episode_s=0.5)
+        nxt = self.feed(t, 50, True)                # 1.0 s of real silence
+        nxt = self.feed(t, 50, True, start=nxt + 30.0)   # after a 30 s hole
+        t.update(False, nxt)
+        # Two measured 1 s episodes, not one 32 s episode: the hole in between was
+        # never observed, so it cannot be claimed as silence.
+        self.assertEqual([round(e.duration, 3) for e in t.episodes], [1.0, 1.0])
+        self.assertEqual(len(t.stalls), 1)
+        self.assertAlmostEqual(t.stalls[0].duration, 30.0, places=6)
+
+    def test_late_reader_within_tolerance_does_not_break_the_run(self):
+        """A descheduled Python reader on a Zero 2 W loses nothing; blocks buffer."""
+        t = capture.SilenceTracker(min_episode_s=0.5, max_gap_s=0.5)
+        t.update(True, 0.0)
+        t.update(True, 0.4)                         # late, but under tolerance
+        nxt = self.feed(t, 30, True, start=0.42)
+        t.update(False, nxt)
+        self.assertEqual(len(t.stalls), 0)
+        self.assertEqual(len(t.episodes), 1)
+        self.assertAlmostEqual(t.episodes[0].duration, 32 * self.BLK)
+
+    def test_untrusted_blocks_are_excluded_entirely(self):
+        """Blocks captured while the stream was on the wrong node prove nothing."""
+        t = capture.SilenceTracker(min_episode_s=0.5)
+        nxt = self.feed(t, 100, True, trusted=False)   # 2 s of foreign silence
+        self.assertEqual(t.total_blocks, 0)
+        self.assertEqual(t.untrusted_blocks, 100)
+        self.assertEqual(t.streak, 0.0)
+        self.assertEqual(t.duty, 0.0)
+        t.update(False, nxt)
+        self.assertEqual(len(t.episodes), 0)
+
+    def test_untrusted_stretch_splits_a_trusted_run(self):
+        t = capture.SilenceTracker(min_episode_s=0.5)
+        nxt = self.feed(t, 50, True)                          # 1 s, trusted
+        nxt = self.feed(t, 50, True, start=nxt, trusted=False)
+        nxt = self.feed(t, 50, True, start=nxt)               # 1 s, trusted again
+        t.update(False, nxt)
+        self.assertEqual([round(e.duration, 3) for e in t.episodes], [1.0, 1.0],
+                         "the two trusted runs must not be spliced into one 3 s claim")
 
     def test_duty_cycle(self):
         t = capture.SilenceTracker()
-        for i in range(10):
-            t.update(i < 3, float(i))
+        now = self.feed(t, 3, True)
+        self.feed(t, 7, False, start=now)
         self.assertAlmostEqual(t.duty, 0.3)
+
+    def test_coverage_reports_the_hole_in_the_record(self):
+        """2 h on the bridge yielded 108.9 min of blocks: coverage 0.92, not 1.0."""
+        t = capture.SilenceTracker()
+        self.feed(t, 500, False)                    # 10 s of blocks...
+        self.assertAlmostEqual(t.coverage(10.0), 1.0, places=3)
+        self.assertAlmostEqual(t.coverage(20.0), 0.5, places=3)   # ...over 20 s
+        self.assertIsNone(t.coverage(0.0))
+
+    def test_stalled_is_true_before_any_block(self):
+        t = capture.SilenceTracker()
+        self.assertTrue(t.stalled(0.0))
+        self.assertIsNone(t.since_last_block(0.0))
+
+
+class TestRecordCmd(unittest.TestCase):
+    """`pw-record --target` is a preference, not a pin — these two props fix that."""
+
+    def test_target_is_pinned_so_a_rebind_cannot_happen_silently(self):
+        cmd = capture.record_cmd("bluez_input.64_B5_F2_F9_A9_4A.2")
+        props = cmd[cmd.index("-P") + 1]
+        self.assertIn("node.dont-reconnect=true", props)
+        self.assertIn(f"node.name={capture.STREAM_NODE}", props)
+        self.assertEqual(cmd[cmd.index("--target") + 1],
+                         "bluez_input.64_B5_F2_F9_A9_4A.2")
+
+    def test_format_matches_what_the_bridge_transmits(self):
+        cmd = capture.record_cmd("x")
+        self.assertEqual(cmd[cmd.index("--rate") + 1], str(capture.RATE))
+        self.assertEqual(cmd[cmd.index("--format") + 1], "s16")
+        self.assertIn("--raw", cmd)
+        self.assertEqual(cmd[-1], "-")
+
+    def test_stream_node_is_distinct_from_the_bridges_own_capture(self):
+        self.assertNotEqual(capture.STREAM_NODE, pwctl.LOOPBACK_CAPTURE)
+
+
+class TestCaptureSnapshot(unittest.TestCase):
+    """The snapshot must publish *why* a reading can or cannot be trusted.
+
+    `Capture` is constructed but never started, so no `pw-record` is spawned — only
+    the readout layer is exercised.
+    """
+
+    def setUp(self):
+        self.cap = capture.Capture("bluez_input.64_B5_F2_F9_A9_4A.2")
+
+    def test_fresh_capture_reports_stalled_and_unchecked(self):
+        s = self.cap.snapshot()
+        self.assertTrue(s["stalled"], "nothing has arrived yet")
+        self.assertIsNone(s["bound"], "binding not checked yet")
+        self.assertIsNone(s["last_block_ago_s"])
+        self.assertEqual(s["silence_streak_s"], 0.0)
+        self.assertEqual(s["stream_node"], capture.STREAM_NODE)
+
+    def test_unbound_capture_reports_what_it_is_actually_on(self):
+        self.cap.set_binding(False, ["rtp-bridge"])
+        s = self.cap.snapshot()
+        self.assertFalse(s["bound"])
+        self.assertEqual(s["fed_by"], ["rtp-bridge"])
+
+    def test_binding_is_cleared_when_the_target_changes(self):
+        self.cap.set_binding(True, ["bluez_input.64_B5_F2_F9_A9_4A.2"])
+        self.cap.set_target("rtp-bridge")
+        s = self.cap.snapshot()
+        self.assertIsNone(s["bound"], "stale binding must not carry over")
+        self.assertEqual(s["fed_by"], [])
+        self.assertEqual(s["target"], "rtp-bridge")
+
+    def test_unbound_right_after_a_switch_is_unknown_not_wrong(self):
+        """"Not linked yet" must not discard the first seconds of a measurement."""
+        self.cap.set_target("rtp-bridge")            # starts the grace period
+        self.cap.set_binding(False, [])
+        self.assertIsNone(self.cap.snapshot()["bound"])
+
+    def test_unbound_after_the_grace_period_is_believed(self):
+        self.cap.set_target("rtp-bridge")
+        self.cap._changed_at -= capture.BIND_GRACE_S + 1.0
+        self.cap.set_binding(False, ["rtp-bridge-monitor"])
+        self.assertFalse(self.cap.snapshot()["bound"])
+
+    def test_a_positive_verdict_ends_the_grace_period(self):
+        self.cap.set_target("rtp-bridge")
+        self.cap.set_binding(True, ["rtp-bridge"])
+        self.cap.set_binding(False, [])              # a real loss, not a slow link
+        self.assertFalse(self.cap.snapshot()["bound"])
+
+    def test_streak_and_episodes_come_from_the_tracker(self):
+        for i in range(50):
+            self.cap.silence.update(True, i * capture.BLOCK_S)
+        s = self.cap.snapshot()
+        self.assertAlmostEqual(s["silence_streak_s"], 1.0)
+        self.assertAlmostEqual(s["measured_s"], 1.0)
+
+
+class TestBindingDecision(unittest.TestCase):
+    """When to trust the capture, and when to replace it.
+
+    `node.dont-reconnect` leaves a stream whose target vanished unlinked *forever*
+    (measured on the bridge), so without the respawn the app would go blind for the
+    rest of the session the moment the phone dropped.
+    """
+
+    PHONE = "bluez_input.64_B5_F2_F9_A9_4A.2"
+
+    def decide(self, **kw):
+        args = dict(pipewire_ok=True, fed_by=[self.PHONE], target=self.PHONE,
+                    node_names=[self.PHONE, "rtp-bridge"], unbound_since=None, now=100.0)
+        args.update(kw)
+        return app.binding_decision(**args)
+
+    def test_bound_when_fed_by_exactly_the_target(self):
+        self.assertEqual(self.decide(), (True, None, False))
+
+    def test_unbound_when_fed_by_something_else(self):
+        bound, since, respawn = self.decide(fed_by=["rtp-bridge"])
+        self.assertFalse(bound)
+        self.assertEqual(since, 100.0, "the clock starts on the unbound state")
+        self.assertFalse(respawn, "not immediately — a normal relink gets a grace period")
+
+    def test_respawn_once_the_grace_period_expires(self):
+        _, _, respawn = self.decide(fed_by=[], unbound_since=100.0, now=100.0 + 6.0)
+        self.assertTrue(respawn)
+
+    def test_no_respawn_while_the_target_is_absent(self):
+        """Phone off: nothing to bind to, so churning processes buys nothing."""
+        bound, since, respawn = self.decide(fed_by=[], node_names=["rtp-bridge"],
+                                            unbound_since=1.0, now=1000.0)
+        self.assertFalse(bound)
+        self.assertFalse(respawn)
+        self.assertIsNone(since)
+
+    def test_unreadable_pipewire_is_unknown_not_unbound(self):
+        """A failed pw-dump must not discard good blocks as untrusted."""
+        self.assertEqual(self.decide(pipewire_ok=False), (None, None, False))
+
+    def test_extra_feed_is_not_bound(self):
+        """Two sources into our stream means we cannot attribute what we hear."""
+        bound, _, _ = self.decide(fed_by=[self.PHONE, "rtp-bridge"])
+        self.assertFalse(bound)
+
+    def test_no_target_is_never_bound(self):
+        bound, _, respawn = self.decide(target=None, fed_by=[])
+        self.assertFalse(bound)
+        self.assertFalse(respawn)
+
+
+class TestAutoTarget(unittest.TestCase):
+    """Adopting a phone that connects later — without stealing a chosen target."""
+
+    PHONE = "bluez_input.64_B5_F2_F9_A9_4A.2"
+    TARGETS = [{"node": PHONE, "kind": "a2dp-source"},
+               {"node": "rtp-bridge", "kind": "sender"}]
+
+    def test_adopts_a_phone_that_appears_while_on_the_fallback(self):
+        self.assertEqual(app.auto_target("rtp-bridge", self.TARGETS, True), self.PHONE)
+
+    def test_stays_put_once_already_on_the_phone(self):
+        self.assertIsNone(app.auto_target(self.PHONE, self.TARGETS, True))
+
+    def test_never_moves_away_from_a_hand_picked_target(self):
+        self.assertIsNone(app.auto_target("rtp-bridge", self.TARGETS, False))
+
+    def test_no_phone_means_no_move(self):
+        targets = [{"node": "rtp-bridge", "kind": "sender"}]
+        self.assertIsNone(app.auto_target("rtp-bridge", targets, True))
+        self.assertIsNone(app.auto_target(None, [], True))
 
 
 class TestHciParsing(unittest.TestCase):
@@ -326,6 +571,60 @@ class TestPwDumpParsing(unittest.TestCase):
         self.assertFalse(chain["capture_linked"])
         self.assertEqual(chain["a2dp_sources"], [])
         self.assertEqual(pwctl.capture_targets([]), [])
+
+    # -- our own capture stream's binding -------------------------------------
+
+    PHONE = "bluez_input.64_B5_F2_F9_A9_4A.2"
+
+    def _with_capture_link(self, output_id: int):
+        """The DUMP plus our capture stream node, fed by `output_id`."""
+        dump = list(self.DUMP)
+        dump.append({
+            "id": 93, "type": "PipeWire:Interface:Node",
+            "info": {"state": "running",
+                     "props": {"node.name": capture.STREAM_NODE,
+                               "media.class": "Stream/Input/Audio"}},
+        })
+        dump.append({
+            "id": 80, "type": "PipeWire:Interface:Link",
+            "info": {"state": "active",
+                     "props": {"link.output.node": output_id, "link.input.node": 93}},
+        })
+        return dump
+
+    def test_capture_binding_on_the_phone_is_bound(self):
+        links = pwctl.parse_links(self._with_capture_link(51))
+        b = pwctl.capture_binding(links, capture.STREAM_NODE, self.PHONE)
+        self.assertTrue(b["bound"])
+        self.assertEqual(b["fed_by"], [self.PHONE])
+
+    def test_capture_binding_catches_the_rebind_to_the_rtp_monitor(self):
+        """The measured failure: target gone, stream silently moved to the sink's
+        monitor, app still naming the phone and calling it digital silence."""
+        links = pwctl.parse_links(self._with_capture_link(60))  # rtp-bridge
+        b = pwctl.capture_binding(links, capture.STREAM_NODE, self.PHONE)
+        self.assertFalse(b["bound"])
+        self.assertEqual(b["fed_by"], ["rtp-bridge"])
+        self.assertTrue(b["present"], "linked, just to the wrong thing")
+
+    def test_capture_binding_with_no_link_or_no_target(self):
+        links = pwctl.parse_links(self.DUMP)
+        b = pwctl.capture_binding(links, capture.STREAM_NODE, self.PHONE)
+        self.assertFalse(b["bound"])
+        self.assertFalse(b["present"])
+        self.assertEqual(b["fed_by"], [])
+        # No target selected can never count as bound.
+        b = pwctl.capture_binding(pwctl.parse_links(self._with_capture_link(51)),
+                                  capture.STREAM_NODE, None)
+        self.assertFalse(b["bound"])
+
+    def test_feeding_nodes_is_deduped_and_sorted(self):
+        links = [{"output_node": "b", "input_node": "x"},
+                 {"output_node": "a", "input_node": "x"},
+                 {"output_node": "a", "input_node": "x"},
+                 {"output_node": "c", "input_node": "y"}]
+        self.assertEqual(pwctl.feeding_nodes(links, "x"), ["a", "b"])
+        self.assertEqual(pwctl.feeding_nodes(links, "z"), [])
 
 
 class TestNormalizeCodecs(unittest.TestCase):

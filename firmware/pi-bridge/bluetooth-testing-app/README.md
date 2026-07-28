@@ -94,9 +94,47 @@ categorically different from "quiet", and the distinction is the whole point:
 | silence + `A2DP in` at ~0 | the phone stopped sending, or the link dropped |
 | silence + transport not `active` | A2DP was suspended |
 | waveform present but `RTP out` ~0 | the bridge is receiving but not transmitting — look at the chain panel |
+| **`not attached to …`** | the capture is not linked to the node it names — every reading is void until it is |
+| **`capture stalled`** | no blocks are arriving; the app is not measuring anything, which is *not* the same as silence |
 
 The episode log is the same measurement that produced the dropout table in the
 investigation, just live: durations there ran 10–261 s at a 26 % silent duty.
+
+### Only silence that was actually observed is reported (fixed 2026-07-29)
+
+The last two rows exist because the first version of this app could not tell "the
+source sent zeros" from "I stopped looking", and reported both as digital silence.
+It was caught in the act: with the phone disconnected it showed an **8-minute and
+growing** silence streak, `error: None`, and a **frozen block cursor** — because
+`pw-record --target` is only a *preference*, so PipeWire had quietly rebound the
+stream to `rtp-bridge:monitor` while the UI went on naming the phone. In the 2 h
+session before that it logged a 149 s "dropout" of which the far end (the add-on's
+Opus relay log) saw only ~30 s: the rest was a stall in the app's own reader.
+
+Four changes, all verified on the bridge by destroying a capture target under a
+live stream (see *Verification status*):
+
+- **The stream is pinned** — `node.dont-reconnect=true`, plus a distinct
+  `node.name=bt-testing-capture`. A target that vanishes now leaves the stream
+  *unlinked* instead of silently rebound.
+- **The binding is checked independently**, every 2.5 s, against the graph's links.
+  Blocks captured while the stream is not on its target are marked **untrusted**
+  and excluded from silence entirely — the pin does not cover a target that is
+  already missing at startup, so this is the backstop that does.
+- **Silence is counted in blocks, not seconds.** The streak is
+  `silent_blocks × 20 ms`, so if the capture freezes the streak freezes with it.
+- **A gap in the data is a stall, never silence.** Wall-clock time the blocks
+  cannot account for is logged in its own table, counted in `lost_s`, and it
+  *ends* the silence run instead of extending it. `Data coverage` is the headline:
+  how much of the elapsed time actually reached the page. Over that 2 h session it
+  was 0.92 — nine minutes the app never saw, while the UI implied an unbroken
+  record. **Read "no dropouts" as "no dropouts over the covered fraction."**
+
+Because a pinned stream never re-links itself, the binding watch also **respawns
+`pw-record`** once the target is back in the graph, and the app **adopts an A2DP
+source that appears later** — but never one you selected by hand, and never away
+from a phone it is already on. Every switch resets the ring and the statistics, so
+no reading is ever attributed to the wrong node.
 
 ## Codecs
 
@@ -169,9 +207,9 @@ The page is a client of this; `curl` works just as well.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | the page |
-| `GET` | `/api/state` | one JSON snapshot: `audio`, `graph`, `counters` |
+| `GET` | `/api/state` | one JSON snapshot: `audio`, `graph`, `counters` — `audio` carries the integrity fields `bound`, `fed_by`, `stalled`, `coverage`, `lost_s`, `untrusted_blocks`, `stalls` alongside `episodes` |
 | `GET` | `/api/stream?since=N` | SSE, 5 Hz; each frame carries only envelope points after `N` |
-| `POST` | `/api/capture` | `{"target": "<node>"}` — point the waveform elsewhere |
+| `POST` | `/api/capture` | `{"target": "<node>"}` — point the waveform elsewhere. Also turns **off** auto-adoption of a phone; `{"target": null}` turns it back on |
 | `POST` | `/api/codec/profile` | `{"device_id": N, "profile_index": N}` — lever 1 |
 | `POST` | `/api/codec/pin` | `{"codecs": ["aac","sbc"]}` — write the allow-list only; `[]` means no restriction. A bare `{"codec": "sbc"}` is accepted as a one-element set |
 | `POST` | `/api/codec/apply` | same body — write **and** renegotiate (disconnect → restart WirePlumber → reconnect). Returns a `steps` array |
@@ -184,7 +222,7 @@ backfills the whole ring (~9 KB), subsequent frames are ~1.4 KB — about 7 kB/s
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v     # 51 tests, no Pi or PipeWire needed
+python3 -m unittest discover -s tests -v     # 87 tests, no Pi or PipeWire needed
 ```
 
 Everything that parses external output or makes a decision is a pure function
@@ -195,6 +233,12 @@ guards, and the apply sequence's ordering and both of its failure paths (with th
 service restart injected, so tests never restart a real WirePlumber — an earlier
 smoke test that let it through restarted the developer's audio stack). That split
 exists because this tool targets a box that is not always reachable.
+
+The integrity rules get the same treatment, each test named for the way the app
+once lied: a streak that grew on the clock with a frozen cursor, a 149 s "episode"
+that was a reader stall, foreign blocks counted as the target's silence, a rebind
+to `rtp-bridge:monitor` reported under the phone's name, and coverage silently
+reading 1.0 while nine minutes were missing.
 
 ## Verification status
 
@@ -219,11 +263,29 @@ tests whose fixtures mirror the real formats:
   `/dev_…/sepN/fdN` — both were observed on this one bridge, hours apart. Matching
   only the first shape made the transport row read "none" on a healthy link.
 
+**The silence-integrity fixes, verified on the bridge (2026-07-29)** by creating a
+disposable virtual source (`pw-loopback` → `tmp-src`), pointing the capture at it
+and then destroying it under the live stream — the phone-drop scenario on demand:
+
+| Step | Observed |
+|---|---|
+| attached | `bound=true fed_by=[tmp-src] stalled=false untrusted=0`, cursor advancing |
+| target destroyed | `bound=false fed_by=[] stalled=true`, **streak frozen at 7.9 s** (the old code grew it forever) |
+| target restored | respawned and relinked within ~6 s; the outage booked as **`lost_s=19.5`, one stall**, and the silence run *closed* at the discontinuity rather than extended across it |
+
+Two findings from that run, both now in the code and in `record_cmd`'s docstring:
+`node.dont-reconnect=true` **does** stop the rebind (the pinned stream ends up with
+no links at all, where the unpinned control was moved to `rtp-bridge:monitor`), but
+it does **not** make `pw-record` exit, and it does **not** apply to a target that
+was already missing at startup — that case still resolves to the default source.
+Hence the link check and the stall detection; the pin alone would not have been
+enough.
+
 Also verified on the developer box: SSE streaming and its delta/cursor logic
 (750-point backfill then ~1.4 kB frames), `pw-record` capture end to end,
 peak/RMS, ring trimming, target switching, graceful degradation when
 `hciconfig`/`hcitool` are absent, and the allow-list write/read-back against a
-throwaway `HOME` including both guards. **54 unit tests pass.**
+throwaway `HOME` including both guards. **87 unit tests pass.**
 
 **Not yet verified** — needs a run with a phone connected *and* a deliberate config
 change, so it was left for you:

@@ -49,6 +49,8 @@
   dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}
   dt{color:var(--dim);font-size:12px}
   dd{margin:0;font:13px var(--mono);word-break:break-word}
+  dd.ok{color:var(--ok)}
+  dd.bad{color:var(--bad)}
   .big{font:600 26px/1 var(--mono)}
   .pill{font:600 11px/1 var(--mono);padding:4px 8px;border-radius:999px;
         border:1px solid var(--line);color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
@@ -129,10 +131,23 @@
         <dt>Current streak</dt><dd id="streak">—</dd>
         <dt>Silent duty</dt><dd id="duty">—</dd>
         <dt>Capture uptime</dt><dd id="uptime">—</dd>
+        <dt>Attached to target</dt><dd id="bound">—</dd>
+        <dt>Data coverage</dt><dd id="coverage">—</dd>
       </dl>
       <table style="margin-top:12px">
         <thead><tr><th>Episode (ago)</th><th>Duration</th></tr></thead>
         <tbody id="episodes"><tr><td colspan="2" style="color:var(--dim)">none yet</td></tr></tbody>
+      </table>
+      <p class="note" id="integrityNote">
+        <strong>Coverage</strong> is how much of the elapsed time actually reached this
+        page as audio blocks. Below 100 % there are gaps the app never saw, listed as
+        stalls — and a silence episode is only ever built from contiguous blocks while
+        the capture was attached to the target, so a gap breaks a run instead of being
+        billed as silence. Read “no dropouts” as “no dropouts, over the covered part”.
+      </p>
+      <table style="margin-top:8px">
+        <thead><tr><th>Capture stall (ago)</th><th>Not seen</th></tr></thead>
+        <tbody id="stalls"><tr><td colspan="2" style="color:var(--dim)">none</td></tr></tbody>
       </table>
     </section>
 
@@ -306,7 +321,19 @@ function render(s) {
 
   const last = ring.length ? ring[ring.length - 1] : null;
   const badge = $("badge");
+  // Order matters: "not measuring" must never be shown as "digital silence" —
+  // that conflation is exactly what made this app report a dropout it never saw.
   if (a.error) { badge.className = "nodata"; badge.textContent = a.error.slice(0, 60); }
+  else if (a.bound === false) {
+    badge.className = "nodata";
+    badge.textContent = "not attached to " + (a.target || "target") +
+      (a.fed_by && a.fed_by.length ? " — on " + a.fed_by.join(", ") : " — no link");
+  }
+  else if (a.stalled) {
+    badge.className = "nodata";
+    badge.textContent = "capture stalled — no blocks for " +
+      (a.last_block_ago_s === null ? "?" : a.last_block_ago_s.toFixed(1) + " s");
+  }
   else if (!last) { badge.className = "nodata"; badge.textContent = "no data"; }
   else if (last.p === 0) { badge.className = "silent"; badge.textContent = "digital silence"; }
   else { badge.className = "audio"; badge.textContent = "audio"; }
@@ -316,14 +343,37 @@ function render(s) {
   $("peakBar").style.width = (d === null ? 0 : Math.max(0, Math.min(100, (d + 60) / 60 * 100))) + "%";
 
   $("streak").textContent = a.silence_streak_s > 0 ? a.silence_streak_s.toFixed(1) + " s" : "—";
-  $("duty").textContent = (a.silent_duty * 100).toFixed(1) + " %";
+  $("duty").textContent = (a.silent_duty * 100).toFixed(1) + " %"
+    + (a.measured_s ? ` of ${(a.measured_s / 60).toFixed(1)} min measured` : "");
   $("uptime").textContent = a.uptime_s.toFixed(0) + " s";
+
+  const bd = $("bound");
+  if (a.bound === null || a.bound === undefined) { bd.textContent = "checking…"; bd.className = ""; }
+  else if (a.bound) { bd.textContent = "yes · " + a.stream_node; bd.className = "ok"; }
+  else {
+    bd.textContent = "NO — metering " + (a.fed_by && a.fed_by.length ? a.fed_by.join(", ") : "nothing");
+    bd.className = "bad";
+  }
+
+  const cov = $("coverage");
+  cov.textContent = a.coverage === null || a.coverage === undefined
+    ? "—"
+    : (a.coverage * 100).toFixed(1) + " %"
+      + (a.lost_s ? ` · ${a.lost_s.toFixed(0)} s not seen` : "")
+      + (a.untrusted_blocks ? ` · ${(a.untrusted_blocks * BLOCK_MS / 1000).toFixed(0)} s untrusted` : "");
+  cov.className = a.coverage !== null && a.coverage < 0.99 ? "bad" : "";
 
   const tb = $("episodes");
   tb.innerHTML = a.episodes.length
     ? a.episodes.slice().reverse().map(e =>
         `<tr><td>${e.start_ago_s.toFixed(0)} s ago</td><td>${e.duration_s.toFixed(1)} s</td></tr>`).join("")
     : `<tr><td colspan="2" style="color:var(--dim)">none yet</td></tr>`;
+
+  const st = $("stalls");
+  st.innerHTML = (a.stalls || []).length
+    ? a.stalls.slice().reverse().map(e =>
+        `<tr><td>${e.start_ago_s.toFixed(0)} s ago</td><td>${e.duration_s.toFixed(1)} s</td></tr>`).join("")
+    : `<tr><td colspan="2" style="color:var(--dim)">none</td></tr>`;
 
   // link + transmit
   $("a2dpRate").textContent = c.hci_available

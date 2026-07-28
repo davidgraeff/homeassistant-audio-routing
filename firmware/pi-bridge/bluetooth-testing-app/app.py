@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, urlparse
 
 import btstat
 import pwctl
-from capture import Capture
+from capture import STREAM_NODE, Capture
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -45,6 +45,63 @@ STREAM_HZ = 5.0
 #: The PipeWire graph changes far more slowly than audio; re-dumping it at stream
 #: rate would waste a Zero 2 W's CPU on JSON parsing, so it gets its own cadence.
 GRAPH_REFRESH_S = 2.0
+#: How often the binding watch re-checks that the capture is on its target. It
+#: must not depend on a browser being open — the whole point of the check is that
+#: unattended measurements can be trusted — so it runs in its own thread and
+#: reuses the graph cache, i.e. it costs no extra `pw-dump`.
+BINDING_WATCH_S = 2.5
+#: How long the capture may sit unbound *while its target exists* before the child
+#: process is replaced. A pinned stream never re-links itself, so this is the only
+#: way back after the phone reconnects; a few seconds of grace keeps a normal
+#: reconnect (target appears, WirePlumber links it) from triggering a needless one.
+UNBOUND_RESPAWN_S = 6.0
+
+
+def auto_target(current: str | None, capture_targets: list[dict],
+                is_auto: bool) -> str | None:
+    """The A2DP source to adopt, or `None` to stay put.
+
+    The app picks the connected phone at startup, but a phone that connects *later*
+    used to be ignored — leaving the capture on the `rtp-bridge` fallback, silently
+    measuring the wrong node for the rest of the session. That is the same class of
+    error as the rebind this app was just fixed for, so it moves.
+
+    Two rules keep the move from becoming its own trap: it only ever moves *to* an
+    A2DP source (never away from one, so a live measurement is not interrupted),
+    and it never overrides a target the user chose by hand — `is_auto` is cleared
+    by `POST /api/capture`. Switching resets the ring and the statistics, so no
+    reading is ever attributed to the wrong node.
+    """
+    if not is_auto:
+        return None
+    sources = [t["node"] for t in capture_targets if t.get("kind") == "a2dp-source"]
+    if not sources or current in sources:
+        return None
+    return sources[0]
+
+
+def binding_decision(*, pipewire_ok: bool, fed_by: list[str], target: str | None,
+                     node_names: list[str], unbound_since: float | None, now: float,
+                     grace_s: float = UNBOUND_RESPAWN_S) -> tuple[bool | None, float | None, bool]:
+    """`(bound, unbound_since, respawn)` — pure, so the recovery rule is testable.
+
+    `bound` is `None` when PipeWire could not be read: "unknown" must not be
+    reported as "not attached", or a momentary `pw-dump` failure would throw away
+    perfectly good blocks as untrusted.
+
+    A respawn is proposed only when the capture is unbound *and* its target is in
+    the graph, after `grace_s` of that state — see `UNBOUND_RESPAWN_S`.
+    """
+    if not pipewire_ok:
+        return None, None, False
+    bound = bool(target) and fed_by == [target]
+    if bound or not target or target not in node_names:
+        return bound, None, False
+    if unbound_since is None:
+        return bound, now, False
+    if now - unbound_since >= grace_s:
+        return bound, None, True
+    return bound, unbound_since, False
 
 
 class GraphCache:
@@ -79,6 +136,12 @@ class GraphCache:
         return {
             "pipewire_ok": bool(dump),
             "chain": pwctl.sender_chain(nodes, links),
+            # What our own capture stream is wired to. The target is not known
+            # here, so the comparison happens in App.refresh_binding.
+            "capture_fed_by": pwctl.feeding_nodes(links, STREAM_NODE),
+            "capture_present": any(l["input_node"] == STREAM_NODE for l in links),
+            # Whether a target still exists at all — the respawn decision needs it.
+            "node_names": [n.name for n in nodes],
             "capture_targets": pwctl.capture_targets(nodes),
             "levers": pwctl.available_levers(devices),
             "devices": [
@@ -197,8 +260,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/api/capture":
             target = body.get("target") or None
+            # A hand-picked target wins over auto-adoption from here on: the app
+            # must not move the measurement out from under whoever set it.
+            app.target_is_auto = target is None
             app.capture.set_target(target)
-            return self._send_json({"ok": True, "target": target})
+            return self._send_json({"ok": True, "target": target,
+                                    "auto": app.target_is_auto})
 
         if u.path == "/api/codec/profile":
             try:
@@ -310,6 +377,56 @@ class App(ThreadingHTTPServer):
         self.counters = Counters()
         self.capture = Capture(target)
         self.capture.start()
+        # An explicit --target is the user's choice; auto-adoption must not fight it.
+        self.target_is_auto = target is None
+        self._unbound_since: float | None = None
+        self._watch = threading.Thread(target=self._binding_watch, name="binding-watch",
+                                       daemon=True)
+        self._watch.start()
+
+    def refresh_binding(self) -> None:
+        """Tell the capture whether its stream is really on the target node.
+
+        `pw-record --target` is only a preference: if the target disappears,
+        PipeWire rebinds the stream to the default source — on this bridge
+        `rtp-bridge:monitor`, which is silent — and every reading after that is
+        about the wrong node. The capture sets `node.dont-reconnect` to prevent it;
+        this is the independent check, and while it says `False` the capture marks
+        its blocks untrusted instead of logging silence episodes.
+
+        It is also the recovery path. `dont-reconnect` leaves a stream whose target
+        vanished **unlinked and alive** — verified on the bridge — so once the
+        target is back in the graph the child has to be replaced or the app stays
+        blind for the rest of the session.
+        """
+        graph = self.graph.get()
+        if graph.get("pipewire_ok"):
+            adopt = auto_target(self.capture.target, graph.get("capture_targets") or [],
+                                self.target_is_auto)
+            if adopt:
+                print(f"visualizing: {adopt} (A2DP source appeared)", flush=True)
+                self.capture.set_target(adopt)
+                self._unbound_since = None
+                return  # let the next tick judge the new binding
+        fed_by = graph.get("capture_fed_by") or []
+        bound, self._unbound_since, respawn = binding_decision(
+            pipewire_ok=bool(graph.get("pipewire_ok")),
+            fed_by=fed_by,
+            target=self.capture.target,
+            node_names=graph.get("node_names") or [],
+            unbound_since=self._unbound_since,
+            now=time.monotonic(),
+        )
+        self.capture.set_binding(bound, fed_by)
+        if respawn:
+            self.capture.restart()
+
+    def _binding_watch(self) -> None:
+        while not self.stopping.wait(BINDING_WATCH_S):
+            try:
+                self.refresh_binding()
+            except Exception:  # pragma: no cover - a diagnostic must not die
+                pass
 
     def pick_default_target(self) -> str | None:
         """Default the waveform to the first connected phone, else the sender.

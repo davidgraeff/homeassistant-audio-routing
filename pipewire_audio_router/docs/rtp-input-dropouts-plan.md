@@ -23,6 +23,14 @@ suspect. The fault is somewhere in **Pi bridge → LAN → `module-rtp-source` �
 > The original plan below is preserved because the *measurement design* (§3) is what
 > produced the answer — but read §1a first.
 
+> **2026-07-29 — §1b answers "does watching it change it?"** A 2 h session with the
+> new [bluetooth-testing-app](../../firmware/pi-bridge/bluetooth-testing-app/)
+> running *looked* dropout-free. It was not: one ~40 s silence is in the far-end
+> record, the app's own log claims a 149 s episode that was largely its own reader
+> stalling, and the app had **three defects that fabricate this exact symptom**. It
+> also perturbs the graph in three measurable ways. §1b has the numbers and the one
+> experiment that settles the observer question.
+
 Current configuration of that source (`/api/sources`):
 
 | Field | Value |
@@ -188,6 +196,90 @@ test resolves that ambiguity too — which is why it is the one to run.
 
 ---
 
+## 1b. Does monitoring change the fault? (2026-07-29)
+
+The question after a 2 h session that felt clean: could running the testing app —
+which holds a `pw-record` on the very node under suspicion — have suppressed the
+dropouts, e.g. by keeping some timeout from firing?
+
+**Timeouts: no.** Nothing in the causal chain of §1a is timeout-driven, both ~2 min
+timers were already excluded (§2), and no client on the Pi can stop a phone or an
+aptX decoder from emitting zeros.
+
+**But the run was not clean, and the instrument was not trustworthy.**
+
+### The two records of that session
+
+| Witness | What it says |
+|---|---|
+| the app's episode log | one **148.9 s** episode at 22:31:01–22:33:29 CEST, plus nine 0.5–2.6 s blips; `silent_duty` 0.28 % over 108.9 min |
+| the relay `largest packet` proxy on the HA host (zero footprint on the Pi) | audio 22:02–22:32:39, **SILENT 22:32:52–22:33:22** (~40 s), then 59 min clean, then end of stream 23:32:42 |
+
+Clocks on Pi/HA/dev were checked and in sync, so those overlap only in their last
+~30 s: the relay was still encoding 500–600 B packets through most of the app's
+"episode". **Silent duty fell from 26.4 % to ~0.7 %, but one real dropout remains.**
+Log retention on the add-on truncated at 22:02, so only the last 1.5 h has a
+far-end record — raise it, or `tee` the relay lines, before the next run.
+
+### The instrument was fabricating the symptom — caught in the act
+
+Queried after the phone had disconnected, the app reported an **8-minute and
+growing digital-silence streak** with `error: None` and a **frozen block cursor**,
+while `pw-link -l` showed its stream connected to `rtp-bridge:monitor`. Three
+defects, each independently sufficient to invent a dropout, all fixed
+[in the app](../../firmware/pi-bridge/bluetooth-testing-app/) (2026-07-29):
+
+1. **`pw-record --target` is a preference, not a pin.** When the target vanishes
+   PipeWire rebinds the stream to the default source. Reproduced on demand by
+   destroying a target under a live capture: the unpinned control moved to
+   `rtp-bridge:monitor`; with `node.dont-reconnect=true` the stream is left
+   unlinked instead. Caveats: `pw-record` does *not* exit, and a target missing at
+   *startup* still falls back — so a link check is mandatory, not optional.
+2. **The streak grew on wall-clock time** (`now - silent_since`), so it counted up
+   while no blocks arrived at all. Silence is now counted in blocks.
+3. **An episode could be entirely a stall.** One zero block set the run, any gap
+   followed, and the next real block closed an "episode" whose duration was the
+   gap. That is the most likely origin of the 148.9 s above. Gaps now end a run and
+   are logged separately as lost data.
+
+Which reframes the numbers from every earlier session: **`coverage` over that 2 h
+was 0.92** — 326 622 blocks = 108.9 min of audio inspected across 117.8 min of
+uptime. Nine minutes were never looked at, and the UI implied an unbroken record.
+
+### It is also not a passive observer
+
+Three real perturbations, worth knowing before treating a monitored run as
+representative:
+
+- **Quantum.** Its `pw-record` requests `node.latency = 960/48000`, and PipeWire
+  takes the minimum in the driver's graph, so the bluez-driven graph runs at 960
+  instead of the 1024 default. The bluez A2DP source's decode-buffer target and
+  rate-matching derive from that duration — the exact buffer whose underrun emits
+  zeros.
+- **An always-active second consumer** on the suspect node: never idle, never
+  suspended, links not re-evaluated.
+- **CPU.** `block_peak_rms` runs a per-sample Python loop over 96 k samples/s on a
+  Zero 2 W, and `pw-top` charged its stream **1621 xruns** against 887 for
+  `bt-bridge-capture` and 117 for `rtp-bridge`. That pushes *toward* underruns, so
+  it cannot explain an improvement — but it is why the app's own reader stalls.
+
+### The likelier reason the rate collapsed
+
+**The Pi had rebooted at 21:06:48 and PipeWire/WirePlumber started at 21:06:45** —
+the entire clean run was on a fresh session, where the 26 %-duty hour was a
+long-lived one with reconnect history. Episodes growing 10 → 261 s fit accumulating
+state that a restart clears. No codec drop-in was written, so negotiation was still
+free (presumably aptX again), and the content differed.
+
+### The experiment that answers it
+
+Stream ≥1 h with **no client on the Pi at all** and judge from the relay proxy
+alone; compare with an identical run with the app attached. Until that A/B exists,
+neither "monitoring suppresses it" nor "the reboot fixed it" is established — and
+the SBC test at the end of §1a is still the one that decides whose bug this is.
+
+---
+
 ## 2. Why "~2 minutes" was a red herring
 
 Two timers do sit near two minutes, and both were checked:
@@ -242,7 +334,18 @@ Two practical traps worth recording, both of which cost time here:
   the wrong one tells you nothing about the module.
 - **`pkill -f <pattern>` matches the calling shell's own command line**, because the
   pattern is *in* it. It killed two ssh sessions before the probes were moved into
-  scripts on the target. Use a pidfile, or the `rtp-[p]robe.sh` bracket trick.
+  scripts on the target. Use a pidfile, or the `rtp-[p]robe.sh` bracket trick. (It
+  bit again on 2026-07-29: `pkill -f "python3 app.py"` over ssh killed its own shell
+  before the restart it was supposed to precede.)
+- **`pw-record --target X` does not guarantee you are recording X.** It is a
+  preference: if `X` is absent — or disappears mid-capture — the stream is bound to
+  the default source instead, which on this bridge is `rtp-bridge:monitor`, and it
+  reports **digital silence** with no error. A probe that concludes "the A2DP source
+  is silent" must therefore prove it was attached: add
+  `-P '{ node.name=probe node.dont-reconnect=true }'` and check
+  `pw-link -l | grep -B1 probe`. Verified on the bridge (WP 0.5.8 / PW 1.4.2) —
+  §1b. The §1a readings survive this because the node was confirmed present and
+  `running` with links intact at the time.
 
 ### The payload probe — the one that mattered
 
@@ -262,6 +365,13 @@ line prints `largest packet`. Digital silence encodes to ~3 B; real audio is 500
 So `docker logs … | grep 'largest packet'` is a free 10 s-resolution record of whether
 audio reached the encoder — **retroactively**, which is how the episode table in §1a was
 built before any new instrumentation existed. Start here next time.
+
+It has a second virtue that only became clear in §1b: it is the **only witness with
+no footprint on the Pi**, so it is the one that can be trusted when the question is
+whether the instrument is changing the outcome — and it is what caught the
+testing-app's fabricated 149 s episode. Its weakness is retention: `docker logs`
+had already truncated the first half of a 2 h run. Raise the add-on's log retention
+or `tee` these lines to a file before a long session.
 
 ```bash
 ssh root@homeassistant.local "docker logs addon_local_pipewire_audio_router 2>&1 \
@@ -452,7 +562,11 @@ ssh david@192.168.178.78
 export XDG_RUNTIME_DIR=/run/user/1000
 pw-link -l                                   # phone -> bt-bridge-capture -> rtp-bridge
 pw-cli info bluez_input.64_B5_F2_F9_A9_4A.2  # api.bluez5.codec, profile, node state
-timeout 4 pw-record --target bluez_input.64_B5_F2_F9_A9_4A.2 /tmp/a2dp.wav  # peak!
+# NB the -P: without it a missing/vanished target silently records the default
+# source (rtp-bridge:monitor) instead, i.e. guaranteed silence -- see §1b.
+timeout 4 pw-record --target bluez_input.64_B5_F2_F9_A9_4A.2 \
+  -P '{ node.name=probe node.dont-reconnect=true }' /tmp/a2dp.wav   # peak!
+pw-link -l | grep -B1 'probe:input_FL'       # ...and prove it was attached
 hciconfig hci0 -a | grep 'RX bytes'          # ACL byte rate == is the phone sending?
 busctl --system get-property org.bluez \
   /org/bluez/hci0/dev_64_B5_F2_F9_A9_4A/fd13 org.bluez.MediaTransport1 State

@@ -268,6 +268,31 @@ def parse_links(dump: list[dict]) -> list[dict]:
     return out
 
 
+def feeding_nodes(links: list[dict], node_name: str) -> list[str]:
+    """Names of the nodes whose output is linked into `node_name`."""
+    return sorted({l["output_node"] for l in links if l["input_node"] == node_name})
+
+
+def capture_binding(links: list[dict], stream_node: str, target: str | None) -> dict:
+    """Is the app's own capture stream really connected to `target`?
+
+    The reason this exists: `pw-record --target X` is a *preference*, and when X
+    goes away PipeWire rebinds the stream to the default source. On this bridge
+    that is `rtp-bridge:monitor`, which is silent — so the app reported the phone's
+    node name while metering something else, and called it digital silence. The
+    capture now sets `node.dont-reconnect`, which should make that impossible; this
+    check is the independent confirmation, since a wrong reading here is
+    indistinguishable from the fault under investigation.
+    """
+    fed_by = feeding_nodes(links, stream_node)
+    return {
+        "stream_node": stream_node,
+        "fed_by": fed_by,
+        "present": any(l["input_node"] == stream_node for l in links),
+        "bound": bool(target) and fed_by == [target],
+    }
+
+
 def a2dp_source_nodes(nodes: list[NodeInfo]) -> list[NodeInfo]:
     """Connected phones/senders: bluez5 nodes that are an audio *source* to us."""
     return [n for n in nodes if n.bt_address and n.media_class.startswith("Audio/Source")]
@@ -309,7 +334,7 @@ def sender_chain(nodes: list[NodeInfo], links: list[dict]) -> dict:
         n = by_name.get(name)
         return {"node": name, "present": n is not None, "state": n.state if n else None}
 
-    feeding = sorted({l["output_node"] for l in links if l["input_node"] == LOOPBACK_CAPTURE})
+    feeding = feeding_nodes(links, LOOPBACK_CAPTURE)
     return {
         "a2dp_sources": [
             {
