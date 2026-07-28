@@ -48,7 +48,13 @@ RAOP is already removed, so this is now acceptance, not a pre-removal gate:
 - **Rate negotiation**: an `Auto` device runs at 48 kHz; switching one to
   **Fixed 44.1 kHz** (or a receiver that rejects 48 kHz) restarts its group at
   44.1 kHz with no audible break.
-- AP2 **announcements** (per-output Play tone / Play announcement) play + duck.
+- AP2 **announcements** (per-output Play tone / Play announcement) play + duck —
+  including on a receiver with **no input routed to it**, which now opens an
+  on-demand session for the clip and hands it back after a 30 s lease
+  ([architecture.md §5.4](architecture.md#54-announcing-to-an-output-with-nothing-routed-into-it)).
+  Confirm by ear: tone on an unrouted receiver (audible a few seconds later, the
+  pair + render-delay cost), a second tone within the lease (fast, warm session),
+  then that the receiver frees its AirPlay input afterwards (a phone can connect).
 - **AP2 alignment**: on the Align page, soloing two receivers and sweeping one's
   render delay by ear brings them into coincidence.
 - Routing + grouping survive an add-on restart (the `raop_migration` shim + no
@@ -67,6 +73,20 @@ RAOP is already removed, so this is now acceptance, not a pre-removal gate:
 - Add tests / CI for the AP2 path; keep a per-brand quirk table.
 - Fold the vendored `with_daemon` mDNS patches + the libairptp patches into the
   `pull_request_docs/` upstream mirrors.
+- **Shutdown during a group's initial connect doesn't TEARDOWN.**
+  `Ap2ServerHandle::shutdown` (the graceful-exit path,
+  [architecture.md §5.2](architecture.md#52-airplay-2-av-receivers-eg-yamaha-wx-021-pioneer-vsx-934))
+  signals the group task and awaits it for ~3 s, but the task only observes that
+  signal *after* its sequential `connect_one` loop — each member costs up to
+  `AP2_CONNECT_TIMEOUT × AP2_CONNECT_ATTEMPTS` plus backoff. So a SIGTERM that
+  lands while a group is still coming up times out and exits without closing those
+  sessions, leaving exactly the stale session the shutdown exists to avoid (the
+  next start's first connect then fails and retries, as before this path existed —
+  so this is a *missed improvement*, not a regression). Fix = make the connect loop
+  cancellable: `tokio::select!` the shutdown receiver against each `connect_one`,
+  and TEARDOWN whatever is already connected. Deliberately not done blind — it
+  touches the proven-on-hardware connect path, so it wants a live re-validation
+  (initial-session reliability + the M2 retry) alongside it.
 
 ### Real-time & allocation hardening
 

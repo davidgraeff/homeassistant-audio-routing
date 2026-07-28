@@ -47,9 +47,31 @@ sleep 1
 # live via the API (see bridge-daemon/src/sources_store.rs and docs/decisions.md).
 # mDNS discovery/advertising is all mdns-sd (no avahi/system-D-Bus daemon).
 bridge-daemon serve &
-PIDS+=("$!")
+DAEMON_PID="$!"
+PIDS+=("$DAEMON_PID")
 
-trap 'kill "${PIDS[@]}" 2>/dev/null' TERM INT
+# Graceful stop. run.sh is PID 1, so when the supervisor sends SIGTERM we must
+# forward it to the bridge daemon AND wait for the daemon to finish its own
+# shutdown before letting this script exit — otherwise PID 1 exits the instant it
+# forwards the signal, the container tears down, and the daemon is SIGKILLed
+# mid-cleanup. The daemon's shutdown sends an AppleMIDI `BY` to every pw-sink
+# receiver (so they drop the session immediately instead of stalling on a stale
+# one until it times out), RTSP-TEARDOWNs every AirPlay-2 session (a receiver
+# accepts only one at a time and holds an unclosed one until it times out — which
+# is what makes the first connect after a restart fail; bounded to ~3s per group),
+# unregisters its mDNS adverts, and stops the AirPlay source. The wait is bounded
+# so a wedged daemon can't block the stop forever (the supervisor's own stop
+# timeout, ~10s, is the outer bound regardless).
+shutdown() {
+    kill -TERM "$DAEMON_PID" 2>/dev/null || true
+    for _ in $(seq 1 80); do            # up to ~8s for a clean daemon exit
+        kill -0 "$DAEMON_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill "${PIDS[@]}" 2>/dev/null || true   # then stop pipewire + wireplumber
+    exit 0
+}
+trap shutdown TERM INT
 
 # Fail-fast: if any component dies unexpectedly, exit so the add-on
 # supervisor (Docker/HA) restarts the whole container rather than limping

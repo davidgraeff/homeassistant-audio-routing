@@ -14,11 +14,33 @@
 // active on that output, so the scheduler's DuckMusic/UnduckMusic actions are
 // no-ops for sendspin per-device (RAOP per-output duck is separate, O-E).
 //
+// Because only a running per-device relay advances an overlay, a slot on an output
+// nothing is streaming would never finish — and would hold that output "occupied"
+// in the announce scheduler forever. [`OverlayMixer::reap_stalled`] is the
+// watchdog for exactly that (see architecture.md §5.3).
+//
 // Audio format is fixed to the capture format (`sendspin_capture`): S16LE, 48 kHz,
 // stereo. Overlay clip PCM must already be in that format.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long an overlay may make **no progress** before [`OverlayMixer::reap_stalled`]
+/// drops it. An overlay is only consumed by a running per-device relay
+/// (sendspin_server / ap2_server / pwsink_server); if the targeted output has no
+/// live sender, nothing ever advances its cursor and — without this — the slot
+/// would sit there forever, holding the output "occupied" in the announce
+/// scheduler so every later announcement to it queues behind a clip that can
+/// never finish. This is the default grace for an output that is *supposed* to
+/// have a live transport already.
+pub const OVERLAY_STALL_GRACE: Duration = Duration::from_secs(5);
+
+/// Stall grace for an output whose transport is being opened **on demand** (an
+/// unrouted AP2 receiver: pair + SETUP + RECORD + stream start, retried once).
+/// The clip legitimately makes no progress until that session is up, so it needs
+/// to outlast a full connect (`AP2_CONNECT_TIMEOUT` × attempts + backoff).
+pub const OVERLAY_ONDEMAND_GRACE: Duration = Duration::from_secs(40);
 
 /// One active overlay on an output.
 struct Overlay {
@@ -28,6 +50,15 @@ struct Overlay {
     cursor: usize,
     /// Music duck gain (0.0–1.0) applied while this overlay plays.
     duck: f32,
+    /// How long this overlay may make no progress before it's reaped.
+    grace: Duration,
+    /// Progress watchdog, driven by the *reaper* (not the RT relay): the cursor
+    /// value last seen by [`OverlayMixer::reap_stalled`] and when it last moved.
+    /// Keeping the clock read out of `mix_into` keeps the RT relay path free of
+    /// per-chunk timekeeping — the cursor is already mutex-protected, so the
+    /// reaper can sample it for free.
+    watch_cursor: usize,
+    watch_since: Instant,
 }
 
 /// Per-output overlay slots. One process-global instance shared by every
@@ -57,11 +88,27 @@ impl OverlayMixer {
     /// the output's capture runs at a different rate (a 44.1 kHz AP2 group), the
     /// clip is resampled once here so it mixes sample-for-sample with the music.
     pub fn start(&self, output: &str, id: u64, pcm: Vec<u8>, duck: f32) {
+        self.start_with_grace(output, id, pcm, duck, OVERLAY_STALL_GRACE);
+    }
+
+    /// [`Self::start`] with an explicit stall `grace` — how long the clip may make
+    /// no progress before [`Self::reap_stalled`] drops it. Callers that first open
+    /// a transport on demand pass [`OVERLAY_ONDEMAND_GRACE`] so the connect has
+    /// time to complete before the watchdog fires.
+    pub fn start_with_grace(&self, output: &str, id: u64, pcm: Vec<u8>, duck: f32, grace: Duration) {
         let rate = self.output_rate.lock().unwrap().get(output).copied().unwrap_or(48_000);
         let pcm = crate::resample::from_48k_stereo_to(&pcm, rate);
         self.slots.lock().unwrap().insert(
             output.to_string(),
-            Overlay { id, pcm, cursor: 0, duck: duck.clamp(0.0, 1.0) },
+            Overlay {
+                id,
+                pcm,
+                cursor: 0,
+                duck: duck.clamp(0.0, 1.0),
+                grace,
+                watch_cursor: 0,
+                watch_since: Instant::now(),
+            },
         );
     }
 
@@ -128,6 +175,34 @@ impl OverlayMixer {
     /// Drain the outputs whose overlay finished since the last call.
     pub fn take_finished(&self) -> Vec<(String, u64)> {
         std::mem::take(&mut *self.finished.lock().unwrap())
+    }
+
+    /// Drop every overlay that has made no progress for longer than its grace and
+    /// return them as `(output, id)` — the safety net for an output nothing is
+    /// streaming (no per-device sender consuming it, or one that died mid-clip).
+    /// The caller (announce.rs) treats a reaped overlay like a finished one, so the
+    /// scheduler releases the output instead of holding it occupied forever.
+    ///
+    /// Called from the announce tick, so "no progress" is sampled at that cadence:
+    /// each call advances the watchdog when the cursor moved, and only fires once
+    /// the cursor has been frozen for the whole grace window.
+    pub fn reap_stalled(&self) -> Vec<(String, u64)> {
+        let mut slots = self.slots.lock().unwrap();
+        let now = Instant::now();
+        let mut reaped = Vec::new();
+        slots.retain(|output, ov| {
+            if ov.cursor != ov.watch_cursor {
+                ov.watch_cursor = ov.cursor;
+                ov.watch_since = now;
+                return true;
+            }
+            if now.duration_since(ov.watch_since) <= ov.grace {
+                return true;
+            }
+            reaped.push((output.clone(), ov.id));
+            false
+        });
+        reaped
     }
 }
 
@@ -237,6 +312,39 @@ mod tests {
         assert_eq!(m.stop("k"), Some(1));
         assert!(!m.is_active("k"));
         assert_eq!(m.stop("k"), None);
+    }
+
+    #[test]
+    fn reaps_an_overlay_nothing_consumes() {
+        let m = OverlayMixer::default();
+        // Zero grace: the very first reap sees a frozen cursor and drops it.
+        m.start_with_grace("k", 9, s16(&[100, 200]), 1.0, Duration::ZERO);
+        assert_eq!(m.reap_stalled(), vec![("k".to_string(), 9)]);
+        assert!(!m.is_active("k"), "reaped slot is gone");
+        assert_eq!(m.reap_stalled(), vec![], "nothing left to reap");
+        // Reaping is NOT a finish — the caller distinguishes them for logging.
+        assert_eq!(m.take_finished(), vec![]);
+    }
+
+    #[test]
+    fn progress_resets_the_stall_watchdog() {
+        let m = OverlayMixer::default();
+        m.start_with_grace("k", 9, s16(&[100, 200, 300, 400]), 1.0, Duration::ZERO);
+        // A consumed chunk moved the cursor, so this reap only re-arms the
+        // watchdog — even at zero grace, a *progressing* overlay is never dropped.
+        m.mix("k", &s16(&[1000])).unwrap();
+        assert_eq!(m.reap_stalled(), vec![], "cursor moved → not stalled");
+        assert!(m.is_active("k"));
+        // Progress then stops → the next reap (grace 0) drops it.
+        assert_eq!(m.reap_stalled(), vec![("k".to_string(), 9)]);
+    }
+
+    #[test]
+    fn a_long_grace_survives_a_stalled_reap() {
+        let m = OverlayMixer::default();
+        m.start_with_grace("k", 9, s16(&[100]), 1.0, Duration::from_secs(60));
+        assert_eq!(m.reap_stalled(), vec![], "still inside its grace window");
+        assert!(m.is_active("k"));
     }
 
     #[test]

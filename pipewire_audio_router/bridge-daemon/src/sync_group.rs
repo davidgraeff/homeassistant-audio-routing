@@ -31,8 +31,9 @@
 //! it), creates new anchors, and restarts a group's sendspin server / AP2 senders
 //! when their dialed set (or the AP2 wire rate) changes.
 
-use crate::config::{PWSINK_DEV_PREFIX, SYNC_GRP_PREFIX};
+use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SYNC_GRP_PREFIX};
 use crate::locks::LockRecover;
+use crate::overlay_mixer::OverlayMixer;
 use crate::pw_target_discovery::{PwTarget, SharedPwTargets};
 use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
@@ -41,7 +42,7 @@ use crate::sendspin_discovery::{SendspinDevice, SharedSendspinDevices};
 use crate::sendspin_server::{self, SendspinServerHandle};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// Ports for group servers' embedded sendspin listeners are allocated upward
@@ -177,6 +178,48 @@ struct IdleSender {
     _server: SendspinServerHandle,
 }
 
+/// An **on-demand** sender for an *unrouted* output, opened so an announcement can
+/// reach it, then torn down again.
+///
+/// Sendspin devices get a permanently-running [`IdleSender`], but the two dialed
+/// backends can't be held open like that:
+///
+/// - an **AirPlay-2** receiver accepts only ONE session at a time, so a permanent
+///   one would block the household's phones from AirPlaying to it (and keep AVRs
+///   parked on their AirPlay input);
+/// - a **pw-sink** session is an advertised mDNS service plus bound ports, and
+///   stock `module-rtp-session` in discover mode connects to *every* advertised
+///   session it sees — a permanent advert per idle target would keep every
+///   receiver on the LAN attached to sessions it has no reason to be in.
+///
+/// So an idle output of either kind gets a transport only while it's actually being
+/// announced to — same shape as `IdleSender` otherwise (its own silent
+/// `null-audio-sink`, whose monitor the overlay mixer turns into the announcement)
+/// — plus a lease: it lingers a while after the clip so back-to-back announcements
+/// skip the connect, then goes away.
+struct AnnounceSession {
+    sink_node_name: String,
+    sink_node_id: u32,
+    /// The live sender; drop = tear its session down.
+    transport: AnnounceSessionTransport,
+    /// Tear the session down at/after this instant. Extended while a clip is
+    /// queued or playing on the output, and on every new announcement to it.
+    expires_at: Instant,
+    /// The lease length used for each extension (see [`ANNOUNCE_LINGER`], never
+    /// shorter than an AP2 receiver's render delay plus a tail).
+    linger: Duration,
+}
+
+/// The per-backend sender behind an [`AnnounceSession`].
+enum AnnounceSessionTransport {
+    /// AirPlay-2: drop = TEARDOWN the receiver's RTSP session.
+    Ap2(crate::ap2_server::Ap2ServerHandle),
+    /// pw-sink: drop = `BY` + withdraw the mDNS advert (the handle is held only for
+    /// that, never read — hence the underscore). `control_port` is tracked so port
+    /// allocation across groups and sessions never collides.
+    PwSink { _server: crate::pwsink_server::PwSinkServerHandle, control_port: u16 },
+}
+
 #[derive(Default)]
 pub struct GroupReconciler {
     /// Keyed by the group's source-set (sorted sources joined by `KEY_SEP`).
@@ -184,12 +227,78 @@ pub struct GroupReconciler {
     /// Standalone senders for ungrouped devices (per-device mode only), keyed by
     /// device node name.
     idle_senders: HashMap<String, IdleSender>,
+    /// On-demand announce sessions for unrouted AP2 receivers / pw-sink targets,
+    /// keyed by output node name (`ap2-dev-*` / `pwsink-dev-*`).
+    announce_sessions: HashMap<String, AnnounceSession>,
 }
 
 /// Distinctive sink-name prefix for an idle device's private sink. Deliberately
 /// not `sendspin-dev-`/`ap2-dev-`/`sync-grp-` so routing never treats it as an
 /// output or anchor.
 const IDLE_SINK_PREFIX: &str = "idle-dev-";
+
+/// How long an on-demand announce session stays up after its clip stops playing.
+/// Long enough that a burst of announcements (or a retry) reuses the warm session
+/// instead of paying the connect again; short enough that an AP2 receiver's single
+/// AirPlay session — and a pw-sink advert the LAN's receivers would otherwise
+/// attach to — is handed back promptly. Also bounds the session's life: the mixer's
+/// stall watchdog guarantees a clip always stops, so `clip length + this` is the
+/// worst case.
+const ANNOUNCE_LINGER: Duration = Duration::from_secs(30);
+
+/// Tail added on top of an AP2 receiver's render delay when clamping the lease, so
+/// audio already buffered on the receiver renders before TEARDOWN cuts it off.
+const ANNOUNCE_TAIL: Duration = Duration::from_secs(2);
+
+/// What will carry an announcement to an output, from
+/// [`GroupReconciler::ensure_announce_transport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnounceTransport {
+    /// A group (or idle) per-device sender is already streaming this output — the
+    /// clip is consumed immediately.
+    Live,
+    /// An on-demand session was just opened; audio starts once the receiver is
+    /// connected (AP2: pairing/SETUP; pw-sink: it discovers our advert and
+    /// initiates the AppleMIDI handshake) — a few seconds either way.
+    Starting,
+    /// An on-demand session opened earlier is still up; its lease was extended.
+    Warm,
+    /// Nothing can carry the clip (reason for the caller to report).
+    Unavailable(String),
+}
+
+impl AnnounceTransport {
+    /// Whether the clip may legitimately sit unconsumed for a while (an on-demand
+    /// session still connecting) — picks the mixer's stall grace.
+    pub fn is_on_demand(&self) -> bool {
+        matches!(self, Self::Starting | Self::Warm)
+    }
+}
+
+/// The shared handles [`GroupReconciler::ensure_announce_transport`] needs to open a
+/// transport on demand. Bundled so the one call site (api.rs's `/api/announce`) can
+/// build it once and the signature stays readable.
+pub struct AnnounceDeps<'a> {
+    pub pw: &'a SharedState,
+    pub pw_cmd: &'a PwCommandSender,
+    pub routing: &'a SharedRouting,
+    pub ap2_devices: &'a crate::ap2_discovery::SharedAp2Devices,
+    pub ap2_ptp: &'a crate::ap2_ptp::SharedAp2Ptp,
+    pub ap2_control: &'a crate::ap2_volume::SharedAp2Control,
+    pub sync_settings: &'a crate::sync_settings::SharedSyncSettings,
+    pub pw_targets: &'a SharedPwTargets,
+}
+
+/// Why an output with no live per-device sender can't carry an announcement, for
+/// the caller to report. The dialed backends (AP2, pw-sink) are handled before this
+/// — they have the on-demand path.
+fn no_transport_reason(output: &str) -> String {
+    if output.starts_with(SENDSPIN_DEV_PREFIX) {
+        "sendspin device is offline (no sender running for it)".into()
+    } else {
+        "output has no per-device sender (only sendspin, AirPlay-2 and PipeWire targets can be announced to individually)".into()
+    }
+}
 
 /// `n` free pw-sink control ports at/above [`PWSINK_BASE_PORT`], skipping any pair
 /// overlapping `taken` (each session binds `control` **and** `control + 1`), so the
@@ -211,6 +320,25 @@ fn next_free_pwsink_ports(taken: impl IntoIterator<Item = u16>, n: usize) -> Vec
         port = port.saturating_add(2);
     }
     out
+}
+
+/// Whether `output` is one of the dialed backends that can get a transport opened
+/// on demand for an announcement (AP2 receivers, pw-sink targets).
+fn supports_on_demand_announce(output: &str) -> bool {
+    output.starts_with(AP2_DEV_PREFIX) || output.starts_with(PWSINK_DEV_PREFIX)
+}
+
+/// The private silent sink backing an on-demand announce session for `output`.
+/// Shares [`IDLE_SINK_PREFIX`] with the sendspin idle sinks (so routing ignores it
+/// the same way) and keeps a per-kind marker, so the kinds can't collide.
+fn announce_sink_name(output: &str) -> String {
+    if let Some(slug) = output.strip_prefix(AP2_DEV_PREFIX) {
+        format!("{IDLE_SINK_PREFIX}ap2-{slug}")
+    } else if let Some(slug) = output.strip_prefix(PWSINK_DEV_PREFIX) {
+        format!("{IDLE_SINK_PREFIX}pwsink-{slug}")
+    } else {
+        format!("{IDLE_SINK_PREFIX}{output}")
+    }
 }
 
 /// Shared handle so the alignment API (calibrate.rs) can read the live group
@@ -261,18 +389,357 @@ impl GroupReconciler {
     /// sends the `BY` inline before returning.
     pub fn shutdown_pwsink(&mut self) {
         let groups = self.running.values().filter(|g| g.pwsink_server.is_some()).count();
-        if groups == 0 {
+        // On-demand announce sessions advertise the same way, so they need the same
+        // clean BY (their sinks go with the process — nothing else references them).
+        let announce: Vec<String> = self
+            .announce_sessions
+            .iter()
+            .filter(|(_, s)| matches!(s.transport, AnnounceSessionTransport::PwSink { .. }))
+            .map(|(o, _)| o.clone())
+            .collect();
+        if groups == 0 && announce.is_empty() {
             return;
         }
         // Log BEFORE dropping: the container's stop-grace can SIGKILL us partway
         // through the drop, so the tail of a post-drop log may never flush. The
         // BY itself still escapes — `AppleMidiSender::Drop` withdraws the advert
         // and sends BY *first*, before the worker-thread joins that a SIGKILL cuts.
-        tracing::info!("graceful shutdown: withdrawing advert + sending BY for {groups} pw-sink group session(s)");
+        tracing::info!(
+            "graceful shutdown: withdrawing advert + sending BY for {groups} pw-sink group session(s) and {} on-demand announce session(s)",
+            announce.len()
+        );
         for g in self.running.values_mut() {
             g.pwsink_server = None; // drop → advert withdraw + BY to peers
             g.pwsink_members.clear();
             g.pwsink_ports.clear();
+        }
+        for output in announce {
+            self.announce_sessions.remove(&output); // drop → advert withdraw + BY
+        }
+    }
+
+    /// Is a per-device sender currently streaming `output` (so an overlay dropped on
+    /// it is consumed right away)? Covers every backend: a group's sendspin server /
+    /// AP2 senders / pw-sink senders, plus a sendspin device's idle sender.
+    ///
+    /// For the two **dialed** backends, group membership is not the answer — it lists
+    /// what the group *dialed*, including a receiver still connecting or one whose
+    /// session failed, neither of which consumes an overlay. So:
+    /// - **AP2**: `ap2_connected` (from `Ap2Control::connected`) = its sender
+    ///   registered a command channel, i.e. the session is up.
+    /// - **pw-sink**: `PwSinkLiveness` `established` = a receiver completed the
+    ///   AppleMIDI handshake to our advertised session (it is receiver-initiated, so
+    ///   an advertised session with nobody attached carries nothing).
+    fn has_live_sender(&self, output: &str, ap2_connected: &HashSet<String>) -> bool {
+        if output.starts_with(AP2_DEV_PREFIX) {
+            return ap2_connected.contains(output);
+        }
+        if output.starts_with(PWSINK_DEV_PREFIX) {
+            return crate::pw_sink_liveness::PwSinkLiveness::global().get(output).is_some_and(|s| s.established);
+        }
+        if self.idle_senders.contains_key(output) {
+            return true;
+        }
+        self.running.values().any(|g| g.server_devices.iter().any(|d| d == output))
+    }
+
+    /// Make sure *something* will carry an announcement to `output`, and say what.
+    ///
+    /// An output only hears an announcement while a per-device sender is reading
+    /// its overlay slot (sendspin_server / ap2_server / pwsink_server all call
+    /// `OverlayMixer::mix_into`). Sendspin devices always have one — grouped or via
+    /// their idle sender — but the **dialed** backends only have a sender while they
+    /// are routed, so an unrouted AP2 receiver / pw-sink target had no transport at
+    /// all and announcements to it were silently dropped. For those this opens an
+    /// on-demand session ([`AnnounceSession`]); otherwise it reports honestly so the
+    /// caller can tell the user instead of claiming "playing".
+    ///
+    /// Call this **before** starting the clip: it publishes the session's wire rate
+    /// to the mixer, which `OverlayMixer::start` needs to rate-match the clip.
+    pub async fn ensure_announce_transport(&mut self, output: &str, deps: &AnnounceDeps<'_>) -> AnnounceTransport {
+        let ap2_connected = deps.ap2_control.lock().await.connected();
+        let live = self.has_live_sender(output, &ap2_connected);
+        // An on-demand session already up: extend its lease and reuse it (whether or
+        // not it has finished connecting).
+        if let Some(s) = self.announce_sessions.get_mut(output) {
+            s.expires_at = Instant::now() + s.linger;
+            return if live { AnnounceTransport::Live } else { AnnounceTransport::Warm };
+        }
+        if live {
+            return AnnounceTransport::Live;
+        }
+        if !supports_on_demand_announce(output) {
+            return AnnounceTransport::Unavailable(no_transport_reason(output));
+        }
+
+        // Only for an endpoint with NO wired input. A routed one belongs to the group
+        // reconciler, which owns (and retries) its session; a second AP2 session would
+        // collide (a receiver accepts one), and a second pw-sink advert would give the
+        // receiver two sessions to attach to.
+        let intent = routing_store::snapshot(deps.routing);
+        if !routing::source_set_of(&intent, output).is_empty() {
+            return AnnounceTransport::Unavailable(if output.starts_with(AP2_DEV_PREFIX) {
+                "routed, but its AirPlay-2 sender isn't streaming (receiver unreachable, or still connecting)".into()
+            } else {
+                "routed, but no receiver has connected to its session yet (its module-rtp-session must initiate the handshake)".into()
+            });
+        }
+
+        if output.starts_with(AP2_DEV_PREFIX) {
+            self.open_ap2_announce_session(output, deps).await
+        } else {
+            self.open_pwsink_announce_session(output, deps).await
+        }
+    }
+
+    /// Open an on-demand AP2 session for an unrouted receiver (see
+    /// [`AnnounceSession`]). The lease outlasts the receiver's render buffer so a
+    /// TEARDOWN can't cut off audio it hasn't rendered yet.
+    async fn open_ap2_announce_session(&mut self, output: &str, deps: &AnnounceDeps<'_>) -> AnnounceTransport {
+        let device = deps.ap2_devices.lock_recover().get(output).cloned();
+        let Some(device) = device else {
+            return AnnounceTransport::Unavailable("unknown AirPlay-2 receiver".into());
+        };
+        if !device.present {
+            return AnnounceTransport::Unavailable("receiver is offline".into());
+        }
+        let Some(addr) = device.addr else {
+            return AnnounceTransport::Unavailable("receiver has no resolved address yet".into());
+        };
+        // Receivers are registered as PTP peers at discovery; make sure the
+        // host-global grandmaster is up so PT=87 anchors carry its clock id.
+        let clock_id = match deps.ap2_ptp.ensure_started() {
+            Ok(id) => id,
+            Err(e) => return AnnounceTransport::Unavailable(format!("AP2 PTP grandmaster unavailable: {e}")),
+        };
+        let (rate, delay) = {
+            let ss = deps.sync_settings.lock_recover();
+            (ss.ap2_group_rate([output]), ss.ap2_latency(output))
+        };
+
+        let (sink_node_name, sink_node_id) = match self.ensure_announce_sink(output, deps).await {
+            Ok(v) => v,
+            Err(e) => return AnnounceTransport::Unavailable(e),
+        };
+
+        // Publish the wire rate BEFORE the clip starts: `OverlayMixer::start`
+        // resamples the 48 kHz clip to the output's rate, and ap2_server only
+        // publishes it once the receiver has connected — too late for a clip queued
+        // now, which would then play back at the wrong pitch on a 44.1 kHz receiver.
+        OverlayMixer::global().set_output_rate(output, rate);
+
+        let server = match crate::ap2_server::start(
+            vec![(output.to_string(), addr.ip(), delay)],
+            sink_node_id,
+            clock_id,
+            deps.ap2_control.clone(),
+            rate,
+            deps.sync_settings.clone(),
+        ) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.abandon_announce_sink(output, sink_node_id, deps.pw_cmd).await;
+                return AnnounceTransport::Unavailable(format!("failed to start an on-demand AirPlay-2 session: {e}"));
+            }
+        };
+
+        let render_delay_ms = u64::from(delay.unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16));
+        let linger = ANNOUNCE_LINGER.max(Duration::from_millis(render_delay_ms) + ANNOUNCE_TAIL);
+        tracing::info!(
+            "on-demand AP2 announce session for '{output}' ({}) opening @ {rate} Hz (sink '{sink_node_name}', lease {}s)",
+            addr.ip(),
+            linger.as_secs()
+        );
+        self.announce_sessions.insert(
+            output.to_string(),
+            AnnounceSession {
+                sink_node_name,
+                sink_node_id,
+                transport: AnnounceSessionTransport::Ap2(server),
+                expires_at: Instant::now() + linger,
+                linger,
+            },
+        );
+        AnnounceTransport::Starting
+    }
+
+    /// Open an on-demand pw-sink session for an unrouted remote PipeWire host: bind a
+    /// control/data port pair and advertise `pwrouter-<slug>` for the target's
+    /// `module-rtp-session` to attach to, fed from a private silent sink.
+    ///
+    /// The handshake is **receiver-initiated**, so the clip waits until the target
+    /// notices the advert and connects — the overlay isn't consumed before then, so it
+    /// still plays whole, a second or two late. Same caveat as a routed pw-sink
+    /// session: stock `module-rtp-session` in discover mode attaches to *every*
+    /// advertised session, so with 2+ pw-sink targets on one LAN an announcement aimed
+    /// at one can be heard by the others (the deferred session-scoping decision, see
+    /// docs/pipewire-sink-roadmap.md §4).
+    async fn open_pwsink_announce_session(&mut self, output: &str, deps: &AnnounceDeps<'_>) -> AnnounceTransport {
+        let target = deps.pw_targets.lock_recover().get(output).cloned();
+        let Some(target) = target else {
+            return AnnounceTransport::Unavailable("unknown PipeWire target".into());
+        };
+        if !target.present {
+            return AnnounceTransport::Unavailable("target is not on the network (no mDNS advert)".into());
+        }
+        let Some(control_port) = self.alloc_pwsink_ports(1).first().copied() else {
+            return AnnounceTransport::Unavailable("no free control port for a pw-sink session".into());
+        };
+
+        let (sink_node_name, sink_node_id) = match self.ensure_announce_sink(output, deps).await {
+            Ok(v) => v,
+            Err(e) => return AnnounceTransport::Unavailable(e),
+        };
+
+        let member = crate::pwsink_server::PwSinkMember { node_name: output.to_string(), control_port };
+        let server = match crate::pwsink_server::start(vec![member], sink_node_id) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.abandon_announce_sink(output, sink_node_id, deps.pw_cmd).await;
+                return AnnounceTransport::Unavailable(format!("failed to start an on-demand pw-sink session: {e}"));
+            }
+        };
+
+        tracing::info!(
+            "on-demand pw-sink announce session for '{output}' advertising on control port {control_port} (sink '{sink_node_name}', lease {}s)",
+            ANNOUNCE_LINGER.as_secs()
+        );
+        self.announce_sessions.insert(
+            output.to_string(),
+            AnnounceSession {
+                sink_node_name,
+                sink_node_id,
+                transport: AnnounceSessionTransport::PwSink { _server: server, control_port },
+                expires_at: Instant::now() + ANNOUNCE_LINGER,
+                linger: ANNOUNCE_LINGER,
+            },
+        );
+        AnnounceTransport::Starting
+    }
+
+    /// The private silent sink an on-demand session captures from: nothing is routed
+    /// in, so its monitor is silence and the overlay mixer supplies the whole
+    /// announcement. Reuses the node if one with this name already exists (a previous
+    /// session's sink can outlive the daemon — they're created `object.linger`).
+    /// Returns `(node_name, node_id)` or the reason to report.
+    async fn ensure_announce_sink(&self, output: &str, deps: &AnnounceDeps<'_>) -> Result<(String, u32), String> {
+        let sink_node_name = announce_sink_name(output);
+        if let Some(id) = node_id_for(&deps.pw.lock_recover(), &sink_node_name) {
+            return Ok((sink_node_name, id));
+        }
+        let (tx, rx) = oneshot::channel();
+        if deps.pw_cmd.send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx }).is_err() {
+            return Err("PipeWire thread unavailable".into());
+        }
+        match rx.await {
+            Ok(Ok(())) => {}
+            _ => return Err(format!("failed to create announce sink '{sink_node_name}'")),
+        }
+        match wait_for_node(deps.pw, &sink_node_name).await {
+            Some(id) => Ok((sink_node_name, id)),
+            None => Err(format!("announce sink '{sink_node_name}' did not appear in the graph")),
+        }
+    }
+
+    /// Undo [`Self::ensure_announce_sink`] when the sender failed to start, so a
+    /// retry doesn't inherit a stray sink (and the overlay rate doesn't stick).
+    async fn abandon_announce_sink(&self, output: &str, sink_node_id: u32, pw_cmd: &PwCommandSender) {
+        OverlayMixer::global().clear_output_rate(output);
+        let (tx, rx) = oneshot::channel();
+        if pw_cmd.send(PwCommand::DestroySinkNode { node_id: sink_node_id, reply: tx }).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// Expire on-demand announce sessions whose lease has run out. Driven from a
+    /// slow ticker in main.rs; a session with a clip still queued or playing keeps
+    /// having its lease extended (the mixer's stall watchdog bounds that, so a
+    /// receiver that never connects can't hold its session open forever).
+    pub async fn poll_announce_sessions(&mut self, pw_cmd: &PwCommandSender) {
+        if self.announce_sessions.is_empty() {
+            return;
+        }
+        let mixer = OverlayMixer::global();
+        // A clip that's playing on the output, or still queued for it, keeps the
+        // lease rolling — the queued case has no overlay slot yet, so the mixer
+        // alone would let the session go before the clip's turn came.
+        let in_flight = crate::announce::AnnounceCoordinator::global().outputs_in_flight();
+        let now = Instant::now();
+        let mut expired: Vec<String> = Vec::new();
+        for (output, s) in self.announce_sessions.iter_mut() {
+            if mixer.is_active(output) || in_flight.contains(output) {
+                s.expires_at = now + s.linger;
+            } else if now >= s.expires_at {
+                expired.push(output.clone());
+            }
+        }
+        for output in expired {
+            self.drop_announce_session(&output, pw_cmd, "lease expired").await;
+        }
+    }
+
+    /// Tear down one on-demand announce session — AP2: TEARDOWN the receiver's RTSP
+    /// session; pw-sink: `BY` + withdraw the advert (both on handle drop) — then
+    /// destroy its private sink.
+    async fn drop_announce_session(&mut self, output: &str, pw_cmd: &PwCommandSender, why: &str) {
+        let Some(s) = self.announce_sessions.remove(output) else { return };
+        tracing::info!("on-demand announce session for '{output}' torn down ({why}); removing sink '{}'", s.sink_node_name);
+        drop(s.transport); // AP2: TEARDOWN + capture close; pw-sink: BY + advert withdraw
+        OverlayMixer::global().clear_output_rate(output);
+        let (tx, rx) = oneshot::channel();
+        if pw_cmd.send(PwCommand::DestroySinkNode { node_id: s.sink_node_id, reply: tx }).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// Graceful process-exit teardown for every AP2 session — group senders **and**
+    /// on-demand announce sessions.
+    ///
+    /// A receiver accepts one AirPlay session at a time and holds a session we never
+    /// closed until it times out: that is what makes the next start's first connect
+    /// fail (the "cold/stale session" retry in `connect_one`) and what leaves the
+    /// receiver's AirPlay input busy for phones in between. Dropping the handles only
+    /// *signals* their tasks, and on process exit nothing polls those again — so this
+    /// awaits them (each bounded inside `Ap2ServerHandle::shutdown`, all concurrently
+    /// so an unreachable receiver doesn't serialize the rest).
+    ///
+    /// Called explicitly from main.rs's shutdown path, like `shutdown_pwsink`,
+    /// because the reconcile task's own `Drop` isn't guaranteed to run on exit.
+    pub async fn shutdown_ap2(&mut self) {
+        let mut handles: Vec<crate::ap2_server::Ap2ServerHandle> = Vec::new();
+        for g in self.running.values_mut() {
+            if let Some(h) = g.ap2_sender.take() {
+                handles.push(h);
+                g.ap2_members.clear();
+            }
+        }
+        // On-demand AP2 announce sessions too (pw-sink ones are handled by
+        // `shutdown_pwsink`, whose BY is synchronous). Their private sinks go with the
+        // process — nothing else references them — so only the RTSP session matters.
+        let ap2_announce: Vec<String> = self
+            .announce_sessions
+            .iter()
+            .filter(|(_, s)| matches!(s.transport, AnnounceSessionTransport::Ap2(_)))
+            .map(|(o, _)| o.clone())
+            .collect();
+        for output in ap2_announce {
+            tracing::debug!("graceful shutdown: tearing down on-demand announce session for '{output}'");
+            if let Some(s) = self.announce_sessions.remove(&output) {
+                if let AnnounceSessionTransport::Ap2(h) = s.transport {
+                    handles.push(h);
+                }
+            }
+        }
+        if handles.is_empty() {
+            return;
+        }
+        tracing::info!("graceful shutdown: TEARDOWN for {} AirPlay-2 session group(s)", handles.len());
+        // Concurrently, via tasks (no `futures` dependency): each `shutdown()` carries
+        // its own timeout, so the whole wait is bounded by the slowest single one
+        // rather than their sum.
+        let joins: Vec<tokio::task::JoinHandle<()>> = handles.into_iter().map(|h| tokio::spawn(h.shutdown())).collect();
+        for j in joins {
+            let _ = j.await;
         }
     }
 
@@ -392,8 +859,14 @@ impl GroupReconciler {
     /// running group's pw-sink senders already hold. Ports step by 2 from
     /// PWSINK_BASE_PORT so the control/data pairs never overlap.
     fn alloc_pwsink_ports(&self, n: usize) -> Vec<u16> {
+        // Both a group's senders and an on-demand announce session bind out of this
+        // range, so both must be in the taken set.
         let group_ports = self.running.values().flat_map(|g| g.pwsink_ports.iter().copied());
-        next_free_pwsink_ports(group_ports, n)
+        let announce_ports = self.announce_sessions.values().filter_map(|s| match &s.transport {
+            AnnounceSessionTransport::PwSink { control_port, .. } => Some(*control_port),
+            AnnounceSessionTransport::Ap2(_) => None,
+        });
+        next_free_pwsink_ports(group_ports.chain(announce_ports), n)
     }
 
     /// `send_ahead_us` is the group presentation lead from the sync settings
@@ -509,6 +982,37 @@ impl GroupReconciler {
                     let _ = rx.await;
                 }
             }
+        }
+
+        // 1c. On-demand announce-session teardown. An AP2 receiver accepts ONE
+        //     session and a pw-sink receiver would see two adverts, so an on-demand
+        //     session must go BEFORE the group senders below dial/advertise for the
+        //     same endpoint. Also drops sessions whose device/target went away (the
+        //     handle would be streaming into the void).
+        let grouped: HashSet<&str> = desired
+            .values()
+            .flat_map(|d| d.ap2_members.iter().map(|(n, _, _)| n.as_str()).chain(d.pwsink_members.iter().map(String::as_str)))
+            .collect();
+        let drop_announce: Vec<(String, &str)> = self
+            .announce_sessions
+            .keys()
+            .filter_map(|o| {
+                let still_there = if o.starts_with(AP2_DEV_PREFIX) {
+                    ap2_map.get(o).is_some_and(|d| d.present && d.addr.is_some())
+                } else {
+                    pw_targets_map.get(o).is_some_and(|t| t.present)
+                };
+                if grouped.contains(o.as_str()) {
+                    Some((o.clone(), "endpoint is now routed — its group sender takes over"))
+                } else if !still_there {
+                    Some((o.clone(), "endpoint went offline"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (output, why) in drop_announce {
+            self.drop_announce_session(&output, pw_cmd, why).await;
         }
 
         // 2. Create/steer each desired group.
@@ -830,4 +1334,103 @@ async fn wait_for_node(pw: &SharedState, node_name: &str) -> Option<u32> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A running group with the given members and no live handles — enough to
+    /// exercise the "is something streaming this output?" bookkeeping.
+    fn running_group(sendspin: &[&str], ap2: &[&str], pwsink: &[&str]) -> RunningGroup {
+        RunningGroup {
+            anchor_node_name: "sync-grp-test".into(),
+            anchor_node_id: 1,
+            port: GROUP_BASE_PORT,
+            server: None,
+            server_devices: sendspin.iter().map(|s| s.to_string()).collect(),
+            server_members: Vec::new(),
+            server_codec: "pcm",
+            server_send_ahead_us: 0,
+            ap2_sender: None,
+            ap2_members: ap2.iter().map(|s| s.to_string()).collect(),
+            ap2_rate: 48_000,
+            pwsink_server: None,
+            pwsink_members: pwsink.iter().map(|s| s.to_string()).collect(),
+            pwsink_ports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn announce_sink_names_are_distinct_from_outputs_and_anchors() {
+        for (output, expected) in
+            [("ap2-dev-dusche", "idle-dev-ap2-dusche"), ("pwsink-dev-office", "idle-dev-pwsink-office")]
+        {
+            let name = announce_sink_name(output);
+            assert_eq!(name, expected);
+            // Routing must never mistake it for an output or a sync anchor.
+            assert!(!name.starts_with(AP2_DEV_PREFIX));
+            assert!(!name.starts_with(SENDSPIN_DEV_PREFIX));
+            assert!(!name.starts_with(PWSINK_DEV_PREFIX));
+            assert!(!name.starts_with(SYNC_GRP_PREFIX));
+        }
+    }
+
+    #[test]
+    fn has_live_sender_uses_membership_for_sendspin_and_real_state_for_dialed_backends() {
+        let mut r = GroupReconciler::new();
+        r.running.insert(
+            "src".into(),
+            running_group(&["sendspin-dev-kitchen"], &["ap2-dev-dusche", "ap2-dev-pioneer"], &["pwsink-dev-office"]),
+        );
+        let connected: HashSet<String> = ["ap2-dev-dusche".to_string()].into_iter().collect();
+        assert!(r.has_live_sender("sendspin-dev-kitchen", &connected));
+        assert!(r.has_live_sender("ap2-dev-dusche", &connected));
+        // Routed (a dialed group member) but its session never came up: an overlay
+        // dropped on it would go nowhere, so this must NOT read as live.
+        assert!(!r.has_live_sender("ap2-dev-pioneer", &connected));
+        // Same for pw-sink, whose handshake is receiver-initiated: group membership
+        // means we advertise a session, not that anyone attached to it. (The global
+        // liveness registry is empty in this test = nobody attached.)
+        assert!(!r.has_live_sender("pwsink-dev-office", &connected));
+        // Unrouted endpoints have no sender at all — the case that used to make
+        // announcements silently disappear.
+        assert!(!r.has_live_sender("ap2-dev-bad", &connected));
+        assert!(!r.has_live_sender("pwsink-dev-bad", &connected));
+    }
+
+    #[test]
+    fn only_the_dialed_backends_get_an_on_demand_transport() {
+        assert!(supports_on_demand_announce("ap2-dev-dusche"));
+        assert!(supports_on_demand_announce("pwsink-dev-office"));
+        assert!(!supports_on_demand_announce("sendspin-dev-kitchen"));
+        assert!(!supports_on_demand_announce("some-local-sink"));
+        // …and the kinds that don't must explain themselves rather than drop the clip.
+        for (output, needle) in [("sendspin-dev-kitchen", "offline"), ("some-local-sink", "no per-device sender")] {
+            let msg = no_transport_reason(output);
+            assert!(msg.contains(needle), "{output}: {msg:?} lacks {needle:?}");
+        }
+    }
+
+    #[test]
+    fn pwsink_ports_step_past_pairs_already_taken() {
+        // Nothing taken → consecutive control/data pairs from the base.
+        assert_eq!(next_free_pwsink_ports([], 2), vec![PWSINK_BASE_PORT, PWSINK_BASE_PORT + 2]);
+        // A group's session holds the first pair (control + data) → step past both.
+        assert_eq!(next_free_pwsink_ports([PWSINK_BASE_PORT], 1), vec![PWSINK_BASE_PORT + 2]);
+        // An on-demand announce session's port is fed in the same way, so a group
+        // starting afterwards can't be handed the port it's already bound to.
+        assert_eq!(
+            next_free_pwsink_ports([PWSINK_BASE_PORT, PWSINK_BASE_PORT + 2], 2),
+            vec![PWSINK_BASE_PORT + 4, PWSINK_BASE_PORT + 6]
+        );
+    }
+
+    #[test]
+    fn on_demand_transports_get_the_longer_stall_grace() {
+        assert!(AnnounceTransport::Starting.is_on_demand());
+        assert!(AnnounceTransport::Warm.is_on_demand());
+        assert!(!AnnounceTransport::Live.is_on_demand());
+        assert!(!AnnounceTransport::Unavailable("x".into()).is_on_demand());
+    }
 }

@@ -116,18 +116,54 @@ struct ConnectFail {
     msg: String,
 }
 
+/// How long [`Ap2ServerHandle::shutdown`] waits for the task to TEARDOWN its
+/// receivers before giving up. The task's `stop()`/`disconnect()` are unbounded
+/// RTSP round trips, so a powered-off receiver could otherwise stall process exit
+/// past the container's stop-grace (which would SIGKILL us and lose the TEARDOWNs
+/// that *did* have somewhere to go).
+const AP2_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A running group's AP2 senders. Dropping it signals the task to stop + TEARDOWN
 /// every receiver session (mirrors `SendspinServerHandle`: drop = tear down), and
 /// drops the capture handle — which closes the capture channel so the RT relay
 /// thread exits.
+///
+/// Drop alone is fire-and-forget: the TEARDOWNs happen in the spawned task, which
+/// is fine mid-run (the runtime keeps turning) but NOT on process exit, where
+/// nothing polls it again. Use [`Self::shutdown`] there to actually wait for them.
 pub struct Ap2ServerHandle {
     shutdown: Option<oneshot::Sender<()>>,
-    _task: tokio::task::JoinHandle<()>,
-    /// Owned here (not by the relay thread) so this Drop closes the capture channel
-    /// → the relay's `blocking_recv` returns `None` → the relay thread exits.
-    _capture: crate::sendspin_capture::CaptureHandle,
-    /// The RT relay thread; exits on its own once `_capture` closes the channel.
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// Owned here (not by the relay thread) so dropping this handle closes the
+    /// capture channel → the relay's `blocking_recv` returns `None` → the relay
+    /// thread exits. `Option` only so [`Self::shutdown`] can close it *before*
+    /// awaiting the TEARDOWNs rather than after.
+    capture: Option<crate::sendspin_capture::CaptureHandle>,
+    /// The RT relay thread; exits on its own once `capture` closes the channel.
     _relay: std::thread::JoinHandle<()>,
+}
+
+impl Ap2ServerHandle {
+    /// Graceful stop: signal the task and **wait** (bounded by
+    /// [`AP2_TEARDOWN_TIMEOUT`]) for it to TEARDOWN every receiver session, so a
+    /// receiver releases its single AirPlay session now instead of holding a stale
+    /// one until it times out — which is what makes the next start's first connect
+    /// fail ("Pairing error M2" / cold RECORD) and keeps the receiver's AirPlay
+    /// input busy for phones. Only worth calling on process exit; mid-run a plain
+    /// drop is enough (the runtime still polls the task).
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        // Close the capture NOW so the RT relay stops feeding senders while their
+        // connections tear down (the task owns those and does the RTSP work).
+        drop(self.capture.take());
+        if let Some(task) = self.task.take() {
+            if tokio::time::timeout(AP2_TEARDOWN_TIMEOUT, task).await.is_err() {
+                tracing::warn!("AP2 group: TEARDOWN did not finish within {:?}; exiting anyway", AP2_TEARDOWN_TIMEOUT);
+            }
+        }
+    }
 }
 
 impl Drop for Ap2ServerHandle {
@@ -135,7 +171,7 @@ impl Drop for Ap2ServerHandle {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(()); // task's select! wakes → disconnects receivers
         }
-        // `_capture` then drops (field order) → capture channel closes → relay exits.
+        // `capture` then drops (field order) → capture channel closes → relay exits.
     }
 }
 
@@ -486,5 +522,5 @@ pub fn start(
         tracing::info!("AP2 group: senders stopped");
     });
 
-    Ok(Ap2ServerHandle { shutdown: Some(shutdown_tx), _task: task, _capture: capture, _relay: relay })
+    Ok(Ap2ServerHandle { shutdown: Some(shutdown_tx), task: Some(task), capture: Some(capture), _relay: relay })
 }

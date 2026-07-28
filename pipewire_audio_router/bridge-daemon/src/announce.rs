@@ -18,7 +18,7 @@ use crate::announce_arbiter::{Action, Admission, AnnounceScheduler, Announcement
 use crate::overlay_mixer::OverlayMixer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Monotonic milliseconds since first use (for the scheduler's time base).
 fn now_ms() -> u64 {
@@ -29,6 +29,11 @@ fn now_ms() -> u64 {
 struct Clip {
     pcm: Arc<Vec<u8>>,
     duck: f32,
+    /// Stall grace handed to the mixer on every (re)start of this clip — longer
+    /// when a target's transport is being opened on demand (see
+    /// `overlay_mixer::OVERLAY_ONDEMAND_GRACE`). Kept on the clip so a queued or
+    /// barge-preempted announcement gets the same grace when it finally starts.
+    grace: Duration,
 }
 
 struct Inner {
@@ -47,7 +52,7 @@ impl Inner {
             match action {
                 Action::StartAnnouncement(output, id) => {
                     if let Some(clip) = self.clips.get(&id) {
-                        mixer.start(&output, id, (*clip.pcm).clone(), clip.duck);
+                        mixer.start_with_grace(&output, id, (*clip.pcm).clone(), clip.duck, clip.grace);
                     }
                 }
                 Action::StopAnnouncement(output, _id) => {
@@ -79,6 +84,10 @@ impl AnnounceCoordinator {
 
     /// Admit an announcement (clip already decoded to 48k/S16/stereo). Returns
     /// the scheduler's admission (`Playing` / `Queued{pos}` / `Rejected`).
+    ///
+    /// `grace` is how long the clip may sit unconsumed on an output before the
+    /// stall watchdog releases it — pass `overlay_mixer::OVERLAY_ONDEMAND_GRACE`
+    /// when a target's sender is still being connected (an unrouted AP2 receiver).
     #[allow(clippy::too_many_arguments)]
     pub fn announce(
         &self,
@@ -89,12 +98,13 @@ impl AnnounceCoordinator {
         on_busy: OnBusy,
         barge_in: bool,
         ttl_ms: Option<u64>,
+        grace: Duration,
     ) -> Admission {
         let now = now_ms();
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id;
         inner.next_id += 1;
-        inner.clips.insert(id, Clip { pcm: Arc::new(pcm), duck });
+        inner.clips.insert(id, Clip { pcm: Arc::new(pcm), duck, grace });
         let (admission, effects) =
             inner.sched.begin(Request { id, priority, targets, on_busy, barge_in, ttl_ms }, now);
         inner.apply(effects);
@@ -111,14 +121,26 @@ impl AnnounceCoordinator {
         self.inner.lock().unwrap().sched.outputs_in_flight()
     }
 
-    /// Periodic tick: complete finished overlays (start next queued / end duck)
-    /// and expire stale queued announcements. Driven from main.rs.
+    /// Periodic tick: complete finished overlays (start next queued / end duck),
+    /// release overlays nothing is consuming, and expire stale queued
+    /// announcements. Driven from main.rs.
     pub fn poll(&self) {
         let now = now_ms();
-        let finished = OverlayMixer::global().take_finished();
+        let mixer = OverlayMixer::global();
+        let mut done = mixer.take_finished();
+        // Overlays no sender consumed (an output with no live transport, or one
+        // whose sender died mid-clip). Treated exactly like a finish so the
+        // scheduler frees the output — otherwise it stays occupied by a clip that
+        // can never end, and every later announcement to it queues forever.
+        for (output, id) in mixer.reap_stalled() {
+            tracing::warn!(
+                "announce {id} on '{output}': nothing consumed its audio (no per-device sender streaming this output); releasing it"
+            );
+            done.push((output, id));
+        }
         let mut inner = self.inner.lock().unwrap();
         let mut seen = HashSet::new();
-        for (_output, id) in finished {
+        for (_output, id) in done {
             // A multi-output announcement reports finished on each output; one
             // complete() per id.
             if seen.insert(id) {

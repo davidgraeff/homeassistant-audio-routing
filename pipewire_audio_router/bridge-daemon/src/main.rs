@@ -373,8 +373,9 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         }
 
         // Announce coordinator tick: complete finished per-device overlays (start
-        // the next queued clip / end the duck) and expire stale queued
-        // announcements. Cheap no-op when nothing is announcing.
+        // the next queued clip / end the duck), release overlays no sender is
+        // consuming, and expire stale queued announcements. Cheap no-op when
+        // nothing is announcing.
         tokio::spawn(async move {
             let coordinator = announce::AnnounceCoordinator::global();
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(150));
@@ -383,6 +384,26 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                 coordinator.poll();
             }
         });
+
+        // On-demand AP2 announce sessions (sync_group.rs): an unrouted receiver gets
+        // a temporary sender so an announcement can reach it, kept on a short lease
+        // afterwards. This tick hands the receiver's single AirPlay session back once
+        // the lease runs out. Slow on purpose (nothing is time-critical) and
+        // `try_lock`, so it never queues behind a reconcile pass — a skipped tick
+        // just tears down a second later.
+        {
+            let groups = groups.clone();
+            let pw_cmd = pw_cmd.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    ticker.tick().await;
+                    if let Ok(mut g) = groups.try_lock() {
+                        g.poll_announce_sessions(&pw_cmd).await;
+                    }
+                }
+            });
+        }
 
         // Kept for the graceful-shutdown path below (the reconcile task's own
         // Drop isn't guaranteed to run on process exit, so pw-sink sessions are
@@ -428,6 +449,11 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             // a BY and drop the session now, instead of holding a stale one until it
             // times out (which otherwise blocks a prompt reconnect after restart).
             groups.shutdown_pwsink();
+            // Same reasoning for AirPlay-2, and it also matters for the *next* start:
+            // a receiver accepts one session and holds an unclosed one until it times
+            // out, which is what makes the first connect after a restart fail. Awaits
+            // the RTSP TEARDOWNs (bounded), unlike a plain drop.
+            groups.shutdown_ap2().await;
         }
         for (_id, handle) in std::mem::take(&mut *airplay.lock().await) {
             handle.stop().await;

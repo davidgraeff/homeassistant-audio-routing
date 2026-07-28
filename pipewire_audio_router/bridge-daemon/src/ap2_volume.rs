@@ -87,6 +87,15 @@ impl Ap2Control {
         self.notify_changed();
     }
 
+    /// Node names whose AP2 sender is connected and streaming *right now* (it
+    /// registered its command channel). Distinguishes a receiver actually being fed
+    /// from one merely routed — a group's `ap2_members` includes receivers whose
+    /// session failed or is still pairing. The announce path uses this to decide
+    /// whether an overlay dropped on an output will really be consumed.
+    pub fn connected(&self) -> std::collections::HashSet<String> {
+        self.senders.keys().cloned().collect()
+    }
+
     /// The level to send when we DO send (mute/unmute, or re-applying user intent):
     /// `0.0` while muted, else the known volume, else `0.0` (unknown → silent, never
     /// a made-up level). Note `register` does NOT call this on a first connect — the

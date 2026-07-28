@@ -1803,10 +1803,14 @@ async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, St
     }
 }
 
-/// Announcement-group announce (announce.rs): play a clip to a set of sendspin
+/// Announcement-group announce (announce.rs): play a clip to a set of per-device
 /// outputs with per-device duck+overlay and scheduler policy (queue/barge/TTL).
-/// Requires the target devices to be on per-device senders. The node-based path
-/// remains on `/api/media_players/:id/announce`.
+///
+/// Each target needs a per-device sender to *consume* its overlay, so the handler
+/// first ensures one exists — including opening an **on-demand AP2 session** for a
+/// receiver with nothing routed into it (sync_group.rs) — and reports any target
+/// nothing can carry instead of dropping the clip silently. The node-based
+/// (real-sink) path remains on `/api/media_players/:id/announce`.
 #[derive(Deserialize)]
 struct AgAnnounceRequest {
     /// Target output node names (`sendspin-dev-…`). Optional if
@@ -1922,6 +1926,60 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
         _ => crate::announce_arbiter::OnBusy::Queue,
     };
 
+    // Make sure each target actually has a sender that will *consume* the overlay.
+    // An announcement is only audible while a per-device relay reads its output's
+    // overlay slot, and an unrouted AP2 receiver / pw-sink target has no sender at
+    // all — so this opens an on-demand session for it. Done before the (possibly
+    // slow) clip fetch/decode so the connect overlaps it. Targets that nothing can
+    // carry are dropped from the announcement and reported, rather than silently
+    // swallowing the clip and answering "playing".
+    use crate::sync_group::{AnnounceDeps, AnnounceTransport};
+    let mut transports: Vec<(String, AnnounceTransport)> = Vec::with_capacity(targets.len());
+    {
+        let deps = AnnounceDeps {
+            pw: &state.pw,
+            pw_cmd: &state.pw_cmd,
+            routing: &state.routing,
+            ap2_devices: &state.ap2_devices,
+            ap2_ptp: &state.ap2_ptp,
+            ap2_control: &state.ap2_control,
+            sync_settings: &state.sync_settings,
+            pw_targets: &state.pw_targets,
+        };
+        let mut groups = state.groups.lock().await;
+        for target in &targets {
+            let t = groups.ensure_announce_transport(target, &deps).await;
+            transports.push((target.clone(), t));
+        }
+    }
+    let skipped: Vec<String> = transports
+        .iter()
+        .filter_map(|(t, s)| match s {
+            AnnounceTransport::Unavailable(why) => Some(format!("{} ({why})", crate::routing::output_display_name(t))),
+            _ => None,
+        })
+        .collect();
+    let starting: Vec<String> = transports
+        .iter()
+        .filter(|(_, s)| matches!(s, AnnounceTransport::Starting))
+        .map(|(t, _)| crate::routing::output_display_name(t))
+        .collect();
+    // A clip may sit unconsumed while an on-demand session pairs up; give the
+    // mixer's stall watchdog a matching grace so it isn't reaped mid-connect.
+    let grace = if transports.iter().any(|(_, s)| s.is_on_demand()) {
+        crate::overlay_mixer::OVERLAY_ONDEMAND_GRACE
+    } else {
+        crate::overlay_mixer::OVERLAY_STALL_GRACE
+    };
+    let targets: Vec<String> = transports
+        .into_iter()
+        .filter(|(_, s)| !matches!(s, AnnounceTransport::Unavailable(_)))
+        .map(|(t, _)| t)
+        .collect();
+    if targets.is_empty() {
+        return reject(format!("no target can play an announcement right now: {}", skipped.join("; ")));
+    }
+
     let pcm = match acquire_announce_pcm(&req).await {
         Ok(p) if !p.is_empty() => p,
         Ok(_) => return reject("empty audio".into()),
@@ -1929,23 +1987,27 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     };
 
     let target_count = targets.len();
-    let admission = crate::announce::AnnounceCoordinator::global().announce(targets, pcm, duck, priority, on_busy, req.barge_in, req.ttl_ms);
+    let admission =
+        crate::announce::AnnounceCoordinator::global().announce(targets, pcm, duck, priority, on_busy, req.barge_in, req.ttl_ms, grace);
     use crate::announce_arbiter::Admission;
     let (label, position, reason, ok) = match admission {
         Admission::Playing => ("playing", None, None, true),
         Admission::Queued { position } => ("queued", Some(position), None, true),
         Admission::Rejected(r) => ("rejected", None, Some(format!("{r:?}")), false),
     };
-    (
-        StatusCode::OK,
-        Json(AgAnnounceResponse {
-            ok,
-            admission: label.to_string(),
-            position,
-            reason,
-            message: format!("announce to {target_count} target(s): {label}"),
-        }),
-    )
+    let mut message = format!("announce to {target_count} target(s): {label}");
+    if !starting.is_empty() {
+        // Honest about the wait: the endpoint has to connect first (AP2: pair +
+        // SETUP + its render buffer; pw-sink: discover our advert and handshake).
+        message.push_str(&format!(
+            " — opening an on-demand session for {} (audio starts in a few seconds)",
+            starting.join(", ")
+        ));
+    }
+    if !skipped.is_empty() {
+        message.push_str(&format!("; skipped {}", skipped.join("; ")));
+    }
+    (StatusCode::OK, Json(AgAnnounceResponse { ok, admission: label.to_string(), position, reason, message }))
 }
 
 // ---- Named groups (groups_store.rs) -------------------------------------
