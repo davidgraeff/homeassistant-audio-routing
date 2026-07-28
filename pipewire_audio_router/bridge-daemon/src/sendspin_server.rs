@@ -149,8 +149,22 @@ pub struct SendspinServerHandle {
     _advertisement: Advertisement,
     client_manager: ClientManager,
     _capture: crate::sendspin_capture::CaptureHandle,
-    accept_task: JoinHandle<()>,
-    event_task: JoinHandle<()>,
+    /// The live per-device groups (client_id → its single-member group on the
+    /// shared timeline), shared with the accept loop, the event loop, the
+    /// membership task and the relay. Held here so a *deliberate* teardown can
+    /// send `stream/end` before the socket goes — see [`Self::shutdown`].
+    groups: Arc<Mutex<HashMap<String, Group<SharesTimeline>>>>,
+    /// client_id → device node name, so a caller who knows the device can find
+    /// its group (the reverse of what the relay uses it for).
+    client_to_node: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Discovery registry, to map an mDNS fullname back to a device node name in
+    /// [`Self::stop_device`].
+    devices: crate::sendspin_discovery::SharedSendspinDevices,
+    /// `Option` so a deliberate shutdown can `take()` each task, abort it and
+    /// **await** it — that await is what guarantees the listener's socket is
+    /// closed (and its port free) before the caller binds a new server on it.
+    accept_task: Option<JoinHandle<()>>,
+    event_task: Option<JoinHandle<()>>,
     /// Arms/disarms `StreamPolicy::WhenAnnounced` devices around announcements;
     /// `None` under `StreamPolicy::Always` (members join on connect and stay).
     arm_task: Option<JoinHandle<()>>,
@@ -886,11 +900,24 @@ pub fn device_supports(device_codecs: &[String], codec: &str) -> bool {
 /// Falls back to PCM whenever the choice isn't usable — an explicitly-picked codec
 /// we can't encode, or one a member can't decode — because a stream nothing can
 /// decode is worse than a lossless one nobody asked for.
+///
+/// **A member whose capabilities we don't know yet (an empty list) is skipped, not
+/// treated as PCM-only.** Capabilities are learned from the device's own
+/// `client/hello`, so every device is "unknown" until it has connected once —
+/// and counting unknown as PCM-only meant routing one more speaker into a live Opus
+/// group dropped the *whole group* to PCM, restarted it, then restarted it again the
+/// moment the newcomer said it decodes Opus (measured: two restarts 914 ms apart, see
+/// docs/sendspin-group-churn-plan.md §2b). Assuming the group's codec instead costs at
+/// most one restart, and only for hardware that really can't decode it:
+/// `report_format_support` nudges a reconcile as soon as the device's `client/hello`
+/// proves otherwise. Per-device *display* of what a codec is worth stays honest —
+/// that's [`device_supports`], which still answers "unknown ⇒ only PCM is assured".
 pub fn resolve_codec<'a>(
     mode: crate::sync_settings::SendspinCodec,
     device_codecs: impl IntoIterator<Item = &'a Vec<String>> + Clone,
 ) -> &'static str {
-    let usable = |codec: &str| can_encode(codec) && device_codecs.clone().into_iter().all(|d| device_supports(d, codec));
+    let usable =
+        |codec: &str| can_encode(codec) && device_codecs.clone().into_iter().filter(|d| !d.is_empty()).all(|d| device_supports(d, codec));
     match mode.explicit_codec() {
         Some(codec) => OFFERED_CODECS.iter().copied().find(|c| *c == codec && usable(c)).unwrap_or("pcm"),
         None => AUTO_CODEC_PREFERENCE.iter().copied().find(|c| usable(c)).unwrap_or("pcm"),
@@ -1255,12 +1282,32 @@ mod tests {
     }
 
     #[test]
-    fn a_device_we_have_never_connected_to_counts_as_pcm_only() {
+    fn a_device_we_have_never_connected_to_is_only_pcm_assured() {
         // Empty = "hasn't told us yet" (capabilities come from client/hello, not
-        // mDNS), so we assume only the format every player must handle.
+        // mDNS). For *display* that means only PCM is assured...
         let unknown: Vec<String> = Vec::new();
         assert!(device_supports(&unknown, "pcm"));
         assert!(!device_supports(&unknown, "opus"));
-        assert_eq!(resolve_codec(SendspinCodec::Auto, std::iter::once(&unknown)), "pcm");
+    }
+
+    #[test]
+    fn an_unknown_member_does_not_drag_the_group_off_its_codec() {
+        // ...but for *stream selection* an unknown member imposes nothing: routing one
+        // more speaker into a live Opus group must not downgrade everyone to PCM and
+        // restart the group twice while the newcomer's client/hello is still in flight
+        // (docs/sendspin-group-churn-plan.md §2b, H2).
+        let unknown: Vec<String> = Vec::new();
+        let capable = codecs(&["pcm", "opus"]);
+        assert_eq!(resolve_codec(SendspinCodec::Auto, [&capable, &unknown].into_iter()), "opus");
+        // A member that HAS spoken and lacks the codec still vetoes it — the
+        // conservative rule is only relaxed for genuine ignorance.
+        let pcm_only = codecs(&["pcm"]);
+        assert_eq!(resolve_codec(SendspinCodec::Auto, [&capable, &pcm_only].into_iter()), "pcm");
+        // A group of nothing but unknowns still gets the preferred codec, and
+        // `report_format_support` corrects it on the first connect if that was wrong.
+        assert_eq!(resolve_codec(SendspinCodec::Auto, std::iter::once(&unknown)), "opus");
+        // An explicit pick is unaffected by ignorance in either direction.
+        assert_eq!(resolve_codec(SendspinCodec::Pcm, std::iter::once(&unknown)), "pcm");
+        assert_eq!(resolve_codec(SendspinCodec::Flac, std::iter::once(&unknown)), "flac");
     }
 }
