@@ -1,76 +1,30 @@
-//! Graph inspection + node volume for the agent side.
+//! One-shot graph inspection and volume control, used by the `spike-*` commands.
 //!
-//! The volume half is the same mechanism as `bridge-daemon/src/volume.rs` —
-//! `channelVolumes` on a node's SPA `Props`, with the cubic↔linear conversion
-//! wpctl and HA's `volume_level` both use (`channelVolumes = V³`). P1 factors
-//! this into the shared `pw-control` crate (docs/receiver-agent-plan.md §12);
-//! until then it is a copy, kept deliberately small.
+//! The service path does not go through here — it uses the long-lived
+//! `pw_thread`. This module keeps the *diagnostic* path: connect, look, act,
+//! disconnect, so a host can be inspected by hand without a paired daemon. Pod
+//! encoding and the cubic scale are shared with the service path via `pods`.
 //!
-//! The graph half is agent-specific: to control the *master out* we first have to
-//! know which sink our received audio lands in. Rather than reading
-//! `default.audio.sink` metadata (pipewire-rs 0.10 has no typed Metadata proxy),
-//! we follow the link out of our own receive stream — authoritative by
-//! construction, and it tracks the user moving the stream to another device
-//! (plan §6).
+//! Two traps this encodes, both found in the S1/S2 spikes (plan §6.1, §7.1):
 //!
-//! One trap the S1 spike surfaced: `module-rtp-session` creates **two** stream
-//! nodes per session with the same `node.name` (a send stream in the INPUT
-//! direction and a receive stream in the OUTPUT direction, see `make_session` in
-//! module-rtp-session.c). Only the latter feeds a sink, so
-//! [`Graph::find_receive_stream`] prefers the candidate that actually has an
-//! outgoing link.
+//! * a device sink's master volume lives in the **device's `Route`** param, not in
+//!   the node's `Props` — writes to the latter are invisible to `wpctl` and get
+//!   re-synced away by WirePlumber. Virtual sinks have no route, so the node is
+//!   the lever there;
+//! * `rtp.session` is not in a registry `global`'s reduced prop set, and registry
+//!   globals are emitted once per proxy — so nodes must be bound *inside* the
+//!   registry callback.
 
+use crate::pods::{self, VolumeProps};
 use anyhow::anyhow;
 use pipewire as pw;
-use pw::spa;
-use spa::param::ParamType;
-use spa::pod::{deserialize::PodDeserializer, serialize::PodSerializer, Object, Pod, Property, Value, ValueArray};
+use pw::spa::param::ParamType;
+use pw::spa::pod::Pod;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Converts a linear `channelVolume` to the cubic 0.0-1.0 scale wpctl/HA use.
-fn linear_to_cubic(linear: f32) -> f32 {
-    linear.max(0.0).cbrt()
-}
-
-/// Converts a cubic 0.0-1.0 volume to the linear gain `channelVolumes` wants.
-fn cubic_to_linear(v: f32) -> f32 {
-    v.clamp(0.0, 1.0).powi(3)
-}
-
-/// Extracts the `channelVolumes` array (linear) from a `Props` param pod.
-fn parse_channel_volumes(pod: &Pod) -> Option<Vec<f32>> {
-    let (_, value) = PodDeserializer::deserialize_any_from(pod.as_bytes()).ok()?;
-    let Value::Object(obj) = value else { return None };
-    for prop in obj.properties {
-        if prop.key == pw::spa::sys::SPA_PROP_channelVolumes {
-            if let Value::ValueArray(ValueArray::Float(vols)) = prop.value {
-                return Some(vols);
-            }
-        }
-    }
-    None
-}
-
-/// Serializes a `Props` object carrying just `channelVolumes`.
-fn channel_volumes_props_pod(linear: &[f32]) -> anyhow::Result<Vec<u8>> {
-    let object = Object {
-        type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
-        id: pw::spa::sys::SPA_PARAM_Props,
-        properties: vec![Property::new(
-            pw::spa::sys::SPA_PROP_channelVolumes,
-            Value::ValueArray(ValueArray::Float(linear.to_vec())),
-        )],
-    };
-    let bytes = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(object))
-        .map_err(|e| anyhow!("serialize Props pod: {e}"))?
-        .0
-        .into_inner();
-    Ok(bytes)
-}
-
 /// A short-lived PipeWire client connection with a synchronous roundtrip helper.
-struct Session {
+pub(crate) struct Session {
     mainloop: pw::main_loop::MainLoopRc,
     _context: pw::context::ContextRc,
     core: pw::core::CoreRc,
@@ -113,53 +67,6 @@ impl Session {
             self.mainloop.run();
         }
     }
-
-    fn bind_node(&self, node_id: u32) -> Option<pw::node::Node> {
-        let found: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
-        let _listener = self
-            .registry
-            .add_listener_local()
-            .global({
-                let registry = self.registry.clone();
-                let found = found.clone();
-                move |global| {
-                    if global.id == node_id && global.type_ == pw::types::ObjectType::Node {
-                        if let Ok(node) = registry.bind::<pw::node::Node, _>(global) {
-                            *found.borrow_mut() = Some(node);
-                        }
-                    }
-                }
-            })
-            .register();
-        self.roundtrip();
-        // Two-step on purpose: returning the temporary directly keeps the
-        // `RefMut` alive past `found`'s drop (E0597).
-        let node = found.borrow_mut().take();
-        node
-    }
-
-    fn read_channel_volumes(&self, node: &pw::node::Node) -> Option<Vec<f32>> {
-        let volumes: Rc<RefCell<Option<Vec<f32>>>> = Rc::new(RefCell::new(None));
-        let _listener = node
-            .add_listener_local()
-            .param({
-                let volumes = volumes.clone();
-                move |_seq, param_type, _index, _next, pod| {
-                    if param_type == ParamType::Props {
-                        if let Some(pod) = pod {
-                            if let Some(v) = parse_channel_volumes(pod) {
-                                *volumes.borrow_mut() = Some(v);
-                            }
-                        }
-                    }
-                }
-            })
-            .register();
-        node.enum_params(0, Some(ParamType::Props), 0, u32::MAX);
-        self.roundtrip();
-        let vols = volumes.borrow_mut().take();
-        vols
-    }
 }
 
 /// One node in the snapshot.
@@ -173,20 +80,8 @@ pub struct NodeInfo {
     pub session: Option<String>,
 }
 
-/// A one-shot snapshot of nodes and links, enough to walk stream → sink.
-pub struct Graph {
-    nodes: Vec<NodeInfo>,
-    /// `(output_node, input_node)` per link.
-    links: Vec<(u32, u32)>,
-}
-
 /// A playback-stream node bound during the registry pass so its *full* props
 /// (which carry `rtp.session`) arrive on the same connection.
-///
-/// Binding has to happen inside the `global` callback: registry globals are
-/// emitted once per proxy, so a listener registered after the first roundtrip
-/// never sees the nodes that already went past (S1 spike finding — the reason
-/// this isn't a simple two-pass snapshot).
 struct StreamProbe {
     id: u32,
     session: Rc<RefCell<Option<String>>>,
@@ -197,6 +92,13 @@ struct StreamProbe {
 /// Nodes plus `(output_node, input_node)` links, as collected by the registry
 /// callback.
 type Collected = Rc<RefCell<(Vec<NodeInfo>, Vec<(u32, u32)>)>>;
+
+/// A one-shot snapshot of nodes and links, enough to walk stream → sink.
+pub struct Graph {
+    nodes: Vec<NodeInfo>,
+    /// `(output_node, input_node)` per link.
+    links: Vec<(u32, u32)>,
+}
 
 impl Graph {
     pub fn snapshot() -> anyhow::Result<Self> {
@@ -306,30 +208,182 @@ impl Graph {
     }
 }
 
-/// Reads `node_id`'s volume on the cubic 0.0-1.0 scale, `None` if it has no
-/// volume control.
-pub fn get_volume(node_id: u32) -> anyhow::Result<Option<f32>> {
-    let session = Session::connect()?;
-    let Some(node) = session.bind_node(node_id) else {
-        return Ok(None);
-    };
-    Ok(session.read_channel_volumes(&node).and_then(|v| v.first().copied()).map(linear_to_cubic))
+/// Where a sink's master volume actually lives.
+pub enum Lever {
+    /// A real device sink: the device's `Route` param (what `wpctl` uses).
+    Route {
+        session: Session,
+        device: pw::device::Device,
+        index: i32,
+        card_device: i32,
+        channels: usize,
+    },
+    /// A virtual sink (loopback, null-sink): its own node `Props`.
+    NodeProps { session: Session, node: pw::node::Node, channels: usize },
 }
 
-/// Sets `node_id`'s volume (cubic 0.0-1.0) on every channel.
-pub fn set_volume(node_id: u32, volume: f32) -> anyhow::Result<()> {
+impl Lever {
+    pub fn describe(&self) -> String {
+        match self {
+            Lever::Route { index, card_device, channels, .. } => {
+                format!("device Route (index={index}, device={card_device}, {channels}ch)")
+            }
+            Lever::NodeProps { channels, .. } => format!("node Props ({channels}ch, virtual sink)"),
+        }
+    }
+
+    pub fn read(&self) -> anyhow::Result<Option<VolumeProps>> {
+        match self {
+            Lever::Route { session, device, card_device, .. } => {
+                Ok(read_routes(session, device).into_iter().find(|r| r.device == *card_device).map(|r| r.props))
+            }
+            Lever::NodeProps { session, node, .. } => Ok(read_node_props(session, node)),
+        }
+    }
+
+    /// Writes volume (cubic) and/or mute. Omitting `volume` keeps the current
+    /// level, so a mute toggle cannot resurrect a stale one.
+    pub fn write(&self, volume: Option<f32>, mute: Option<bool>) -> anyhow::Result<()> {
+        let current = self.read()?;
+        let cubic = volume.or_else(|| current.as_ref().and_then(|p| p.cubic())).unwrap_or(1.0);
+        match self {
+            Lever::Route { session, device, index, card_device, channels } => {
+                let linear = pods::linear_channels(cubic, *channels);
+                let bytes = pods::route_pod(*index, *card_device, &linear, mute)?;
+                let pod = Pod::from_bytes(&bytes).ok_or_else(|| anyhow!("invalid Route pod"))?;
+                device.set_param(ParamType::Route, 0, pod);
+                session.roundtrip();
+            }
+            Lever::NodeProps { session, node, channels } => {
+                let linear = pods::linear_channels(cubic, *channels);
+                let bytes = pods::node_props_pod(&linear, mute)?;
+                let pod = Pod::from_bytes(&bytes).ok_or_else(|| anyhow!("invalid Props pod"))?;
+                node.set_param(ParamType::Props, 0, pod);
+                session.roundtrip();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Binds `sink_id` and works out which lever controls it.
+pub fn master_lever(sink_id: u32) -> anyhow::Result<Option<Lever>> {
     let session = Session::connect()?;
-    let Some(node) = session.bind_node(node_id) else {
-        return Err(anyhow!("no such node: {node_id}"));
+    // Bind the sink and the devices in one registry pass (globals are emitted once
+    // per proxy, so a second pass would see nothing).
+    let sink: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
+    let devices: Rc<RefCell<Vec<(u32, pw::device::Device)>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink_props: Rc<RefCell<Option<(Option<u32>, Option<i32>)>>> = Rc::new(RefCell::new(None));
+    let listeners: Rc<RefCell<Vec<pw::node::NodeListener>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let _listener = session
+        .registry
+        .add_listener_local()
+        .global({
+            let registry = session.registry.clone();
+            let sink = sink.clone();
+            let devices = devices.clone();
+            let sink_props = sink_props.clone();
+            let listeners = listeners.clone();
+            move |global| match global.type_ {
+                pw::types::ObjectType::Node if global.id == sink_id => {
+                    if let Ok(node) = registry.bind::<pw::node::Node, _>(global) {
+                        let listener = node
+                            .add_listener_local()
+                            .info({
+                                let sink_props = sink_props.clone();
+                                move |info| {
+                                    if let Some(p) = info.props() {
+                                        *sink_props.borrow_mut() = Some((
+                                            p.get("device.id").and_then(|v| v.parse().ok()),
+                                            p.get("card.profile.device").and_then(|v| v.parse().ok()),
+                                        ));
+                                    }
+                                }
+                            })
+                            .register();
+                        node.subscribe_params(&[ParamType::Props]);
+                        listeners.borrow_mut().push(listener);
+                        *sink.borrow_mut() = Some(node);
+                    }
+                }
+                pw::types::ObjectType::Device => {
+                    if let Ok(device) = registry.bind::<pw::device::Device, _>(global) {
+                        devices.borrow_mut().push((global.id, device));
+                    }
+                }
+                _ => {}
+            }
+        })
+        .register();
+    session.roundtrip(); // globals + binds
+    session.roundtrip(); // info events
+
+    let Some(node) = sink.borrow_mut().take() else {
+        return Ok(None);
     };
-    let channels = session.read_channel_volumes(&node).map(|v| v.len()).filter(|n| *n > 0).unwrap_or(2);
-    let linear = vec![cubic_to_linear(volume); channels];
-    let bytes = channel_volumes_props_pod(&linear)?;
-    let pod = Pod::from_bytes(&bytes).ok_or_else(|| anyhow!("invalid Props pod"))?;
-    node.set_param(ParamType::Props, 0, pod);
-    // Flush the set request to the server before the connection drops.
+    let (device_id, card_device) = sink_props.borrow().unwrap_or((None, None));
+
+    if let (Some(device_id), Some(card_device)) = (device_id, card_device) {
+        // Two statements on purpose: nesting the `remove` inside the `position`
+        // closure borrows `devices` twice.
+        let position = devices.borrow().iter().position(|(id, _)| *id == device_id);
+        let device = position.map(|i| devices.borrow_mut().remove(i));
+        if let Some((_, device)) = device {
+            if let Some(entry) = read_routes(&session, &device).into_iter().find(|r| r.device == card_device) {
+                let channels = entry.props.channel_volumes.len().max(1);
+                return Ok(Some(Lever::Route { session, device, index: entry.index, card_device, channels }));
+            }
+        }
+    }
+
+    let channels = read_node_props(&session, &node).map(|p| p.channel_volumes.len()).filter(|n| *n > 0);
+    match channels {
+        Some(channels) => Ok(Some(Lever::NodeProps { session, node, channels })),
+        None => Ok(None),
+    }
+}
+
+fn read_routes(session: &Session, device: &pw::device::Device) -> Vec<pods::RouteEntry> {
+    let routes: Rc<RefCell<Vec<pods::RouteEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    let _listener = device
+        .add_listener_local()
+        .param({
+            let routes = routes.clone();
+            move |_seq, param_type, _index, _next, pod| {
+                if param_type == ParamType::Route {
+                    if let Some(entry) = pod.and_then(pods::parse_route) {
+                        routes.borrow_mut().push(entry);
+                    }
+                }
+            }
+        })
+        .register();
+    device.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
     session.roundtrip();
-    Ok(())
+    let collected = routes.borrow().clone();
+    collected
+}
+
+fn read_node_props(session: &Session, node: &pw::node::Node) -> Option<VolumeProps> {
+    let props: Rc<RefCell<Option<VolumeProps>>> = Rc::new(RefCell::new(None));
+    let _listener = node
+        .add_listener_local()
+        .param({
+            let props = props.clone();
+            move |_seq, param_type, _index, _next, pod| {
+                if param_type == ParamType::Props {
+                    if let Some(parsed) = pod.and_then(pods::parse_props) {
+                        *props.borrow_mut() = Some(parsed);
+                    }
+                }
+            }
+        })
+        .register();
+    node.enum_params(0, Some(ParamType::Props), 0, u32::MAX);
+    session.roundtrip();
+    let collected = props.borrow_mut().take();
+    collected
 }
 
 #[cfg(test)]
@@ -338,15 +392,6 @@ mod tests {
 
     fn node(id: u32, name: &str, session: Option<&str>) -> NodeInfo {
         NodeInfo { id, name: name.into(), media_class: None, session: session.map(str::to_string) }
-    }
-
-    #[test]
-    fn cubic_matches_wpctl_reference_points() {
-        assert!((cubic_to_linear(0.5) - 0.125).abs() < 1e-6);
-        assert!((cubic_to_linear(0.25) - 0.015625).abs() < 1e-6);
-        for v in [0.0f32, 0.1, 0.5, 1.0] {
-            assert!((linear_to_cubic(cubic_to_linear(v)) - v).abs() < 1e-5);
-        }
     }
 
     #[test]

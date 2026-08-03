@@ -343,17 +343,35 @@ applications' streams on that sink, never `pwsink-in`.
 | `bridge-daemon/src/pwsink_server.rs` | unchanged audio path; gains session-scoping once S1b lands |
 | `custom_components/pipewire_audio_router/media_player.py` | `VOLUME_SET`/`VOLUME_MUTE` for pw-sink outputs with a connected agent |
 
-## 13. Open questions
+## 13. Decisions and deferrals
 
-1. `rtp-session` session-name filtering (S1b) — decides whether multi-target
-   cross-talk is fixed now or stays deferred.
-2. Multi-user hosts: one agent per logged-in session, or a system agent? v1
-   assumes single desktop user (the actual use case); the pairing identity is the
-   host, which would need revisiting.
-3. Does the agent also own the BT-bridge RTP *source* config (§9.3), i.e. is it
-   "the router's presence on this host" rather than "the pw-sink receiver"?
-4. Sleep/resume: after a suspend the module may need a reload rather than a
-   reconnect — determine empirically in P2.
+Answered 2026-08-03:
+
+1. **Session-name filtering** — impossible in the module; done agent-side via
+   `rtp.session` (§7.1). *Deferred:* actively tearing down a foreign router's
+   links. The agent ignores foreign sessions and logs them; cross-talk with two
+   routers on one LAN therefore still exists, and choosing teardown-vs-mute stays
+   open (§7.2 shares that decision).
+2. **Multi-user hosts** — **one agent per logged-in session.** The config lives in
+   the user's `~/.config`, and the pairing identity is *machine + user*, so two
+   users on one host pair as two independent targets. A system-wide agent is not
+   built.
+3. **BT-bridge RTP source** — **not** the agent's business; that drop-in was a test
+   fixture. The agent owns only the pw-sink receive side.
+4. **Sleep/resume** — to be determined empirically on the author's own host during
+   normal use; no self-inflicted suspend cycles. The agent already reloads the
+   receiver module on every reconnect, which is the expected remedy if a resumed
+   session comes back mute.
+
+Still deferred (open design questions, deliberately not implemented):
+
+* the send-twin cleanup / self-created link (§7.2) — includes "which sink" control;
+* extracting the shared `pw-control` crate: `Dockerfile` copies only
+  `bridge-daemon/` into the build context, so a path dep one level up needs a
+  build-context change to that and to `scripts/build-daemon.sh`. Until then the
+  agent carries a marked copy of the pod/volume code (same convention as
+  `pw_module.rs`);
+* §11 P4 host-scoped extras (named-sink targeting, xrun reporting).
 
 ## 14. Spike results
 

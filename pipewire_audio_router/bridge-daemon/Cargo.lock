@@ -566,6 +566,7 @@ dependencies = [
  "cc",
  "clap",
  "flacenc",
+ "futures-util",
  "libc",
  "mdns-sd 0.20.2",
  "opusic-sys",

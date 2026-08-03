@@ -96,7 +96,7 @@ impl Drop for PwSinkServerHandle {
 /// The AppleMIDI session name the daemon advertises for a target — the target's
 /// virtual node name (`pwsink-dev-<slug>`) re-prefixed to `pwrouter-<slug>` so
 /// discovery (pw_target_discovery.rs) filters it out of the target list.
-fn session_name_for(node_name: &str) -> String {
+pub fn session_name_for(node_name: &str) -> String {
     let slug = node_name.strip_prefix(PWSINK_DEV_PREFIX).unwrap_or(node_name);
     format!("{PWSINK_SESSION_PREFIX}{slug}")
 }

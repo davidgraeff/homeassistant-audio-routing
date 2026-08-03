@@ -1,0 +1,149 @@
+//! The agent↔daemon wire protocol (docs/receiver-agent-plan.md §5).
+//!
+//! JSON over one WebSocket, dialled *out* by the agent — nothing listens on the
+//! receiver host. Mirrored byte-for-byte by `bridge-daemon/src/pwsink_agent.rs`;
+//! the two files must stay in sync (they are small and versioned by
+//! [`PROTOCOL_VERSION`], which the daemon checks in `Hello`).
+//!
+//! Two properties this shape deliberately has:
+//!
+//! * **Commands are an enum, not a passthrough.** The daemon can set volume, set
+//!   mute, duck and unduck — it cannot ask the host to run, load or configure
+//!   anything else. Even the receiver module's arguments are built by the agent
+//!   from the parameters in `Welcome` (§5.1), never sent as a string.
+//! * **Pairing happens on this same socket.** A first connection without a token
+//!   becomes a pending pair request; the daemon answers with a short code that the
+//!   agent logs, so the person approving in the UI can check they are approving
+//!   *this* host and not a stranger's.
+
+use serde::{Deserialize, Serialize};
+
+/// Bumped on any incompatible change; the daemon refuses mismatched majors.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Agent → daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMsg {
+    /// First message on every connection. `token` is absent only when pairing.
+    Hello {
+        protocol: u32,
+        agent_version: String,
+        /// Stable per-*session* identity: machine id + user (plan §13.2 — one
+        /// agent per logged-in session, so two users on one host are two targets).
+        identity: String,
+        /// Human label for the UI, e.g. `david-local (david)`.
+        label: String,
+        token: Option<String>,
+    },
+    /// Pushed whenever anything changes, including local changes made by the user.
+    State(HostState),
+    /// A router session other than ours is also being received here (§7.1).
+    ForeignSession { session: String },
+    Pong,
+}
+
+/// Daemon → agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DaemonMsg {
+    /// Pairing accepted as pending: show/log `code`, then wait for `paired`.
+    PairPending { code: String },
+    /// Approval granted — persist this token and reconnect with it.
+    Paired { token: String },
+    /// Refused: unknown token, denied pairing, or protocol mismatch.
+    Denied { reason: String },
+    /// Control granted. The agent becomes the receiver for `session_name` and
+    /// enforces `keepalive_secs` (§9.2).
+    Welcome {
+        session_name: String,
+        ifname: Option<String>,
+        jitter_ms: Option<u32>,
+        keepalive_secs: u64,
+    },
+    /// Stop being a receiver: the target was unrouted or removed. The agent
+    /// unloads the module (its nodes disappear) but stays paired and connected.
+    Release,
+    SetVolume { volume: f32 },
+    SetMute { muted: bool },
+    Duck { depth: f32, ramp_ms: u64 },
+    Unduck { ramp_ms: u64 },
+    Ping,
+}
+
+/// The host's controllable state, as the daemon sees it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HostState {
+    /// Cubic 0.0-1.0 (the wpctl/HA `volume_level` scale), `None` when unknown.
+    pub volume: Option<f32>,
+    pub muted: Option<bool>,
+    pub sink_name: Option<String>,
+    /// Our receive stream exists and is linked to a sink.
+    pub receiving: bool,
+    /// Foreign streams are currently attenuated.
+    pub ducked: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_without_a_token_is_a_pair_request() {
+        let json = serde_json::to_string(&AgentMsg::Hello {
+            protocol: PROTOCOL_VERSION,
+            agent_version: "0.1.0".into(),
+            identity: "abc:david".into(),
+            label: "david-local (david)".into(),
+            token: None,
+        })
+        .unwrap();
+        assert!(json.contains("\"type\":\"hello\""));
+        assert!(json.contains("\"token\":null"));
+    }
+
+    #[test]
+    fn commands_round_trip() {
+        for msg in [
+            DaemonMsg::SetVolume { volume: 0.42 },
+            DaemonMsg::SetMute { muted: true },
+            DaemonMsg::Duck { depth: 0.2, ramp_ms: 200 },
+            DaemonMsg::Unduck { ramp_ms: 400 },
+            DaemonMsg::Release,
+            DaemonMsg::Ping,
+            DaemonMsg::Welcome {
+                session_name: "pwrouter-david_local".into(),
+                ifname: Some("enp5s0".into()),
+                jitter_ms: None,
+                keepalive_secs: 10,
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn unknown_command_is_rejected_not_guessed() {
+        // A daemon speaking a newer protocol must not have its messages
+        // half-interpreted by an older agent.
+        let err = serde_json::from_str::<DaemonMsg>(r#"{"type":"run_shell","cmd":"rm -rf /"}"#);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn state_round_trips() {
+        let state = HostState {
+            volume: Some(0.5),
+            muted: Some(false),
+            sink_name: Some("alsa_output.x".into()),
+            receiving: true,
+            ducked: false,
+        };
+        let json = serde_json::to_string(&AgentMsg::State(state.clone())).unwrap();
+        match serde_json::from_str::<AgentMsg>(&json).unwrap() {
+            AgentMsg::State(s) => assert_eq!(s, state),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}

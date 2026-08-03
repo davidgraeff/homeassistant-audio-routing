@@ -92,6 +92,7 @@ airplay-client = { path = "vendor/airplay2-sender/crates/airplay-client" }
 airplay-core = { path = "vendor/airplay2-sender/crates/airplay-core" }
 opusic-sys = "0.7.4"
 flacenc = { version = "0.5.1", default-features = false, features = ["log"] }
+futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
 
 # Compiles the vendored libairptp C (vendor/libairptp/) — OwnTone's MIT
 # AirPlay-2 gPTP grandmaster — into the daemon for the AP2 sender's PTP.

@@ -77,6 +77,9 @@ pub struct AppState {
     /// PipeWire hosts running `module-rtp-session`, surfaced as virtual routing
     /// outputs (`pwsink-dev-*`) and driven by per-target AppleMIDI senders.
     pub pw_targets: crate::pw_target_discovery::SharedPwTargets,
+    /// Paired receiver agents (pwsink_agent.rs) — the source of truth for pw-sink
+    /// outputs, their volume/mute control channel, and the pairing queue.
+    pub agents: crate::pwsink_agent::SharedAgents,
     /// Live mDNS-discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs).
     /// Unlike the other discoveries these are *senders*, not outputs: they build
     /// no audio path, they annotate an RTP source with which bridge feeds it and
@@ -146,6 +149,7 @@ pub fn router(
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
     pw_targets: crate::pw_target_discovery::SharedPwTargets,
+    agents: crate::pwsink_agent::SharedAgents,
     bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
     ap2_ptp: SharedAp2Ptp,
     routing: SharedRouting,
@@ -175,6 +179,7 @@ pub fn router(
         sendspin_devices,
         ap2_devices,
         pw_targets,
+        agents,
         bt_bridges,
         ap2_ptp,
         routing,
@@ -253,6 +258,14 @@ pub fn router(
         .route("/api/routing/unlink", post(routing::unlink))
         .route("/api/routing/entity/{node_name}", delete(routing::forget_entity))
         .route("/api/routing/ws", get(routing::routing_ws))
+        // The receiver agents' own control plane: the agent dials in here.
+        .route("/api/agent/ws", get(crate::pwsink_agent::agent_ws))
+        .route("/api/agents", get(get_agents))
+        .route("/api/agents/approve", post(approve_agent))
+        .route("/api/agents/deny", post(deny_agent))
+        .route("/api/agents/forget", post(forget_agent))
+        .route("/api/pwsink/volume", put(set_pwsink_volume))
+        .route("/api/pwsink/mute", put(set_pwsink_mute))
         // Everything else (`/`, `/assets/*`, favicon, …) is the built Svelte SPA,
         // read into memory ONCE at startup (below) and served from RAM. This
         // deliberately does NOT use `ServeDir`: the add-on's `/data` lives on a USB
@@ -569,6 +582,20 @@ struct OutputInfo {
     /// `None` = not a pw-sink output. Distinct from `present` (mDNS visibility).
     #[serde(skip_serializing_if = "Option::is_none")]
     pwsink_streaming: Option<bool>,
+    /// pw-sink only: the host's master volume as *reported by its agent*, cubic
+    /// 0.0-1.0. `None` when no agent is connected — deliberately not a
+    /// fabricated 100 % (same rule as `ap2_volume`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwsink_volume: Option<f32>,
+    /// pw-sink only: the host's mute state, as reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwsink_muted: Option<bool>,
+    /// pw-sink only: which sink on the host plays our stream (display only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwsink_sink_name: Option<String>,
+    /// pw-sink only: whether foreign streams on that host are currently ducked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwsink_ducked: Option<bool>,
 }
 
 /// One entry in a sendspin output's codec picker.
@@ -709,6 +736,10 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_required_lead_ms: required_lead_ms,
             sendspin_send_ahead_ms: Some(send_ahead_ms),
             pwsink_streaming: None,
+            pwsink_volume: None,
+            pwsink_muted: None,
+            pwsink_sink_name: None,
+            pwsink_ducked: None,
             node_name,
         });
     }
@@ -811,35 +842,46 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_required_lead_ms: None,
             sendspin_send_ahead_ms: None,
             pwsink_streaming: None,
+            pwsink_volume: None,
+            pwsink_muted: None,
+            pwsink_sink_name: None,
+            pwsink_ducked: None,
             node_name,
         });
     }
 
-    // Discovered pw-sink targets (present) + remembered offline ones. Like
-    // sendspin/AP2 they're virtual (no local PipeWire
-    // node) and always auto-discovered; the audio path is a per-target AppleMIDI
-    // sender (pwsink_server.rs). `present` = mDNS-visible; `pwsink_streaming` =
-    // a receiver has actually completed the handshake (pw_sink_liveness.rs).
-    let pw_targets = state.pw_targets.lock_recover().clone();
-    let mut pwsink_names: BTreeSet<String> = pw_targets.keys().cloned().collect();
+    // pw-sink targets = **paired agents** (docs/receiver-agent-plan.md §3). A host
+    // is a target because a helper on it paired and can be controlled, not because
+    // something answered an mDNS browse — which is why `present` here means "the
+    // agent is connected" and `pwsink_streaming` still means "a receiver completed
+    // the AppleMIDI handshake" (pw_sink_liveness.rs). Remembered-but-unpaired names
+    // are listed too, so a target whose agent was removed doesn't silently vanish
+    // from the Outputs page while its routing entries still exist.
+    let (agent_targets, agent_rows) = {
+        let agents = state.agents.lock().await;
+        (agents.targets(), agents.snapshot())
+    };
+    let mut pwsink_names: BTreeSet<String> = agent_targets.iter().map(|(node_name, _, _)| node_name.clone()).collect();
     pwsink_names.extend(remembered.iter().filter(|n| n.starts_with(PWSINK_DEV_PREFIX)).cloned());
     for node_name in pwsink_names {
-        let tgt = pw_targets.get(&node_name);
-        let present = tgt.map(|t| t.present).unwrap_or(false);
-        let name = tgt
-            .map(|t| t.display_name.clone())
+        let target = agent_targets.iter().find(|(n, _, _)| *n == node_name);
+        let connected = target.map(|(_, _, connected)| *connected).unwrap_or(false);
+        let name = target
+            .map(|(_, label, _)| label.clone())
             .unwrap_or_else(|| node_name.strip_prefix(PWSINK_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
-        let addr = tgt.and_then(|t| t.addr);
-        // Streaming status only meaningful while present + a sender is running.
+        let host_state = agent_rows
+            .iter()
+            .find(|row| row.node_name.as_deref() == Some(node_name.as_str()))
+            .and_then(|row| row.state.clone());
         let streaming = crate::pw_sink_liveness::PwSinkLiveness::global().get(&node_name).map(|s| s.established);
         outputs.push(OutputInfo {
             kind: "pwsink",
-            present,
-            configured: false, // pw-sink targets are always auto-discovered
+            present: connected,
+            configured: false, // a pairing, not a hand-written config
             state: adoption(&node_name),
             name,
-            ip: addr.map(|a| a.to_string()),
-            port: None, // the control port is internal/dynamic (pwsink_server.rs)
+            ip: None, // the agent dials us; we never need its address
+            port: None,
             encryption: Some("None".to_string()), // L16 RTP is unencrypted
             latency_ms: None,
             ptp_locked: None,
@@ -857,8 +899,13 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_min_buffer_ms: None,
             sendspin_required_lead_ms: None,
             sendspin_send_ahead_ms: None,
-            // present-but-not-connected reads as Some(false); streaming = Some(true).
-            pwsink_streaming: if present { Some(streaming.unwrap_or(false)) } else { None },
+            pwsink_streaming: if connected { Some(streaming.unwrap_or(false)) } else { None },
+            // Host-reported, never fabricated: the user's own desktop owns these
+            // values and the agent pushes changes back (plan §9.4).
+            pwsink_volume: host_state.as_ref().and_then(|s| s.volume),
+            pwsink_muted: host_state.as_ref().and_then(|s| s.muted),
+            pwsink_sink_name: host_state.as_ref().and_then(|s| s.sink_name.clone()),
+            pwsink_ducked: host_state.as_ref().map(|s| s.ducked),
             node_name,
         });
     }
@@ -1606,6 +1653,105 @@ async fn set_ap2_mute(
         format!("saved {verb} for '{}' (not streaming)", req.node_name)
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+}
+
+// ---- Receiver agents (pwsink_agent.rs) -----------------------------------
+//
+// A pw-sink target is a paired agent (docs/receiver-agent-plan.md §3), so these
+// endpoints cover both the pairing queue and the per-host volume/mute the agent
+// applies on the receiver's *own* master out. Unlike sendspin/AP2 volume there is
+// nothing to "save for later": the host owns the value and reports it back, so an
+// unreachable host is an error rather than a stored intent (§9.4).
+
+async fn get_agents(State(state): State<AppState>) -> Json<Vec<crate::pwsink_agent::AgentInfo>> {
+    Json(state.agents.lock().await.snapshot())
+}
+
+#[derive(Deserialize)]
+struct AgentIdentityRequest {
+    identity: String,
+}
+
+async fn approve_agent(
+    State(state): State<AppState>,
+    Json(req): Json<AgentIdentityRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    match state.agents.lock().await.approve(&req.identity) {
+        Ok(agent) => (
+            StatusCode::OK,
+            Json(OutputOpResponse { ok: true, message: format!("paired '{}' as {}", agent.label, agent.node_name) }),
+        ),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+    }
+}
+
+async fn deny_agent(
+    State(state): State<AppState>,
+    Json(req): Json<AgentIdentityRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    match state.agents.lock().await.deny(&req.identity) {
+        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "pairing declined".into() })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+    }
+}
+
+/// Revokes a pairing. The host stops being a target; its routing entries stay
+/// (dormant) so re-pairing the same machine+user restores them.
+async fn forget_agent(
+    State(state): State<AppState>,
+    Json(req): Json<AgentIdentityRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    match state.agents.lock().await.forget(&req.identity) {
+        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "agent removed".into() })),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPwsinkVolumeRequest {
+    node_name: String,
+    /// Cubic 0.0-1.0, same scale as HA's `volume_level` and `wpctl`.
+    volume: f32,
+}
+
+async fn set_pwsink_volume(
+    State(state): State<AppState>,
+    Json(req): Json<SetPwsinkVolumeRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let delivered = state.agents.lock().await.set_volume(&req.node_name, req.volume);
+    if delivered {
+        (
+            StatusCode::OK,
+            Json(OutputOpResponse { ok: true, message: format!("set '{}' to {:.0}%", req.node_name, req.volume * 100.0) }),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(OutputOpResponse { ok: false, message: format!("no agent connected for '{}'", req.node_name) }),
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPwsinkMuteRequest {
+    node_name: String,
+    muted: bool,
+}
+
+async fn set_pwsink_mute(
+    State(state): State<AppState>,
+    Json(req): Json<SetPwsinkMuteRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let delivered = state.agents.lock().await.set_mute(&req.node_name, req.muted);
+    let verb = if req.muted { "muted" } else { "unmuted" };
+    if delivered {
+        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{verb} '{}'", req.node_name) }))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(OutputOpResponse { ok: false, message: format!("no agent connected for '{}'", req.node_name) }),
+        )
+    }
 }
 
 // ---- Sync tuning: group lead + per-device static delay -------------------
