@@ -348,31 +348,6 @@ class PipewireRouterApiClient:
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not set AirPlay-2 mute: {err}") from err
 
-    async def async_announce(self, node_id: int, url: str, duck_volume: float | None = None) -> None:
-        """Ducks whatever is currently linked into this output and plays
-        `url` into the same sink (bridge-daemon's `/announce` endpoint,
-        PLAN.md Section 5.6 v1 — the file+URL path, unchanged by v2)."""
-        await self._async_announce(node_id, {"url": url}, duck_volume)
-
-    async def async_announce_wyoming(
-        self,
-        node_id: int,
-        host: str,
-        text: str,
-        port: int = 10200,
-        voice: str | None = None,
-        duck_volume: float | None = None,
-    ) -> None:
-        """Same ducked-announce mechanism as `async_announce`, but
-        synthesizes directly against a Wyoming TTS server (e.g. Piper)
-        instead of fetching a rendered URL (Section 5.6 v2, Phase 3.5) —
-        additive: callers pick this per call via `play_media`'s `extra`
-        dict (see media_player.py), `async_announce`/v1 is unaffected."""
-        wyoming: dict = {"host": host, "text": text, "port": port}
-        if voice is not None:
-            wyoming["voice"] = voice
-        await self._async_announce(node_id, {"wyoming": wyoming}, duck_volume)
-
     # The RTP source is now one entry in the daemon's source collection
     # (`/api/sources`), not the retired singular `/api/source/rtp`. This
     # integration models a single Bluetooth-bridge RTP input, so it operates on
@@ -628,8 +603,8 @@ class PipewireRouterApiClient:
 
     async def async_announce_group(self, group_id: str, *, url: str | None = None, wyoming: dict | None = None) -> None:
         """Announce to a named announcement group (`POST /api/announce`), which
-        resolves the group's targets/priority/duck. Returns once admitted
-        (playing/queued) — not after playback, unlike the node-based announce."""
+        resolves the group's targets/priority/duck. Returns once **admitted**
+        (playing/queued), not after playback."""
         payload: dict = {"announcement_group": group_id}
         if url is not None:
             payload["url"] = url
@@ -646,21 +621,3 @@ class PipewireRouterApiClient:
             raise PipewireRouterApiError(f"could not announce to group: {err}") from err
         if not body.get("ok", False):
             raise PipewireRouterApiError(body.get("message") or body.get("reason") or "announce rejected")
-
-    async def _async_announce(self, node_id: int, source: dict, duck_volume: float | None) -> None:
-        """Shared POST for both announce sources — blocks for the duration
-        of playback, since the bridge daemon only responds once the clip
-        has finished and ducked sources are restored, so the timeout here
-        needs headroom beyond typical announce-clip length."""
-        payload = dict(source)
-        if duck_volume is not None:
-            payload["duck_volume"] = duck_volume
-        try:
-            async with self._session.post(
-                f"{self._base_url}/api/media_players/{node_id}/announce",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                resp.raise_for_status()
-        except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"could not announce: {err}") from err

@@ -653,53 +653,18 @@ See "Routing matrix" below.
 
 Outputs are all virtual now (a per-device sender fed by the group relay, no PipeWire
 node of their own), so there is no node-backed volume/state overlay any more: the
-`GET /api/media_players` listing and the per-node `…/volume` get/set endpoints were
+`GET /api/media_players` listing, the per-node `…/volume` get/set endpoints and the
+node-based ducked announce (`POST /api/media_players/{node_id}/announce`) were all
 removed along with the node-volume code behind them (`volume.rs`).
+
+Announcements go to [`POST /api/announce`](#post-apiannounce), which ducks and overlays
+per device in the relay instead of moving node volumes.
 
 Take an output's state from the **routing matrix** ([`GET /api/routing`](#get-apirouting)),
 and its volume from the backend's own control:
 [`/api/sendspin/volume`](#put-apisendspinvolume) or
 [`/api/ap2/volume`](#put-apiap2volume), with current values from
 [`GET /api/outputs`](#get-apioutputs).
-
-### `POST /api/media_players/{node_id}/announce`
-Ducks every source currently linked into the target, plays a clip, then
-unconditionally restores original volumes (even on failure). Full design
-rationale in [decisions.md](decisions.md#ttsannounce-ducking-url-based-v1-and-wyoming-based-v2-additive).
-
-Exactly one of `url` or `wyoming` must be present:
-
-```json
-// v1: fetch + decode a rendered clip (symphonia — pure Rust, any
-// format: mp3, wav, aac, ogg, flac; no ffmpeg/system dependency)
-{ "url": "http://homeassistant.local:8123/api/tts_proxy/....mp3", "duck_volume": 0.25 }
-
-// v2: direct Wyoming TTS synthesis, no decode step needed at all
-{
-  "wyoming": { "host": "192.168.1.20", "port": 10200, "text": "Front door opened", "voice": null },
-  "duck_volume": 0.25
-}
-```
-
-`duck_volume` defaults to `0.25` if omitted. Response:
-
-```json
-{ "ok": true, "message": "announced on ap2-dev-pioneer_vsx_934_f11b89, ducked 1 source(s)" }
-```
-
-Playback is native — a `pw::stream` targeting the sink node (`player.rs`),
-not a `pw-cat` subprocess; volume ducking/restore is the native Props path
-(`volume.rs`). Failure modes: both/neither of `url`/`wyoming` set → 400.
-Target `node_id` not found → 404. `url` fetch failure → 502. Decode
-failure → 400. Wyoming synthesis failure → 502. Failure writing the
-synthesized WAV → 500. Native playback (or reading the clip back) failure
-→ 400.
-
-This call blocks until playback (and restore) completes — for a
-multi-second announcement, expect the HTTP response to take that long
-too. The HA integration's `async_play_media` reflects this; it isn't a
-bug if a voice response takes a few seconds to return from a service
-call.
 
 ## Routing matrix (manual routing UI)
 

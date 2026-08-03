@@ -264,7 +264,6 @@ pub fn router(
         .route("/api/align/start", post(align_start))
         .route("/api/align/select", post(align_select))
         .route("/api/align/volume", post(align_volume))
-        .route("/api/media_players/{node_id}/announce", post(announce))
         .route("/api/routing", get(routing::get_routing))
         .route("/api/routing/link", post(routing::link))
         .route("/api/routing/unlink", post(routing::unlink))
@@ -2404,8 +2403,22 @@ async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, St
 /// Each target needs a per-device sender to *consume* its overlay, so the handler
 /// first ensures one exists — including opening an **on-demand AP2 session** for a
 /// receiver with nothing routed into it (sync_group.rs) — and reports any target
-/// nothing can carry instead of dropping the clip silently. The node-based
-/// (real-sink) path remains on `/api/media_players/:id/announce`.
+/// nothing can carry instead of dropping the clip silently.
+#[derive(Deserialize)]
+struct WyomingAnnounceRequest {
+    host: String,
+    #[serde(default = "default_wyoming_port")]
+    port: u16,
+    text: String,
+    /// Optional Piper multi-speaker voice name; omit for the server's
+    /// default voice.
+    voice: Option<String>,
+}
+
+fn default_wyoming_port() -> u16 {
+    10200
+}
+
 #[derive(Deserialize)]
 struct AgAnnounceRequest {
     /// Target output node names (`sendspin-dev-…`). Optional if
@@ -3118,191 +3131,6 @@ async fn set_ap2_rate_mode(
         crate::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' sample rate to {label} (applies shortly)") }))
-}
-
-/// TTS/voice-response ducked announce stream. Ducks
-/// every source currently linked into this sink by setting their **node**
-/// volume (not link volume — PipeWire Links have no Props/gain stage at
-/// all, only a Format param; disproven empirically in
-/// spikes/05-tts-ducking-mechanism.md), plays the announce clip into the
-/// sink natively via a `pw::stream` (player.rs), then restores every ducked
-/// source to its original volume, always — even if playback fails — so an
-/// announce error can never leave music stuck at duck volume.
-///
-/// The announce audio itself comes from exactly one of two mutually
-/// exclusive sources; the caller picks one per call:
-/// - `url`: a rendered TTS clip fetched over HTTP (LAN-local, e.g. HA's own
-///   `tts` integration), decoded to WAV via `decode.rs`.
-/// - `wyoming`: synthesized directly against a local Wyoming TTS server
-///   (e.g. Piper, see wyoming.rs), skipping the render-to-file-then-HTTP-
-///   fetch round trip for lower first-audible-word latency.
-#[derive(Deserialize)]
-struct AnnounceRequest {
-    url: Option<String>,
-    wyoming: Option<WyomingAnnounceRequest>,
-    /// 0.0-1.0, the level surviving sources are ducked to while the
-    /// announce plays. Omitted → the global default (settings_store.rs),
-    /// which keeps music audibly present but subordinate, matching Section
-    /// 5.6's "ducked, not silenced" design.
-    #[serde(default)]
-    duck_volume: Option<f32>,
-}
-
-#[derive(Deserialize)]
-struct WyomingAnnounceRequest {
-    host: String,
-    #[serde(default = "default_wyoming_port")]
-    port: u16,
-    text: String,
-    /// Optional Piper multi-speaker voice name; omit for the server's
-    /// default voice.
-    voice: Option<String>,
-}
-
-fn default_wyoming_port() -> u16 {
-    10200
-}
-
-#[derive(Serialize)]
-struct AnnounceResponse {
-    ok: bool,
-    message: String,
-}
-
-async fn announce(
-    State(state): State<AppState>,
-    Path(node_id): Path<u32>,
-    Json(req): Json<AnnounceRequest>,
-) -> (StatusCode, Json<AnnounceResponse>) {
-    let pw_state = &state.pw;
-    // Fall back to the configured global default when the caller omits a level.
-    let duck_volume = req.duck_volume.unwrap_or_else(|| state.settings.lock_recover().default_duck());
-    let (target_name, source_node_ids): (String, Vec<u32>) = {
-        let state = pw_state.lock_recover();
-        match state.nodes.get(&node_id) {
-            Some(target) => {
-                // A stereo source contributes two Link objects (FL + FR)
-                // into the sink, both sharing the same output_node — dedupe
-                // by node id here, or a node gets ducked/restored twice:
-                // the second "duck" fetches the volume the first duck call
-                // already set (mistaking it for the original), and the
-                // second "restore" then clobbers the correct restore with
-                // that wrong cached value, leaving the source stuck ducked.
-                let mut sources: Vec<u32> = state.links.values().filter(|l| l.input_node == node_id).map(|l| l.output_node).collect();
-                sources.sort_unstable();
-                sources.dedup();
-                (target.node_name.clone(), sources)
-            }
-            None => return (StatusCode::NOT_FOUND, Json(AnnounceResponse { ok: false, message: format!("no such node: {node_id}") })),
-        }
-    };
-
-    let (url, wyoming_req) = match (&req.url, &req.wyoming) {
-        (Some(url), None) => (Some(url), None),
-        (None, Some(w)) => (None, Some(w)),
-        (Some(_), Some(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(AnnounceResponse { ok: false, message: "exactly one of `url` or `wyoming` must be given, not both".to_string() }),
-            )
-        }
-        (None, None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(AnnounceResponse { ok: false, message: "one of `url` or `wyoming` is required".to_string() }),
-            )
-        }
-    };
-
-    let fetch_path = std::env::temp_dir().join(format!("announce-{node_id}-fetch"));
-    let wav_path = std::env::temp_dir().join(format!("announce-{node_id}.wav"));
-    // Always clear stale paths from a prior announce before writing new
-    // ones — see tests/test_addon_phase3_multi_output.sh's comments on
-    // cliraop's mkfifo gotcha for why a leftover file at a reused path is
-    // a real, previously-hit failure mode, not just defensive paranoia.
-    let _ = tokio::fs::remove_file(&fetch_path).await;
-    let _ = tokio::fs::remove_file(&wav_path).await;
-
-    if let Some(url) = url {
-        if let Err(e) = fetch_to_file(url, &fetch_path).await {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(AnnounceResponse { ok: false, message: format!("failed to fetch announce audio: {e}") }),
-            );
-        }
-
-        let decode_result = crate::decode::decode_file_to_wav(&fetch_path).await;
-        let _ = tokio::fs::remove_file(&fetch_path).await;
-        match decode_result {
-            Ok(wav_bytes) => {
-                if let Err(e) = tokio::fs::write(&wav_path, &wav_bytes).await {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(AnnounceResponse { ok: false, message: format!("failed to write decoded audio: {e}") }),
-                    );
-                }
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(AnnounceResponse { ok: false, message: format!("failed to decode announce audio: {e}") }),
-                )
-            }
-        }
-    } else if let Some(w) = wyoming_req {
-        // No decode step needed here — we build the WAV ourselves
-        // from the exact PCM format Wyoming reports (wyoming.rs).
-        match crate::wyoming::synthesize_to_wav(&w.host, w.port, &w.text, w.voice.as_deref()).await {
-            Ok(wav_bytes) => {
-                if let Err(e) = tokio::fs::write(&wav_path, &wav_bytes).await {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(AnnounceResponse { ok: false, message: format!("failed to write synthesized audio: {e}") }),
-                    );
-                }
-            }
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, Json(AnnounceResponse { ok: false, message: format!("wyoming synthesis failed: {e}") }))
-            }
-        }
-    }
-
-    let mut original_volumes = Vec::with_capacity(source_node_ids.len());
-    for &src_id in &source_node_ids {
-        if let Ok(Some(vol)) = crate::volume::get_volume(src_id).await {
-            original_volumes.push((src_id, vol));
-            let _ = crate::volume::set_volume(src_id, duck_volume).await;
-        }
-    }
-
-    // Play the WAV natively (pw::stream on a blocking thread — player.rs),
-    // replacing a `pw-cat --playback` subprocess. `play_wav_to_target` blocks
-    // until the clip has drained, matching pw-cat's blocking behaviour.
-    let wav_bytes = tokio::fs::read(&wav_path).await;
-    let _ = tokio::fs::remove_file(&wav_path).await;
-    let play_result = match wav_bytes {
-        Ok(bytes) => tokio::task::spawn_blocking(move || crate::player::play_wav_to_target(node_id, &bytes))
-            .await
-            .unwrap_or_else(|e| Err(format!("playback task panicked: {e}"))),
-        Err(e) => Err(format!("could not read announce audio back: {e}")),
-    };
-
-    // Restore unconditionally, after playback returns — a failed announce must
-    // never leave music stuck at duck volume.
-    for (src_id, vol) in &original_volumes {
-        let _ = crate::volume::set_volume(*src_id, *vol).await;
-    }
-
-    match play_result {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(AnnounceResponse {
-                ok: true,
-                message: format!("announced on {target_name}, ducked {} source(s)", original_volumes.len()),
-            }),
-        ),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(AnnounceResponse { ok: false, message: e })),
-    }
 }
 
 async fn fetch_to_file(url: &str, path: &std::path::Path) -> anyhow::Result<()> {

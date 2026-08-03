@@ -31,9 +31,8 @@ HOST_PORT="${HOST_PORT:-18400}"
 
 cleanup() {
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  # See tests/test_addon_announce_ducking_e2e.sh for why this is bounded
-  # with `timeout` — `docker network rm` right after `docker rm -f` on the
-  # same network has been observed to hang for minutes.
+  # Bounded with `timeout` on purpose: `docker network rm` right after
+  # `docker rm -f` on the same network has been observed to hang for minutes.
   timeout 5 docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
   rm -rf "$DATA_DIR"
 }

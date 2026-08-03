@@ -15,21 +15,9 @@ use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
-/// Decodes the file at `path` — symphonia probes the actual format from
-/// content, so it doesn't matter whether it's mp3, wav, aac, ogg, or flac
-/// (whatever a caller's HTTP-fetched TTS clip happens to be) — into a
-/// complete WAV file's bytes, always standardized to 16-bit PCM regardless
-/// of the source sample format. Runs on a blocking thread pool: symphonia's
-/// API is synchronous, and decoding would otherwise block the async
-/// runtime's worker thread for the duration.
-pub async fn decode_file_to_wav(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || decode_file_to_wav_blocking(&path)).await?
-}
-
 /// Decodes an in-memory clip (e.g. a `include_bytes!`-embedded diagnostic
-/// asset) into a 16-bit PCM WAV. Same standardization as [`decode_file_to_wav`],
-/// but sourced from a byte slice rather than a file. `ext` is a format hint
+/// asset) into a 16-bit PCM WAV. Always standardized to 16-bit PCM,
+/// whatever the source sample format. `ext` is a format hint
 /// (`"mp3"`, `"wav"`, …); symphonia still probes the real format from content.
 pub async fn decode_bytes_to_wav(bytes: &'static [u8], ext: &'static str) -> anyhow::Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
@@ -57,17 +45,6 @@ pub async fn decode_file_to_pcm_48k_stereo(path: &Path) -> anyhow::Result<Vec<u8
         Ok(crate::resample::to_48k_stereo_s16le(&pcm, rate, channels))
     })
     .await?
-}
-
-fn decode_file_to_wav_blocking(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    decode_stream_to_wav(mss, hint)
 }
 
 /// Shared decode core: probe the stream's format, decode its first audio track,

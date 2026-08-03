@@ -48,7 +48,6 @@ mod settings_store;
 mod sources_store;
 mod sync_group;
 mod sync_settings;
-mod volume;
 mod wav;
 mod wyoming;
 

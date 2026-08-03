@@ -267,8 +267,10 @@ Spike 5 (`spikes/05-tts-ducking-mechanism.md`) found this doesn't exist:
 PipeWire Links carry no Props/gain stage at all (Format param only) — a
 `volume` property set via `pw-link -p` is stored but has zero audible
 effect. The real mechanism is **per-source-**node** volume** — the node's
-SPA `Props` `channelVolumes`, set natively (`volume.rs`), already used by
-the daemon's `/api/media_players/:id/volume` endpoint. A real A/B/restore signal test confirmed this ducks only the
+SPA `Props` `channelVolumes`, set natively — at the time via `volume.rs` and
+the daemon's `/api/media_players/:id/volume` endpoint, both since removed (every
+output is virtual now, and the per-device relay ducks inside the mix instead).
+A real A/B/restore signal test confirmed this ducks only the
 intended source while a second source mixed into the same sink is
 unaffected, with a clean restore to the original level. A related real
 bug caught during end-to-end testing: a stereo source contributes two
@@ -489,9 +491,9 @@ cost of enabling every codec is a bit more compiled Rust in our own
 ~8MB binary, not a system dependency tree, so there's no reason to
 hand-pick a narrower set) brought the image from **864MB to 456MB**.
 Verified functionally identical, not just smaller: the same real-signal
-e2e test (`tests/test_addon_announce_ducking_e2e.sh`) produced the exact
-same baseline/ducked/restored RMS measurements before and after the
-swap.
+e2e test (then `tests/test_addon_announce_ducking_e2e.sh`, since removed with
+the node-volume announce path) produced the exact same
+baseline/ducked/restored RMS measurements before and after the swap.
 
 **Considered and rejected**: rewriting `aiosendspin`'s server essentials
 (the other ~212MB) in Rust/Go/C++, prompted by finding

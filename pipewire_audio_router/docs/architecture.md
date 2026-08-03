@@ -500,8 +500,8 @@ and PipeWire does the SRC in-graph on its RT thread.
 
 ## 9. Control plane → Home Assistant
 
-The daemon exposes state + native mutation (links, per-node volume via
-`Props`/`channelVolumes`, announce playback via a `pw::stream`) over
+The daemon exposes state + native mutation (links, per-device volume in-band
+per backend, announcements mixed per device by the relay) over
 REST + WebSocket (`api.rs`; full list in
 [`../../docs/api-reference.md`](../../docs/api-reference.md)). The Python
 `custom_components` integration exposes a `media_player` per **music group**
