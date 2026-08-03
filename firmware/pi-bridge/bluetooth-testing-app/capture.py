@@ -495,6 +495,15 @@ class Capture(threading.Thread):
                         err = proc.stderr.read().decode(errors="replace").strip()
                     except (OSError, ValueError):
                         err = ""
+                # Reap it. Without this the child stays a zombie until some later
+                # Popen happens to clean it up, and `returncode` is still None —
+                # so the error read "pw-record exited (None)", which says nothing.
+                # This loop respawns every 2 s against a target that may never come
+                # back, so "eventually" is not good enough.
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+                    proc.kill()
                 with self._lock:
                     self._error = err or f"pw-record exited ({proc.returncode})"
                 time.sleep(2.0)  # don't spin on a target that never works

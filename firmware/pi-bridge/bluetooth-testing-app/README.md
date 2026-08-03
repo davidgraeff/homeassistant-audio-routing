@@ -77,6 +77,20 @@ systemctl --user daemon-reload && systemctl --user enable --now bt-testing-app
 > It binds `0.0.0.0` with **no authentication** — it can switch codecs and
 > disconnect Bluetooth devices. Fine on a trusted home LAN; don't expose it.
 
+### Reaching it from the add-on
+
+`setup_pi_bridge.py` advertises this bridge over mDNS, including the port this
+app serves on, so the add-on's **Sources** tab shows a **Show diagnostics** link
+straight to this page on the RTP source that the bridge feeds.
+
+The advert is installed by the setup script, not by this app, so it is there
+whether or not the app is running — which is why the add-on probes
+`/api/state` first and only shows the link when this app actually answers. Two
+consequences: run the app (a `--user` unit, above, keeps it up across reboots)
+if you want the link to be there when you need it, and if you pass `--port`, pass
+the matching `--diag-port` to `setup_pi_bridge.py`. The link opens this Pi
+directly, so the browser must be on the same network.
+
 ## What the waveform means
 
 The capture is `s16` stereo @ 48 kHz — the same format the bridge transmits — so

@@ -195,3 +195,35 @@ Samsung S23 → RTP → add-on → speakers), not a preference.
   re-join, so no dedicated "rejoin" control is needed). A point-to-point
   link has no group to lose, so `destination.ip = <add-on IP>` + the add-on
   source set to *Accept all* just resumes after either side restarts.
+- **The bridge announces itself over mDNS; the add-on cannot deduce it
+  (2026-07-29).** The add-on has no way to learn *which host* feeds an RTP
+  source: `module-rtp-source` exposes only the address it **listens on**
+  (`rtp.source.ip` — `0.0.0.0` or the group; verified against the live
+  node's props), and a second socket on the RTP port to sniff the sender
+  would take datagrams away from the module (`SO_REUSEPORT` load-balances
+  unicast) and cause real dropouts. So `setup_pi_bridge.py` publishes a
+  static Avahi service file advertising `_pwrouter-btbridge._tcp` on the
+  diagnostics port, with the stream parameters (`rtp_port`, `rtp_dest`,
+  `rate`, `fmt`, `channels`) in TXT. The add-on browses it
+  (`bt_bridge_discovery.rs`), which buys **one-click adoption** of a bridge
+  with its real parameters prefilled — a typo'd port is indistinguishable
+  from a bridge that isn't sending — and a **link to the bridge's
+  diagnostics page**.
+  - *A static service file, not `avahi-publish`.* `avahi-daemon` is already
+    running on Raspberry Pi OS and reads `/etc/avahi/services/`, but
+    `avahi-utils` is **not** installed; a file needs no new package, no unit
+    to supervise, and survives reboots.
+  - *Reversing the pw-sink mechanism was rejected.* `_pipewire-audio._udp`
+    means the opposite (a `module-rtp-session` host willing to *receive*,
+    which the add-on already lists as an **output**), stock
+    `module-rtp-session` refuses plain RTP, and in discover mode it attaches
+    to *every* session of the media type — including the `pwrouter-*`
+    sessions the add-on advertises for its own outputs, which would loop
+    output audio back in as an input.
+  - *The advert is not evidence the diagnostics app is up.* The file is
+    written by the setup script and outlives any run of the app, so the
+    daemon HTTP-probes `/api/state` (and checks the body really is that
+    app) before the UI offers a link.
+  - *An `ServiceResolved` can arrive with AAAA but no A* (observed on this
+    LAN), so address selection prefers IPv4, falls back to a routable IPv6,
+    and never downgrades v4 → v6 on a later resolve.

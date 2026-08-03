@@ -4,7 +4,14 @@
   import { routing } from '../lib/routing';
   import { run } from '../lib/toast';
   import RtpSenderDocs from './RtpSenderDocs.svelte';
-  import type { AirplayClient, AirplaySourceCfg, RtpSourceCfg, SourceKind, SourceView } from '../lib/types';
+  import type {
+    AirplayClient,
+    AirplaySourceCfg,
+    BridgeInfo,
+    RtpSourceCfg,
+    SourceKind,
+    SourceView,
+  } from '../lib/types';
 
   // The set of configured input sources (AirPlay-receive + RTP-receive). Loaded
   // from the daemon's /api/sources collection; the user adds / edits / removes
@@ -12,6 +19,10 @@
   // node_name automatically. (The CRUD endpoints land in a later phase, so
   // these calls 404 until then — that's expected.)
   let sources = $state<SourceView[]>([]);
+  // Bluetooth→RTP bridges discovered over mDNS that no source is listening for
+  // yet. Same response as `sources`, so the two can never disagree about which
+  // bridge is already adopted.
+  let discoveredBridges = $state<BridgeInfo[]>([]);
   let loading = $state(true);
   let busy = $state(false);
 
@@ -20,8 +31,10 @@
     try {
       const res = await api.listSources();
       sources = res.sources;
+      discoveredBridges = res.discovered_bridges ?? [];
     } catch {
       sources = [];
+      discoveredBridges = [];
     }
     loading = false;
     // Pull the client lists for whatever AirPlay sources we now know about.
@@ -279,6 +292,50 @@
     if (await run(() => api.deleteSource(s.id), `Removed source '${s.label}'`)) await refresh();
   }
 
+  // ---- Discovered Bluetooth bridges ---------------------------------------
+  // A bridge advertises the port/rate/destination it *actually sends*, so adopting
+  // one copies those over instead of asking the user to retype them — a typo'd
+  // port looks exactly like a bridge that isn't sending, which is the single most
+  // confusing failure this page can produce.
+
+  /** The RTP source config that receives what `b` transmits. */
+  function bridgeRtpBody(b: BridgeInfo): Partial<RtpSourceCfg> {
+    const multicast = /^(2(2[4-9]|3\d)\.)/.test(b.rtp_dest) || b.rtp_dest.toLowerCase().startsWith('ff');
+    return {
+      port: b.rtp_port,
+      rate: b.rate,
+      latency_msec: 200,
+      // Mirror the sender: a multicast bridge needs the group joined (and
+      // `ignore_ssrc`, since a shared group may carry more than one sender);
+      // a unicast one just needs the port open to anyone.
+      source_addr: multicast ? b.rtp_dest : '0.0.0.0',
+      ignore_ssrc: true,
+    };
+  }
+
+  async function adoptBridge(b: BridgeInfo) {
+    busy = true;
+    const ok = await run(
+      () => api.addSource({ label: b.display_name, kind: 'rtp', rtp: bridgeRtpBody(b) }),
+      `Added RTP source '${b.display_name}'`,
+    );
+    busy = false;
+    if (ok) await refresh();
+  }
+
+  /** Open the add form prefilled from `b`, for renaming/tweaking before saving. */
+  function openAddFromBridge(b: BridgeInfo) {
+    openAdd('rtp');
+    formLabel = b.display_name;
+    const cfg = bridgeRtpBody(b);
+    rtpPort = cfg.port ?? 46000;
+    rtpRate = cfg.rate ?? 48000;
+    rtpLatency = cfg.latency_msec ?? 200;
+    rtpMode = deriveRtpMode(cfg.source_addr ?? '0.0.0.0', cfg.ignore_ssrc ?? true);
+    if (rtpMode === 'multicast') rtpMulticastAddr = cfg.source_addr ?? '239.255.42.42';
+  }
+
+
   // ---- Sender setup docs (RTP only) ---------------------------------------
   // Fed the port/rate/mode currently in view so the sample configs are
   // copy-pasteable for this install (see RtpSenderDocs.svelte).
@@ -470,6 +527,18 @@
                 {connectedCount(s.id)}&nbsp;connected
               </span>
             {/if}
+            {#if s.bridge}
+              <!-- Which discovered Pi feeds this source. Visible collapsed too:
+                   it identifies the sender, which nothing else on this page does. -->
+              <span
+                class="badge {s.bridge.diag_ok ? 'on' : ''}"
+                title="Discovered Bluetooth bridge sending to this source: {s.bridge.hostname}{s.bridge.addr
+                  ? ` (${s.bridge.addr})`
+                  : ''}{s.bridge.diag_ok ? '' : ' — diagnostics page not answering'}"
+              >
+                via&nbsp;{s.bridge.display_name}
+              </span>
+            {/if}
             <code class="muted node-name" title="Routing node name">{s.node_name}</code>
           </div>
         </div>
@@ -496,6 +565,22 @@
           {/if}
           <div class="form-actions">
             <span class="spacer"></span>
+            {#if s.bridge?.diag_ok && s.bridge.diag_url}
+              <!-- Only when the daemon's probe found the bridge's diagnostics app
+                   answering: the mDNS advert is written by setup_pi_bridge.py and
+                   outlives any run of that app, so the advert alone would produce
+                   dead links. Opens the Pi directly, so it needs a browser on the
+                   same LAN — hence the explicit note in the title. -->
+              <a
+                class="ghost btn-link"
+                href={s.bridge.diag_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Open the live Bluetooth diagnostics page on {s.bridge.display_name} ({s.bridge.hostname}) — served by that Pi, so your browser must be on the same network"
+              >
+                Show diagnostics ↗
+              </a>
+            {/if}
             <button class="ghost danger" type="button" onclick={() => remove(s)} disabled={busy}>Remove</button>
             <button class="primary" type="submit" disabled={busy || !formLabel.trim()}>Save</button>
           </div>
@@ -608,6 +693,49 @@
       <button class="ghost" type="button" onclick={() => openAdd('airplay')} disabled={busy}>+ AirPlay receiver</button>
       <button class="ghost" type="button" onclick={() => openAdd('rtp')} disabled={busy}>+ RTP receiver</button>
     </div>
+  {/if}
+
+  <!-- Bridges that announced themselves but that nothing is listening for. Only
+       rendered when there are any, so a LAN without bridges sees no dead UI. -->
+  {#if discoveredBridges.length}
+    <section class="card discovered">
+      <h2>Discovered Bluetooth bridges</h2>
+      <p class="note" style="margin-top:0">
+        These Raspberry Pi bridges announced themselves on the network but nothing here is receiving
+        them yet. <strong>Add as RTP source</strong> copies the port, rate and destination they said
+        they transmit, so the two ends can't disagree by typo. Set up with
+        <code>firmware/pi-bridge/setup_pi_bridge.py</code>.
+      </p>
+      <table class="bridges">
+        <thead>
+          <tr><th>Bridge</th><th>Sends to</th><th>Format</th><th></th></tr>
+        </thead>
+        <tbody>
+          {#each discoveredBridges as b (b.fullname)}
+            <tr>
+              <td>
+                <strong>{b.display_name}</strong>
+                <span class="muted">{b.hostname}{b.addr ? ` · ${b.addr}` : ''}</span>
+              </td>
+              <td class="muted"><code>{b.rtp_dest}:{b.rtp_port}</code></td>
+              <td class="muted">{(b.rate / 1000).toFixed(1)} kHz · {b.channels}&nbsp;ch</td>
+              <td style="text-align:right; white-space:nowrap">
+                {#if b.diag_ok && b.diag_url}
+                  <a class="ghost btn-link" href={b.diag_url} target="_blank" rel="noopener noreferrer"
+                     title="Open this bridge's live Bluetooth diagnostics page">Diagnostics ↗</a>
+                {/if}
+                <button class="ghost" type="button" disabled={busy}
+                        title="Open the add form with this bridge's settings, to rename or adjust first"
+                        onclick={() => openAddFromBridge(b)}>Review…</button>
+                <button class="primary" type="button" disabled={busy}
+                        title="Create an RTP source that receives this bridge"
+                        onclick={() => adoptBridge(b)}>Add as RTP source</button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </section>
   {/if}
 {/if}
 
@@ -908,6 +1036,48 @@
   input.prio {
     width: 4rem;
     margin: 0;
+  }
+
+  /* Discovered-bridge listing. Same table shape as the AirPlay client list, and
+     `.btn-link` makes an <a> sit level with the buttons beside it — it has to be
+     an anchor, not a button, because it opens the Pi's own page in a new tab. */
+  table.bridges {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  table.bridges th,
+  table.bridges td {
+    text-align: left;
+    padding: 0.4rem 0.5rem;
+    border-bottom: 1px solid var(--divider-color);
+    vertical-align: middle;
+  }
+  table.bridges th {
+    font-weight: 600;
+    color: var(--secondary-text-color);
+  }
+  table.bridges .muted {
+    display: inline-block;
+    margin-left: 0.4rem;
+  }
+  .discovered {
+    overflow-x: auto;
+  }
+  a.btn-link {
+    display: inline-block;
+    text-decoration: none;
+    /* Buttons in this UI are styled globally by element; an <a> needs the box
+       metrics restated so it lines up with the Remove/Save row. */
+    padding: 0.4rem 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--divider-color);
+    color: var(--primary-text-color);
+    font-size: 0.9rem;
+    line-height: 1.2;
+  }
+  a.btn-link:hover {
+    background: color-mix(in srgb, var(--primary-text-color) 8%, transparent);
   }
 
   /* Live input-level meter — same look as the routing-graph meter. */

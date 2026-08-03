@@ -330,6 +330,40 @@ export interface RtpSourceCfg {
   rate: number;
 }
 
+/** A Bluetooth→RTP bridge discovered over mDNS (`_pwrouter-btbridge._tcp`,
+ *  published by `firmware/pi-bridge/setup_pi_bridge.py`).
+ *
+ *  The daemon cannot infer where an RTP source's audio comes from —
+ *  `module-rtp-source` only knows the address it *listens* on — so the bridge
+ *  announces itself. That buys two things: adopting a bridge with its stream
+ *  parameters prefilled, and a link to its diagnostics page
+ *  (`firmware/pi-bridge/bluetooth-testing-app/`).
+ *
+ *  **`diag_ok` gates the link, not `diag_url`.** The mDNS advert is installed by
+ *  the setup script and outlives any particular run of the diagnostics app, so a
+ *  bridge can be discovered while nothing is serving that port. The daemon probes
+ *  it (verifying the response really is that app) before setting this. */
+export interface BridgeInfo {
+  /** mDNS instance fullname — stable identity to key on. */
+  fullname: string;
+  /** Human label from the advert (the bridge's Bluetooth / host name). */
+  display_name: string;
+  /** mDNS hostname, trailing dot trimmed. */
+  hostname: string;
+  /** Resolved address; `null` until mDNS resolves one (then `diag_url` is null too). */
+  addr?: string | null;
+  /** UDP port this bridge sends RTP to — what a source must listen on. */
+  rtp_port: number;
+  /** Its destination: this host's address, or a multicast group. */
+  rtp_dest: string;
+  rate: number;
+  channels: number;
+  /** Diagnostics page URL, or `null` while the address is unresolved. */
+  diag_url?: string | null;
+  /** The diagnostics app answered the last probe. Only offer the link if true. */
+  diag_ok: boolean;
+}
+
 /** One configured input source as returned by the daemon. `present` = a live
  *  PipeWire node named `node_name` exists right now (generalizes the old
  *  "airplay running" / "rtp loaded" flags). Exactly one of `airplay`/`rtp` is
@@ -342,6 +376,18 @@ export interface SourceView {
   node_name: string;
   airplay?: AirplaySourceCfg | null;
   rtp?: RtpSourceCfg | null;
+  /** The discovered bridge feeding this RTP source, when exactly one advertises
+   *  its port (and multicast group). Null for AirPlay, when none advertises, and
+   *  deliberately when *two* do — an ambiguous match would link to the wrong Pi. */
+  bridge?: BridgeInfo | null;
+}
+
+/** `GET /api/sources`. `discovered_bridges` holds bridges no configured source
+ *  is listening for — i.e. exactly what is missing, since an adopted bridge moves
+ *  into its source's `bridge` field and out of this list. */
+export interface SourcesResponse {
+  sources: SourceView[];
+  discovered_bridges: BridgeInfo[];
 }
 
 export interface MediaPlayerInfo {

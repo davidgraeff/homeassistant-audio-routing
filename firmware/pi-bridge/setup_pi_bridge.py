@@ -30,7 +30,10 @@ What this script does (idempotent -- safe to re-run):
   5. Points BlueZ at the A2DP-sink role, an audio device class, and installs a
      "just works" pairing agent + discoverable/pairable-on-boot service so a
      phone can pair with no screen on the Pi.
-  6. (Re)starts everything and prints how to verify.
+  6. Publishes an mDNS advert (`_pwrouter-btbridge._tcp`) so the add-on can
+     *discover* this bridge instead of being told about it -- see
+     `avahi_service_xml`.
+  7. (Re)starts everything and prints how to verify.
 
 The audio path it builds:
 
@@ -90,6 +93,24 @@ APT_PACKAGES = [
     "bluez-tools",  # provides bt-agent
     "iw",           # to disable WiFi power-save (BT coexistence)
 ]
+
+#: mDNS service type the add-on browses to find Bluetooth->RTP bridges. Custom,
+#: because there is no stock convention for "I am an RTP audio *sender* looking
+#: for a receiver": PipeWire's `_pipewire-audio._udp` means the opposite (a
+#: `module-rtp-session` host willing to *receive*), and the add-on already treats
+#: those as routing *outputs* — advertising it here would make this Pi show up as
+#: a speaker. `_tcp` because what the advert points at is the HTTP diagnostics
+#: page; the audio itself stays plain RTP on `--port` and is not discovered.
+AVAHI_SERVICE_TYPE = "_pwrouter-btbridge._tcp"
+AVAHI_SERVICE_FILE = "/etc/avahi/services/pw-bt-bridge.service"
+#: Port the bluetooth-testing-app listens on (its own default). The advert names
+#: it so the add-on can offer a link to the diagnostics page; the add-on probes it
+#: before showing the link, so advertising it while the app is *not* running is
+#: harmless.
+DEFAULT_DIAG_PORT = 8080
+#: Bumped when the TXT record's meaning changes, so an old add-on can ignore an
+#: advert it would misread rather than guess.
+AVAHI_TXT_VERSION = 1
 
 PW_DROPIN_NAME = "60-bt-rtp-bridge.conf"
 WP_LUA_DROPIN_NAME = "51-bt-rtp-bridge.lua"        # WirePlumber 0.4.x
@@ -334,6 +355,96 @@ WantedBy=bluetooth.target
     sudo(["systemctl", "enable", "--now", AGENT_UNIT])
 
 
+def avahi_service_xml(*, name: str | None, host: str, port: int, fmt: str, rate: int,
+                      channels: int, diag_port: int) -> str:
+    """A static Avahi service file advertising this bridge to the add-on.
+
+    **Why the add-on cannot just work it out.** `module-rtp-source` exposes only
+    the address it *listens on* (`rtp.source.ip` — `0.0.0.0` or a multicast
+    group), never the sender's, and a second socket on the RTP port to sniff it
+    would take datagrams away from the module (SO_REUSEPORT load-balances
+    unicast) and cause real dropouts. So the bridge announces itself instead.
+
+    **Why a static file and not `avahi-publish`.** `avahi-daemon` is already
+    running and reads `/etc/avahi/services/` at startup and on change, so this
+    needs no new package (`avahi-utils` is *not* installed on Raspberry Pi OS by
+    default), no unit to supervise, and it survives reboots. It is also
+    independent of the diagnostics app: the advert says "a bridge lives here and
+    these are its stream parameters", and the add-on probes the HTTP port before
+    offering a link, so the advert is never a lie about what is running.
+
+    `<port>` is the **diagnostics** port, not the audio port: the advert points at
+    something reachable over HTTP. The RTP parameters travel in TXT so the add-on
+    can match this bridge to an existing RTP source (by `rtp_port`/`rtp_dest`) or
+    prefill a new one without the user retyping them.
+
+    `%h` is expanded by Avahi to this host's name; an explicit `--name` wins
+    because it is what the owner already chose to see on their phone.
+    """
+    label = name.strip() if name and name.strip() else "Bluetooth bridge on %h"
+    txt = [
+        f"ver={AVAHI_TXT_VERSION}",
+        "role=rtp-sender",
+        f"rtp_port={port}",
+        f"rtp_dest={host}",
+        f"rate={rate}",
+        f"fmt={fmt}",
+        f"channels={channels}",
+        f"diag_port={diag_port}",
+        "diag_path=/",
+    ]
+    lines = "\n".join(f"    <txt-record>{_xml_escape(t)}</txt-record>" for t in txt)
+    return f"""\
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!-- {MANAGED_MARKER.lstrip('# ')} -->
+<!-- Advertises this Bluetooth->RTP bridge so the PipeWire audio-router add-on
+     can discover it. <port> is the HTTP diagnostics port (the bluetooth-testing-
+     app); the audio stream itself is plain RTP to rtp_dest:rtp_port and is not
+     discovered. Delete this file (and reload avahi-daemon) to stop advertising. -->
+<service-group>
+  <name replace-wildcards="yes">{_xml_escape(label)}</name>
+  <service>
+    <type>{AVAHI_SERVICE_TYPE}</type>
+    <port>{diag_port}</port>
+{lines}
+  </service>
+</service-group>
+"""
+
+
+def _xml_escape(text: str) -> str:
+    """Escape for XML text content. A Bluetooth name may contain `&` or `<`."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def publish_mdns_advert(*, name: str | None, host: str, port: int, fmt: str, rate: int,
+                        channels: int, diag_port: int) -> None:
+    """Install the Avahi service file and make the running daemon pick it up."""
+    print("== Advertising this bridge over mDNS ==")
+    if not os.path.isdir("/etc/avahi/services"):
+        print("  /etc/avahi/services missing — avahi-daemon not installed; skipping advert.")
+        print("  (The add-on can still receive audio; it just won't auto-discover this bridge.)")
+        return
+    sudo_write(
+        AVAHI_SERVICE_FILE,
+        avahi_service_xml(name=name, host=host, port=port, fmt=fmt, rate=rate,
+                          channels=channels, diag_port=diag_port),
+    )
+    # avahi-daemon watches the directory, but a reload is instant and makes the
+    # advert appear before `verify()` tells the user to go look for it.
+    sudo(["systemctl", "reload-or-restart", "avahi-daemon"], check=False)
+
+
+def remove_mdns_advert() -> None:
+    """Stop advertising. Safe when the file was never written."""
+    if not os.path.exists(AVAHI_SERVICE_FILE):
+        return
+    print("== Removing mDNS advert ==")
+    sudo(["rm", "-f", AVAHI_SERVICE_FILE], check=False)
+    sudo(["systemctl", "reload-or-restart", "avahi-daemon"], check=False)
+
+
 def pw_dropin(host: str, port: int, fmt: str, rate: int, channels: int) -> str:
     return f"""\
 {MANAGED_MARKER}
@@ -480,6 +591,7 @@ def disable(home: str) -> None:
         f".config/wireplumber/wireplumber.conf.d/{WP_CONF_DROPIN_NAME}",
     ):
         user_remove(os.path.join(home, rel))
+    remove_mdns_advert()
     sudo(["systemctl", "disable", "--now", AGENT_UNIT], check=False)
     sudo(["systemctl", "disable", "--now", POWERSAVE_UNIT], check=False)
     sudo(["rm", "-f", f"/etc/systemd/system/{AGENT_UNIT}", f"/etc/systemd/system/{POWERSAVE_UNIT}", NM_POWERSAVE_CONF], check=False)
@@ -488,12 +600,16 @@ def disable(home: str) -> None:
     print("Bridge config removed. Packages and BlueZ settings were left in place.")
 
 
-def verify(host: str, port: int) -> None:
+def verify(host: str, port: int, *, diag_port: int | None = None) -> None:
     print("\n== Verification ==")
     env = dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}")
     r = subprocess.run(["pw-cli", "ls", "Node"], text=True, capture_output=True, env=env)
     loaded = "rtp-bridge" in r.stdout
     print(f"  rtp-bridge sink present: {'YES' if loaded else 'NO'}")
+    if diag_port is not None:
+        advertised = os.path.exists(AVAHI_SERVICE_FILE)
+        print(f"  mDNS advert installed:   {'YES' if advertised else 'NO'} "
+              f"({AVAHI_SERVICE_TYPE}, port {diag_port})")
     print(
         "\nNext:\n"
         f"  1. Pair a phone: it should see this Pi as a Bluetooth speaker and pair\n"
@@ -505,6 +621,13 @@ def verify(host: str, port: int) -> None:
         f"  3. On the add-on, enable the RTP source on port {port} and confirm the\n"
         f"     `bt-bridge-rtp` node shows signal. RTP is being sent to {host}:{port}.\n"
     )
+    if diag_port is not None:
+        print(
+            f"  4. The add-on's Sources tab should now *discover* this bridge and offer\n"
+            f"     to add it as an RTP source. For the 'Show diagnostics' link there,\n"
+            f"     run the testing app on this Pi (it serves port {diag_port}):\n"
+            f"       firmware/pi-bridge/bluetooth-testing-app/  ->  python3 app.py\n"
+        )
 
 
 # --- Main --------------------------------------------------------------------
@@ -520,6 +643,12 @@ def main() -> None:
     ap.add_argument("--format", default=DEFAULT_FORMAT, help=f"RTP audio format (default {DEFAULT_FORMAT}).")
     ap.add_argument("--rate", type=int, default=DEFAULT_RATE, help=f"Sample rate (default {DEFAULT_RATE}).")
     ap.add_argument("--channels", type=int, default=DEFAULT_CHANNELS, help=f"Channels (default {DEFAULT_CHANNELS}).")
+    ap.add_argument("--diag-port", type=int, default=DEFAULT_DIAG_PORT,
+                    help=f"Port the bluetooth-testing-app serves on, advertised over mDNS "
+                         f"(default {DEFAULT_DIAG_PORT}).")
+    ap.add_argument("--no-mdns", action="store_true",
+                    help="Don't advertise this bridge over mDNS (the add-on then can't "
+                         "auto-discover it, and shows no diagnostics link).")
     ap.add_argument("--disable", action="store_true", help="Remove the bridge configuration and exit.")
     args = ap.parse_args()
 
@@ -542,8 +671,13 @@ def main() -> None:
     install_pairing_agent()
     write_pipewire_config(home, args.host, args.port, args.format, args.rate, args.channels)
     write_wireplumber_config(home)
+    if args.no_mdns:
+        remove_mdns_advert()  # idempotent: also un-advertises a previously-set-up bridge
+    else:
+        publish_mdns_advert(name=args.name, host=args.host, port=args.port, fmt=args.format,
+                            rate=args.rate, channels=args.channels, diag_port=args.diag_port)
     restart_services()
-    verify(args.host, args.port)
+    verify(args.host, args.port, diag_port=None if args.no_mdns else args.diag_port)
 
 
 if __name__ == "__main__":

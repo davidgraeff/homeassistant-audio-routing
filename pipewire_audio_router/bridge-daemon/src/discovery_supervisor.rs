@@ -1,4 +1,5 @@
-//! Runtime on/off for mDNS auto-discovery (sendspin + AirPlay-2).
+//! Runtime on/off for mDNS auto-discovery (sendspin + AirPlay-2 + pw-sink
+//! targets + Bluetooth→RTP bridges).
 //!
 //! A **single** shared `ServiceDaemon` lives here behind a shared mutex and both
 //! browsers (sendspin_discovery.rs + ap2_discovery.rs) run their `browse()` on
@@ -121,6 +122,10 @@ struct Inner {
     ap2_ptp: SharedAp2Ptp,
     /// Discovered pw-sink targets (pw_target_discovery.rs).
     pw_targets: crate::pw_target_discovery::SharedPwTargets,
+    /// Discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs). Unlike the
+    /// others these are not outputs and build no audio path — they annotate RTP
+    /// *sources* with their sender's identity and diagnostics page.
+    bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
     changes: ChangeNotifier,
 }
 
@@ -133,9 +138,10 @@ impl DiscoverySupervisor {
         ap2_devices: SharedAp2Devices,
         ap2_ptp: SharedAp2Ptp,
         pw_targets: crate::pw_target_discovery::SharedPwTargets,
+        bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
         changes: ChangeNotifier,
     ) -> Self {
-        Self(Arc::new(Mutex::new(Inner { running: None, devices, ap2_devices, ap2_ptp, pw_targets, changes })))
+        Self(Arc::new(Mutex::new(Inner { running: None, devices, ap2_devices, ap2_ptp, pw_targets, bt_bridges, changes })))
     }
 
     pub fn is_running(&self) -> bool {
@@ -156,6 +162,7 @@ impl DiscoverySupervisor {
             sendspin_discovery::spawn(&daemon, inner.devices.clone(), inner.changes.clone())?;
             ap2_discovery::spawn(&daemon, inner.ap2_devices.clone(), inner.changes.clone(), inner.ap2_ptp.clone())?;
             crate::pw_target_discovery::spawn(&daemon, inner.pw_targets.clone(), inner.changes.clone())?;
+            crate::bt_bridge_discovery::spawn(&daemon, inner.bt_bridges.clone(), inner.changes.clone())?;
             Ok(())
         })();
         if let Err(e) = spawned {
@@ -173,7 +180,7 @@ impl DiscoverySupervisor {
         let mut inner = self.0.lock_recover();
         if let Some(daemon) = inner.running.take() {
             // `shutdown()` sends the daemon's run loop a `Command::Exit`; it
-            // drops every browse sender, so all three worker loops disconnect
+            // drops every browse sender, so all four worker loops disconnect
             // and exit. Best-effort — a shutdown error just means the daemon
             // was already gone.
             let _ = daemon.shutdown();

@@ -54,7 +54,13 @@ Run it **as the bridge user** (not root), on the Pi:
   group** like `239.255.42.42` to fan out to several receivers.
 - `--port` (default `46000`): must match the add-on's RTP source port.
 - `--name`: the Bluetooth name phones see (sets the system pretty-hostname,
-  which BlueZ advertises; omit to keep the current one).
+  which BlueZ advertises; omit to keep the current one). It also becomes the
+  bridge's mDNS name, i.e. how it appears on the add-on's Sources tab.
+- `--diag-port` (default `8080`): the port the
+  [testing app](bluetooth-testing-app/) serves on, published in the mDNS advert
+  so the add-on can link to it.
+- `--no-mdns`: don't advertise at all (the add-on then can't auto-discover this
+  bridge, and shows no diagnostics link).
 - `--disable`: remove the bridge config again.
 
 Then pair your phone with the advertised name and play — audio appears as the
@@ -88,7 +94,11 @@ wall (see [../../docs/decisions.md](../../docs/decisions.md#raspberry-pi-bluetoo
    discoverable/pairable on boot, so phones pair with no screen / no PIN.
 6. **PipeWire drop-in**: `module-rtp-sink` (the RTP *sender*, node `rtp-bridge`,
    pointed at the add-on) + `module-loopback` bridging the phone's audio into it.
-7. **WirePlumber drop-in** (SPA-JSON for 0.5, Lua for 0.4):
+7. **mDNS advert** (`/etc/avahi/services/pw-bt-bridge.service`): announces this
+   bridge as `_pwrouter-btbridge._tcp` on the diagnostics port, carrying the
+   stream parameters in TXT (`rtp_port`, `rtp_dest`, `rate`, `fmt`, `channels`).
+   See [*Being discovered by the add-on*](#being-discovered-by-the-add-on).
+8. **WirePlumber drop-in** (SPA-JSON for 0.5, Lua for 0.4):
    - **`monitor.bluez.seat-monitoring = disabled`** (+ `support.logind`) —
      **critical on WirePlumber 0.5 headless.** WP 0.5 only manages Bluetooth for
      the user on the *active login seat*; a lingering headless session has no
@@ -99,6 +109,33 @@ wall (see [../../docs/decisions.md](../../docs/decisions.md#raspberry-pi-bluetoo
      sink's own monitor: the loopback's default-following capture then binds to
      the phone (and re-binds the same way on reconnect/re-pair). `input` role +
      no idle suspend round it out.
+
+### Being discovered by the add-on
+
+The add-on cannot work out which host feeds an RTP source — `module-rtp-source`
+only knows the address it *listens on*, and sniffing the RTP port would steal
+datagrams from the module — so the bridge announces itself instead. With the
+advert in place, the add-on's **Sources** tab:
+
+- lists this bridge under **Discovered Bluetooth bridges** while no source is
+  receiving it, with **Add as RTP source** copying the advertised port, rate and
+  destination (so the two ends can't disagree by typo);
+- once adopted, marks that source `via <bridge name>` and — if the
+  [testing app](bluetooth-testing-app/) is running — offers **Show diagnostics**,
+  a direct link to this Pi's live waveform/silence page.
+
+The advert is written by this script and therefore outlives any particular run
+of the testing app, so the add-on HTTP-probes the page before offering the link.
+That means: **the bridge appears as soon as it is set up; the diagnostics link
+appears only while the app is running.** The link opens the Pi directly, so the
+browser has to be on the same network (a remote Home Assistant session won't
+reach it).
+
+Check the advert from any Linux box on the LAN:
+
+```
+avahi-browse -rt _pwrouter-btbridge._tcp
+```
 
 ### The audio path
 

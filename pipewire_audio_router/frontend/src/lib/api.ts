@@ -24,6 +24,7 @@ import type {
   RtpSourceCfg,
   SendspinCodec,
   SourceKind,
+  SourcesResponse,
   SourceView,
   StatusInfo,
   SyncSettingsInfo,
@@ -199,7 +200,12 @@ export const api = {
   // the singular /api/source/{airplay,rtp} endpoints above. The backend routes
   // land in a later phase, so these 404 until then. `add`/`update` take a
   // partial per-kind config; the daemon fills defaults + allocates ports.
-  listSources: () => request<{ sources: SourceView[] }>('GET', 'api/sources'),
+  // Returns the configured sources *and* the mDNS-discovered Bluetooth bridges
+  // that none of them is listening for yet (see `SourcesResponse`). The daemon
+  // re-probes stale bridge diagnostics pages while serving this, so `diag_ok` is
+  // fresh — which is why the Sources tab reads the offer list from here rather
+  // than from a separate endpoint.
+  listSources: () => request<SourcesResponse>('GET', 'api/sources'),
   addSource: (body: {
     label: string;
     kind: SourceKind;

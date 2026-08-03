@@ -10,6 +10,7 @@ mod ap2_server;
 mod ap2_spike;
 mod ap2_volume;
 mod api;
+mod bt_bridge_discovery;
 mod calibrate;
 mod config;
 mod decode;
@@ -231,6 +232,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // (`pwsink-dev-*`) and driven by per-target AppleMIDI senders (pwsink_server.rs).
     let pw_targets: pw_target_discovery::SharedPwTargets =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // Discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs): Pis advertising
+    // `_pwrouter-btbridge._tcp`. These are input *senders*, so unlike the four
+    // registries above they drive no audio path — they let the Sources tab offer
+    // one-click adoption and a link to a bridge's diagnostics page.
+    let bt_bridges: bt_bridge_discovery::SharedBtBridges =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     let (pw_state, changes, pw_cmd, xruns) = pw_thread::spawn()?;
 
@@ -245,6 +252,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         ap2_devices.clone(),
         ap2_ptp.clone(),
         pw_targets.clone(),
+        bt_bridges.clone(),
         changes.clone(),
     );
     if settings.lock_recover().discovery_enabled() {
@@ -443,6 +451,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             sendspin_devices,
             ap2_devices,
             pw_targets,
+            bt_bridges,
             ap2_ptp.clone(),
             routing,
             sendspin_control,

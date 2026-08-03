@@ -228,7 +228,8 @@ no node-volume path (AP2 outputs are virtual).
 The daemon runs **one** `mdns_sd::ServiceDaemon` for the whole process (that
 consolidation is what fixed the multicast CPU storm), and exactly **one browse per
 service type**: `sendspin_discovery` owns `_sendspin._tcp`, `ap2_discovery` owns
-`_airplay._tcp`, `pw_target_discovery` owns `_pipewire-audio._udp`. That is not
+`_airplay._tcp`, `pw_target_discovery` owns `_pipewire-audio._udp`,
+`bt_bridge_discovery` owns `_pwrouter-btbridge._tcp`. That is not
 tidiness — it is required:
 
 > mdns-sd keeps `service_queriers: HashMap<String, Sender<ServiceEvent>>`, one listener
@@ -253,6 +254,21 @@ redirects the supervisor without restarting the server. Upstream note + suggeste
 `log` crate, so `sendspin=info` belongs in the `EnvFilter` (main.rs). Without that
 target, every dial, failure, retry and goodbye is dropped — which is what made the
 above take a day to find instead of a minute.
+
+**Three of the four browses find outputs; the fourth finds an input.**
+`bt_bridge_discovery` is the odd one out and deliberately builds **no audio
+path**: a Bluetooth→RTP bridge (`firmware/pi-bridge/setup_pi_bridge.py`)
+advertises `_pwrouter-btbridge._tcp` with its stream parameters in TXT, and the
+daemon uses that only to (a) offer the bridge on the Sources tab with its real
+port/rate prefilled and (b) link to its diagnostics page. It exists because the
+daemon otherwise cannot tell *which host* feeds an RTP source —
+`module-rtp-source` exposes only the address it listens on, and sniffing the port
+would take datagrams from the module. Note the direction trap this avoids:
+reusing `_pipewire-audio._udp` here would list a bridge as an **output** (that is
+what the type means), and a stock `module-rtp-session` in discover mode attaches
+to every session of the media type — including our own `pwrouter-*` output
+sessions, looping output audio back in as an input. See
+[decisions](../../docs/decisions.md#raspberry-pi-bluetooth--rtp-bridge).
 
 ### 5.4 Announcing to an output with nothing routed into it
 
