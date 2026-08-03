@@ -24,6 +24,10 @@ python3 -m pytest custom_components/pipewire_audio_router/tests/ -p pytest_homea
 - `test_media_player.py` — one `media_player` per output: state/volume,
   announce (URL), `select_source`/`link`/`unlink`, and the live
   routing WebSocket.
+- `test_voice_duck.py` — voice-assistant ducking: satellite state → area →
+  which outputs are ducked (both scopes), the satellite's own output included,
+  entity-area override, two rooms at once, release on idle/unavailable/switch-off
+  and on entry unload, and the AP2-by-IP path with per-output entities off.
 - `test_rtp_source.py` — the Bluetooth-bridge RTP `switch`/`number`: entities
   reflect daemon state, enable/disable, live vs. remembered port changes, and
   the API client's `/api/sources` calls (parsing + `ok`-flag errors).

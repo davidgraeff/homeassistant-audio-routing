@@ -51,6 +51,33 @@ Both are config entities (they show under the device's *Configuration*
 section) and go **unavailable** if the add-on is unreachable or too old to
 expose the `/api/sources` collection.
 
+### Voice-assistant ducking (`switch` + `number` + `select`)
+
+While a voice assistant in a room is talking, the router's speakers **in that
+room** play quietly. No automation, no blueprint:
+
+| Entity | What it does |
+|---|---|
+| `switch.voice_assistant_ducking` | On/off. **Off by default** — if you still run a volume-ducking blueprint, turn that off first or you'll duck twice. |
+| `number.voice_assistant_duck_level` | How quiet, as a **gain**: `0.25` = quarter volume, `1` = no ducking. (Not a divisor.) |
+| `select.voice_assistant_duck_scope` | `area` (default) ducks only the satellite's own room, even mid-song inside a multi-room group. `music_group` widens it to the whole synchronized group — for open-plan rooms where the same track next door drowns the response. |
+
+Every `assist_satellite` is covered automatically, including ones added later.
+The room comes from Home Assistant's areas: the satellite's area (its entity's
+override if set, else its device's), matched against the area each router output
+adopted from the real speaker's device. A satellite in no area ducks nothing.
+
+Why this beats ducking with `volume_set`: the add-on applies a gain inside its
+mix, so **your speakers' volume never moves** (no slider jumping, nothing to
+restore, no race if you change the volume mid-sentence), the duck lands within
+milliseconds, overlapping turns in different rooms are independent, and a single
+speaker of a synced group can duck while the others keep playing. The duck is
+held on a lease the integration renews; if Home Assistant restarts or the network
+drops mid-turn, the add-on un-ducks by itself within ~30 s.
+
+The satellite's *own* speaker is ducked too, on purpose: the add-on may be
+streaming music to it while the device speaks locally.
+
 ### Outputs (`media_player`)
 
 One `media_player` entity per output in the add-on's routing matrix — the
@@ -162,10 +189,12 @@ See `tests/README.md` for what each test actually covers.
 __init__.py       setup/teardown, coordinator (5s poll: players + RTP source; routing pushed via /api/routing/ws), platform forwarding
 config_flow.py     single-step host/port form, validates by calling the add-on
 media_player.py    the MediaPlayerEntity subclass described above (incl. select_source + link/unlink services)
-switch.py          Bluetooth-bridge RTP source enable/disable switch
-number.py          Bluetooth-bridge RTP source listen-port number (restore-backed)
+switch.py          RTP-source enable/disable + voice-ducking on/off switches
+number.py          RTP-source port/latency + voice duck level numbers (restore-backed)
+select.py          voice duck scope: area | music_group (restore-backed)
+voice_duck.py      watches assist_satellite states, resolves area -> outputs, holds the daemon-side duck
 api.py             thin async HTTP client for the add-on's REST API (media players, routing matrix, RTP source)
-const.py           domain, default port(s), poll interval, service/source names
+const.py           domain, default port(s), poll interval, service/source names, voice-duck defaults
 services.yaml      link/unlink service descriptions for the automation editor
 strings.json       UI strings (config flow + service descriptions)
 manifest.json      integration metadata (config_flow: true, no extra deps)

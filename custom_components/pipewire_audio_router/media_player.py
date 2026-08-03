@@ -186,6 +186,25 @@ def _find_ap2_ha_device(hass: HomeAssistant, ip: str | None) -> dr.DeviceEntry |
     return dev_reg.async_get(next(iter(matched)))
 
 
+def find_output_ha_device(
+    hass: HomeAssistant, node_name: str, outputs_meta: dict[str, OutputMeta]
+) -> dr.DeviceEntry | None:
+    """The Home Assistant device representing the same physical speaker as this
+    output, by whichever correlation rule its kind allows — the sendspin mDNS
+    hostname or the AirPlay-2 receiver IP above.
+
+    Shared with `voice_duck.py`, which needs an output's **area** whether or not
+    per-output `media_player` entities are exposed; keeping the rules in one place
+    means ducking and adoption can never disagree about which device an output is.
+    `None` for kinds with no correlation rule (`pwsink-dev-`) or no match."""
+    if node_name.startswith(SENDSPIN_DEV_PREFIX):
+        return _find_ha_device(hass, node_name)
+    if node_name.startswith(AP2_DEV_PREFIX):
+        meta = outputs_meta.get(node_name)
+        return _find_ap2_ha_device(hass, meta.ip if meta else None)
+    return None
+
+
 def _output_node_names(coordinator: PipewireRouterCoordinator) -> list[str]:
     """The node names of every routing-matrix output — the set that should
     have a media_player. Drives both creation and removal, so an output that

@@ -40,9 +40,10 @@ from .const import (
     SERVICE_CLEANUP_ENTITIES,
     UPDATE_INTERVAL_SECONDS,
 )
+from .voice_duck import VoiceDucker
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS = [Platform.MEDIA_PLAYER, Platform.NUMBER, Platform.SWITCH]
+PLATFORMS = [Platform.MEDIA_PLAYER, Platform.NUMBER, Platform.SELECT, Platform.SWITCH]
 
 _EMPTY_ROUTING = RoutingMatrix(sources=[], outputs=[], links=[])
 
@@ -108,6 +109,11 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
         self.music_groups: list[MusicGroup] = []
         self.announcement_groups: list[AnnouncementGroup] = []
         self.expose_outputs: bool = False
+        # Voice-assistant ducking (voice_duck.py). Set in `async_setup_entry`
+        # right after the coordinator exists, because the ducker reads the polled
+        # routing/groups/outputs state this object holds. Its enabled/level/scope
+        # live on it and are owned by the switch/number/select entities.
+        self.voice_duck: VoiceDucker = None  # type: ignore[assignment]
 
     async def _async_update_data(self) -> None:
         # Reachability first, and it is the only fatal call: everything below is
@@ -222,6 +228,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, coordinator.async_routing_ws_loop(), f"{DOMAIN}_routing_ws"
     )
 
+    # Voice-assistant ducking: watches every `assist_satellite` and asks the
+    # daemon to duck the outputs in the talking satellite's area. Inert until the
+    # switch entity turns it on (off by default — see PipewireVoiceDuckingSwitch).
+    coordinator.voice_duck = VoiceDucker(hass, entry, coordinator)
+    coordinator.voice_duck.async_start()
+
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_register_cleanup_service(hass)
@@ -263,5 +275,9 @@ def _async_register_cleanup_service(hass: HomeAssistant) -> None:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        # Stop watching satellites and hand back any duck we're holding, so a
+        # reload mid-turn doesn't leave music quiet until the lease expires.
+        if coordinator is not None and coordinator.voice_duck is not None:
+            await coordinator.voice_duck.async_stop()
     return unloaded

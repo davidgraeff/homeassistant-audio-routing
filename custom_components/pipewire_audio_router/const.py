@@ -38,3 +38,37 @@ ATTR_SOURCE = "source"
 # Integration-wide service to purge media_player entities the daemon no longer
 # reports (e.g. renamed/removed devices left behind as `unavailable`).
 SERVICE_CLEANUP_ENTITIES = "cleanup_entities"
+
+# --- Voice-assistant ducking (voice_duck.py) ---------------------------------
+# Replaces the community "duck every media_player in the satellite's area via
+# volume_set" blueprint: the daemon holds a leased mixer-gain duck instead, so
+# nothing touches a device's user-visible volume and a per-room duck works even
+# inside a multi-room music group.
+
+# Music gain while a voice assistant in the room is talking. A *gain*, not the
+# blueprint's divisor: 0.25 = quarter volume. Seeds the `number` entity.
+DEFAULT_VOICE_DUCK_LEVEL = 0.25
+
+# Lease we ask the daemon for, and how often we renew it while a turn is open.
+# The daemon un-ducks on its own one lease after we stop renewing, so a reload
+# or crash mid-turn can't leave music quiet; renewing at a third of the lease
+# leaves room for two missed renewals.
+VOICE_DUCK_TTL_SECONDS = 30
+VOICE_DUCK_RENEW_SECONDS = 10
+
+# Which speakers duck for a satellite's turn.
+#   area        — only the outputs in the satellite's own area, even when they
+#                 are mid-song inside a multi-room group (the default).
+#   music_group — those, plus every other member of a music group they belong
+#                 to: for open-plan rooms where the same track next door
+#                 drowns the response.
+VOICE_DUCK_SCOPE_AREA = "area"
+VOICE_DUCK_SCOPE_MUSIC_GROUP = "music_group"
+VOICE_DUCK_SCOPES = [VOICE_DUCK_SCOPE_AREA, VOICE_DUCK_SCOPE_MUSIC_GROUP]
+
+# `assist_satellite` states that mean "a turn is in progress". Everything else
+# (idle, unavailable, unknown) releases the duck. `responding` is included on
+# purpose: the satellite speaks its answer through its own speaker, so the
+# room's music has to stay out of the way until the turn is fully over.
+ASSIST_SATELLITE_DOMAIN = "assist_satellite"
+VOICE_DUCK_ACTIVE_STATES = frozenset({"listening", "processing", "responding"})

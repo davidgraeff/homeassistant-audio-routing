@@ -25,7 +25,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import PipewireRouterCoordinator
-from .const import DOMAIN
+from .const import DEFAULT_VOICE_DUCK_LEVEL, DOMAIN
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -34,6 +34,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         [
             PipewireRtpPortNumber(coordinator, entry),
             PipewireRtpLatencyNumber(coordinator, entry),
+            PipewireVoiceDuckLevelNumber(coordinator, entry),
         ]
     )
 
@@ -139,3 +140,42 @@ class PipewireRtpLatencyNumber(CoordinatorEntity[PipewireRouterCoordinator], Res
         else:
             # Disabled: just remember it for the next enable.
             self.async_write_ha_state()
+
+
+class PipewireVoiceDuckLevelNumber(CoordinatorEntity[PipewireRouterCoordinator], RestoreNumber):
+    """How quiet the room's music goes while a voice assistant there is talking.
+
+    A **gain**, not the ducking blueprint's divisor: 0.25 means a quarter of the
+    music's level, 1.0 means no ducking at all. It is applied in the daemon's mix,
+    so it never moves a device's own volume.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Voice assistant duck level"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:volume-low"
+    _attr_native_min_value = 0.05
+    _attr_native_max_value = 1.0
+    _attr_native_step = 0.05
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_voice_duck_level"
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_number_data()
+        if last is not None and last.native_value is not None:
+            self.coordinator.voice_duck.level = float(last.native_value)
+            self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float:
+        return self.coordinator.voice_duck.level or DEFAULT_VOICE_DUCK_LEVEL
+
+    async def async_set_native_value(self, value: float) -> None:
+        # Takes effect on the next voice turn; an in-flight duck keeps its level
+        # rather than jumping mid-sentence.
+        self.coordinator.voice_duck.level = value
+        self.async_write_ha_state()

@@ -601,6 +601,52 @@ class PipewireRouterApiClient:
         if not body.get("ok", False):
             raise PipewireRouterApiError(body.get("message") or "un-route failed")
 
+    # --- Duck holds (voice ducking, overlay_mixer.rs) ---
+    #
+    # A hold attenuates an output's music with no clip of its own, on a lease the
+    # holder renews. The daemon un-ducks by itself one lease after we stop
+    # renewing, so a reload mid-turn can't leave music quiet — which is why
+    # `async_duck_renew` reports a lost hold instead of raising: the caller starts
+    # a fresh one rather than believing it is still ducking.
+
+    async def async_duck_start(self, targets: list[str], level: float, ttl_ms: int) -> int:
+        """Start a duck hold on `targets` (`POST /api/duck`), returning its id."""
+        try:
+            async with self._session.post(
+                f"{self._base_url}/api/duck",
+                json={"targets": targets, "level": level, "ttl_ms": ttl_ms},
+            ) as resp:
+                body = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not duck: {err}") from err
+        if not body.get("ok", False) or body.get("hold_id") is None:
+            raise PipewireRouterApiError(body.get("message") or "duck rejected")
+        return int(body["hold_id"])
+
+    async def async_duck_renew(self, hold_id: int, ttl_ms: int) -> bool:
+        """Extend a hold's lease. `False` = the daemon no longer has it (expired,
+        or the daemon restarted), so the caller should start a new hold."""
+        try:
+            async with self._session.post(
+                f"{self._base_url}/api/duck/{hold_id}",
+                json={"ttl_ms": ttl_ms},
+            ) as resp:
+                if resp.status == 404:
+                    return False
+                resp.raise_for_status()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not renew duck hold: {err}") from err
+        return True
+
+    async def async_duck_release(self, hold_id: int) -> None:
+        """Release a hold (`DELETE /api/duck/{id}`). Releasing one the daemon has
+        already dropped is success — the intent is "not ducking"."""
+        try:
+            async with self._session.delete(f"{self._base_url}/api/duck/{hold_id}") as resp:
+                resp.raise_for_status()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not release duck hold: {err}") from err
+
     async def async_announce_group(self, group_id: str, *, url: str) -> None:
         """Announce to a named announcement group (`POST /api/announce`), which
         resolves the group's targets/priority/duck. Returns once **admitted**
