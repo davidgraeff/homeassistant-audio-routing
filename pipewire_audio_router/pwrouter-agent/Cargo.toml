@@ -1,0 +1,18 @@
+[package]
+name = "pwrouter-agent"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace root, like bridge-daemon: the two crates are built and
+# shipped separately (the agent runs on the *receiver* host, not in the add-on
+# container), and keeping the roots separate stops one's vendored/excluded trees
+# and lint config from leaking into the other.
+[workspace]
+
+[dependencies]
+# The agent is a PipeWire *client*: it loads module-rtp-session into its own
+# context (docs/receiver-agent-plan.md §4) and reads/writes channelVolumes on the
+# sink our receive stream feeds (§6). Same major as bridge-daemon so the shared
+# `pw-control` crate (P1) can serve both.
+pipewire = "0.10"
+anyhow = "1"
