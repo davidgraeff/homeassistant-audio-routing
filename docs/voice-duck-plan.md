@@ -203,13 +203,27 @@ automatable:
 
 ## 4. Work breakdown
 
+> **VD1–VD4 done 2026-08-03** (2 commits: `duck:` the daemon mechanism, `ha:`
+> the integration). 174 daemon tests, 55 integration tests, no build warnings,
+> `svelte-check` clean. **VD5 is split**: the docs half landed (api-reference
+> §"Duck holds", architecture §5.5, both READMEs), the **UI badge is deliberately
+> not built** — the Outputs tab is mid-rework in a parallel branch, and a cosmetic
+> badge is not worth a conflict there. `GET /api/duck` exists and is documented,
+> so the badge is a few lines whenever that rework settles.
+>
+> What changed against the plan while building: `player`/`decode` helpers fell out
+> as dead (recorded in §7), and `media_player.find_output_ha_device` had to be
+> extracted so area resolution works when per-output entities are *not* exposed —
+> the plan assumed those entities always exist. Nothing else deviated. **Live
+> validation on the instance is still outstanding — §6 is the script.**
+
 | ID | Scope | Files | Done when |
 |---|---|---|---|
-| **VD1** | Duck holds in the mixer | `overlay_mixer.rs` | `ducks` map + aggregate gain + expiry; unit tests: hold-only ducks, hold+overlay takes the min, two holds refcount, expiry restores full gain, hold survives with no relay and applies once one starts, `reap_stalled`/`take_finished` unaffected |
-| **VD2** | Hold registry + expiry tick | `announce.rs` (or a small `duck_holds.rs`), `main.rs` | ids allocated, TTL expiry driven from the existing 150 ms poll, `GET` snapshot |
-| **VD3** | REST API | `api.rs`, `docs/api-reference.md` | 4 endpoints, `announcement_group` resolution reusing the `/api/announce` code path, one `USER ACTION: duck -> N target(s)` log line per call |
-| **VD4** | HA voice ducking | `voice_duck.py`, `api.py`, `__init__.py`, `switch.py`, `number.py`, `select.py`, `const.py`, `strings.json` | satellite→area→outputs resolution, both scopes, renewal, release on idle; pytest: area via device, area overridden on entity, satellite with no area (no-op), scope `music_group` expands to all MG members, scope `area` does **not**, satellite's own output *included*, two satellites in different areas concurrently, release on `unavailable` |
-| **VD5** | UI + docs | `frontend/src/components/OutputsTab.svelte`, `docs/architecture.md` §5.3, `README.md` | a "ducked" badge on an output with a live hold; architecture note that duck now has two producers (AG overlay, duck hold) |
+| ~~VD1~~ **done** | Duck holds in the mixer | `overlay_mixer.rs` | `ducks` map + aggregate gain + expiry; unit tests: hold-only ducks, hold+overlay takes the min, two holds refcount, expiry restores full gain, hold survives with no relay and applies once one starts, `reap_stalled`/`take_finished` unaffected |
+| ~~VD2~~ **done** | Hold registry + expiry tick | `announce.rs` (or a small `duck_holds.rs`), `main.rs` | ids allocated, TTL expiry driven from the existing 150 ms poll, `GET` snapshot |
+| ~~VD3~~ **done** | REST API | `api.rs`, `docs/api-reference.md` | 4 endpoints, `announcement_group` resolution reusing the `/api/announce` code path, one `USER ACTION: duck -> N target(s)` log line per call |
+| ~~VD4~~ **done** | HA voice ducking | `voice_duck.py`, `api.py`, `__init__.py`, `switch.py`, `number.py`, `select.py`, `const.py`, `strings.json` | satellite→area→outputs resolution, both scopes, renewal, release on idle; pytest: area via device, area overridden on entity, satellite with no area (no-op), scope `music_group` expands to all MG members, scope `area` does **not**, satellite's own output *included*, two satellites in different areas concurrently, release on `unavailable` |
+| ~VD5~ **docs done, UI badge deferred** | UI + docs | `frontend/src/components/OutputsTab.svelte`, `docs/architecture.md` §5.3, `README.md` | a "ducked" badge on an output with a live hold; architecture note that duck now has two producers (AG overlay, duck hold) |
 | ~~L1–L5~~ | Legacy removal (§7) | see §7 | **done 2026-08-03** (3 commits); L6 still deferred |
 
 VD1–VD3 are independently testable without HA (`curl` a hold onto a playing
