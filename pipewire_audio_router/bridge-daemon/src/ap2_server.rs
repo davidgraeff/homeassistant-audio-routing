@@ -67,11 +67,12 @@ const AP2_FEED_FRAMES: usize = 128;
 /// exposes it as the per-output latency field.
 pub const AP2_RENDER_DELAY_MS: u32 = 1500;
 
-/// UI-input bounds for the per-output render delay. The lower bound keeps enough
-/// buffer to absorb send-side jitter; the upper bound stays inside the negotiated
-/// `latency_max` (88200 frames ≈ 2 s at 44.1 kHz) so the delay fits the receiver's
-/// buffer.
-pub const AP2_RENDER_DELAY_MIN_MS: u16 = 200;
+/// Upper bound for the per-output render delay: stays inside the negotiated
+/// `latency_max` (88200 frames ≈ 2 s at 44.1 kHz) so the delay fits the
+/// receiver's buffer. There is deliberately **no** lower bound — a small delay
+/// is a legitimate thing to ask for (it's the whole point of tuning this knob
+/// down), it just risks dropouts on a jittery sender, which the UI marks red
+/// rather than forbidding.
 pub const AP2_RENDER_DELAY_MAX_MS: u16 = 2000;
 
 /// ALAC magic cookie for the realtime default format (44100 Hz / 16-bit / stereo,

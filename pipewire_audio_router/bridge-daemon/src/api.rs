@@ -2617,8 +2617,9 @@ struct SetOutputLatencyRequest {
 /// There's no PipeWire module to reload: the value is applied **live** to the
 /// running stream (the PT=87 anchor offset the streamer reads per packet) with
 /// no reconnect, and reused as the initial delay on the next (membership/rate)
-/// reconnect. The input is clamped to the render-delay window so it fits the
-/// receiver's negotiated buffer.
+/// reconnect. Only the upper bound is enforced (the receiver's negotiated
+/// buffer); a low delay is allowed through even though it risks dropouts, since
+/// finding that threshold is exactly what this knob is for.
 async fn set_output_latency(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
@@ -2630,9 +2631,7 @@ async fn set_output_latency(
             Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not an AirPlay-2 output") }),
         );
     }
-    let clamped = req
-        .latency_ms
-        .map(|ms| ms.clamp(crate::ap2_server::AP2_RENDER_DELAY_MIN_MS, crate::ap2_server::AP2_RENDER_DELAY_MAX_MS));
+    let clamped = req.latency_ms.map(|ms| ms.min(crate::ap2_server::AP2_RENDER_DELAY_MAX_MS));
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_latency(&node_name, clamped) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
