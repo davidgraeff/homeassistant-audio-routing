@@ -34,6 +34,12 @@
 //! }
 //! ```
 
+// LOCAL: lint noise from upstream silenced here so it can't bury a real
+// warning from the daemon (upstream leftovers). Fixing the ~50 sites
+// across this tree would make it undiffable against lmcgartland/airplay2-rs.
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 mod client;
 mod connection;
 mod group;

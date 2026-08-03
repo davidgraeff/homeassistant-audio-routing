@@ -13,6 +13,12 @@
 //! - **Apple TV**: Use [`PairSetup::new(pin)`] with HKP=3 header (HomeKit Normal)
 //! - **HomePod**: Use [`PairSetup::new_transient()`] with HKP=4 header (HomeKit Transient)
 
+// LOCAL: lint noise from upstream silenced here so it can't bury a real
+// warning from the daemon (upstream API surface the daemon doesn't call; upstream deprecates types it still uses internally). Fixing the ~50 sites
+// across this tree would make it undiffable against lmcgartland/airplay2-rs.
+#![allow(dead_code)]
+#![allow(deprecated)]
+
 mod channel;
 mod controller;
 mod fairplay;

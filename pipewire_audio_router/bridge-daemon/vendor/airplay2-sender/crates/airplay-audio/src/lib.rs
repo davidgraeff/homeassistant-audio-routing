@@ -11,6 +11,12 @@
 //! - Audio buffer management
 //! - Retransmission handling
 
+// LOCAL: lint noise from upstream silenced here so it can't bury a real
+// warning from the daemon (upstream API surface the daemon doesn't call; upstream leftovers). Fixing the ~50 sites
+// across this tree would make it undiffable against lmcgartland/airplay2-rs.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 pub mod cipher;
 mod decoder;
 mod encoder;

@@ -19,6 +19,10 @@ fn main() {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-sign-compare")
         .flag_if_supported("-Wno-unused-variable")
+        // Upstream writes `const char __thread *x`; GCC wants the storage class
+        // first. Suppressed rather than patched, like the warnings above, so the
+        // vendored tree stays diffable against OwnTone.
+        .flag_if_supported("-Wno-old-style-declaration")
         .file(src.join("airptp.c"))
         .file(src.join("utils.c"))
         .file(src.join("daemon.c"))

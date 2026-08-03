@@ -12,6 +12,11 @@
 //!
 //! All secret material is zeroized on drop.
 
+// LOCAL: lint noise from upstream silenced here so it can't bury a real
+// warning from the daemon (upstream leftovers). Fixing the ~50 sites
+// across this tree would make it undiffable against lmcgartland/airplay2-rs.
+#![allow(unused_imports)]
+
 pub mod aes;
 pub mod chacha;
 pub mod curve25519;

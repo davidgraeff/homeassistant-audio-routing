@@ -9,6 +9,11 @@
 //! - Session management
 //! - Two-phase SETUP handling
 
+// LOCAL: lint noise from upstream silenced here so it can't bury a real
+// warning from the daemon (upstream API surface the daemon doesn't call). Fixing the ~50 sites
+// across this tree would make it undiffable against lmcgartland/airplay2-rs.
+#![allow(dead_code)]
+
 mod connection;
 mod request;
 mod response;
