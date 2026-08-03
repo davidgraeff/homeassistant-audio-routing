@@ -33,16 +33,6 @@ class PipewireRouterApiError(Exception):
 
 
 @dataclass
-class MediaPlayerState:
-    """Mirrors bridge-daemon's `MediaPlayerInfo` JSON shape exactly."""
-
-    node_id: int
-    node_name: str
-    state: str  # "playing" | "idle"
-    volume: float | None
-
-
-@dataclass
 class OutputMeta:
     """Supplementary per-output info from `/api/outputs` that the routing
     *matrix* (the entity source of truth) doesn't carry — the output `kind`
@@ -240,22 +230,15 @@ class PipewireRouterApiClient:
         into something Home Assistant can fetch."""
         return self._base_url
 
-    async def async_get_media_players(self) -> list[MediaPlayerState]:
+    async def async_health(self) -> None:
+        """Reachability probe (`GET /health`) — the daemon's cheapest endpoint,
+        used by the config flow and as the coordinator's authoritative call (the
+        one whose failure takes the entities down). Raises on anything else."""
         try:
-            async with self._session.get(f"{self._base_url}/api/media_players") as resp:
+            async with self._session.get(f"{self._base_url}/health") as resp:
                 resp.raise_for_status()
-                data = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
-        return [
-            MediaPlayerState(
-                node_id=item["node_id"],
-                node_name=item["node_name"],
-                state=item["state"],
-                volume=item.get("volume"),
-            )
-            for item in data
-        ]
 
     async def async_get_outputs(self) -> list[OutputMeta]:
         """Fetch the Outputs listing (`GET /api/outputs`) for the per-output
@@ -284,16 +267,6 @@ class PipewireRouterApiClient:
             )
             for item in data
         ]
-
-    async def async_set_volume(self, node_id: int, volume: float) -> None:
-        try:
-            async with self._session.post(
-                f"{self._base_url}/api/media_players/{node_id}/volume",
-                json={"volume": volume},
-            ) as resp:
-                resp.raise_for_status()
-        except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"could not set volume: {err}") from err
 
     async def async_get_sendspin_volumes(self) -> dict[str, int]:
         """Desired per-device sendspin volumes (`GET /api/sendspin/volumes`),

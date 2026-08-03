@@ -30,7 +30,7 @@ class PipewireRouterConfigFlow(ConfigFlow, domain=DOMAIN):
             session = async_get_clientsession(self.hass)
             client = PipewireRouterApiClient(session, user_input[CONF_HOST], user_input[CONF_PORT])
             try:
-                await client.async_get_media_players()
+                await client.async_health()
             except PipewireRouterApiError:
                 errors["base"] = "cannot_connect"
             else:

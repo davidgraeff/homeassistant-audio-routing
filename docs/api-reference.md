@@ -651,60 +651,16 @@ See "Routing matrix" below.
 
 ## Media players
 
-### `GET /api/media_players`
-The volume/state overlay for outputs backed by a real **PipeWire node**, filtered on
-the `sendspin-out-` prefix.
+Outputs are all virtual now (a per-device sender fed by the group relay, no PipeWire
+node of their own), so there is no node-backed volume/state overlay any more: the
+`GET /api/media_players` listing and the per-node `…/volume` get/set endpoints were
+removed along with the node-volume code behind them (`volume.rs`).
 
-> **On the current architecture this is normally an empty list, and that is correct.**
-> Nothing creates `sendspin-out-*` nodes any more: RAOP outputs were dropped, and
-> sendspin, AirPlay-2 and pw-sink outputs are all **virtual** — a per-device sender fed
-> by the group relay, with no node in the graph. Verified live: the daemon's graph
-> contains only the source, the sync anchor, the relay captures and the peak taps.
->
-> The HA integration knows this and takes virtual outputs' state from the **routing
-> matrix** instead — see `media_player.py`'s `_is_virtual`: *"A virtual output (sendspin
-> or AirPlay-2) has no PipeWire node: it never appears in the polled media_players feed,
-> so its state comes from routing rather than the feed."*
->
-> So do **not** "fix" an empty response by pointing the filter at `sendspin-dev-`: that
-> would give the integration a second, conflicting source of truth for devices it
-> already tracks. An earlier revision of this document claimed the endpoint returns the
-> live `sendspin-dev-*` nodes — that was wrong on both counts (wrong prefix, and
-> sendspin devices deliberately never appear here).
-
-```json
-[
-  { "node_id": 42, "node_name": "sendspin-out-kitchen", "state": "playing", "volume": 0.62 }
-]
-```
-
-`state` is `"playing"` if any link currently feeds the node, else `"idle"`. `volume` is
-read natively from the node's SPA `Props` param (`channelVolumes`, `volume.rs`); `null`
-if the node exposes no volume control. If node-backed outputs ever return, this reports
-them again with no change.
-
-For the volume of a *virtual* output, use the backend's own control:
+Take an output's state from the **routing matrix** ([`GET /api/routing`](#get-apirouting)),
+and its volume from the backend's own control:
 [`/api/sendspin/volume`](#put-apisendspinvolume) or
 [`/api/ap2/volume`](#put-apiap2volume), with current values from
 [`GET /api/outputs`](#get-apioutputs).
-
-### `GET /api/media_players/{node_id}/volume`
-```json
-{ "volume": 0.62, "message": null }
-```
-`volume: null` with a `message` when the node has no volume control (200);
-`volume: null` + `message` with 500 if the read failed outright.
-
-### `POST /api/media_players/{node_id}/volume`
-```json
-// Request
-{ "volume": 0.5 }
-// Response
-{ "volume": 0.5, "message": null }
-```
-0.0–1.0, on the same cubic scale as `wpctl`/HA's `volume_level`: the value
-`V` is written to the node's `channelVolumes` as `V³` (linear gain), so it
-reads back identically to what `wpctl` would show.
 
 ### `POST /api/media_players/{node_id}/announce`
 Ducks every source currently linked into the target, plays a clip, then
@@ -881,6 +837,6 @@ synchronized-group badges, and a live input-level meter per source) plus
 RAOP-output and AirPlay/RTP-source management and per-output diagnostic test
 buttons (Play tone / Play announcement). Sendspin
 devices are auto-discovered, so there's no manual sendspin management — just a
-capabilities note. Volume sliders poll `/api/media_players` +
-`/api/sendspin/volumes` every few seconds, since volume changes aren't a
-registry event.
+capabilities note. Volume sliders poll `/api/sendspin/volumes` (and read
+`/api/outputs` for AirPlay-2 levels) every few seconds, since volume changes
+aren't a registry event.

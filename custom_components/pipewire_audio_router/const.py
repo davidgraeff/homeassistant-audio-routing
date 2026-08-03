@@ -17,9 +17,9 @@ DEFAULT_RTP_PORT = 46000
 # weak-signal bridge to trade latency for fewer audible dropouts.
 DEFAULT_RTP_LATENCY_MSEC = 200
 
-# Poll interval for GET /api/media_players (volume + playing/idle state) —
-# there's no push channel for those. Routing is NOT polled: it's pushed live
-# over the daemon's /api/routing/ws WebSocket (see PipewireRouterCoordinator).
+# Poll interval for the daemon state that has no push channel (RTP source,
+# per-device volumes, output metadata, named groups). Routing is NOT polled:
+# it's pushed live over /api/routing/ws (see PipewireRouterCoordinator).
 UPDATE_INTERVAL_SECONDS = 5
 
 # Delay before the routing WebSocket task reconnects after the socket drops.

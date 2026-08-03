@@ -16,7 +16,6 @@ import type {
   AirplaySourceCfg,
   AppSettings,
   AppSettingsUpdate,
-  MediaPlayerInfo,
   MusicGroup,
   NodesResponse,
   OpResponse,
@@ -29,7 +28,6 @@ import type {
   SourceView,
   StatusInfo,
   SyncSettingsInfo,
-  VolumeResponse,
 } from './types';
 
 const BASE = new URL('.', document.baseURI);
@@ -88,14 +86,6 @@ export const api = {
   /** Forget all routing for an offline entity (matrix remove-✕). */
   forgetEntity: (nodeName: string) =>
     request<OpResponse>('DELETE', `api/routing/entity/${encodeURIComponent(nodeName)}`),
-
-  // Media players (volume). Ducked TTS/announce playback is driven by the Home
-  // Assistant integration against the daemon's `/announce` endpoint, not the web
-  // UI — the Outputs tab's Play tone / Play announcement buttons are the UI's
-  // own (unducked) diagnostics (see `testTone`/`testAnnouncement`).
-  mediaPlayers: () => request<MediaPlayerInfo[]>('GET', 'api/media_players'),
-  setVolume: (nodeId: number, volume: number) =>
-    request<VolumeResponse>('POST', `api/media_players/${nodeId}/volume`, { volume }),
 
   // Receiver agents (pwrouter-agent). Diagnostics only: a host waiting to pair is a
   // discovered `pwsink` output, so the *decisions* are the output calls below —

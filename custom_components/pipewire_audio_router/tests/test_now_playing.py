@@ -57,7 +57,7 @@ def _make_entry(hass):
 
 def _patch_daemon(routing, music_groups=()):
     stack = ExitStack()
-    stack.enter_context(patch(f"{API}.async_get_media_players", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{API}.async_health", new=AsyncMock(return_value=None)))
     stack.enter_context(patch(f"{API}.async_get_routing", new=AsyncMock(return_value=routing)))
     stack.enter_context(patch(f"{API}.async_get_rtp_source", new=AsyncMock(return_value=RTP_DISABLED)))
     stack.enter_context(patch(f"{API}.async_get_sendspin_volumes", new=AsyncMock(return_value={})))

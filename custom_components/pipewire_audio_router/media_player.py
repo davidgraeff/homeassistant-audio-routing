@@ -446,9 +446,9 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _S
 
     @property
     def _is_virtual(self) -> bool:
-        """A virtual output (sendspin or AirPlay-2) has no PipeWire node: it
-        never appears in the polled media_players feed, so its state comes from
-        routing rather than the feed."""
+        """A virtual output has no PipeWire node of its own — audio reaches it
+        through a per-device sender — so its state and volume come from the
+        routing matrix and the daemon's per-device stores."""
         return self._is_sendspin or self._is_ap2 or self._is_pwsink
 
     @property

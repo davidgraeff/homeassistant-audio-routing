@@ -21,7 +21,6 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import (
     AnnouncementGroup,
-    MediaPlayerState,
     MusicGroup,
     NowPlaying,
     NowPlayingFrame,
@@ -48,12 +47,13 @@ PLATFORMS = [Platform.MEDIA_PLAYER, Platform.NUMBER, Platform.SWITCH]
 _EMPTY_ROUTING = RoutingMatrix(sources=[], outputs=[], links=[])
 
 
-class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
+class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
     """Two feeds from one daemon:
 
-    - **Players** (volume + playing/idle state) are *polled* via
-      `GET /api/media_players` — there's no push channel for volume — and
-      live in `.data`.
+    - **Polled** state that has no push channel — RTP source, per-device
+      volumes, output metadata, named groups — is refreshed on the interval and
+      lives in the attributes set up below, not in `.data` (which is unused:
+      every value here has a different shape and its own staleness rules).
     - **Routing** (the source×output matrix) is *pushed* over the daemon's
       `/api/routing/ws` WebSocket by a background task (`async_routing_ws_loop`)
       and lives in `.routing`, so a re-wire is reflected instantly instead of
@@ -109,9 +109,13 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         self.announcement_groups: list[AnnouncementGroup] = []
         self.expose_outputs: bool = False
 
-    async def _async_update_data(self) -> list[MediaPlayerState]:
+    async def _async_update_data(self) -> None:
+        # Reachability first, and it is the only fatal call: everything below is
+        # best-effort, so one unavailable endpoint must not take the entities
+        # down. (This used to be `GET /api/media_players`, which no longer
+        # exists — every output is virtual, so it had nothing to report.)
         try:
-            players = await self.client.async_get_media_players()
+            await self.client.async_health()
         except PipewireRouterApiError as err:
             raise UpdateFailed(str(err)) from err
         # RTP state is secondary — never fail the whole update (and take the
@@ -144,7 +148,6 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
             self.expose_outputs = (await self.client.async_get_settings()).expose_outputs_as_media_players
         except PipewireRouterApiError as err:
             _LOGGER.debug("groups/settings unavailable: %s", err)
-        return players
 
     async def async_init_routing(self) -> None:
         """One-shot routing fetch so `source`/`source_list` are populated the

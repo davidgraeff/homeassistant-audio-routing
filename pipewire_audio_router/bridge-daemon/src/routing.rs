@@ -14,11 +14,13 @@
 //!
 //! **Source/output classification is a heuristic over live registry
 //! state, not a fixed list** — consistent with the rest of this project's
-//! "trust the observed graph" approach (api.rs's `/api/media_players`):
-//! - **Outputs** are exactly the nodes `/api/media_players` already
-//!   recognizes (`RAOP_NODE_PREFIX`/`SENDSPIN_NODE_PREFIX`) — one source of
-//!   truth for "what counts as a routable output" shared with the HA
-//!   integration.
+//! "trust the observed graph" approach:
+//! - **Outputs** are the nodes `is_output_node` recognizes by name prefix
+//!   (`SENDSPIN_NODE_PREFIX`). This is vestigial — nothing creates such a node
+//!   any more, so `present_outputs` is always empty and every output's `node_id`
+//!   is `None`; adopted virtual outputs are added separately below. Retiring the
+//!   prefix changes this classification rule rather than deleting a dead branch,
+//!   so it is deferred (docs/voice-duck-plan.md §7 L6).
 //! - **Sources** are any node with at least one **non-monitor** output-
 //!   direction port. Every sink in this project also exposes `monitor_*`
 //!   output ports (monitor/capture taps) — excluding ports named with that

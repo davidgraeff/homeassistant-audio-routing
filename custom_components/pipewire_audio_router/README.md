@@ -20,7 +20,7 @@ Not HACS-packaged (no `hacs.json`) — install manually:
 3. Settings → Devices & Services → **Add Integration** → search
    "PipeWire Audio Router".
 4. Enter the bridge daemon add-on's host and port (default `8099`).
-   Setup actually calls the add-on (`GET /api/media_players`) to verify
+   Setup actually calls the add-on (`GET /health`) to verify
    it's reachable before completing — if that fails you'll see "Could
    not reach the bridge daemon at that host/port" rather than a silent
    success.

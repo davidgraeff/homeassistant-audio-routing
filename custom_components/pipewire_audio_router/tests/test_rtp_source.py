@@ -40,7 +40,7 @@ async def _setup(hass, stack, rtp=RTP_DISABLED):
     mocks stay in force for any post-setup service call (each triggers a
     coordinator refresh that re-polls the daemon)."""
     entry = _make_entry(hass)
-    stack.enter_context(patch(f"{API}.async_get_media_players", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{API}.async_health", new=AsyncMock(return_value=None)))
     from custom_components.pipewire_audio_router.api import RoutingMatrix
 
     stack.enter_context(

@@ -48,7 +48,7 @@ def _patch_setup():
 
 async def test_user_flow_success(hass):
     with (
-        patch(f"{API}.async_get_media_players", new=AsyncMock(return_value=[])),
+        patch(f"{API}.async_health", new=AsyncMock(return_value=None)),
         _patch_setup(),
     ):
         result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
@@ -64,7 +64,7 @@ async def test_user_flow_success(hass):
 
 async def test_user_flow_cannot_connect(hass):
     with patch(
-        "custom_components.pipewire_audio_router.config_flow.PipewireRouterApiClient.async_get_media_players",
+        "custom_components.pipewire_audio_router.config_flow.PipewireRouterApiClient.async_health",
         new=AsyncMock(side_effect=PipewireRouterApiError("no route")),
     ):
         result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
@@ -77,7 +77,7 @@ async def test_user_flow_cannot_connect(hass):
 
 async def test_duplicate_entry_aborts(hass):
     with (
-        patch(f"{API}.async_get_media_players", new=AsyncMock(return_value=[])),
+        patch(f"{API}.async_health", new=AsyncMock(return_value=None)),
         _patch_setup(),
     ):
         for expected_type in (FlowResultType.CREATE_ENTRY, FlowResultType.ABORT):

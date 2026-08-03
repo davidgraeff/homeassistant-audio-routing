@@ -456,13 +456,6 @@ export interface SourcesResponse {
   discovered_bridges: BridgeInfo[];
 }
 
-export interface MediaPlayerInfo {
-  node_id: number;
-  node_name: string;
-  state: 'playing' | 'idle';
-  volume: number | null;
-}
-
 export interface OpResponse {
   ok: boolean;
   message: string;
@@ -492,11 +485,6 @@ export interface AnnounceResponse {
   /** Why it was rejected, when `admission === "rejected"`. */
   reason?: string;
   message: string;
-}
-
-export interface VolumeResponse {
-  volume: number | null;
-  message: string | null;
 }
 
 /** One row of `GET /api/agents`: a paired receiver host, or one asking to be

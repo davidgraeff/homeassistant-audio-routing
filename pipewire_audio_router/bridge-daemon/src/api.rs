@@ -4,7 +4,7 @@
 use crate::airplay_clients::AirplayClientStore;
 use crate::ap2_discovery::SharedAp2Devices;
 use crate::ap2_ptp::SharedAp2Ptp;
-use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
+use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use crate::locks::LockRecover;
 use crate::outputs_store::{OutputState, SharedOutputs};
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
@@ -264,8 +264,6 @@ pub fn router(
         .route("/api/align/start", post(align_start))
         .route("/api/align/select", post(align_select))
         .route("/api/align/volume", post(align_volume))
-        .route("/api/media_players", get(list_media_players))
-        .route("/api/media_players/{node_id}/volume", get(get_volume).post(set_volume))
         .route("/api/media_players/{node_id}/announce", post(announce))
         .route("/api/routing", get(routing::get_routing))
         .route("/api/routing/link", post(routing::link))
@@ -3120,94 +3118,6 @@ async fn set_ap2_rate_mode(
         crate::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' sample rate to {label} (applies shortly)") }))
-}
-
-/// One output the custom HA integration turns into a
-/// `media_player` entity: derived from the live registry, not from static
-/// config, so it only lists sinks PipeWire actually created — matching this
-/// project's "trust the observed state" approach throughout. (Virtual outputs —
-/// sendspin/AP2 devices — are exposed to HA separately, via `/api/outputs`.)
-#[derive(Serialize)]
-struct MediaPlayerInfo {
-    node_id: u32,
-    node_name: String,
-    /// "playing" if any link currently feeds this node, "idle" otherwise
-    /// (pw_thread.rs's `node_has_incoming_link`) — there is no richer
-    /// PipeWire-native concept of "paused" for a passive routing sink, so
-    /// this entity's state model is necessarily simpler than a real
-    /// playback device's.
-    state: &'static str,
-    /// Included inline (read natively from the node's Props param, volume.rs)
-    /// rather than requiring the HA integration to make a second request
-    /// per output on every poll — `None` if the node has no volume control.
-    volume: Option<f32>,
-}
-
-async fn list_media_players(State(pw_state): State<SharedState>) -> Json<Vec<MediaPlayerInfo>> {
-    // **Normally empty on the current architecture, and that is correct.** This
-    // endpoint is the volume/state overlay for outputs that are backed by a real
-    // PipeWire node, and it filters on `SENDSPIN_NODE_PREFIX` ("sendspin-out-").
-    // Nothing creates such nodes any more: RAOP outputs were dropped, and sendspin,
-    // AirPlay-2 and pw-sink outputs are all *virtual* (a per-device sender fed by
-    // the group relay, no node in the graph). The HA integration knows this and
-    // takes virtual outputs' state from the routing matrix instead — see
-    // `media_player.py`'s `_is_virtual`: "A virtual output ... has no PipeWire
-    // node: it never appears in the polled media_players feed."
-    //
-    // So do NOT "fix" an empty response by pointing this at `SENDSPIN_DEV_PREFIX`:
-    // that would hand the integration a second, conflicting source of truth for
-    // devices it already tracks. If node-backed outputs return, this starts
-    // reporting them again with no change.
-    //
-    // Snapshot and release the lock before the async volume reads below —
-    // std::sync::MutexGuard isn't safe to hold across an .await point.
-    let candidates: Vec<(u32, String, bool)> = {
-        let state = pw_state.lock_recover();
-        state
-            .nodes
-            .values()
-            .filter(|n| n.node_name.starts_with(SENDSPIN_NODE_PREFIX))
-            .map(|n| (n.node_id, n.node_name.clone(), state.node_has_incoming_link(n.node_id)))
-            .collect()
-    };
-
-    // Sequential, not concurrent: candidate counts are small (a handful of
-    // rooms), and this avoids pulling in a join_all dependency for it.
-    let mut players = Vec::with_capacity(candidates.len());
-    for (node_id, node_name, playing) in candidates {
-        let volume = crate::volume::get_volume(node_id).await.ok().flatten();
-        players.push(MediaPlayerInfo { node_id, node_name, state: if playing { "playing" } else { "idle" }, volume });
-    }
-
-    Json(players)
-}
-
-#[derive(Serialize)]
-struct VolumeResponse {
-    volume: Option<f32>,
-    message: Option<String>,
-}
-
-async fn get_volume(Path(node_id): Path<u32>) -> (StatusCode, Json<VolumeResponse>) {
-    match crate::volume::get_volume(node_id).await {
-        Ok(Some(volume)) => (StatusCode::OK, Json(VolumeResponse { volume: Some(volume), message: None })),
-        Ok(None) => (StatusCode::OK, Json(VolumeResponse { volume: None, message: Some(format!("node {node_id} has no volume control")) })),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(VolumeResponse { volume: None, message: Some(e) })),
-    }
-}
-
-#[derive(Deserialize)]
-struct SetVolumeRequest {
-    /// 0.0-1.0, matching `wpctl`'s own scale (1.0 = 100%) and HA's
-    /// `MediaPlayerEntity.volume_level`.
-    volume: f32,
-}
-
-async fn set_volume(Path(node_id): Path<u32>, Json(req): Json<SetVolumeRequest>) -> (StatusCode, Json<VolumeResponse>) {
-    match crate::volume::set_volume(node_id, req.volume).await {
-        Ok(()) => (StatusCode::OK, Json(VolumeResponse { volume: Some(req.volume), message: None })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(VolumeResponse { volume: None, message: Some(e) })),
-    }
 }
 
 /// TTS/voice-response ducked announce stream. Ducks

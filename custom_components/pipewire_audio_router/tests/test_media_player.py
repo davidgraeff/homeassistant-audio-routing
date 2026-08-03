@@ -39,13 +39,13 @@ def _make_entry(hass):
     return entry
 
 
-def _patch_daemon(players, routing=EMPTY_ROUTING, rtp=RTP_DISABLED, sendspin_volumes=None, outputs=None):
-    """Keep setup/refresh fully offline: mock the polled players + RTP-source +
+def _patch_daemon(routing=EMPTY_ROUTING, rtp=RTP_DISABLED, sendspin_volumes=None, outputs=None):
+    """Keep setup/refresh fully offline: mock the health probe + RTP-source +
     sendspin-volume + outputs-listing fetches and the one-shot routing seed, and
     stub out the routing WebSocket loop so no real socket is opened (routing is
     driven directly in the WS tests)."""
     stack = ExitStack()
-    stack.enter_context(patch(f"{API}.async_get_media_players", new=AsyncMock(return_value=players)))
+    stack.enter_context(patch(f"{API}.async_health", new=AsyncMock(return_value=None)))
     stack.enter_context(patch(f"{API}.async_get_routing", new=AsyncMock(return_value=routing)))
     stack.enter_context(patch(f"{API}.async_get_rtp_source", new=AsyncMock(return_value=rtp)))
     stack.enter_context(
@@ -67,12 +67,6 @@ def _patch_daemon(players, routing=EMPTY_ROUTING, rtp=RTP_DISABLED, sendspin_vol
     return stack
 
 
-# The virtual outputs never appear in the polled media_players feed, so the
-# routing tests run with an empty feed and drive everything off the matrix.
-def _routing_players():
-    return []
-
-
 def _routing_matrix(links, outputs=None):
     return RoutingMatrix(
         sources=[
@@ -91,13 +85,13 @@ async def test_entities_created_from_matrix_including_sendspin(hass):
     routing = RoutingMatrix(
         sources=[],
         outputs=[
-            # Both kinds are virtual: no node_id, not in the media_players feed.
+            # Both kinds are virtual: no PipeWire node of their own.
             RoutingNode(node_id=None, node_name="ap2-dev-pioneer", display_name="Pioneer", configured=False),
             RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False),
         ],
         links=[],
     )
-    with _patch_daemon([], routing, sendspin_volumes={"sendspin-dev-bath": 50}):
+    with _patch_daemon(routing, sendspin_volumes={"sendspin-dev-bath": 50}):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -152,7 +146,7 @@ async def test_sendspin_device_adopts_matching_ha_device_name_and_area(hass):
         ],
         links=[],
     )
-    with _patch_daemon([], routing):
+    with _patch_daemon(routing):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -182,7 +176,7 @@ async def test_sendspin_device_without_matching_ha_device_keeps_derived_name(has
         outputs=[RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False)],
         links=[],
     )
-    with _patch_daemon([], routing):
+    with _patch_daemon(routing):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -207,7 +201,7 @@ async def test_ap2_output_becomes_media_player_routable_with_volume(hass):
     )
     # No ap2_volume => unknown; ap2_muted absent too.
     outputs = [OutputMeta(node_name="ap2-dev-dusche", kind="airplay2", ip=None)]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -234,7 +228,7 @@ async def test_ap2_reports_device_authoritative_volume_and_mute(hass):
         links=[],
     )
     outputs = [OutputMeta(node_name="ap2-dev-dusche", kind="airplay2", ip=None, ap2_volume=0.42, ap2_muted=True)]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -262,7 +256,7 @@ async def test_pwsink_host_reports_its_own_master_volume(hass):
             node_name="pwsink-dev-desk_dave", kind="pwsink", ip=None, pwsink_volume=0.37, pwsink_muted=False
         )
     ]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -286,7 +280,7 @@ async def test_pwsink_volume_is_none_without_a_connected_agent(hass):
         links=[],
     )
     outputs = [OutputMeta(node_name="pwsink-dev-desk_dave", kind="pwsink", ip=None)]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -305,7 +299,7 @@ async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
         links=[],
     )
     outputs = [OutputMeta(node_name="pwsink-dev-desk_dave", kind="pwsink", ip=None)]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -313,7 +307,6 @@ async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
             patch(f"{API}.async_set_pwsink_volume", new=AsyncMock()) as mock_vol,
             patch(f"{API}.async_set_pwsink_mute", new=AsyncMock()) as mock_mute,
             patch(f"{API}.async_set_ap2_volume", new=AsyncMock()) as mock_ap2_vol,
-            patch(f"{API}.async_set_volume", new=AsyncMock()) as mock_node_vol,
         ):
             await hass.services.async_call(
                 "media_player",
@@ -330,7 +323,6 @@ async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
             mock_vol.assert_awaited_once_with("pwsink-dev-desk_dave", 0.6)
             mock_mute.assert_awaited_once_with("pwsink-dev-desk_dave", True)
             mock_ap2_vol.assert_not_awaited()
-            mock_node_vol.assert_not_awaited()
 
 
 async def test_set_volume_on_ap2_device_uses_ap2_api(hass):
@@ -343,13 +335,12 @@ async def test_set_volume_on_ap2_device_uses_ap2_api(hass):
         links=[],
     )
     outputs = [OutputMeta(node_name="ap2-dev-dusche", kind="airplay2", ip=None)]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
         with (
             patch(f"{API}.async_set_ap2_volume", new=AsyncMock()) as mock_ap2_vol,
-            patch(f"{API}.async_set_volume", new=AsyncMock()) as mock_node_vol,
             patch(f"{API}.async_set_sendspin_volume", new=AsyncMock()) as mock_sendspin_vol,
         ):
             await hass.services.async_call(
@@ -359,7 +350,6 @@ async def test_set_volume_on_ap2_device_uses_ap2_api(hass):
                 blocking=True,
             )
             mock_ap2_vol.assert_awaited_once_with("ap2-dev-dusche", 0.6)
-            mock_node_vol.assert_not_awaited()
             mock_sendspin_vol.assert_not_awaited()
 
 
@@ -372,7 +362,7 @@ async def test_mute_on_ap2_device_uses_ap2_api(hass):
         links=[],
     )
     outputs = [OutputMeta(node_name="ap2-dev-dusche", kind="airplay2", ip=None)]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -414,7 +404,7 @@ async def test_ap2_device_adopts_matching_ha_device_by_ip(hass):
         links=[],
     )
     outputs = [OutputMeta(node_name="ap2-dev-dusche", kind="airplay2", ip="192.168.1.55")]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -438,7 +428,7 @@ async def test_ap2_device_without_ip_match_keeps_derived_name(hass):
         links=[],
     )
     outputs = [OutputMeta(node_name="ap2-dev-dusche", kind="airplay2", ip="192.168.1.55")]
-    with _patch_daemon([], routing, outputs=outputs):
+    with _patch_daemon(routing, outputs=outputs):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -460,7 +450,7 @@ async def test_ap2_group_membership_attribute(hass):
         ],
         links=[("shairport-sync", "ap2-dev-dusche"), ("shairport-sync", "ap2-dev-salon")],
     )
-    with _patch_daemon([], routing):
+    with _patch_daemon(routing):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -479,13 +469,12 @@ async def test_set_volume_on_sendspin_device_uses_sendspin_api(hass):
         outputs=[RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False)],
         links=[],
     )
-    with _patch_daemon([], routing):
+    with _patch_daemon(routing):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
         with (
             patch(f"{API}.async_set_sendspin_volume", new=AsyncMock()) as mock_sendspin_vol,
-            patch(f"{API}.async_set_volume", new=AsyncMock()) as mock_node_vol,
         ):
             await hass.services.async_call(
                 "media_player",
@@ -494,7 +483,6 @@ async def test_set_volume_on_sendspin_device_uses_sendspin_api(hass):
                 blocking=True,
             )
             mock_sendspin_vol.assert_awaited_once_with("sendspin-dev-bath", 40)
-            mock_node_vol.assert_not_awaited()
 
 
 async def test_sendspin_group_membership_attribute(hass):
@@ -509,7 +497,7 @@ async def test_sendspin_group_membership_attribute(hass):
         ],
         links=[("shairport-sync", "sendspin-dev-bath"), ("shairport-sync", "sendspin-dev-den")],
     )
-    with _patch_daemon([], routing):
+    with _patch_daemon(routing):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -523,7 +511,7 @@ async def test_offline_output_is_unavailable(hass):
     present=False → the entity shows unavailable (not removed, not crashing)."""
     entry = _make_entry(hass)
     online = _routing_matrix([], outputs=[RoutingNode(node_id=None, node_name="ap2-dev-pioneer", display_name="Pioneer", present=True)])
-    with _patch_daemon([], online):
+    with _patch_daemon(online):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -541,7 +529,7 @@ async def test_output_gone_from_matrix_is_removed(hass):
     """An output that leaves the matrix entirely (a discovered device that's
     gone) has its entity removed rather than lingering as unavailable."""
     entry = _make_entry(hass)
-    with _patch_daemon([], _routing_matrix([], outputs=[RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False)])):
+    with _patch_daemon(_routing_matrix([], outputs=[RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", configured=False)])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     assert hass.states.get("media_player.bath") is not None
@@ -558,7 +546,7 @@ async def test_output_gone_from_matrix_is_removed(hass):
 
 async def test_source_list_and_current_source_from_routing(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
+    with _patch_daemon(_routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -570,7 +558,7 @@ async def test_source_list_and_current_source_from_routing(hass):
 
 async def test_current_source_is_none_when_nothing_linked(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([])):
+    with _patch_daemon(_routing_matrix([])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -579,7 +567,7 @@ async def test_current_source_is_none_when_nothing_linked(hass):
 
 async def test_select_source_unlinks_previous_then_links_new(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
+    with _patch_daemon(_routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -599,7 +587,7 @@ async def test_select_source_unlinks_previous_then_links_new(hass):
 
 async def test_select_source_none_unlinks_without_linking(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
+    with _patch_daemon(_routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -619,7 +607,7 @@ async def test_select_source_none_unlinks_without_linking(hass):
 
 async def test_select_source_already_selected_is_noop(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
+    with _patch_daemon(_routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -639,7 +627,7 @@ async def test_select_source_already_selected_is_noop(hass):
 
 async def test_select_unknown_source_raises(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
+    with _patch_daemon(_routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -654,7 +642,7 @@ async def test_select_unknown_source_raises(hass):
 
 async def test_link_service_is_additive(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
+    with _patch_daemon(_routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -674,7 +662,7 @@ async def test_link_service_is_additive(hass):
 
 async def test_unlink_service_named_source(hass):
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
+    with _patch_daemon(_routing_matrix([("shairport-sync", "ap2-dev-kitchen")])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -691,7 +679,6 @@ async def test_unlink_service_named_source(hass):
 async def test_unlink_service_without_source_drops_all(hass):
     entry = _make_entry(hass)
     with _patch_daemon(
-        _routing_players(),
         _routing_matrix([("shairport-sync", "ap2-dev-kitchen"), ("bt-bridge", "ap2-dev-kitchen")]),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -716,7 +703,7 @@ async def test_cleanup_entities_service_removes_stale_registry_entries(hass):
     """The domain service deletes media_player registry entries whose output
     the daemon no longer reports, keeping the ones still in the matrix."""
     entry = _make_entry(hass)
-    with _patch_daemon(_routing_players(), _routing_matrix([])):
+    with _patch_daemon(_routing_matrix([])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -748,7 +735,7 @@ async def test_routing_push_updates_source_live(hass):
     entry = _make_entry(hass)
     # Seed with the kitchen output present but nothing linked, so the entity
     # exists at setup; the push then adds a link.
-    with _patch_daemon(_routing_players(), _routing_matrix([])):
+    with _patch_daemon(_routing_matrix([])):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
