@@ -2,7 +2,6 @@
   import { onMount, onDestroy } from 'svelte';
   import { api } from '../lib/api';
   import type { NodeInfo, OutputInfo, StatusInfo } from '../lib/types';
-  import FlowGraph from './FlowGraph.svelte';
 
   // PipeWire internals that are never routing endpoints — shown grayed and
   // non-interactive in the raw node list.
@@ -40,6 +39,19 @@
     return `${mb} MiB`;
   }
 
+  // Versions are `major.minor.YYYYMMDDHHMMSS`, where the revision is the UTC
+  // build time (see scripts/release.py). Split it so the long unbreakable stamp
+  // doesn't overflow its grid cell into the neighbouring value, and so the build
+  // time can be rendered in the browser's timezone.
+  function parseVersion(v: string): { label: string; built: Date | null } {
+    const m = /^(\d+\.\d+)\.(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(v);
+    if (!m) return { label: v, built: null };
+    const [, label, y, mo, d, h, min, s] = m;
+    return { label, built: new Date(Date.UTC(+y, +mo - 1, +d, +h, +min, +s)) };
+  }
+
+  const buildTimeFmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+
   function fmtUptime(secs: number): string {
     const d = Math.floor(secs / 86400);
     const h = Math.floor((secs % 86400) / 3600);
@@ -74,9 +86,8 @@
   }
   onMount(() => {
     refresh();
-    // Keep the live graph reflecting changes made elsewhere while this tab is
-    // open (a silent poll — no loading flicker). The routing matrix below is
-    // already push-updated over the WebSocket.
+    // Keep the status + node list reflecting changes made elsewhere while this
+    // tab is open (a silent poll — no loading flicker).
     poll = setInterval(() => refresh(true), 4000);
   });
   onDestroy(() => clearInterval(poll));
@@ -88,8 +99,15 @@
     <button class="ghost" onclick={() => refresh()} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
   </div>
   {#if status}
+    {@const ver = parseVersion(status.version)}
     <dl class="status-grid">
-      <div><dt>Version</dt><dd>{status.version}</dd></div>
+      <div><dt>Version</dt><dd title={status.version}>{ver.label}</dd></div>
+      {#if ver.built}
+        <div>
+          <dt>Built</dt>
+          <dd style="font-size:1rem" title="{ver.built.toISOString()} (UTC)">{buildTimeFmt.format(ver.built)}</dd>
+        </div>
+      {/if}
       <div><dt>Uptime</dt><dd>{fmtUptime(status.uptime_secs)}</dd></div>
       <div>
         <dt>Discovery</dt>
@@ -165,36 +183,28 @@
   </div>
 {/if}
 
-<FlowGraph />
-
 <div class="card">
-  <details class="collapsible">
-    <summary>
-      <!-- Same disclosure affordance as an output card (OutputsTab.svelte): a
-           28px chevron box that rotates when open. Kept as <details>/<summary>
-           so open/close stays native — the span only borrows the styling. -->
-      <span class="collapse-toggle" aria-hidden="true"><span class="chevron">▶</span></span>
-      <h2>PipeWire Nodes</h2>
-    </summary>
-    <p class="card-sub">
-      Every node in the live audio graph right now — sources, sinks, and internal plumbing. Grayed rows are internal
-      nodes (drivers, unclassified) that aren't routing endpoints; they're shown for diagnostics only.
-    </p>
-    {#if nodes.length === 0}
-      <p class="empty">{loading ? 'Loading…' : 'No nodes.'}</p>
-    {:else}
-      <div style="overflow-x:auto">
-        <table>
-          <thead><tr><th>ID</th><th>Node name</th><th>Media class</th></tr></thead>
-          <tbody>
-            {#each nodes as n (n.node_id)}
-              <tr class:internal={isInternal(n)}><td>{n.node_id}</td><td><code>{n.node_name}</code></td><td>{n.media_class ?? '—'}</td></tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    {/if}
-  </details>
+  <h2>PipeWire nodes</h2>
+  <p class="card-sub">
+    Every node in the live audio graph right now — sources, sinks, and internal plumbing — refreshed every few seconds.
+    Grayed rows are internal nodes (drivers, unclassified) that aren't routing endpoints; they're shown for diagnostics
+    only. To see and edit how sources are wired to speakers, use the routing graph on the
+    <strong>Music groups</strong> page.
+  </p>
+  {#if nodes.length === 0}
+    <p class="empty">{loading ? 'Loading…' : 'No nodes.'}</p>
+  {:else}
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>ID</th><th>Node name</th><th>Media class</th></tr></thead>
+        <tbody>
+          {#each nodes as n (n.node_id)}
+            <tr class:internal={isInternal(n)}><td>{n.node_id}</td><td><code>{n.node_name}</code></td><td>{n.media_class ?? '—'}</td></tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -212,43 +222,9 @@
     margin: 2px 0 0;
     font-size: 1.1rem;
     font-weight: 500;
-  }
-  /* Disclosure header: chevron + title on one row, no native marker. */
-  .collapsible > summary {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    cursor: pointer;
-    list-style: none;
-    user-select: none;
-  }
-  .collapsible > summary::-webkit-details-marker {
-    display: none;
-  }
-  .collapsible > summary h2 {
-    margin: 0;
-  }
-  .collapse-toggle {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 6px;
-    color: var(--secondary-text-color);
-  }
-  .collapsible > summary:hover .collapse-toggle {
-    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
-    color: var(--primary-color);
-  }
-  .chevron {
-    font-size: 0.7rem;
-    line-height: 1;
-    transition: transform 0.15s ease;
-  }
-  .collapsible[open] > summary .chevron {
-    transform: rotate(90deg);
+    /* Long unbreakable values (version stamps, CPU models) must wrap inside
+       their cell rather than spill over the next column. */
+    overflow-wrap: anywhere;
   }
   tr.internal {
     opacity: 0.45;

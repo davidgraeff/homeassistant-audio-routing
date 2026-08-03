@@ -3,7 +3,10 @@
   import { api } from '../lib/api';
   import { routing } from '../lib/routing';
   import { run } from '../lib/toast';
+  import { align } from '../lib/align.svelte';
   import RtpSenderDocs from './RtpSenderDocs.svelte';
+  import AlignDocs from './AlignDocs.svelte';
+  import AlignPanel from './AlignPanel.svelte';
   import type {
     AirplayClient,
     AirplaySourceCfg,
@@ -103,7 +106,14 @@
     refresh();
     // Light poll so connect/disconnect/ban shows up without a manual reload.
     const timer = setInterval(refreshAllClients, 5000);
-    return () => clearInterval(timer);
+    // Alignment lives on this page (a sync group is identified by its source):
+    // attach loads the session + alignable groups and, on unmount, stops any
+    // session so speakers aren't left muted with the click looping.
+    const detachAlign = align.attach();
+    return () => {
+      clearInterval(timer);
+      detachAlign();
+    };
   });
 
   // Live input-level meters. Subscribing to the `routing` store opens the same
@@ -335,6 +345,9 @@
     if (rtpMode === 'multicast') rtpMulticastAddr = cfg.source_addr ?? '239.255.42.42';
   }
 
+  // ---- Alignment docs ------------------------------------------------------
+  // Static document (no per-source parameters), so a simple open flag.
+  let alignDocsOpen = $state(false);
 
   // ---- Sender setup docs (RTP only) ---------------------------------------
   // Fed the port/rate/mode currently in view so the sample configs are
@@ -374,14 +387,24 @@
 <div class="card info">
   <div class="info-head">
     <h2>Input sources</h2>
-    <button
-      class="ghost"
-      type="button"
-      title="How to turn a PipeWire machine into a sender that feeds an RTP-receive source"
-      onclick={openDocs}
-    >
-      Explain RTP sender setup
-    </button>
+    <div class="info-actions">
+      <button
+        class="ghost"
+        type="button"
+        title="Why speakers on one source drift apart, and how to align them by ear"
+        onclick={() => (alignDocsOpen = true)}
+      >
+        Explain speaker alignment
+      </button>
+      <button
+        class="ghost"
+        type="button"
+        title="How to turn a PipeWire machine into a sender that feeds an RTP-receive source"
+        onclick={openDocs}
+      >
+        Explain RTP sender setup
+      </button>
+    </div>
   </div>
   <p class="card-sub">
     The audio this router can receive and route onward. Add as many as you like of two kinds:
@@ -391,19 +414,34 @@
   </p>
   <p class="card-sub" style="margin-bottom:0">
     A <span class="badge on">present</span> source has a live PipeWire node right now; an
-    <span class="badge off">offline</span> one is configured but not currently receiving. Expand a card
-    for its settings, its connected senders, and to remove it.
+    <span class="badge off">offline</span> one is configured but not currently receiving. Each card also lists the
+    speakers currently playing that source — they play off one clock, so that's the set you can
+    <strong>align</strong> by ear. Expand a card for its settings, its connected senders, and to remove it.
   </p>
 </div>
 
-<!-- AirPlay field group, shared by add + edit (references the ap* form state). -->
-{#snippet airplayFields()}
-  <div class="field">
-    <label for="src-latency">Jitter buffer (ms)</label>
-    <input id="src-latency" type="number" min="20" max="2000" step="10" bind:value={apLatency} placeholder="150" />
-    <span class="hint">Raise if playback stutters — trades latency for smoother audio.</span>
+<!-- Both field groups are shared by the add form and a card's edit form, and only
+     one form is ever open at a time — but the id prefix (`idp`) keeps label/input
+     pairs unambiguous either way. Everything is on one flat surface: no
+     "Advanced" disclosure, since a source has few enough settings that hiding
+     two of them cost more than it saved. Fields that belong together sit in a
+     `.row.fields`, which wraps to one per line on a narrow screen. -->
+
+<!-- AirPlay field group (references the ap* form state). -->
+{#snippet airplayFields(idp: string)}
+  <div class="row fields">
+    <div class="field grow">
+      <label for="{idp}-label">Name</label>
+      <input id="{idp}-label" type="text" bind:value={formLabel} placeholder="Kitchen AirPlay" />
+      <span class="hint">The service name phones and PCs see when casting.</span>
+    </div>
+    <div class="field narrow">
+      <label for="{idp}-latency">Jitter buffer (ms)</label>
+      <input id="{idp}-latency" type="number" min="20" max="2000" step="10" bind:value={apLatency} placeholder="150" />
+      <span class="hint">Raise if playback stutters — trades latency for smoother audio.</span>
+    </div>
   </div>
-  <div class="row">
+  <div class="row fields">
     <div class="field grow">
       <label class="check">
         <input type="checkbox" bind:checked={apAuthSetup} />
@@ -419,25 +457,28 @@
       <span class="hint">Refuse a new sender while one is already streaming.</span>
     </div>
   </div>
-  <details class="advanced">
-    <summary>Advanced</summary>
-    <div class="field">
-      <label for="src-ap-port">RTSP port</label>
-      <input id="src-ap-port" type="number" min="0" max="65535" bind:value={apPort} placeholder="auto" />
-      <span class="hint">The AirPlay control port. Leave 0 to let the router allocate a free one (starting at 5000) and keep it stable across restarts.</span>
-    </div>
-  </details>
+  <div class="field narrow last">
+    <label for="{idp}-ap-port">RTSP port</label>
+    <input id="{idp}-ap-port" type="number" min="0" max="65535" bind:value={apPort} placeholder="auto" />
+    <span class="hint">The AirPlay control port. Leave 0 to let the router allocate a free one (starting at 5000) and keep it stable across restarts.</span>
+  </div>
 {/snippet}
 
-<!-- RTP field group, shared by add + edit (references the rtp* form state). -->
-{#snippet rtpFields()}
-  <div class="field">
-    <label for="src-rtp-port">Listen port</label>
-    <input id="src-rtp-port" type="number" min="1" max="65535" bind:value={rtpPort} placeholder="46000" />
-    <span class="hint">Must match the port the sender targets. Two enabled RTP sources can't share a port.</span>
+<!-- RTP field group (references the rtp* form state). -->
+{#snippet rtpFields(idp: string)}
+  <div class="row fields">
+    <div class="field grow">
+      <label for="{idp}-label">Name</label>
+      <input id="{idp}-label" type="text" bind:value={formLabel} placeholder="Bluetooth Bridge" />
+    </div>
+    <div class="field narrow">
+      <label for="{idp}-rtp-port">Listen port</label>
+      <input id="{idp}-rtp-port" type="number" min="1" max="65535" bind:value={rtpPort} placeholder="46000" />
+      <span class="hint">Must match the port the sender targets. Two enabled RTP sources can't share a port.</span>
+    </div>
   </div>
   <div class="field">
-    <span class="group-label" id="src-rtp-source-label">Source</span>
+    <span class="group-label" id="{idp}-rtp-source-label">Source</span>
     <div class="rtp-source-row">
       <div class="dropdown" bind:this={rtpDropdownEl}>
         <button
@@ -445,14 +486,14 @@
           class="dd-trigger"
           aria-haspopup="listbox"
           aria-expanded={rtpMenuOpen}
-          aria-labelledby="src-rtp-source-label"
+          aria-labelledby="{idp}-rtp-source-label"
           onclick={() => (rtpMenuOpen = !rtpMenuOpen)}
         >
           <span>{rtpModeInfo.label}</span>
           <span class="caret" aria-hidden="true">▾</span>
         </button>
         {#if rtpMenuOpen}
-          <ul class="dd-menu" role="listbox" aria-labelledby="src-rtp-source-label">
+          <ul class="dd-menu" role="listbox" aria-labelledby="{idp}-rtp-source-label">
             {#each RTP_MODES as m (m.value)}
               <li role="option" aria-selected={m.value === rtpMode}>
                 <button type="button" class="dd-item" class:active={m.value === rtpMode} onclick={() => selectRtpMode(m.value)}>
@@ -476,24 +517,21 @@
     </div>
     <span class="hint">{rtpModeInfo.desc}</span>
   </div>
-  <details class="advanced">
-    <summary>Advanced</summary>
-    <div class="row">
-      <div class="field">
-        <label for="src-rtp-latency">Jitter buffer (ms)</label>
-        <input id="src-rtp-latency" type="number" min="20" max="2000" step="10" bind:value={rtpLatency} placeholder="200" />
-        <span class="hint">Raise if a weak-signal bridge stutters — trades latency for dropout tolerance.</span>
-      </div>
-      <div class="field">
-        <label for="src-rtp-rate">Sample rate</label>
-        <select id="src-rtp-rate" bind:value={rtpRate}>
-          <option value={48000}>48 kHz (recommended)</option>
-          <option value={44100}>44.1 kHz</option>
-        </select>
-        <span class="hint">Must match the sender. 48 kHz keeps the whole path at the router's native rate (no resample).</span>
-      </div>
+  <div class="row fields last">
+    <div class="field narrow">
+      <label for="{idp}-rtp-latency">Jitter buffer (ms)</label>
+      <input id="{idp}-rtp-latency" type="number" min="20" max="2000" step="10" bind:value={rtpLatency} placeholder="200" />
+      <span class="hint">Raise if a weak-signal bridge stutters — trades latency for dropout tolerance.</span>
     </div>
-  </details>
+    <div class="field narrow">
+      <label for="{idp}-rtp-rate">Sample rate</label>
+      <select id="{idp}-rtp-rate" bind:value={rtpRate}>
+        <option value={48000}>48 kHz (recommended)</option>
+        <option value={44100}>44.1 kHz</option>
+      </select>
+      <span class="hint">Must match the sender. 48 kHz keeps the whole path at the router's native rate (no resample).</span>
+    </div>
+  </div>
 {/snippet}
 
 {#if loading}
@@ -549,19 +587,16 @@
         {/if}
       </header>
 
+      <!-- The sync group this source feeds + its alignment session. Shown
+           collapsed as well as expanded: it's live state, not a setting. -->
+      <AlignPanel sourceNodeName={s.node_name} />
+
       {#if isExpanded(s)}
         <form class="src-form" onsubmit={save}>
-          <div class="field">
-            <label for="src-label">Name</label>
-            <input id="src-label" type="text" bind:value={formLabel} placeholder="Kitchen AirPlay" />
-            {#if s.kind === 'airplay'}
-              <span class="hint">The service name phones and PCs see when casting.</span>
-            {/if}
-          </div>
           {#if s.kind === 'airplay'}
-            {@render airplayFields()}
+            {@render airplayFields('edit')}
           {:else}
-            {@render rtpFields()}
+            {@render rtpFields('edit')}
           {/if}
           <div class="form-actions">
             <span class="spacer"></span>
@@ -668,17 +703,10 @@
         </div>
       </header>
       <form class="src-form" onsubmit={save}>
-        <div class="field">
-          <label for="src-label-new">Name</label>
-          <input id="src-label-new" type="text" bind:value={formLabel} placeholder={form.kind === 'airplay' ? 'Kitchen AirPlay' : 'Bluetooth Bridge'} />
-          {#if form.kind === 'airplay'}
-            <span class="hint">The service name phones and PCs see when casting.</span>
-          {/if}
-        </div>
         {#if form.kind === 'airplay'}
-          {@render airplayFields()}
+          {@render airplayFields('add')}
         {:else}
-          {@render rtpFields()}
+          {@render rtpFields('add')}
         {/if}
         <div class="form-actions">
           <span class="spacer"></span>
@@ -739,6 +767,10 @@
   {/if}
 {/if}
 
+{#if alignDocsOpen}
+  <AlignDocs onClose={() => (alignDocsOpen = false)} />
+{/if}
+
 {#if docsParams}
   <RtpSenderDocs
     port={docsParams.port}
@@ -762,6 +794,12 @@
   }
   .info-head h2 {
     margin: 0;
+  }
+  .info-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
   }
 
   /* One card per source; offline ones dim like the outputs list. */
@@ -876,36 +914,29 @@
     font-size: 0.9rem;
   }
 
-  /* Collapsible advanced block, hidden by default (same as the old panels). */
-  details.advanced {
-    margin-top: 12px;
-    border-top: 1px solid var(--divider-color);
-    padding-top: 12px;
+  /* A row of labelled fields: two equal columns while there's room for them,
+     one per line below that (a grid rather than `.row`'s flex, so the columns
+     line up across rows and the labels don't stagger with the hints). */
+  .row.fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    align-items: start;
+    gap: 0 16px;
   }
-  details.advanced > summary {
-    cursor: pointer;
-    font-size: 0.8rem;
-    font-weight: 500;
-    color: var(--secondary-text-color);
-    list-style: none;
-    user-select: none;
+  .row.fields > .field {
+    margin-bottom: 12px;
   }
-  details.advanced > summary::-webkit-details-marker {
-    display: none;
+  /* A port, a buffer size or a rate doesn't need the whole column — but its
+     hint does, so the control shrinks, not the field. */
+  .field.narrow input {
+    max-width: 12rem;
   }
-  details.advanced > summary::before {
-    content: '▸';
-    display: inline-block;
-    margin-right: 6px;
-    transition: transform 0.15s;
+  .field.narrow select {
+    max-width: 15rem; /* wide enough for "48 kHz (recommended)" */
   }
-  details.advanced[open] > summary::before {
-    transform: rotate(90deg);
-  }
-  details.advanced > summary + * {
-    margin-top: 12px;
-  }
-  details.advanced .field {
+  /* The form's last field group sits directly above the action buttons. */
+  .field.last,
+  .row.fields.last > .field {
     margin-bottom: 0;
   }
   label.check {

@@ -115,6 +115,29 @@ a {
   color: var(--secondary-text-color);
   font-size: 0.85rem;
 }
+/* A card's title line with actions (a docs button, a toggle) beside it. */
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.card-head h2 {
+  margin: 0;
+}
+.card-head .actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* One short line of guidance next to a card title — the alternative to a
+   paragraph of instructions above the thing it describes. */
+.hint {
+  color: var(--secondary-text-color);
+  font-size: 0.78rem;
+}
 
 /* ---- Buttons ----------------------------------------------------------- */
 button {
@@ -233,6 +256,174 @@ th {
   margin: 0;
 }
 
+/* ---- Group editor (music + announcement pages) ------------------------- */
+/* The chip-and-zone editor shared by the Music-groups and Announcements pages:
+   an "Available" pool, one group, and the dashed "drop to start a group" dock.
+   Each of those is a first-class `.card` — they used to be bordered boxes nested
+   inside one wrapping card, which drew a border inside a border. Global (not
+   scoped) because both pages render the same object and the chips live in a
+   shared component (DeviceChip.svelte). */
+
+/* A card that takes dropped speakers: lights up while the pointer is over it. */
+.card.dropzone {
+  transition: border-color 0.12s, background 0.12s;
+}
+.card.dropzone.hover {
+  border-color: var(--primary-color, #03a9f4);
+  background: color-mix(in srgb, var(--primary-color, #03a9f4) 10%, var(--card-background-color));
+}
+/* The dock: an empty, deliberately quiet card that becomes a group on first drop. */
+.card.dock {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--secondary-text-color) 35%, transparent);
+  box-shadow: none;
+  padding: 12px 16px;
+  /* Eases back up when the `launching` animation below is taken off it. */
+  transition: transform 0.2s, opacity 0.2s, border-color 0.12s, background 0.12s;
+}
+.pool {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.grouptop {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+/* Rename affordance: the group name is a button that becomes an input. */
+.gtitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* Takes the free space, but never shrinks below a readable stub — the controls
+     beside it wrap to their own line first (`.grouptop` is flex-wrap). */
+  flex: 1 1 130px;
+  min-width: 90px;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  margin: 0;
+  cursor: text;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  border-radius: 6px;
+}
+.gtitle:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+/* Ellipsize rather than overrun the controls beside it — a long group name on a
+   phone-width card used to print straight through the Priority field. */
+.gtitle strong {
+  font-size: 1rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gtitle .pencil {
+  width: 13px;
+  height: 13px;
+  fill: currentColor;
+  opacity: 0.45;
+  flex: 0 0 auto;
+}
+.gtitle:hover .pencil {
+  opacity: 0.8;
+}
+.rename {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-weight: 700;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--primary-color, #03a9f4);
+}
+/* The dock hands its speaker over to a real group card: the dock sinks away
+   while the new group drops in at the head of the list (its neighbours slide
+   down under `animate:flip`), so the eye follows one object instead of noticing
+   that something appeared elsewhere. */
+.card.dock.launching {
+  animation: dock-launch 0.24s ease-in both;
+}
+@keyframes dock-launch {
+  to {
+    transform: translateY(10px) scale(0.97);
+    opacity: 0.35;
+  }
+}
+.card.arriving {
+  animation: group-arrive 0.32s ease-out;
+}
+@keyframes group-arrive {
+  from {
+    transform: translateY(-18px) scale(0.98);
+    opacity: 0;
+    border-color: var(--primary-color, #03a9f4);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card.dock.launching,
+  .card.arriving {
+    animation: none;
+  }
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  min-height: 30px;
+  align-items: center;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px 4px 5px;
+  border-radius: 999px;
+  background: var(--card-background-color, #fff);
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  font-size: 0.85rem;
+  cursor: grab;
+  touch-action: none; /* let us own the drag gesture on touch */
+  user-select: none;
+  -webkit-user-select: none;
+}
+.chip:active {
+  cursor: grabbing;
+}
+.chip .grip {
+  width: 13px;
+  height: 13px;
+  fill: currentColor;
+  opacity: 0.4;
+  flex: 0 0 auto;
+}
+.drop-hint {
+  opacity: 0.55;
+  font-size: 0.82rem;
+  font-style: italic;
+}
+/* Ghost chip that follows the pointer during a drag. */
+.drag-ghost {
+  position: fixed;
+  z-index: 1000;
+  transform: translate(8px, 8px);
+  pointer-events: none;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--primary-color, #03a9f4);
+  color: var(--text-on-primary, #fff);
+  font-size: 0.85rem;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+  opacity: 0.95;
+}
+
 /* ---- Misc -------------------------------------------------------------- */
 .empty {
   color: var(--secondary-text-color);
@@ -256,6 +447,13 @@ th {
 }
 .badge.warn {
   color: var(--error-color, #db4437);
+  border-color: currentColor;
+}
+/* Between `on` and `warn`: a state that isn't wrong yet but isn't working either
+   (e.g. a reachable output with no session up). Amber, matching the routing
+   graph's tags for the same states. */
+.badge.caution {
+  color: var(--warning-color, #b26a00);
   border-color: currentColor;
 }
 .row {

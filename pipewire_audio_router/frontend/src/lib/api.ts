@@ -91,8 +91,27 @@ export const api = {
   setVolume: (nodeId: number, volume: number) =>
     request<VolumeResponse>('POST', `api/media_players/${nodeId}/volume`, { volume }),
 
-  // Outputs (read-only list — sendspin + AirPlay 2 are auto-discovered).
+  // Outputs: the devices the user has *added* (adopted). Everything else in the
+  // app — the routing matrix, group editors, Align, the HA integration — means
+  // these by "output".
   outputs: () => request<OutputInfo[]>('GET', 'api/outputs'),
+  /** Devices discovery found but the user hasn't added: `state` is 'discovered'
+   * or 'ignored'. Both come in one listing so the Outputs page's "show ignored"
+   * checkbox filters client-side instead of refetching. */
+  discoveredOutputs: () => request<OutputInfo[]>('GET', 'api/outputs/discovered'),
+  /** Add a discovered device: routable from now on, and (with the setting on) an
+   * HA media_player. Any routing it had before starts applying again. */
+  adoptOutput: (nodeName: string) =>
+    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/adopt`),
+  /** Dismiss a discovered device — hidden unless "show ignored" is on. Also
+   * clears any routing / group membership it had. */
+  ignoreOutput: (nodeName: string) =>
+    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/ignore`),
+  /** Remove an output: back to undecided. Stops being routable, loses its HA
+   * media_player, and its routing + group membership are forgotten. Still on the
+   * network ⇒ it reappears under "Discovered". */
+  removeOutput: (nodeName: string) =>
+    request<OpResponse>('DELETE', `api/outputs/${encodeURIComponent(nodeName)}`),
   /** Per-output render delay in ms (AirPlay 2); null resets to default. */
   setOutputLatency: (nodeName: string, latencyMs: number | null) =>
     request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/latency`, { latency_ms: latencyMs }),
@@ -175,7 +194,8 @@ export const api = {
   routeMusicGroup: (id: string, source: string) => request<OpResponse>('POST', `api/groups/music/${id}/route`, { source }),
   unrouteMusicGroup: (id: string) => request<OpResponse>('DELETE', `api/groups/music/${id}/route`),
   announcementGroups: () => request<AnnouncementGroup[]>('GET', 'api/groups/announcement'),
-  createAnnouncementGroup: (name: string, targets: string[], priority: number, duck: number) =>
+  /** `duck` omitted ⇒ the daemon applies the configured default duck level. */
+  createAnnouncementGroup: (name: string, targets: string[], priority: number, duck?: number) =>
     request<{ ok: boolean; group?: AnnouncementGroup; message?: string }>('POST', 'api/groups/announcement', { name, targets, priority, duck }),
   updateAnnouncementGroup: (id: string, patch: { name?: string; targets?: string[]; priority?: number; duck?: number }) =>
     request<{ ok: boolean; group?: AnnouncementGroup; message?: string }>('PUT', `api/groups/announcement/${id}`, patch),

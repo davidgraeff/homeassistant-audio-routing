@@ -126,7 +126,8 @@
   <div class="card">
     <h2>Auto-discovery</h2>
     <p class="card-sub">
-      Finds AirPlay and Sendspin devices on your network via mDNS and lists them automatically. Turning this off stops
+      Finds AirPlay and Sendspin devices on your network via mDNS and lists them on the Outputs page, where you add the
+      ones you want — being discovered on its own does nothing. Turning this off stops
       discovering <strong>new</strong> devices; ones already present stay until they drop off the network on their own.
     </p>
     <label class="check">
@@ -205,7 +206,8 @@
     <p class="card-sub">
       The Home Assistant integration creates one <code>media_player</code> per <strong>music group</strong> and per
       <strong>announcement group</strong>. Enable this to <strong>also</strong> expose every individual output as its own
-      <code>media_player</code>, for directly addressing a single speaker regardless of its group.
+      <code>media_player</code>, for directly addressing a single speaker regardless of its group. Only outputs you
+      <strong>added</strong> on the Outputs page count — a merely discovered device never becomes an entity.
     </p>
     <label class="check">
       <input type="checkbox" checked={exposeOutputs} disabled={exposeBusy} onchange={toggleExposeOutputs} />

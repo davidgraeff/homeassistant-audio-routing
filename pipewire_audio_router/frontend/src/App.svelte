@@ -3,21 +3,23 @@
   import ThemeToggle from './components/ThemeToggle.svelte';
   import Toasts from './components/Toasts.svelte';
   import OutputsTab from './components/OutputsTab.svelte';
-  import GroupsTab from './components/GroupsTab.svelte';
-  import AlignTab from './components/AlignTab.svelte';
+  import MusicGroupsTab from './components/MusicGroupsTab.svelte';
+  import AnnouncementsTab from './components/AnnouncementsTab.svelte';
   import SourcesTab from './components/SourcesTab.svelte';
   import SettingsTab from './components/SettingsTab.svelte';
   import DiagnosticsTab from './components/DiagnosticsTab.svelte';
 
-  // Groups is the primary surface. The low-level routing matrix moved into
-  // Diagnostics (a connection-diagnosis tool, not a daily-use page).
-  type Tab = 'groups' | 'outputs' | 'sources' | 'align' | 'settings' | 'diagnostics';
-  let tab = $state<Tab>('groups');
+  // Music groups is the primary surface: who plays together, and what they play
+  // (with the low-level routing graph on the same page). Announcements is the
+  // other half of the group model. Alignment is per sync group, and a sync group
+  // is identified by its source, so it lives on Sources.
+  type Tab = 'music' | 'announcements' | 'outputs' | 'sources' | 'settings' | 'diagnostics';
+  let tab = $state<Tab>('music');
   const tabs: { id: Tab; label: string }[] = [
-    { id: 'groups', label: 'Groups' },
+    { id: 'music', label: 'Music groups' },
+    { id: 'announcements', label: 'Announcements' },
     { id: 'outputs', label: 'Outputs' },
     { id: 'sources', label: 'Sources' },
-    { id: 'align', label: 'Align' },
     { id: 'settings', label: 'Settings' },
     { id: 'diagnostics', label: 'Diagnostics' },
   ];
@@ -38,14 +40,14 @@
 </nav>
 
 <main>
-  {#if tab === 'groups'}
-    <GroupsTab />
+  {#if tab === 'music'}
+    <MusicGroupsTab />
+  {:else if tab === 'announcements'}
+    <AnnouncementsTab />
   {:else if tab === 'outputs'}
     <OutputsTab />
   {:else if tab === 'sources'}
     <SourcesTab />
-  {:else if tab === 'align'}
-    <AlignTab />
   {:else if tab === 'settings'}
     <SettingsTab />
   {:else}

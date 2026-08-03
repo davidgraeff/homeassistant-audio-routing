@@ -5,8 +5,19 @@ export interface RoutingNode {
   node_name: string;
   display_name: string;
   /** In the live graph right now. `false` = offline (configured/previously
-   * routed but currently absent) — shown grayed; routing kept and reapplied. */
+   * routed but currently absent) — shown grayed; routing kept and reapplied.
+   *
+   * For the dialed backends this is *reachability*: an AP2 receiver answers on
+   * :7000, and a pw-sink target advertises over mDNS, long before (or without
+   * ever) accepting a session. Whether audio is really carried is `streaming`. */
   present: boolean;
+  /** Outputs only: is a session to this output actually up, i.e. is audio routed
+   * to it really being carried? `false` = present/reachable but nothing attached,
+   * so the route delivers nothing and its wire must not animate. Absent when the
+   * question doesn't apply: sources, and sendspin devices (which always have a
+   * sender while adopted). Same rule as the Outputs page badge and the announce
+   * arbiter. */
+  streaming?: boolean | null;
   /** Outputs only: manually-configured (`true`) vs mDNS auto-discovered
    * (`false`) — drives the "auto" badge. Always `true` for sources. */
   configured: boolean;
@@ -68,6 +79,11 @@ export interface AnnouncementGroup {
 
 export type Encryption = 'none' | 'RSA' | 'auth_setup';
 
+/** Whether the user has added a discovered device as one of their outputs.
+ * Discovery only *offers* a device: until it's adopted it isn't routable and
+ * gets no Home Assistant media_player. */
+export type OutputAdoption = 'adopted' | 'discovered' | 'ignored';
+
 export interface OutputInfo {
   node_name: string;
   name: string;
@@ -78,6 +94,12 @@ export interface OutputInfo {
   present: boolean;
   /** Manual store entry (`true`) vs mDNS auto-discovered (`false`). */
   configured: boolean;
+  /** The user's verdict on this discovered device (daemon's outputs_store):
+   * 'adopted' = one of our outputs (routable, exposed to Home Assistant),
+   * 'discovered' = found on the network, awaiting a decision, 'ignored' =
+   * dismissed. `GET /api/outputs` returns only 'adopted'; the discovered
+   * listing returns the other two. */
+  state: OutputAdoption;
   /** Connection details — known only for configured AirPlay entries (else null). */
   ip: string | null;
   port: number | null;
