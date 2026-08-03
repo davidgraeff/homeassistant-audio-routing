@@ -432,6 +432,22 @@ the node appearing.
 
 ## TTS/announce ducking: URL-based (v1) and Wyoming-based (v2), additive
 
+> **Superseded 2026-08-03 — both halves of this are gone.** The v1 endpoint
+> (`POST /api/media_players/:node_id/announce`, node-volume ducking) was removed
+> with the node-backed output API; announcements now go to `POST /api/announce`,
+> which ducks and overlays per device inside the relay. The **Wyoming source was
+> removed too** (`wyoming.rs`, the `wyoming` request field, and the integration's
+> `extra.wyoming` branch): Home Assistant's own TTS entity already renders to a
+> URL — with voice selection *and* the cache the last paragraph below calls out
+> as missing — so keeping a second synthesis path meant pinning a Piper
+> host/port inside automations to get a strictly worse result. `url` (plus the
+> built-in `test`/`tone` clips) is the whole surface now.
+>
+> Kept because the reasoning below is still the record of *why* the shape was
+> chosen, and because two findings in it outlive the code: Wyoming's
+> `AudioFormat.width` is **bytes**, not bits, and buffering a whole clip before
+> playback is fine at announcement lengths.
+
 `POST /api/media_players/:node_id/announce` accepts either `url` (fetch
 + decode to WAV via `symphonia` — pure Rust, no system dependency —
 works with HA's standard `tts.speak` contract unchanged) or `wyoming`
@@ -484,8 +500,8 @@ to patch around for a packaging win.)
 **Fix**: replaced the `ffmpeg` subprocess with `symphonia`
 (`decode.rs`), a pure-Rust decoder with zero system dependencies —
 probes the format from content (mp3/wav/aac/ogg/flac all work
-unmodified) and decodes to a `SampleBuffer<i16>`, which `wav.rs` (shared
-with the Wyoming path) turns into a WAV. Removing `ffmpeg` from the
+unmodified) and decodes to a `SampleBuffer<i16>`, which `wav.rs` (then shared
+with the since-removed Wyoming path) turns into a WAV. Removing `ffmpeg` from the
 Dockerfile and adding the `symphonia` crate (`features = ["all"]` — the
 cost of enabling every codec is a bit more compiled Rust in our own
 ~8MB binary, not a system dependency tree, so there's no reason to

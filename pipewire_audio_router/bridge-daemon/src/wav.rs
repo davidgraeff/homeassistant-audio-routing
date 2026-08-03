@@ -1,8 +1,7 @@
-//! Minimal in-memory WAV construction, shared by both announce audio
-//! sources (api.rs's `AnnounceRequest`): `decode.rs` (URL-fetched clips
-//! decoded via symphonia) and `wyoming.rs` (synthesized PCM from a Wyoming
-//! TTS server). Neither path needs a real encoder — both already have raw
-//! PCM samples in hand, just missing a header.
+//! Minimal in-memory WAV construction for announce audio: `decode.rs` hands
+//! over PCM decoded from a URL-fetched clip (via symphonia), and `calibrate.rs`
+//! builds its click track directly. Neither needs a real encoder — both already
+//! have raw PCM samples in hand, just missing a header.
 
 /// Builds a complete PCM WAV file from raw interleaved samples already in
 /// the given format. No external encoder involved — this is just the

@@ -151,10 +151,10 @@ jobs:
         # The whole add-on suite runs. phase2 / phase3 self-skip here: they need
         # Music Assistant's proprietary `cliraop` (a real AirPlay sender) that
         # isn't in this repo — run them locally with CLIRAOP_PATH set. The rest
-        # are self-contained (virtual PipeWire nodes, a mock Wyoming server, …).
+        # are self-contained (virtual PipeWire nodes, a local HTTP clip source, …).
         run: |
           fail=0
-          for t in phase1_e2e phase2_e2e phase3_multi_output hot_reload_e2e routing_ui_e2e announce_wyoming_e2e; do
+          for t in phase1_e2e phase2_e2e phase3_multi_output hot_reload_e2e routing_ui_e2e; do
             echo "::group::test_addon_${t}.sh"
             bash "tests/test_addon_${t}.sh" || { echo "FAILED: $t"; fail=1; }
             echo "::endgroup::"

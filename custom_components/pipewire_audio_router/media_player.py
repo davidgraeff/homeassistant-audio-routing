@@ -829,16 +829,12 @@ class AnnouncementGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator],
             media_id,
             extra,
         )
-        wyoming = extra.get("wyoming")
         try:
-            if wyoming:
-                await self.coordinator.client.async_announce_group(self._group_id, wyoming=wyoming)
-            else:
-                if media_source.is_media_source_id(media_id):
-                    resolved = await media_source.async_resolve_media(self.hass, media_id, self.entity_id)
-                    media_id = resolved.url
-                media_id = async_process_play_media_url(self.hass, media_id)
-                await self.coordinator.client.async_announce_group(self._group_id, url=media_id)
+            if media_source.is_media_source_id(media_id):
+                resolved = await media_source.async_resolve_media(self.hass, media_id, self.entity_id)
+                media_id = resolved.url
+            media_id = async_process_play_media_url(self.hass, media_id)
+            await self.coordinator.client.async_announce_group(self._group_id, url=media_id)
         except Exception as err:
             _LOGGER.error("announce to group %s failed: %s", self.entity_id, err)
             raise

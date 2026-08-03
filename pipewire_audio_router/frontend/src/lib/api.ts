@@ -141,7 +141,7 @@ export const api = {
     request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/sendspin-codec`, { codec }),
 
   // Per-device announcement (announce.rs). Plays a clip (built-in test/tone,
-  // or url/wyoming) to a set of per-device-sender outputs with duck/overlay —
+  // or a url) to a set of per-device-sender outputs with duck/overlay —
   // the backend-agnostic path (Sendspin now, AirPlay 2 later), used by the
   // Outputs tab's Play tone / Play announcement diagnostics.
   announce: (req: AnnounceRequest) => request<AnnounceResponse>('POST', 'api/announce', req),

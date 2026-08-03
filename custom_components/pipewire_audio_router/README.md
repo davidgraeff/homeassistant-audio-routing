@@ -117,31 +117,29 @@ data:
   source: bt-bridge             # optional
 ```
 
-### Using Wyoming TTS instead of a rendered URL
+### Announcing TTS
 
-`tts.speak`/normal automations work unchanged (the URL path). To use
-direct Wyoming synthesis instead of a rendered clip, call
-`media_player.play_media` with the standard `extra` dict:
+Announcements take a **URL** (or a `media-source` id, which is resolved for
+you), so Home Assistant's own TTS is the whole story:
 
 ```yaml
-action: media_player.play_media
+action: tts.speak
 target:
-  entity_id: media_player.kitchen
+  entity_id: tts.piper                # your TTS entity — Piper, Cloud, …
 data:
-  media_content_id: ""          # ignored when extra.wyoming is set
-  media_content_type: music
-  extra:
-    wyoming:
-      host: 192.168.1.20
-      port: 10200                # optional, defaults to 10200
-      text: "Front door opened"
-      voice: null                # optional
+  media_player_entity_id: media_player.downstairs_announcements
+  message: "Front door opened"
 ```
 
-This is additive — setting `extra.wyoming` bypasses the URL path
-entirely for that one call; every other automation is unaffected. See
-[../../docs/api-reference.md](../../docs/api-reference.md#post-apimedia_playersnode_idannounce)
-for what this actually sends to the add-on.
+The add-on fetches and decodes the rendered clip (symphonia — mp3, wav, aac,
+ogg, flac), then mixes it over the ducked music per device.
+
+> Earlier versions also accepted `extra.wyoming` to make the add-on synthesize
+> against a Wyoming server (Piper) itself. That was removed: it duplicated a job
+> Home Assistant already does better — its TTS entity handles voice selection
+> and caching, whereas the add-on re-synthesized identical text on every call —
+> and it meant pinning a Piper host/port inside automations. Use `tts.speak` as
+> above.
 
 ## Testing
 

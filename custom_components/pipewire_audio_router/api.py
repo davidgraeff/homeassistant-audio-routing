@@ -601,15 +601,11 @@ class PipewireRouterApiClient:
         if not body.get("ok", False):
             raise PipewireRouterApiError(body.get("message") or "un-route failed")
 
-    async def async_announce_group(self, group_id: str, *, url: str | None = None, wyoming: dict | None = None) -> None:
+    async def async_announce_group(self, group_id: str, *, url: str) -> None:
         """Announce to a named announcement group (`POST /api/announce`), which
         resolves the group's targets/priority/duck. Returns once **admitted**
         (playing/queued), not after playback."""
-        payload: dict = {"announcement_group": group_id}
-        if url is not None:
-            payload["url"] = url
-        elif wyoming is not None:
-            payload["wyoming"] = wyoming
+        payload: dict = {"announcement_group": group_id, "url": url}
         try:
             async with self._session.post(
                 f"{self._base_url}/api/announce",

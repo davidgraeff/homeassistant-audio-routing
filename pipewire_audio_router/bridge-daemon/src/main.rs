@@ -49,7 +49,6 @@ mod sources_store;
 mod sync_group;
 mod sync_settings;
 mod wav;
-mod wyoming;
 
 use crate::locks::LockRecover;
 use clap::{Parser, Subcommand};

@@ -22,7 +22,7 @@ python3 -m pytest custom_components/pipewire_audio_router/tests/ -p pytest_homea
 - `test_config_flow.py` — the host/port config flow (success, cannot-connect,
   duplicate-abort).
 - `test_media_player.py` — one `media_player` per output: state/volume,
-  announce (URL + Wyoming), `select_source`/`link`/`unlink`, and the live
+  announce (URL), `select_source`/`link`/`unlink`, and the live
   routing WebSocket.
 - `test_rtp_source.py` — the Bluetooth-bridge RTP `switch`/`number`: entities
   reflect daemon state, enable/disable, live vs. remembered port changes, and

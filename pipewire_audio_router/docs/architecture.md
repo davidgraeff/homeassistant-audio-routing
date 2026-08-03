@@ -508,9 +508,10 @@ REST + WebSocket (`api.rs`; full list in
 and per **announcement group** (and, optionally, one per individual output).
 `MediaPlayerEntityFeature.MEDIA_ANNOUNCE` (ducking, not replacing) lives on
 the **announcement-group** entity — the intended announce/TTS target;
-per-output entities carry `SELECT_SOURCE` + volume/mute only. Announce/duck
-is URL- or Wyoming-based; audio is decoded with `symphonia` (no `ffmpeg`).
-See
+per-output entities carry `SELECT_SOURCE` + volume/mute only. An announcement
+is a **URL** (a `media-source` id is resolved by the integration first), decoded
+with `symphonia` (no `ffmpeg`) — plus the built-in `test`/`tone` diagnostic
+clips. See
 [decisions.md](decisions.md#ttsannounce-ducking-url-based-v1-and-wyoming-based-v2-additive).
 
 ---

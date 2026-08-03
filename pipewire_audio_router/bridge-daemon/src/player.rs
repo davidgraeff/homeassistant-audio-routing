@@ -8,9 +8,9 @@
 //! and keeps announce playback fully isolated from the long-lived registry/
 //! command thread (pw_thread.rs).
 //!
-//! Only 16-bit PCM is handled, which is all this daemon ever produces: both
-//! announce sources converge on `wav::build_wav` at 16-bit (decode.rs via
-//! symphonia, wyoming.rs from the synthesized PCM).
+//! Only 16-bit PCM is handled, which is all this daemon ever produces —
+//! everything converges on `wav::build_wav` at 16-bit (decode.rs via
+//! symphonia, calibrate.rs for the click track).
 
 use pipewire as pw;
 use pw::spa;

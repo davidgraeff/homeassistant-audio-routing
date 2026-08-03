@@ -2405,21 +2405,6 @@ async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, St
 /// receiver with nothing routed into it (sync_group.rs) — and reports any target
 /// nothing can carry instead of dropping the clip silently.
 #[derive(Deserialize)]
-struct WyomingAnnounceRequest {
-    host: String,
-    #[serde(default = "default_wyoming_port")]
-    port: u16,
-    text: String,
-    /// Optional Piper multi-speaker voice name; omit for the server's
-    /// default voice.
-    voice: Option<String>,
-}
-
-fn default_wyoming_port() -> u16 {
-    10200
-}
-
-#[derive(Deserialize)]
 struct AgAnnounceRequest {
     /// Target output node names (`sendspin-dev-…`). Optional if
     /// `announcement_group` is given (its targets are used).
@@ -2430,9 +2415,7 @@ struct AgAnnounceRequest {
     announcement_group: Option<String>,
     #[serde(default)]
     url: Option<String>,
-    #[serde(default)]
-    wyoming: Option<WyomingAnnounceRequest>,
-    /// Use the built-in test-announcement clip (no url/wyoming needed).
+    /// Use the built-in test-announcement clip (no url needed).
     #[serde(default)]
     test: bool,
     /// Use the built-in calibration tone (the `calibrate.rs` click track) as a
@@ -2464,7 +2447,7 @@ struct AgAnnounceResponse {
     message: String,
 }
 
-/// Acquire the announce audio as 48k/S16/stereo PCM from one of test/tone/url/wyoming.
+/// Acquire the announce audio as 48k/S16/stereo PCM from one of test/tone/url.
 async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String> {
     if req.test {
         let wav = crate::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3")
@@ -2480,8 +2463,8 @@ async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String
         let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("tone clip not a PCM WAV")?;
         return Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch));
     }
-    match (&req.url, &req.wyoming) {
-        (Some(url), None) => {
+    match &req.url {
+        Some(url) => {
             let path = std::env::temp_dir().join("ag-announce-fetch");
             let _ = tokio::fs::remove_file(&path).await;
             fetch_to_file(url, &path).await.map_err(|e| format!("fetch: {e}"))?;
@@ -2489,14 +2472,7 @@ async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String
             let _ = tokio::fs::remove_file(&path).await;
             pcm
         }
-        (None, Some(w)) => {
-            let wav = crate::wyoming::synthesize_to_wav(&w.host, w.port, &w.text, w.voice.as_deref())
-                .await
-                .map_err(|e| format!("wyoming: {e}"))?;
-            let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("wyoming did not return a PCM WAV")?;
-            Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch))
-        }
-        _ => Err("provide exactly one of: test, tone, url, wyoming".to_string()),
+        None => Err("provide exactly one of: test, tone, url".to_string()),
     }
 }
 
