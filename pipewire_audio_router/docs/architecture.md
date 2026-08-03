@@ -417,6 +417,16 @@ A hold on an output nothing is streaming is inaudible and harmless: holds are
 keyed by output name and outlive any relay, so music that starts mid-hold comes
 up already ducked.
 
+**Agent-backed hosts need the aggregate, not the delta.** A pw-sink target is a
+whole host that may be playing music of its own, outside our stream, which the
+overlay mix cannot reach — so its duck is mirrored to that host's agent
+(`pwsink_agent::duck_output`), which attenuates the foreign streams on its sink.
+The agent takes an **absolute** depth and does no ref-counting, so every producer
+of ducking re-asserts `OverlayMixer::effective_duck` (the same value the mix
+applies) through `announce::sync_agent_duck` rather than clearing the host
+outright. Without that, an announcement finishing on such a host would un-duck a
+room whose voice assistant is still talking.
+
 ## 6. The two clocks, cleanly separated
 
 AP2 needs *two* independent clocks, and conflating them is the classic

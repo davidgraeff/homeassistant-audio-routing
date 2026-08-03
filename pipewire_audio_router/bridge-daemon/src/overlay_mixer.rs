@@ -207,31 +207,39 @@ impl OverlayMixer {
         found
     }
 
-    /// Release a hold on every output it covers. Returns whether it existed.
-    pub fn release_duck(&self, id: DuckHoldId) -> bool {
+    /// Release a hold, returning the outputs it covered (empty ⇒ unknown id, i.e.
+    /// already released or expired). The caller re-asserts each returned output's
+    /// duck state, since an agent-backed host is told an absolute depth rather
+    /// than ref-counting for us.
+    pub fn release_duck(&self, id: DuckHoldId) -> Vec<String> {
         let mut ducks = self.ducks.lock().unwrap();
-        let mut found = false;
-        for holds in ducks.values_mut() {
+        let mut affected = Vec::new();
+        for (output, holds) in ducks.iter_mut() {
             let before = holds.len();
             holds.retain(|h| h.id != id);
-            found |= holds.len() != before;
+            if holds.len() != before {
+                affected.push(output.clone());
+            }
         }
         ducks.retain(|_, holds| !holds.is_empty());
-        found
+        affected.sort();
+        affected
     }
 
-    /// Drop every hold whose lease has run out and return their ids (deduplicated,
-    /// for one log line each). Driven from the announce tick — the safety net for
-    /// a holder that stopped renewing without releasing.
-    pub fn expire_ducks(&self) -> Vec<DuckHoldId> {
+    /// Drop every hold whose lease has run out, as `(id, outputs it covered)` —
+    /// one entry per expired hold, so the caller can log it once and re-assert
+    /// those outputs. Driven from the announce tick: the safety net for a holder
+    /// that stopped renewing without releasing.
+    pub fn expire_ducks(&self) -> Vec<(DuckHoldId, Vec<String>)> {
         let now = Instant::now();
-        let mut expired = Vec::new();
+        let mut expired: Vec<(DuckHoldId, Vec<String>)> = Vec::new();
         let mut ducks = self.ducks.lock().unwrap();
-        for holds in ducks.values_mut() {
+        for (output, holds) in ducks.iter_mut() {
             holds.retain(|h| {
                 if h.expires <= now {
-                    if !expired.contains(&h.id) {
-                        expired.push(h.id);
+                    match expired.iter_mut().find(|(id, _)| *id == h.id) {
+                        Some((_, outs)) => outs.push(output.clone()),
+                        None => expired.push((h.id, vec![output.clone()])),
                     }
                     false
                 } else {
@@ -240,7 +248,25 @@ impl OverlayMixer {
             });
         }
         ducks.retain(|_, holds| !holds.is_empty());
+        for (_, outs) in &mut expired {
+            outs.sort();
+        }
         expired
+    }
+
+    /// The duck gain in force on `output` right now — the strongest of every live
+    /// hold and any announcement overlay's own duck — or `None` when its music
+    /// plays untouched. This is exactly what [`Self::mix_into`] applies, exposed
+    /// because an agent-backed pw-sink host is told an *absolute* depth for the
+    /// foreign audio on its sink (`pwsink_agent`), so whoever changes one duck
+    /// has to re-assert the aggregate rather than assume ref-counting.
+    pub fn effective_duck(&self, output: &str) -> Option<f32> {
+        let hold = Self::duck_gain(&self.ducks.lock().unwrap(), output);
+        let overlay = self.slots.lock().unwrap().get(output).map(|ov| ov.duck);
+        match (hold, overlay) {
+            (Some(h), Some(o)) => Some(h.min(o)),
+            (h, o) => h.or(o),
+        }
     }
 
     /// Live holds as `(output, id, level)`, sorted by output — for `GET /api/duck`
@@ -506,9 +532,9 @@ mod tests {
         let m = OverlayMixer::default();
         let id = m.start_duck(&out("k"), 0.5, TTL);
         assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![500]);
-        assert!(m.release_duck(id));
+        assert!(!m.release_duck(id).is_empty());
         assert!(m.mix("k", &s16(&[1000])).is_none(), "released → plain music again");
-        assert!(!m.release_duck(id), "second release is a no-op");
+        assert!(m.release_duck(id).is_empty(), "second release is a no-op");
     }
 
     #[test]
@@ -562,7 +588,7 @@ mod tests {
     fn an_expired_lease_un_ducks_on_its_own() {
         let m = OverlayMixer::default();
         let id = m.start_duck(&out("k"), 0.25, Duration::ZERO);
-        assert_eq!(m.expire_ducks(), vec![id], "lease already up");
+        assert_eq!(m.expire_ducks(), vec![(id, vec![o("k")])], "lease already up");
         assert!(m.mix("k", &s16(&[1000])).is_none(), "music back at full level");
         assert!(m.expire_ducks().is_empty(), "nothing left to expire");
         // A live lease is never expired.
@@ -605,6 +631,32 @@ mod tests {
         m.start("k", 10, s16(&[0, 0]), 1.0);
         assert_eq!(m.stop("k"), Some(10));
         assert_eq!(m.duck_holds().len(), 1);
+    }
+
+    #[test]
+    fn effective_duck_is_the_aggregate_an_agent_host_must_be_told() {
+        let m = OverlayMixer::default();
+        assert_eq!(m.effective_duck("k"), None, "nothing ducking → agent un-ducked");
+        // Hold only, overlay only, and both: always the strongest.
+        let hold = m.start_duck(&out("k"), 0.4, TTL);
+        assert_eq!(m.effective_duck("k"), Some(0.4));
+        m.start("k", 1, s16(&[0, 0]), 0.2);
+        assert_eq!(m.effective_duck("k"), Some(0.2));
+        // The announcement ending must NOT read as "un-duck the host" while the
+        // voice hold is still live — that's the clobbering this exists to prevent.
+        m.stop("k");
+        assert_eq!(m.effective_duck("k"), Some(0.4));
+        assert_eq!(m.release_duck(hold), vec![o("k")]);
+        assert_eq!(m.effective_duck("k"), None);
+    }
+
+    #[test]
+    fn expiry_reports_every_output_a_hold_covered() {
+        let m = OverlayMixer::default();
+        // One hold over two outputs → one entry naming both, so the caller can
+        // re-assert each agent host exactly once.
+        let id = m.start_duck(&[o("bath"), o("k")], 0.25, Duration::ZERO);
+        assert_eq!(m.expire_ducks(), vec![(id, vec![o("bath"), o("k")])]);
     }
 
     #[test]

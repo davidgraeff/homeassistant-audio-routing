@@ -685,7 +685,16 @@ either way.
 ```json
 [ { "output": "sendspin-dev-kitchen", "hold_id": 4, "level": 0.25 } ]
 ```
-Live holds, sorted by output — the answer to "why is this speaker quiet?".
+Live holds, sorted by output — the answer to "why is this speaker quiet?". The
+Outputs tab polls this every 2 s and shows a `ducked NN%` badge per output, so
+the answer is on screen while it is happening (holds last one voice turn).
+
+**A pw-sink host also ducks its own audio.** For an agent-backed `pwsink-dev-*`
+output the duck is mirrored to that host's agent, which attenuates the streams it
+is playing *itself* (music not in ours). The agent is told an absolute depth, so
+the daemon re-asserts the aggregate of every hold *and* any announcement overlay
+(`OverlayMixer::effective_duck`) on each change — an announcement ending never
+un-ducks a host whose room still has an assistant talking.
 
 **The lease is the safety net.** Nothing else un-ducks a hold whose owner died:
 the announce tick (150 ms) expires overdue leases and logs one line per hold, so
@@ -867,7 +876,8 @@ also surfaced in the HA sidebar via ingress. It's a full admin console: the
 routing matrix (outputs as rows, sources as columns, live over
 `/api/routing/ws`, clickable link/unlink cells, per-output volume sliders
 including sendspin devices, offline endpoints grayed with a forget button,
-synchronized-group badges, and a live input-level meter per source) plus
+synchronized-group badges, a `ducked NN%` badge while an output's music is
+attenuated for a voice turn, and a live input-level meter per source) plus
 RAOP-output and AirPlay/RTP-source management and per-output diagnostic test
 buttons (Play tone / Play announcement). Sendspin
 devices are auto-discovered, so there's no manual sendspin management — just a

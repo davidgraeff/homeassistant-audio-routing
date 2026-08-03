@@ -2690,6 +2690,11 @@ async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>)
     let level = req.level.unwrap_or_else(|| state.settings.lock_recover().default_duck()).clamp(0.0, 1.0);
     let ttl = duck_ttl(req.ttl_ms);
     let id = crate::overlay_mixer::OverlayMixer::global().start_duck(&targets, level, ttl);
+    // An agent-backed pw-sink host also ducks the audio it plays *itself* — the
+    // overlay mix can't reach that. No-op for every other kind.
+    for target in &targets {
+        crate::announce::sync_agent_duck(target);
+    }
     // One line per call, like announce: "why is the kitchen quiet?" is answerable
     // from the log alone.
     tracing::info!(
@@ -2733,7 +2738,11 @@ async fn duck_renew(Path(hold_id): Path<u64>, Json(req): Json<DuckRequest>) -> (
 
 /// Release a hold now (the normal end of a voice turn).
 async fn duck_release(Path(hold_id): Path<u64>) -> (StatusCode, Json<DuckResponse>) {
-    let existed = crate::overlay_mixer::OverlayMixer::global().release_duck(hold_id);
+    let affected = crate::overlay_mixer::OverlayMixer::global().release_duck(hold_id);
+    let existed = !affected.is_empty();
+    for output in &affected {
+        crate::announce::sync_agent_duck(output);
+    }
     tracing::info!("USER ACTION: unduck -> hold {hold_id}{}", if existed { "" } else { " (already gone)" });
     // Releasing an already-gone hold is success: the caller wanted it not ducking.
     (

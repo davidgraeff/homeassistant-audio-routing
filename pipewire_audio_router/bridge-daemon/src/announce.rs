@@ -60,12 +60,16 @@ impl Inner {
                     if let Some(clip) = self.clips.get(&id) {
                         mixer.start_with_grace(&output, id, (*clip.pcm).clone(), clip.duck, clip.grace);
                         // No-op unless `output` is an agent-backed host.
-                        crate::pwsink_agent::duck_output(&output, clip.duck);
+                        sync_agent_duck(&output);
                     }
                 }
                 Action::StopAnnouncement(output, _id) => {
                     mixer.stop(&output);
-                    crate::pwsink_agent::unduck_output(&output);
+                    // Not a plain unduck: a voice-duck hold may still be in force
+                    // on this output (an assistant is talking in that room), and
+                    // the agent takes an absolute depth — so re-assert whatever
+                    // remains instead of clearing the host outright.
+                    sync_agent_duck(&output);
                 }
                 // Duck is implicit in the mix for sendspin per-device.
                 Action::DuckMusic(_) | Action::UnduckMusic(_) => {}
@@ -74,6 +78,23 @@ impl Inner {
         for (id, _reason) in effects.dropped {
             self.clips.remove(&id);
         }
+    }
+}
+
+/// Push an output's *current* aggregate duck to its pw-sink agent, if it has one.
+///
+/// A pw-sink target is a whole host, which may be playing music of its own that
+/// is not in our stream, so the overlay mix cannot reach it — the agent
+/// attenuates the foreign streams on its sink instead. It is told an **absolute**
+/// depth and does no ref-counting, so every producer of ducking (an announcement
+/// overlay, a voice-duck hold) must re-assert the aggregate rather than clear it:
+/// otherwise a finishing announcement would un-duck a host whose room still has
+/// a voice assistant talking. [`OverlayMixer::effective_duck`] is that aggregate
+/// — the same value the mix applies. No-op for every other output kind.
+pub(crate) fn sync_agent_duck(output: &str) {
+    match OverlayMixer::global().effective_duck(output) {
+        Some(depth) => crate::pwsink_agent::duck_output(output, depth),
+        None => crate::pwsink_agent::unduck_output(output),
     }
 }
 
@@ -138,8 +159,14 @@ impl AnnounceCoordinator {
         // Duck holds are independent of announcements (no clip, no occupancy) —
         // this tick is just the lease enforcer, so a holder that died mid-turn
         // can't leave music ducked forever.
-        for id in mixer.expire_ducks() {
-            tracing::warn!("duck hold {id}: lease expired without a release; un-ducking (holder stopped renewing)");
+        for (id, outputs) in mixer.expire_ducks() {
+            tracing::warn!(
+                "duck hold {id} on [{}]: lease expired without a release; un-ducking (holder stopped renewing)",
+                outputs.join(", ")
+            );
+            for output in &outputs {
+                sync_agent_duck(output);
+            }
         }
         let mut done = mixer.take_finished();
         // Overlays no sender consumed (an output with no live transport, or one
