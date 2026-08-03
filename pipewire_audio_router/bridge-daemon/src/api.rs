@@ -254,6 +254,8 @@ pub fn router(
         .route("/api/spike/ap2", post(spike_ap2_start).delete(spike_ap2_stop))
         .route("/api/spike/pw-sink", post(spike_pwsink_start).delete(spike_pwsink_stop))
         .route("/api/announce", post(ag_announce))
+        .route("/api/duck", get(duck_list).post(duck_start))
+        .route("/api/duck/{hold_id}", post(duck_renew).delete(duck_release))
         .route("/api/groups/music", get(list_music_groups).post(create_music_group))
         .route("/api/groups/music/{id}", put(update_music_group).delete(delete_music_group))
         .route("/api/groups/music/{id}/route", post(route_music_group).delete(unroute_music_group))
@@ -2607,6 +2609,154 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
         message.push_str(&format!("; skipped {}", skipped.join("; ")));
     }
     (StatusCode::OK, Json(AgAnnounceResponse { ok, admission: label.to_string(), position, reason, message }))
+}
+
+// ---- Duck holds (overlay_mixer.rs) --------------------------------------
+//
+// A duck hold attenuates an output's music with **no clip of its own** — what
+// voice ducking needs, since a voice assistant speaking through its own speaker
+// gives the router nothing to play. Deliberately not the announce path: that one
+// is built for atomic clips (whole-or-nothing, queue, barge-in, TTL) and it
+// *occupies* its targets, which would make a doorbell queue behind someone's
+// voice turn instead of playing over the already-ducked music.
+//
+// The daemon knows nothing about rooms: Home Assistant resolves "which speakers
+// are in the room the satellite is in" (its own area registry) and posts output
+// names. Holds are leased, so a holder that dies mid-turn cannot leave music
+// ducked forever — see `DUCK_HOLD_TTL` and the announce tick.
+
+#[derive(Deserialize)]
+struct DuckRequest {
+    /// Output node names to duck. Optional if `announcement_group` is given.
+    #[serde(default)]
+    targets: Vec<String>,
+    /// Named announcement group (groups_store.rs) whose targets to duck — the
+    /// same addressing `/api/announce` accepts, so an AG can double as "these
+    /// speakers" without repeating the list.
+    #[serde(default)]
+    announcement_group: Option<String>,
+    /// Music gain 0.0–1.0 while held. Omitted → the daemon's default duck.
+    #[serde(default)]
+    level: Option<f32>,
+    /// Lease length; omitted → `DUCK_HOLD_TTL` (30 s). Renew inside it.
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DuckResponse {
+    ok: bool,
+    /// The hold's id — pass it to renew/release. `None` when `ok` is false.
+    hold_id: Option<u64>,
+    /// Outputs this hold covers.
+    #[serde(default)]
+    ducked: Vec<String>,
+    level: Option<f32>,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct DuckHoldView {
+    output: String,
+    hold_id: u64,
+    level: f32,
+}
+
+fn duck_ttl(ttl_ms: Option<u64>) -> std::time::Duration {
+    ttl_ms.map_or(crate::overlay_mixer::DUCK_HOLD_TTL, std::time::Duration::from_millis)
+}
+
+/// Start a duck hold on a set of outputs. Idempotent in the only sense that
+/// matters: holds compose (strongest gain wins), so two callers ducking the same
+/// output don't fight, and each releases only its own.
+async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>) -> (StatusCode, Json<DuckResponse>) {
+    let reject = |msg: String| {
+        (StatusCode::BAD_REQUEST, Json(DuckResponse { ok: false, hold_id: None, ducked: Vec::new(), level: None, message: msg }))
+    };
+    let mut targets = req.targets.clone();
+    if let Some(agid) = &req.announcement_group {
+        let store = state.groups_config.lock_recover();
+        match store.announcement_by_id(agid) {
+            Some(ag) if targets.is_empty() => targets = ag.targets.clone(),
+            Some(_) => {}
+            None => return reject(format!("no announcement group '{agid}'")),
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return reject("no targets (provide `targets` or `announcement_group`)".into());
+    }
+    let level = req.level.unwrap_or_else(|| state.settings.lock_recover().default_duck()).clamp(0.0, 1.0);
+    let ttl = duck_ttl(req.ttl_ms);
+    let id = crate::overlay_mixer::OverlayMixer::global().start_duck(&targets, level, ttl);
+    // One line per call, like announce: "why is the kitchen quiet?" is answerable
+    // from the log alone.
+    tracing::info!(
+        "USER ACTION: duck -> {} target(s) [{}] at gain {level:.2}, hold {id}, lease {} ms",
+        targets.len(),
+        targets.join(", "),
+        ttl.as_millis()
+    );
+    let message = format!("ducking {} target(s) to {level:.2}", targets.len());
+    (StatusCode::OK, Json(DuckResponse { ok: true, hold_id: Some(id), ducked: targets, level: Some(level), message }))
+}
+
+/// Extend a hold's lease. 404 when the id is unknown (released or expired) so the
+/// caller starts a fresh hold instead of believing it is still ducking.
+async fn duck_renew(Path(hold_id): Path<u64>, Json(req): Json<DuckRequest>) -> (StatusCode, Json<DuckResponse>) {
+    let ttl = duck_ttl(req.ttl_ms);
+    if crate::overlay_mixer::OverlayMixer::global().renew_duck(hold_id, ttl) {
+        (
+            StatusCode::OK,
+            Json(DuckResponse {
+                ok: true,
+                hold_id: Some(hold_id),
+                ducked: Vec::new(),
+                level: None,
+                message: format!("renewed hold {hold_id} for {} ms", ttl.as_millis()),
+            }),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(DuckResponse {
+                ok: false,
+                hold_id: None,
+                ducked: Vec::new(),
+                level: None,
+                message: format!("no duck hold {hold_id} (released or expired) — start a new one"),
+            }),
+        )
+    }
+}
+
+/// Release a hold now (the normal end of a voice turn).
+async fn duck_release(Path(hold_id): Path<u64>) -> (StatusCode, Json<DuckResponse>) {
+    let existed = crate::overlay_mixer::OverlayMixer::global().release_duck(hold_id);
+    tracing::info!("USER ACTION: unduck -> hold {hold_id}{}", if existed { "" } else { " (already gone)" });
+    // Releasing an already-gone hold is success: the caller wanted it not ducking.
+    (
+        StatusCode::OK,
+        Json(DuckResponse {
+            ok: true,
+            hold_id: Some(hold_id),
+            ducked: Vec::new(),
+            level: None,
+            message: if existed { format!("released hold {hold_id}") } else { format!("hold {hold_id} was already gone") },
+        }),
+    )
+}
+
+/// Live holds — for the UI and for answering "why is this output quiet?".
+async fn duck_list() -> Json<Vec<DuckHoldView>> {
+    Json(
+        crate::overlay_mixer::OverlayMixer::global()
+            .duck_holds()
+            .into_iter()
+            .map(|(output, hold_id, level)| DuckHoldView { output, hold_id, level })
+            .collect(),
+    )
 }
 
 // ---- Named groups (groups_store.rs) -------------------------------------

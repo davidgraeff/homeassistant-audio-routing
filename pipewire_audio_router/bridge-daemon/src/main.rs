@@ -454,8 +454,9 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 
         // Announce coordinator tick: complete finished per-device overlays (start
         // the next queued clip / end the duck), release overlays no sender is
-        // consuming, and expire stale queued announcements. Cheap no-op when
-        // nothing is announcing.
+        // consuming, expire stale queued announcements, and enforce duck-hold
+        // leases (voice ducking). Cheap no-op when nothing is announcing or
+        // ducked.
         tokio::spawn(async move {
             let coordinator = announce::AnnounceCoordinator::global();
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(150));

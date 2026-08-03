@@ -12,7 +12,15 @@
 //
 // Ducking is *implicit* here: it happens inside the mix only while an overlay is
 // active on that output, so the scheduler's DuckMusic/UnduckMusic actions are
-// no-ops for sendspin per-device (RAOP per-output duck is separate, O-E).
+// no-ops for sendspin per-device.
+//
+// There is a second, independent producer of ducking: a **duck hold** (see
+// `DuckHold`), an open-ended lease that attenuates one output's music with no clip
+// of its own. That is what voice ducking needs — an assistant speaking through its
+// own speaker gives the router nothing to play, only music to get out of the way —
+// and it composes with an announcement overlay by taking the stronger of the two
+// gains. Holds live in their own map so no overlay bookkeeping path (the progress
+// watchdog, the finished-drain, `stop`) can see them.
 //
 // Because only a running per-device relay advances an overlay, a slot on an output
 // nothing is streaming would never finish — and would hold that output "occupied"
@@ -61,11 +69,46 @@ struct Overlay {
     watch_since: Instant,
 }
 
+/// Identifies one **duck hold** — an open-ended request to keep an output's music
+/// ducked with no clip of its own (voice_duck: a voice assistant is talking in
+/// that room and speaks through its *own* speaker, so the router has nothing to
+/// play, only music to get out of the way).
+pub type DuckHoldId = u64;
+
+/// Default lease length for a duck hold. The holder is expected to renew well
+/// inside this; the TTL exists so a holder that dies mid-turn (Home Assistant
+/// restarting, the network dropping, the integration reloading) cannot leave
+/// music ducked forever.
+pub const DUCK_HOLD_TTL: Duration = Duration::from_secs(30);
+
+/// One live duck hold on one output.
+struct DuckHold {
+    id: DuckHoldId,
+    /// Music gain (0.0–1.0) while this hold is live.
+    level: f32,
+    /// Lease deadline; extended by [`OverlayMixer::renew_duck`], enforced by
+    /// [`OverlayMixer::expire_ducks`].
+    expires: Instant,
+}
+
 /// Per-output overlay slots. One process-global instance shared by every
 /// per-device server and the API (announcements are addressed by output name).
 #[derive(Default)]
 pub struct OverlayMixer {
     slots: Mutex<HashMap<String, Overlay>>,
+    /// Live duck holds per output, newest last. Deliberately a **separate** map
+    /// from `slots`: a hold has no clip and no cursor, so it must never be
+    /// reachable by the progress watchdog ([`Self::reap_stalled`]) or the
+    /// finished-drain — keeping it out of `Overlay` buys that structurally
+    /// instead of by a flag check on every path. A hold and an announcement
+    /// overlay can be live on the same output at once; the mix takes the
+    /// strongest (lowest) gain of the two, so a doorbell stays audible over
+    /// already-ducked music.
+    ///
+    /// Holds are keyed by output name and outlive any relay, so a hold placed on
+    /// an output nothing is streaming simply applies later, when music starts.
+    ducks: Mutex<HashMap<String, Vec<DuckHold>>>,
+    next_duck_id: Mutex<DuckHoldId>,
     /// Overlays that reached the end of their clip since the last drain, so the
     /// caller can tell the scheduler the announcement finished on that output.
     finished: Mutex<Vec<(String, u64)>>,
@@ -126,25 +169,127 @@ impl OverlayMixer {
         self.slots.lock().unwrap().contains_key(output)
     }
 
+    /// Start a duck hold on every output in `targets` and return its id. One id
+    /// covers all of them, so a single release/renew ends or extends the whole
+    /// turn. `level` is the music gain (0.0–1.0); `ttl` is the lease.
+    ///
+    /// A hold on an output with nothing playing is inaudible and harmless — that
+    /// is deliberate, so the caller need not know which speakers are live, and
+    /// music that *starts* mid-turn comes up already ducked.
+    pub fn start_duck(&self, targets: &[String], level: f32, ttl: Duration) -> DuckHoldId {
+        let id = {
+            let mut next = self.next_duck_id.lock().unwrap();
+            *next += 1;
+            *next
+        };
+        let expires = Instant::now() + ttl;
+        let level = level.clamp(0.0, 1.0);
+        let mut ducks = self.ducks.lock().unwrap();
+        for output in targets {
+            ducks.entry(output.clone()).or_default().push(DuckHold { id, level, expires });
+        }
+        id
+    }
+
+    /// Extend a hold's lease by `ttl` from now. Returns `false` if the id is
+    /// unknown (already released or expired) so the caller can start a new one
+    /// rather than silently ducking nothing.
+    pub fn renew_duck(&self, id: DuckHoldId, ttl: Duration) -> bool {
+        let expires = Instant::now() + ttl;
+        let mut ducks = self.ducks.lock().unwrap();
+        let mut found = false;
+        for holds in ducks.values_mut() {
+            for h in holds.iter_mut().filter(|h| h.id == id) {
+                h.expires = expires;
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// Release a hold on every output it covers. Returns whether it existed.
+    pub fn release_duck(&self, id: DuckHoldId) -> bool {
+        let mut ducks = self.ducks.lock().unwrap();
+        let mut found = false;
+        for holds in ducks.values_mut() {
+            let before = holds.len();
+            holds.retain(|h| h.id != id);
+            found |= holds.len() != before;
+        }
+        ducks.retain(|_, holds| !holds.is_empty());
+        found
+    }
+
+    /// Drop every hold whose lease has run out and return their ids (deduplicated,
+    /// for one log line each). Driven from the announce tick — the safety net for
+    /// a holder that stopped renewing without releasing.
+    pub fn expire_ducks(&self) -> Vec<DuckHoldId> {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        let mut ducks = self.ducks.lock().unwrap();
+        for holds in ducks.values_mut() {
+            holds.retain(|h| {
+                if h.expires <= now {
+                    if !expired.contains(&h.id) {
+                        expired.push(h.id);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        ducks.retain(|_, holds| !holds.is_empty());
+        expired
+    }
+
+    /// Live holds as `(output, id, level)`, sorted by output — for `GET /api/duck`
+    /// and for debugging "why is this quiet?".
+    pub fn duck_holds(&self) -> Vec<(String, DuckHoldId, f32)> {
+        let ducks = self.ducks.lock().unwrap();
+        let mut v: Vec<(String, DuckHoldId, f32)> =
+            ducks.iter().flat_map(|(o, hs)| hs.iter().map(move |h| (o.clone(), h.id, h.level))).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        v
+    }
+
+    /// The strongest (lowest) duck gain held on `output`, or `None` if none is.
+    fn duck_gain(ducks: &HashMap<String, Vec<DuckHold>>, output: &str) -> Option<f32> {
+        let holds = ducks.get(output)?;
+        holds.iter().map(|h| h.level).fold(None, |acc: Option<f32>, l| Some(acc.map_or(l, |a| a.min(l))))
+    }
+
     /// Mix one music chunk for `output` **into a caller-provided buffer** (reused
     /// across chunks by the sendspin relay, so the per-chunk mix does no
-    /// allocation on the RT relay thread). If an overlay is active, writes
-    /// `duck(music) + overlay` for the next `music.len()` bytes (padding the
-    /// final chunk with silence) into `out`, advances the overlay, and returns
-    /// `true`; when the clip is exhausted the slot is removed and recorded in
-    /// [`Self::take_finished`]. Returns `false` (leaving `out` untouched) if no
-    /// overlay is active — the caller sends plain music.
+    /// allocation on the RT relay thread). Returns `true` when it wrote something,
+    /// `false` (leaving `out` untouched) when the caller should send plain music.
+    ///
+    /// Three cases, in order of how loud the result is:
+    /// * an announcement overlay is active → `duck(music) + overlay` for the next
+    ///   `music.len()` bytes (padding the final chunk with silence), advancing the
+    ///   overlay; when the clip is exhausted the slot is removed and recorded in
+    ///   [`Self::take_finished`]. If a duck hold is *also* live, the stronger
+    ///   (lower) of the two gains applies — the clip itself is untouched;
+    /// * only a duck hold is live → `duck(music)`, no cursor to advance and
+    ///   nothing to finish (its lifecycle is the lease, not progress);
+    /// * neither → `false`.
     pub fn mix_into(&self, output: &str, music: &[u8], out: &mut Vec<u8>) -> bool {
         let mut slots = self.slots.lock().unwrap();
+        let hold_gain = Self::duck_gain(&self.ducks.lock().unwrap(), output);
         let Some(ov) = slots.get_mut(output) else {
-            return false;
+            // Duck-only: attenuate the music, leave every overlay bookkeeping
+            // path alone.
+            let Some(gain) = hold_gain else { return false };
+            mix_s16le_into(music, &[], gain, out);
+            return true;
         };
 
         // Overlay slice matching this music chunk, zero-padded if the clip ends.
         let remaining = &ov.pcm[ov.cursor.min(ov.pcm.len())..];
         let take = remaining.len().min(music.len());
         let overlay_chunk = &remaining[..take];
-        mix_s16le_into(music, overlay_chunk, ov.duck, out);
+        let duck = hold_gain.map_or(ov.duck, |g| g.min(ov.duck));
+        mix_s16le_into(music, overlay_chunk, duck, out);
         ov.cursor += take;
 
         let done = ov.cursor >= ov.pcm.len();
@@ -333,6 +478,140 @@ mod tests {
         m.start_with_grace("k", 9, s16(&[100]), 1.0, Duration::from_secs(60));
         assert_eq!(m.reap_stalled(), vec![], "still inside its grace window");
         assert!(m.is_active("k"));
+    }
+
+    // --- duck holds (voice ducking) ---
+
+    fn o(s: &str) -> String {
+        s.to_string()
+    }
+    fn out(s: &str) -> Vec<String> {
+        vec![o(s)]
+    }
+    const TTL: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn a_duck_hold_alone_attenuates_the_music() {
+        let m = OverlayMixer::default();
+        assert!(m.mix("k", &s16(&[1000])).is_none(), "no hold yet → plain music");
+        m.start_duck(&out("k"), 0.25, TTL);
+        // Ducked, and nothing else: no overlay started, nothing to finish.
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000, 2000])).unwrap()), vec![250, 500]);
+        assert!(!m.is_active("k"), "a hold is not an overlay slot");
+        assert_eq!(m.take_finished(), vec![]);
+    }
+
+    #[test]
+    fn releasing_the_hold_restores_full_gain() {
+        let m = OverlayMixer::default();
+        let id = m.start_duck(&out("k"), 0.5, TTL);
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![500]);
+        assert!(m.release_duck(id));
+        assert!(m.mix("k", &s16(&[1000])).is_none(), "released → plain music again");
+        assert!(!m.release_duck(id), "second release is a no-op");
+    }
+
+    #[test]
+    fn one_hold_id_covers_every_target_and_releases_them_together() {
+        let m = OverlayMixer::default();
+        let id = m.start_duck(&[o("k"), o("bath")], 0.5, TTL);
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![500]);
+        assert_eq!(to_i16(&m.mix("bath", &s16(&[1000])).unwrap()), vec![500]);
+        m.release_duck(id);
+        assert!(m.mix("k", &s16(&[1000])).is_none());
+        assert!(m.mix("bath", &s16(&[1000])).is_none());
+    }
+
+    #[test]
+    fn overlapping_holds_take_the_strongest_and_refcount() {
+        let m = OverlayMixer::default();
+        let quiet = m.start_duck(&out("k"), 0.2, TTL);
+        let mild = m.start_duck(&out("k"), 0.8, TTL);
+        // Strongest (lowest) gain wins while both are live.
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![200]);
+        // Dropping the stronger one leaves the milder duck — NOT full volume.
+        m.release_duck(quiet);
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![800]);
+        m.release_duck(mild);
+        assert!(m.mix("k", &s16(&[1000])).is_none());
+    }
+
+    #[test]
+    fn a_hold_and_an_announcement_compose_at_the_stronger_duck() {
+        let m = OverlayMixer::default();
+        // Announcement ducks to 0.5; a voice turn wants 0.2 on the same output.
+        m.start("k", 7, s16(&[100, 100]), 0.5);
+        m.start_duck(&out("k"), 0.2, TTL);
+        // music*0.2 + overlay — the clip itself is never attenuated.
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![300]);
+        // The overlay still completes normally...
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![300]);
+        assert_eq!(m.take_finished(), vec![("k".to_string(), 7)]);
+        // ...and the hold outlives it, still ducking.
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![200]);
+    }
+
+    #[test]
+    fn an_announcements_own_duck_still_applies_with_no_hold() {
+        let m = OverlayMixer::default();
+        m.start("k", 1, s16(&[0]), 0.5);
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![500]);
+    }
+
+    #[test]
+    fn an_expired_lease_un_ducks_on_its_own() {
+        let m = OverlayMixer::default();
+        let id = m.start_duck(&out("k"), 0.25, Duration::ZERO);
+        assert_eq!(m.expire_ducks(), vec![id], "lease already up");
+        assert!(m.mix("k", &s16(&[1000])).is_none(), "music back at full level");
+        assert!(m.expire_ducks().is_empty(), "nothing left to expire");
+        // A live lease is never expired.
+        m.start_duck(&out("k"), 0.25, Duration::from_secs(60));
+        assert!(m.expire_ducks().is_empty());
+    }
+
+    #[test]
+    fn renewing_keeps_a_hold_alive_and_reports_unknown_ids() {
+        let m = OverlayMixer::default();
+        let id = m.start_duck(&out("k"), 0.25, Duration::ZERO);
+        assert!(m.renew_duck(id, Duration::from_secs(60)));
+        assert!(m.expire_ducks().is_empty(), "renewed before the tick saw it");
+        assert!(m.mix("k", &s16(&[1000])).is_some());
+        assert!(!m.renew_duck(999, TTL), "unknown id → caller starts a new hold");
+    }
+
+    #[test]
+    fn a_hold_survives_with_no_relay_and_applies_once_one_starts() {
+        let m = OverlayMixer::default();
+        // Nothing is streaming this output: no mix calls at all, and the stall
+        // watchdog (an overlay concept) must not touch the hold.
+        let id = m.start_duck(&out("k"), 0.25, TTL);
+        assert_eq!(m.reap_stalled(), vec![]);
+        assert_eq!(m.duck_holds(), vec![("k".to_string(), id, 0.25)]);
+        // Music starts later → it comes up already ducked.
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![250]);
+    }
+
+    #[test]
+    fn holds_are_invisible_to_the_overlay_watchdog_and_stop() {
+        let m = OverlayMixer::default();
+        m.start_duck(&out("k"), 0.25, TTL);
+        m.start_with_grace("k", 9, s16(&[100]), 1.0, Duration::ZERO);
+        // Reaping a stalled overlay leaves the hold in place.
+        assert_eq!(m.reap_stalled(), vec![("k".to_string(), 9)]);
+        assert_eq!(m.duck_holds().len(), 1);
+        assert!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()) == vec![250]);
+        // Same for an explicit overlay stop.
+        m.start("k", 10, s16(&[0, 0]), 1.0);
+        assert_eq!(m.stop("k"), Some(10));
+        assert_eq!(m.duck_holds().len(), 1);
+    }
+
+    #[test]
+    fn duck_level_is_clamped() {
+        let m = OverlayMixer::default();
+        m.start_duck(&out("k"), -1.0, TTL);
+        assert_eq!(to_i16(&m.mix("k", &s16(&[1000])).unwrap()), vec![0], "clamped to silence, not negated");
     }
 
     #[test]

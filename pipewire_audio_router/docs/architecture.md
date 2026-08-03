@@ -386,6 +386,37 @@ on-demand session connects) and `announce.rs` completes it in the scheduler.
 Without that, a clip nothing consumes would hold the output occupied forever and
 every later announcement to it would queue behind a clip that can never finish.
 
+### 5.5 Voice ducking — the other producer of duck
+
+Announcement ducking is a *side effect* of an overlay being mixed. There is a
+second, independent producer: a **duck hold** (`overlay_mixer.rs`), an open-ended
+lease that attenuates one output's music with no clip at all. It exists for a
+voice assistant that speaks through its **own** speaker (an HA Voice PE): the
+router has nothing to play, only music to get out of the way.
+
+Three properties, each deliberate:
+
+- **Not an announcement.** The scheduler is built for atomic clips and it
+  *occupies* its targets; a hold that occupied an output would make a doorbell
+  queue behind someone's voice turn. Holds live in their own map, so no overlay
+  bookkeeping path (`reap_stalled`, the finished-drain, `stop`) can see them, and
+  the two compose in the mix by taking the stronger (lower) gain — the clip
+  itself is never attenuated.
+- **Leased, renewed by the holder.** The announce tick expires overdue leases, so
+  a holder that dies mid-turn (Home Assistant restarting, network dropping) costs
+  one TTL of quiet music rather than silence until someone notices. This is the
+  property that makes the feature safe to enable at all.
+- **Rooms stay in Home Assistant.** The daemon is addressed by output name only.
+  The integration (`voice_duck.py`) resolves satellite → area → outputs from HA's
+  own registries, optionally widening to a whole music group, and it reuses the
+  *same* device correlation as output adoption — so ducking and adoption can never
+  disagree about which device an output is. Nothing about areas is duplicated
+  daemon-side.
+
+A hold on an output nothing is streaming is inaudible and harmless: holds are
+keyed by output name and outlive any relay, so music that starts mid-hold comes
+up already ducked.
+
 ## 6. The two clocks, cleanly separated
 
 AP2 needs *two* independent clocks, and conflating them is the classic

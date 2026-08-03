@@ -57,6 +57,8 @@ handler name, which is the authoritative place to check the exact body shape.
 | `DELETE` | `/api/routing/entity/{node_name}` | forget an entity |
 | `GET` | `/api/routing/ws` | matrix change WebSocket |
 | `POST` | `/api/announce` | announce to explicit targets |
+| `GET`/`POST` | `/api/duck` | list duck holds / start one (voice ducking) |
+| `POST`/`DELETE` | `/api/duck/{hold_id}` | renew / release a duck hold |
 | `GET`/`POST` | `/api/groups/music` | list / create a Music group |
 | `PUT`/`DELETE` | `/api/groups/music/{id}` | edit / delete a Music group |
 | `POST`/`DELETE` | `/api/groups/music/{id}/route` | route / unroute a Music group |
@@ -623,6 +625,73 @@ somewhere. See
 Every call logs one `USER ACTION: announce -> N target(s) [...]` line with the admission,
 any on-demand sessions being opened, and anything skipped and why — so an "it didn't
 play" report is answerable from the log.
+
+## Duck holds (voice ducking)
+
+A **duck hold** attenuates an output's music with **no clip of its own** — an
+open-ended lease rather than an announcement. It exists for voice assistants that
+speak through their *own* speaker (an HA Voice PE): the router has nothing to
+play, only music to get out of the way. Ducking happens as a gain in the
+per-device mix (`overlay_mixer.rs`), so a device's own volume never moves, there
+is nothing to restore, and one member of a synchronized group can duck while its
+groupmates keep playing.
+
+Deliberately **not** the announce path. That one is built for atomic clips
+(whole-or-nothing, queue, barge-in, TTL) and it *occupies* its targets — a
+doorbell would queue behind someone's voice turn instead of playing over the
+already-ducked music. Holds and announcement overlays compose instead: the mix
+takes the stronger (lower) of the two gains, and the clip itself is never
+attenuated.
+
+The daemon knows nothing about rooms. Home Assistant resolves "which speakers are
+in the room the satellite is in" from its own area registry and posts output
+names (see the integration's `voice_duck.py`).
+
+### `POST /api/duck`
+```json
+// Request — targets, or an announcement group's targets
+{ "targets": ["sendspin-dev-kitchen"], "level": 0.25, "ttl_ms": 30000 }
+// Response
+{ "ok": true, "hold_id": 4, "ducked": ["sendspin-dev-kitchen"], "level": 0.25,
+  "message": "ducking 1 target(s) to 0.25" }
+```
+
+`level` is a **gain** (0.25 = quarter volume), defaulting to the daemon's
+`default_duck` setting; `ttl_ms` defaults to 30 000. `targets` may be replaced by
+`announcement_group` to reuse a named group's target list. Unknown group → 400;
+no targets at all → 400.
+
+Holds **compose**: two callers ducking the same output don't fight (strongest
+gain wins) and each releases only its own. A hold on an output with nothing
+playing is inaudible and harmless — that is deliberate, so a caller needn't know
+which speakers are live, and music that *starts* mid-hold comes up already
+ducked.
+
+### `POST /api/duck/{hold_id}`
+```json
+// Request (ttl_ms optional)
+{ "ttl_ms": 30000 }
+```
+Extends the lease from now. **404** once the hold is gone (expired, or the daemon
+restarted) — the caller should then start a new one rather than believe it is
+still ducking.
+
+### `DELETE /api/duck/{hold_id}`
+Releases it now — the normal end of a voice turn. Releasing a hold that is
+already gone is **200**, not an error: the caller's intent ("not ducking") holds
+either way.
+
+### `GET /api/duck`
+```json
+[ { "output": "sendspin-dev-kitchen", "hold_id": 4, "level": 0.25 } ]
+```
+Live holds, sorted by output — the answer to "why is this speaker quiet?".
+
+**The lease is the safety net.** Nothing else un-ducks a hold whose owner died:
+the announce tick (150 ms) expires overdue leases and logs one line per hold, so
+a Home Assistant restart or a dropped network mid-turn costs at most one TTL of
+quiet music instead of silence until someone notices. Every call logs one
+`USER ACTION: duck -> N target(s) [...]` / `USER ACTION: unduck -> hold N` line.
 
 ## Linking
 

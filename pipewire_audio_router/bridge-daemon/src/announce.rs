@@ -130,11 +130,17 @@ impl AnnounceCoordinator {
     }
 
     /// Periodic tick: complete finished overlays (start next queued / end duck),
-    /// release overlays nothing is consuming, and expire stale queued
-    /// announcements. Driven from main.rs.
+    /// release overlays nothing is consuming, expire stale queued announcements,
+    /// and expire duck-hold leases. Driven from main.rs.
     pub fn poll(&self) {
         let now = now_ms();
         let mixer = OverlayMixer::global();
+        // Duck holds are independent of announcements (no clip, no occupancy) —
+        // this tick is just the lease enforcer, so a holder that died mid-turn
+        // can't leave music ducked forever.
+        for id in mixer.expire_ducks() {
+            tracing::warn!("duck hold {id}: lease expired without a release; un-ducking (holder stopped renewing)");
+        }
         let mut done = mixer.take_finished();
         // Overlays no sender consumed (an output with no live transport, or one
         // whose sender died mid-clip). Treated exactly like a finish so the
