@@ -115,6 +115,12 @@ RUN test -f /submodules/sendspin/Cargo.toml || { \
         echo "ERROR: submodules/sendspin is empty — run 'git submodule update --init --recursive'" >&2; \
         exit 1; \
     }
+# The shared pw-control crate (volume pods + the module-load FFI, used by both the
+# daemon and the receiver-side agent). `bridge-daemon/Cargo.toml` reaches it as
+# `../pw-control`, which from WORKDIR /build resolves to /pw-control — same
+# outside-of-/build trick as the submodule above, and copied before bridge-daemon/
+# for the same cache reason.
+COPY pw-control/ /pw-control/
 COPY bridge-daemon/ .
 # BuildKit cache mounts make this incremental. Without them every deploy
 # recompiled all ~600 dependency crates (plus bundled libopus via cmake and

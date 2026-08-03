@@ -24,7 +24,8 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {
-            let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME is set"))?;
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME is set"))?;
             PathBuf::from(home).join(".config")
         }
     };
@@ -34,7 +35,9 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 pub fn load() -> anyhow::Result<Config> {
     let path = config_path()?;
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display())),
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -45,7 +48,9 @@ pub fn load() -> anyhow::Result<Config> {
 /// leave a readable window.
 pub fn save(config: &Config) -> anyhow::Result<()> {
     let path = config_path()?;
-    let dir = path.parent().ok_or_else(|| anyhow!("config path has no parent"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent"))?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let json = serde_json::to_vec_pretty(config)?;
 
@@ -90,7 +95,10 @@ pub fn label() -> String {
 }
 
 pub fn user() -> String {
-    std::env::var("USER").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".to_string())
+    std::env::var("USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn hostname() -> String {
@@ -110,7 +118,10 @@ mod tests {
         // Serialised via one process-wide env mutation per assertion; these two
         // vars are only read here.
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg");
-        assert_eq!(config_path().unwrap(), PathBuf::from("/tmp/xdg/pwrouter-agent/config.json"));
+        assert_eq!(
+            config_path().unwrap(),
+            PathBuf::from("/tmp/xdg/pwrouter-agent/config.json")
+        );
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::set_var("HOME", "/home/someone");
         assert_eq!(
@@ -122,13 +133,19 @@ mod tests {
     #[test]
     fn identity_is_machine_plus_user() {
         let id = identity();
-        assert!(id.contains(':'), "identity should be machine:user, got {id}");
+        assert!(
+            id.contains(':'),
+            "identity should be machine:user, got {id}"
+        );
         assert!(id.ends_with(&user()));
     }
 
     #[test]
     fn config_round_trips_through_json() {
-        let cfg = Config { daemon: Some("192.168.178.22:8099".into()), token: Some("t0ken".into()) };
+        let cfg = Config {
+            daemon: Some("192.168.178.22:8099".into()),
+            token: Some("t0ken".into()),
+        };
         let json = serde_json::to_vec(&cfg).unwrap();
         assert_eq!(serde_json::from_slice::<Config>(&json).unwrap(), cfg);
     }

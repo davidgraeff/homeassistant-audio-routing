@@ -42,7 +42,9 @@ pub enum AgentMsg {
     /// Pushed whenever anything changes, including local changes made by the user.
     State(HostState),
     /// A router session other than ours is also being received here (§7.1).
-    ForeignSession { session: String },
+    ForeignSession {
+        session: String,
+    },
     Pong,
 }
 
@@ -51,11 +53,17 @@ pub enum AgentMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMsg {
     /// Pairing accepted as pending: show/log `code`, then wait for `paired`.
-    PairPending { code: String },
+    PairPending {
+        code: String,
+    },
     /// Approval granted — persist this token and reconnect with it.
-    Paired { token: String },
+    Paired {
+        token: String,
+    },
     /// Refused: unknown token, denied pairing, or protocol mismatch.
-    Denied { reason: String },
+    Denied {
+        reason: String,
+    },
     /// Control granted. The agent becomes the receiver for `session_name` and
     /// enforces `keepalive_secs` (§9.2).
     Welcome {
@@ -67,10 +75,19 @@ pub enum DaemonMsg {
     /// Stop being a receiver: the target was unrouted or removed. The agent
     /// unloads the module (its nodes disappear) but stays paired and connected.
     Release,
-    SetVolume { volume: f32 },
-    SetMute { muted: bool },
-    Duck { depth: f32, ramp_ms: u64 },
-    Unduck { ramp_ms: u64 },
+    SetVolume {
+        volume: f32,
+    },
+    SetMute {
+        muted: bool,
+    },
+    Duck {
+        depth: f32,
+        ramp_ms: u64,
+    },
+    Unduck {
+        ramp_ms: u64,
+    },
     Ping,
 }
 
@@ -111,7 +128,10 @@ mod tests {
         for msg in [
             DaemonMsg::SetVolume { volume: 0.42 },
             DaemonMsg::SetMute { muted: true },
-            DaemonMsg::Duck { depth: 0.2, ramp_ms: 200 },
+            DaemonMsg::Duck {
+                depth: 0.2,
+                ramp_ms: 200,
+            },
             DaemonMsg::Unduck { ramp_ms: 400 },
             DaemonMsg::Release,
             DaemonMsg::Ping,

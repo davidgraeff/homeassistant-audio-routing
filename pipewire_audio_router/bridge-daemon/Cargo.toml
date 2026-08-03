@@ -15,6 +15,12 @@ exclude = ["vendor/airplay2-sender", "vendor/shairplay"]
 
 [dependencies]
 pipewire = "0.10"
+# Volume pods, the cubic scale, and the module-load FFI, shared with the
+# receiver-side agent (docs/receiver-agent-plan.md §12). Outside this workspace
+# root's directory on purpose, so it does not become a member; the Dockerfile
+# copies it to /pw-control so `../pw-control` resolves from WORKDIR /build, the
+# same trick the sendspin submodule uses.
+pw-control = { path = "../pw-control" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }

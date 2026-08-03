@@ -190,11 +190,13 @@ carrying `channelVolumes` and `mute`). That is also how mute arrives for free,
 and it is the value the user's own UI displays — which the §9.4 "never fight the
 user" requirement depends on.
 
-Cubic↔linear (`V³`, matching wpctl and HA's `volume_level`) is unchanged and
-stays shared. P1 factors it into a small **`pw-control`** crate used by daemon and
-agent. It must live *outside* `bridge-daemon/` — a path dep inside the workspace
-root directory silently becomes a workspace member (the load-bearing
-`[workspace] exclude` comment in `bridge-daemon/Cargo.toml`).
+Cubic↔linear (`V³`, matching wpctl and HA's `volume_level`) is shared with the
+daemon through the **`pw-control`** crate (§12). It lives *outside*
+`bridge-daemon/` — a path dep inside the workspace root directory silently becomes
+a workspace member (the load-bearing `[workspace] exclude` comment in
+`bridge-daemon/Cargo.toml`) — and the `Dockerfile` copies it to `/pw-control` so
+`../pw-control` resolves from `WORKDIR /build`, the same trick the sendspin
+submodule uses.
 
 Node `Props` keeps one job: **per-stream duck** (P3) of *foreign* playback
 streams, where it is the correct and appropriately invisible lever — it does not
@@ -284,11 +286,20 @@ Worth an upstream report either way.
 
 1. Daemon advertises `_pwrouter-ctl._tcp` over the shared storm-safe mDNS daemon
    (`discovery_supervisor.rs`, LAN-restricted per the mDNS-storm fix).
-2. `pwrouter-agent pair` browses for it, connects, sends `hello`.
-3. The add-on UI shows *"david-local wants to pair — Approve"*; approving mints a
-   token which the agent stores in `~/.config/pwrouter-agent/config.json` (0600).
-4. Thereafter the agent reconnects on its own with the token, backing off on
+2. `pwrouter-agent run` browses for it, connects, sends `hello` without a token.
+3. The **Outputs tab** shows the request above "Discovered devices" — deliberately
+   there, because a host cannot become a discovered output until it is paired, so
+   this is the earlier step of one flow. The row carries the pairing code, which
+   the agent also logs: approving a request you cannot identify is how you would
+   hand your audio to someone else on the network, so the code is the check. The
+   panel polls (5 s) rather than waiting on the routing WebSocket, which carries
+   the matrix, not the pairing queue — a request you must reload to see is a
+   request you miss.
+4. Approving mints a token; the agent stores it `0600` in
+   `~/.config/pwrouter-agent/config.json` and reconnects with it, backing off on
    failure. Manual override (`--daemon host:port`) for routed/non-mDNS setups.
+5. The same panel lists paired hosts with what each reports (receiving, which sink,
+   level, muted, ducked) and a Remove that revokes the token.
 
 ## 9. Safety rails
 
@@ -349,10 +360,12 @@ applications' streams on that sink, never `pwsink-in`.
 
 | File | Role |
 |---|---|
-| `pwrouter-agent/` (new crate, own workspace root) | the helper: config, WS client, module load, volume. Sibling of `bridge-daemon/`, deliberately **not** copied into the add-on image by `Dockerfile` (P2 adds a build stage so the frontend can serve it) |
+| `pwrouter-agent/` (own workspace root) | the helper: config, pairing, WS client, receiver module, volume, duck. Sibling of `bridge-daemon/`, deliberately **not** copied into the add-on image |
 | `pwrouter-agent/src/receiver.rs` | the `rtp-session` args replacing the drop-in (§7), with tests |
-| `pwrouter-agent/src/volume.rs` | graph snapshot + stream→sink walk + `channelVolumes` (S2b adds `Route`) |
-| `pwrouter-agent/src/pw_module.rs` | copy of the daemon's module-load FFI until `pw-control` exists |
+| `pwrouter-agent/src/pw_thread.rs` | the service path: graph tracking, master lever, duck ramps |
+| `pwrouter-agent/src/volume.rs` | the diagnostic path (`spike-*`): snapshot, stream→sink walk, lever |
+| `pw-control/` (own workspace root) | shared with the daemon: volume/route pods, the cubic scale, and the `pw_context_load_module` FFI neither `pipewire-rs` wraps nor either side should duplicate |
+| `frontend/src/components/AgentsPanel.svelte` | the pairing UI: pending requests with their code, paired hosts with what each reports |
 | `pw-control/` (new crate, P1) | `channelVolumes` get/set + cubic scale, shared with the daemon |
 | `bridge-daemon/src/pwsink_agent.rs` (new) | daemon side: WS endpoint, token store, per-host command channel, keepalive |
 | `bridge-daemon/src/volume.rs` | source of the shared volume code (moves to `pw-control`) |
@@ -384,12 +397,15 @@ Answered 2026-08-03:
 Still deferred (open design questions, deliberately not implemented):
 
 * the send-twin cleanup / self-created link (§7.2) — includes "which sink" control;
-* extracting the shared `pw-control` crate: `Dockerfile` copies only
-  `bridge-daemon/` into the build context, so a path dep one level up needs a
-  build-context change to that and to `scripts/build-daemon.sh`. Until then the
-  agent carries a marked copy of the pod/volume code (same convention as
-  `pw_module.rs`);
-* §11 P4 host-scoped extras (named-sink targeting, xrun reporting).
+* §11 P4 host-scoped extras (named-sink targeting, xrun reporting);
+* shipping the agent binary from the add-on's own frontend (§10): needs a
+  cross-arch build stage in the `Dockerfile`, so installation is `cargo build
+  --release` for now (`pwrouter-agent/README.md`).
+
+Done since: the shared `pw-control` crate (§12) and the pairing UI (§8) are both
+implemented — the build-context question that blocked the crate is answered by one
+`COPY pw-control/ /pw-control/`, verified by resolving `cargo metadata` from a
+replica of the container layout.
 
 ## 14. Spike results
 

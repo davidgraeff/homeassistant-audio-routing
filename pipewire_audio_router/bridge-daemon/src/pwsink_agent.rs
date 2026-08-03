@@ -45,14 +45,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMsg {
-    Hello {
-        protocol: u32,
-        agent_version: String,
-        machine_id: String,
-        hostname: String,
-        user: String,
-        token: Option<String>,
-    },
+    Hello { protocol: u32, agent_version: String, machine_id: String, hostname: String, user: String, token: Option<String> },
     State(HostState),
     ForeignSession { session: String },
     Pong,
@@ -64,12 +57,7 @@ pub enum DaemonMsg {
     PairPending { code: String },
     Paired { token: String },
     Denied { reason: String },
-    Welcome {
-        session_name: String,
-        ifname: Option<String>,
-        jitter_ms: Option<u32>,
-        keepalive_secs: u64,
-    },
+    Welcome { session_name: String, ifname: Option<String>, jitter_ms: Option<u32>, keepalive_secs: u64 },
     Release,
     SetVolume { volume: f32 },
     SetMute { muted: bool },
@@ -232,7 +220,10 @@ pub type SharedAgents = Arc<Mutex<Agents>>;
 /// What a `Hello` resolves to.
 pub enum HelloOutcome {
     /// Approved: this is the host's node name and the session it should receive.
-    Welcome { node_name: String, label: String },
+    Welcome {
+        node_name: String,
+        label: String,
+    },
     /// Waiting for approval; the code was already queued to the agent.
     Pending,
     Denied(String),
@@ -286,9 +277,7 @@ impl Agents {
         tx: mpsc::UnboundedSender<DaemonMsg>,
     ) -> HelloOutcome {
         if protocol != PROTOCOL_VERSION {
-            return HelloOutcome::Denied(format!(
-                "protocol {protocol} is not {PROTOCOL_VERSION}; update the agent or the add-on"
-            ));
+            return HelloOutcome::Denied(format!("protocol {protocol} is not {PROTOCOL_VERSION}; update the agent or the add-on"));
         }
         let identity = format!("{machine_id}:{user}");
         let label = Self::label_for(hostname, user);
@@ -598,11 +587,7 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
         return;
     };
 
-    let outcome = state
-        .agents
-        .lock()
-        .await
-        .hello(protocol, &machine_id, &hostname, &user, token.as_deref(), tx.clone());
+    let outcome = state.agents.lock().await.hello(protocol, &machine_id, &hostname, &user, token.as_deref(), tx.clone());
 
     let (node_name, label) = match outcome {
         HelloOutcome::Welcome { node_name, label } => (node_name, label),

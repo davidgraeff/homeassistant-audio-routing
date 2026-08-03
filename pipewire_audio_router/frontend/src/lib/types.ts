@@ -152,6 +152,17 @@ export interface OutputInfo {
    * routed but the receiver hasn't connected yet; undefined = not a pw-sink
    * output. Distinct from `present` (mDNS visibility). */
   pwsink_streaming?: boolean;
+  /** pw-sink only: the host's own master volume (0.0-1.0) as reported by its
+   * agent. Absent while no agent is connected — never fabricate a level, the
+   * value belongs to that desktop. */
+  pwsink_volume?: number;
+  /** pw-sink only: the host's mute state, as reported. */
+  pwsink_muted?: boolean;
+  /** pw-sink only: which sink on that host plays our stream (display only). */
+  pwsink_sink_name?: string;
+  /** pw-sink only: whether the agent is currently ducking the host's *other*
+   * applications for an announcement. */
+  pwsink_ducked?: boolean;
   /** sendspin only: stored wire-codec choice — 'auto' | 'pcm' | 'opus' | 'flac'. */
   sendspin_codec?: SendspinCodec;
   /** sendspin only: the codec the stream actually uses (the choice narrowed by what
@@ -453,4 +464,28 @@ export interface AnnounceResponse {
 export interface VolumeResponse {
   volume: number | null;
   message: string | null;
+}
+
+/** One row of `GET /api/agents`: a paired receiver host, or a pending pairing
+ * request waiting for someone to approve it (docs/receiver-agent-plan.md §8).
+ *
+ * A pending row has no `node_name` — it has no routing identity until approved —
+ * and carries the `code` the agent also logs, so the person approving can check
+ * they are approving *that* host and not a stranger's request. */
+export interface AgentInfo {
+  /** `<machine-id>:<user>`; the handle every agent endpoint takes. */
+  identity: string;
+  /** `hostname (user)`. */
+  label: string;
+  node_name: string | null;
+  paired: boolean;
+  connected: boolean;
+  code: string | null;
+  state: {
+    volume: number | null;
+    muted: boolean | null;
+    sink_name: string | null;
+    receiving: boolean;
+    ducked: boolean;
+  } | null;
 }

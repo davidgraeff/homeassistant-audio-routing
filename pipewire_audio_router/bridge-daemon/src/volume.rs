@@ -7,55 +7,26 @@
 //! the long-lived registry/command thread and avoids threading `!Send` proxies
 //! around.
 //!
-//! Scale: PipeWire's `channelVolumes` are linear gain, but the user-facing
-//! value `wpctl` shows/sets is **cubic** — `channelVolumes = V³` (confirmed
-//! empirically: `wpctl 0.5` → `0.125`, `0.25` → `0.015625`). We keep the same
-//! `V` contract as before (and as HA's `volume_level` expects), cubing on set
-//! and cube-rooting on read, so behaviour is identical to the old wpctl path.
+//! Scale and pod encoding live in the shared `pw-control` crate (the agent needs
+//! exactly the same ones — docs/receiver-agent-plan.md §12): `channelVolumes` are
+//! linear gain, while the user-facing value `wpctl` and HA's `volume_level` use is
+//! **cubic**, `channelVolumes = V³`.
+//!
+//! Note this is the *node* `Props` lever, which is right for the daemon's own
+//! virtual sinks but **not** for a real device sink — there the master volume lives
+//! in the device's `Route` param (plan §6.1). The daemon only ever drives its own
+//! graph, so it does not need the route lever; the agent does.
 
 use pipewire as pw;
-use pw::spa;
-use spa::param::ParamType;
-use spa::pod::{deserialize::PodDeserializer, serialize::PodSerializer, Object, Pod, Property, Value, ValueArray};
+use pw::spa::param::ParamType;
+use pw::spa::pod::Pod;
+use pw_control::pods;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Converts a linear `channelVolume` to the cubic 0.0-1.0 scale wpctl/HA use.
-fn linear_to_cubic(linear: f32) -> f32 {
-    linear.max(0.0).cbrt()
-}
-
-/// Converts a cubic 0.0-1.0 volume to the linear gain `channelVolumes` wants.
-fn cubic_to_linear(v: f32) -> f32 {
-    v.clamp(0.0, 1.0).powi(3)
-}
-
 /// Extracts the `channelVolumes` array (linear) from a `Props` param pod.
 fn parse_channel_volumes(pod: &Pod) -> Option<Vec<f32>> {
-    let (_, value) = PodDeserializer::deserialize_any_from(pod.as_bytes()).ok()?;
-    let Value::Object(obj) = value else { return None };
-    for prop in obj.properties {
-        if prop.key == pw::spa::sys::SPA_PROP_channelVolumes {
-            if let Value::ValueArray(ValueArray::Float(vols)) = prop.value {
-                return Some(vols);
-            }
-        }
-    }
-    None
-}
-
-/// Serializes a `Props` object carrying just `channelVolumes`.
-fn channel_volumes_props_pod(linear: &[f32]) -> Result<Vec<u8>, String> {
-    let object = Object {
-        type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
-        id: pw::spa::sys::SPA_PARAM_Props,
-        properties: vec![Property::new(pw::spa::sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(linear.to_vec())))],
-    };
-    let bytes = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(object))
-        .map_err(|e| format!("serialize Props pod: {e}"))?
-        .0
-        .into_inner();
-    Ok(bytes)
+    pods::parse_props(pod).map(|p| p.channel_volumes).filter(|v| !v.is_empty())
 }
 
 /// A short-lived PipeWire client connection with a synchronous roundtrip
@@ -160,7 +131,7 @@ pub fn get_volume_blocking(node_id: u32) -> Result<Option<f32>, String> {
     let Some(node) = session.bind_node(node_id) else {
         return Ok(None);
     };
-    Ok(session.read_channel_volumes(&node).and_then(|v| v.first().copied()).map(linear_to_cubic))
+    Ok(session.read_channel_volumes(&node).and_then(|v| v.first().copied()).map(pods::linear_to_cubic))
 }
 
 /// Sets `node_id`'s volume (cubic 0.0-1.0), applied to every channel. Blocks;
@@ -173,8 +144,8 @@ pub fn set_volume_blocking(node_id: u32, volume: f32) -> Result<(), String> {
     // Match the node's channel count so we don't shrink a >2ch node's array;
     // default to stereo if it doesn't report one yet.
     let channels = session.read_channel_volumes(&node).map(|v| v.len()).filter(|n| *n > 0).unwrap_or(2);
-    let linear = vec![cubic_to_linear(volume); channels];
-    let bytes = channel_volumes_props_pod(&linear)?;
+    let linear = pods::linear_channels(volume, channels);
+    let bytes = pods::node_props_pod(&linear, None).map_err(|e| e.to_string())?;
     let pod = Pod::from_bytes(&bytes).ok_or("invalid Props pod")?;
     node.set_param(ParamType::Props, 0, pod);
     // Flush the set request to the server before the connection drops.
@@ -197,13 +168,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cubic_round_trips_wpctl_reference_points() {
-        // Empirically: wpctl 0.5 -> 0.125, 0.25 -> 0.015625, 0.8 -> 0.512.
-        assert!((cubic_to_linear(0.5) - 0.125).abs() < 1e-6);
-        assert!((cubic_to_linear(0.25) - 0.015625).abs() < 1e-6);
-        assert!((cubic_to_linear(0.8) - 0.512).abs() < 1e-6);
-        for v in [0.0f32, 0.1, 0.25, 0.5, 0.7, 1.0] {
-            assert!((linear_to_cubic(cubic_to_linear(v)) - v).abs() < 1e-5);
-        }
+    fn a_props_pod_round_trips_through_the_shared_encoder() {
+        // The cubic maths itself is tested in pw-control; what matters here is that
+        // this module reads back what it writes (an empty channelVolumes array is
+        // reported as "no volume control", not as silence).
+        let bytes = pods::node_props_pod(&pods::linear_channels(0.5, 2), None).unwrap();
+        let pod = Pod::from_bytes(&bytes).unwrap();
+        let volumes = parse_channel_volumes(pod).expect("channelVolumes present");
+        assert_eq!(volumes.len(), 2);
+        assert!((pods::linear_to_cubic(volumes[0]) - 0.5).abs() < 1e-6);
+
+        let empty = pods::node_props_pod(&[], None).unwrap();
+        assert_eq!(parse_channel_volumes(Pod::from_bytes(&empty).unwrap()), None);
     }
 }

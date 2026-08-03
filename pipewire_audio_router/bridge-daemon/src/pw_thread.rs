@@ -10,7 +10,7 @@
 //! This thread does two things: it *observes* the registry (nodes/ports/links)
 //! into a shared snapshot, and it *mutates the graph* on request — loading and
 //! unloading modules into its own context (how RAOP outputs are added/removed
-//! live — pw_module.rs, api.rs's `/api/outputs`) and creating/destroying links
+//! live — `pw_control::module`, api.rs's `/api/outputs`) and creating/destroying links
 //! natively via `Core::create_object`/`Registry::destroy_global` (api.rs,
 //! routing.rs). All mutations arrive over a `pipewire::channel` (`PwCommand`),
 //! which attaches to the loop as an IO source and is the thread-safe way to
@@ -26,7 +26,7 @@
 //! to execute where the proxies live.
 
 use crate::locks::LockRecover;
-use crate::pw_module::LoadedModule;
+use pw_control::module::LoadedModule;
 use pipewire as pw;
 use pipewire::link::Link;
 use pipewire::properties::PropertiesBox;
@@ -278,7 +278,7 @@ fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receive
                 return;
             }
             // SAFETY: we're on the PipeWire thread and context_for_cmds is the
-            // live context this thread owns — exactly pw_module's contract.
+            // live context this thread owns — exactly pw_control::module's contract.
             let result = unsafe { LoadedModule::load(context_for_cmds.as_raw_ptr(), &module_name, &args) };
             match result {
                 Ok(module) => {

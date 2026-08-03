@@ -3,7 +3,7 @@
 //! the Bluetooth bridge firmware's audio stream (firmware/bt-bridge/).
 //!
 //! Loaded into the bridge daemon's *own* PipeWire context at runtime (see
-//! pw_module.rs / pw_thread.rs), exactly like a RAOP sink — enable/disable and
+//! `pw_control::module` / pw_thread.rs), exactly like a RAOP sink — enable/disable and
 //! re-point the listen port live via `/api/sources`, no restart. Unlike the
 //! AirPlay-receive source (a `shairport-sync` subprocess), this is a native
 //! PipeWire module, so it goes through `PwCommand::Load`/`Unload`, not the

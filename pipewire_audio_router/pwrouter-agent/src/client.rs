@@ -19,8 +19,8 @@ use crate::config::{self, Config};
 use crate::proto::{AgentMsg, DaemonMsg, HostState, PROTOCOL_VERSION};
 use crate::pw_thread::{ramp_schedule, Cmd, Event, Handle, MasterState};
 use anyhow::{anyhow, Context as _};
-use pipewire as pw;
 use futures_util::{SinkExt as _, StreamExt as _};
+use pipewire as pw;
 use std::time::Duration;
 use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
@@ -48,7 +48,9 @@ const RESTORE_RAMP_MS: u64 = 150;
 async fn discover_daemon() -> anyhow::Result<String> {
     tokio::task::spawn_blocking(|| {
         let daemon = mdns_sd::ServiceDaemon::new().context("starting mDNS browser")?;
-        let receiver = daemon.browse(CONTROL_SERVICE_TYPE).context("browsing for the daemon")?;
+        let receiver = daemon
+            .browse(CONTROL_SERVICE_TYPE)
+            .context("browsing for the daemon")?;
         let deadline = std::time::Instant::now() + DISCOVERY_TIMEOUT;
         let found = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -73,7 +75,10 @@ async fn discover_daemon() -> anyhow::Result<String> {
 }
 
 /// Resolves the daemon address: explicit override, remembered address, discovery.
-async fn daemon_address(config: &mut Config, override_addr: Option<&str>) -> anyhow::Result<String> {
+async fn daemon_address(
+    config: &mut Config,
+    override_addr: Option<&str>,
+) -> anyhow::Result<String> {
     if let Some(addr) = override_addr {
         return Ok(addr.to_string());
     }
@@ -114,7 +119,11 @@ fn host_state(master: &MasterState) -> HostState {
 
 /// Runs until the process is asked to stop. Reconnects on its own; only a
 /// hard-denied pairing or a protocol mismatch is fatal.
-pub async fn run(handle: Handle, mut events: tokio::sync::mpsc::UnboundedReceiver<Event>, override_addr: Option<String>) -> anyhow::Result<()> {
+pub async fn run(
+    handle: Handle,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    override_addr: Option<String>,
+) -> anyhow::Result<()> {
     let mut config = config::load()?;
     let mut backoff = BACKOFF_START;
 
@@ -154,7 +163,9 @@ pub async fn run(handle: Handle, mut events: tokio::sync::mpsc::UnboundedReceive
         }
 
         // Whatever ended the session, the host must not stay ducked.
-        handle.send(Cmd::Unduck { ramp_ms: RESTORE_RAMP_MS });
+        handle.send(Cmd::Unduck {
+            ramp_ms: RESTORE_RAMP_MS,
+        });
         drive_ramp(handle.sender(), RESTORE_RAMP_MS);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -178,7 +189,9 @@ async fn session(
 ) -> anyhow::Result<Outcome> {
     let url = format!("ws://{addr}/api/agent/ws");
     tracing::info!("connecting to {url}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.with_context(|| format!("connecting to {url}"))?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .with_context(|| format!("connecting to {url}"))?;
 
     let hello = AgentMsg::Hello {
         protocol: PROTOCOL_VERSION,
@@ -188,7 +201,8 @@ async fn session(
         user: config::user(),
         token: config.token.clone(),
     };
-    ws.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
+    ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
+        .await?;
 
     let mut keepalive = Duration::from_secs(DEFAULT_KEEPALIVE_SECS) * 2;
     let mut last_seen = Instant::now();
@@ -199,7 +213,9 @@ async fn session(
         let remaining = keepalive.saturating_sub(last_seen.elapsed());
         if remaining.is_zero() {
             tracing::warn!("no ping within {keepalive:?}; restoring and reconnecting");
-            handle.send(Cmd::Unduck { ramp_ms: RESTORE_RAMP_MS });
+            handle.send(Cmd::Unduck {
+                ramp_ms: RESTORE_RAMP_MS,
+            });
             drive_ramp(handle.sender(), RESTORE_RAMP_MS);
             return Ok(Outcome::Reconnect);
         }
@@ -220,9 +236,8 @@ async fn session(
                             tracing::debug!("ignoring unrecognised daemon message: {text}");
                             continue;
                         };
-                        match handle_daemon_msg(msg, config, handle, &mut keepalive, &mut ws).await? {
-                            Some(outcome) => return Ok(outcome),
-                            None => {}
+                        if let Some(outcome) = handle_daemon_msg(msg, config, handle, &mut keepalive, &mut ws).await? {
+                            return Ok(outcome);
                         }
                     }
                     Message::Ping(payload) => ws.send(Message::Pong(payload)).await?,
@@ -249,7 +264,9 @@ async fn handle_daemon_msg(
     config: &mut Config,
     handle: &Handle,
     keepalive: &mut Duration,
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 ) -> anyhow::Result<Option<Outcome>> {
     match msg {
         DaemonMsg::PairPending { code } => {
@@ -264,13 +281,20 @@ async fn handle_daemon_msg(
             Ok(Some(Outcome::Paired))
         }
         DaemonMsg::Denied { reason } => Ok(Some(Outcome::Denied(reason))),
-        DaemonMsg::Welcome { session_name, ifname, jitter_ms, keepalive_secs } => {
+        DaemonMsg::Welcome {
+            session_name,
+            ifname,
+            jitter_ms,
+            keepalive_secs,
+        } => {
             *keepalive = Duration::from_secs(keepalive_secs.max(1)) * 2;
             // Reload even if the session is unchanged: a reconnect is exactly when
             // a resumed-from-suspend receiver needs rebuilding (plan §13.4).
             match handle.load_receiver(&session_name, ifname, jitter_ms) {
                 Ok(()) => tracing::info!("receiving session '{session_name}'"),
-                Err(e) => tracing::error!("could not become the receiver for '{session_name}': {e}"),
+                Err(e) => {
+                    tracing::error!("could not become the receiver for '{session_name}': {e}")
+                }
             }
             Ok(None)
         }
@@ -298,7 +322,10 @@ async fn handle_daemon_msg(
             Ok(None)
         }
         DaemonMsg::Ping => {
-            ws.send(Message::Text(serde_json::to_string(&AgentMsg::Pong)?.into())).await?;
+            ws.send(Message::Text(
+                serde_json::to_string(&AgentMsg::Pong)?.into(),
+            ))
+            .await?;
             Ok(None)
         }
     }

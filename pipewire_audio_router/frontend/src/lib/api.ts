@@ -6,6 +6,7 @@
 // `<base>/api/...` in both cases.
 
 import type {
+  AgentInfo,
   AirplayClient,
   AlignGroup,
   AlignState,
@@ -90,6 +91,21 @@ export const api = {
   mediaPlayers: () => request<MediaPlayerInfo[]>('GET', 'api/media_players'),
   setVolume: (nodeId: number, volume: number) =>
     request<VolumeResponse>('POST', `api/media_players/${nodeId}/volume`, { volume }),
+
+  // Receiver agents (pwrouter-agent). A pw-sink output *is* a paired agent, so
+  // pairing is a prerequisite for the host showing up under Discovered at all.
+  agents: () => request<AgentInfo[]>('GET', 'api/agents'),
+  /** Approve a pending pairing: mints the host's token, after which it reconnects
+   * on its own and becomes a discovered output. */
+  approveAgent: (identity: string) =>
+    request<OpResponse>('POST', 'api/agents/approve', { identity }),
+  /** Decline a pending pairing. The agent stops retrying until it is restarted. */
+  denyAgent: (identity: string) =>
+    request<OpResponse>('POST', 'api/agents/deny', { identity }),
+  /** Revoke a pairing: the token stops working and the host stops receiving.
+   * Routing entries survive, so re-pairing the same machine+user restores them. */
+  forgetAgent: (identity: string) =>
+    request<OpResponse>('POST', 'api/agents/forget', { identity }),
 
   // Outputs: the devices the user has *added* (adopted). Everything else in the
   // app — the routing matrix, group editors, Align, the HA integration — means

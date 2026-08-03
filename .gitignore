@@ -1,6 +1,7 @@
 # Rust
 pipewire_audio_router/bridge-daemon/target/
 pipewire_audio_router/pwrouter-agent/target/
+pipewire_audio_router/pw-control/target/
 # Container-extracted binary from scripts/build-daemon.sh
 pipewire_audio_router/bridge-daemon/dist/
 

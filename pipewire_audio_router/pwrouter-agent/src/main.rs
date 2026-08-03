@@ -14,16 +14,14 @@
 
 mod client;
 mod config;
-mod pods;
 mod proto;
-mod pw_module;
 mod pw_thread;
 mod receiver;
 mod volume;
 
 use anyhow::{bail, Context as _};
 use pipewire as pw;
-use pw_module::LoadedModule;
+use pw_control::module::LoadedModule;
 
 const USAGE: &str = "\
 pwrouter-agent — receiver-side helper for the PipeWire audio router add-on
@@ -44,12 +42,18 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     let opt = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
 
     match cmd {
         "run" => run(opt("--daemon")),
-        "spike-receiver" => spike_receiver(opt("--ifname"), opt("--node-name").unwrap_or_else(|| receiver::RECEIVE_NODE_NAME.into())),
+        "spike-receiver" => spike_receiver(
+            opt("--ifname"),
+            opt("--node-name").unwrap_or_else(|| receiver::RECEIVE_NODE_NAME.into()),
+        ),
         "spike-volume" => {
             let set = match opt("--set") {
                 Some(v) => Some(v.parse::<f32>().context("--set expects a float 0.0-1.0")?),
@@ -91,9 +95,12 @@ fn run(daemon: Option<String>) -> anyhow::Result<()> {
     // Spawned before the runtime so a PipeWire failure is a plain startup error.
     let handle = pw_thread::spawn(event_tx)?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(async move {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = client::run(handle, event_rx, daemon) => result,
             _ = tokio::signal::ctrl_c() => {
@@ -113,10 +120,16 @@ fn run(daemon: Option<String>) -> anyhow::Result<()> {
 /// S1: become the receiver with no config file.
 fn spike_receiver(ifname: Option<String>, node_name: String) -> anyhow::Result<()> {
     pw::init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow::anyhow!("mainloop: {e}"))?;
-    let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| anyhow::anyhow!("context: {e}"))?;
-    let core = context.connect_rc(None).map_err(|e| anyhow::anyhow!("connect to PipeWire: {e}"))?;
-    let registry = core.get_registry_rc().map_err(|e| anyhow::anyhow!("get registry: {e}"))?;
+    let mainloop =
+        pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow::anyhow!("mainloop: {e}"))?;
+    let context = pw::context::ContextRc::new(&mainloop, None)
+        .map_err(|e| anyhow::anyhow!("context: {e}"))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| anyhow::anyhow!("connect to PipeWire: {e}"))?;
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| anyhow::anyhow!("get registry: {e}"))?;
 
     // Log every node/link the module creates. `rtp.session` is set per discovered
     // session (module-rtp-session's make_session), so a host receiving two
@@ -154,12 +167,21 @@ fn spike_receiver(ifname: Option<String>, node_name: String) -> anyhow::Result<(
         receiver::RECEIVE_NODE_DESCRIPTION,
         None,
     );
-    println!("loading {} with args:\n  {args}\n", receiver::RTP_SESSION_MODULE_NAME);
+    println!(
+        "loading {} with args:\n  {args}\n",
+        receiver::RTP_SESSION_MODULE_NAME
+    );
     // SAFETY: we are on the thread that owns `context` (created here, loop not
     // handed elsewhere), which is pw_module's contract. `_module` is dropped at the
     // end of this function, on this thread.
-    let _module = unsafe { LoadedModule::load(context.as_raw_ptr(), receiver::RTP_SESSION_MODULE_NAME, &args) }
-        .map_err(|e| anyhow::anyhow!("load {}: {e}", receiver::RTP_SESSION_MODULE_NAME))?;
+    let _module = unsafe {
+        LoadedModule::load(
+            context.as_raw_ptr(),
+            receiver::RTP_SESSION_MODULE_NAME,
+            &args,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("load {}: {e}", receiver::RTP_SESSION_MODULE_NAME))?;
     println!("module loaded; running (Ctrl-C or SIGTERM to stop)\n");
 
     mainloop.run();
@@ -167,7 +189,11 @@ fn spike_receiver(ifname: Option<String>, node_name: String) -> anyhow::Result<(
 }
 
 /// S2/S2b: the master volume of the sink our receive stream actually feeds.
-fn spike_volume(node_name: String, session: Option<String>, set: Option<f32>) -> anyhow::Result<()> {
+fn spike_volume(
+    node_name: String,
+    session: Option<String>,
+    set: Option<f32>,
+) -> anyhow::Result<()> {
     let graph = volume::Graph::snapshot()?;
 
     let stream = graph

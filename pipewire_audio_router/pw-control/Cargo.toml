@@ -1,0 +1,17 @@
+[package]
+name = "pw-control"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately its own workspace root, and deliberately *outside* both
+# `bridge-daemon/` and `pwrouter-agent/`: a path dependency living inside a
+# workspace root's directory silently becomes a member of that workspace, which
+# would put this crate under the other's `cargo fmt --all` / `clippy --workspace`
+# and its own excludes (see the comment in bridge-daemon/Cargo.toml).
+[workspace]
+
+[dependencies]
+# Both consumers pin the same major, so the SPA/pod types crossing this boundary
+# are the same types on both sides.
+pipewire = "0.10"
+anyhow = "1"

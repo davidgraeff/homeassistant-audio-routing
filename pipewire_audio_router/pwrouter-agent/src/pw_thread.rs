@@ -16,13 +16,13 @@
 //! * the per-stream duck of *foreign* playback streams, ramped in steps paced by
 //!   the async side, with baselines restored on unduck, on stop, and on drop.
 
-use crate::pods;
-use crate::pw_module::LoadedModule;
 use crate::receiver;
 use anyhow::anyhow;
 use pipewire as pw;
 use pw::spa::param::ParamType;
 use pw::spa::pod::Pod;
+use pw_control::module::LoadedModule;
+use pw_control::pods;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -49,9 +49,14 @@ pub enum Cmd {
     SetMasterMute(bool),
     /// Attenuate every *foreign* playback stream on our target sink to
     /// `depth` × its current volume, ramped over `ramp_ms`.
-    DuckOthers { depth: f32, ramp_ms: u64 },
+    DuckOthers {
+        depth: f32,
+        ramp_ms: u64,
+    },
     /// Ramp foreign streams back to their pre-duck volumes.
-    Unduck { ramp_ms: u64 },
+    Unduck {
+        ramp_ms: u64,
+    },
     /// Advance an in-flight ramp by one step; a no-op when nothing is ramping.
     ///
     /// Ticks are driven from the async side rather than a loop timer: a
@@ -112,9 +117,19 @@ impl Handle {
     }
 
     /// Load the receiver and wait for the module to report success.
-    pub fn load_receiver(&self, session: &str, ifname: Option<String>, jitter_ms: Option<u32>) -> anyhow::Result<()> {
+    pub fn load_receiver(
+        &self,
+        session: &str,
+        ifname: Option<String>,
+        jitter_ms: Option<u32>,
+    ) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
-        self.send(Cmd::LoadReceiver { session: session.to_string(), ifname, jitter_ms, reply: tx });
+        self.send(Cmd::LoadReceiver {
+            session: session.to_string(),
+            ifname,
+            jitter_ms,
+            reply: tx,
+        });
         rx.recv_timeout(Duration::from_secs(5))
             .map_err(|_| anyhow!("PipeWire thread did not answer the receiver load"))?
             .map_err(|e| anyhow!(e))
@@ -194,7 +209,10 @@ impl State {
     /// The sink that plays our audio.
     fn target_sink(&self) -> Option<u32> {
         let stream = self.receive_stream()?;
-        self.links.values().find(|(out, _)| *out == stream).map(|(_, inp)| *inp)
+        self.links
+            .values()
+            .find(|(out, _)| *out == stream)
+            .map(|(_, inp)| *inp)
     }
 
     /// Master volume/mute of the target sink, read from whichever lever applies.
@@ -237,26 +255,43 @@ impl State {
         if node.channel_volumes.is_empty() {
             return None;
         }
-        Some(pods::VolumeProps { channel_volumes: node.channel_volumes.clone(), mute: None })
+        Some(pods::VolumeProps {
+            channel_volumes: node.channel_volumes.clone(),
+            mute: None,
+        })
     }
 
     /// Writes volume and/or mute to the correct lever.
     fn apply_master(&self, volume: Option<f32>, mute: Option<bool>) -> anyhow::Result<()> {
-        let sink_id = self.target_sink().ok_or_else(|| anyhow!("no target sink (not receiving)"))?;
+        let sink_id = self
+            .target_sink()
+            .ok_or_else(|| anyhow!("no target sink (not receiving)"))?;
         let current = self.master_props(sink_id);
-        let channels = current.as_ref().map(|p| p.channel_volumes.len()).filter(|n| *n > 0).unwrap_or(2);
+        let channels = current
+            .as_ref()
+            .map(|p| p.channel_volumes.len())
+            .filter(|n| *n > 0)
+            .unwrap_or(2);
         // Keep the current level when only mute changes, so unmuting cannot
         // resurrect a stale volume.
-        let cubic = volume.or_else(|| current.as_ref().and_then(|p| p.cubic())).unwrap_or(1.0);
+        let cubic = volume
+            .or_else(|| current.as_ref().and_then(|p| p.cubic()))
+            .unwrap_or(1.0);
         let linear = pods::linear_channels(cubic, channels);
 
         if let Some((device_id, entry)) = self.route_for(sink_id) {
-            let device = self.devices.get(&device_id).ok_or_else(|| anyhow!("device {device_id} vanished"))?;
+            let device = self
+                .devices
+                .get(&device_id)
+                .ok_or_else(|| anyhow!("device {device_id} vanished"))?;
             let bytes = pods::route_pod(entry.index, entry.device, &linear, mute)?;
             let pod = Pod::from_bytes(&bytes).ok_or_else(|| anyhow!("invalid Route pod"))?;
             device.proxy.set_param(ParamType::Route, 0, pod);
         } else {
-            let node = self.nodes.get(&sink_id).ok_or_else(|| anyhow!("sink {sink_id} vanished"))?;
+            let node = self
+                .nodes
+                .get(&sink_id)
+                .ok_or_else(|| anyhow!("sink {sink_id} vanished"))?;
             let bytes = pods::node_props_pod(&linear, mute)?;
             let pod = Pod::from_bytes(&bytes).ok_or_else(|| anyhow!("invalid Props pod"))?;
             node.proxy.set_param(ParamType::Props, 0, pod);
@@ -267,7 +302,9 @@ impl State {
     /// Foreign playback streams on our target sink: everything linked into it
     /// that is not one of our own `rtp-session` streams.
     fn foreign_streams(&self) -> Vec<u32> {
-        let Some(sink_id) = self.target_sink() else { return Vec::new() };
+        let Some(sink_id) = self.target_sink() else {
+            return Vec::new();
+        };
         let our_session = self.our_session.as_deref();
         self.links
             .values()
@@ -293,9 +330,15 @@ impl State {
     /// Sets a node's per-stream gain (the duck lever — invisible to the user's
     /// device slider, plan §6.1).
     fn set_node_volumes(&self, node_id: u32, linear: &[f32]) {
-        let Some(node) = self.nodes.get(&node_id) else { return };
-        let Ok(bytes) = pods::node_props_pod(linear, None) else { return };
-        let Some(pod) = Pod::from_bytes(&bytes) else { return };
+        let Some(node) = self.nodes.get(&node_id) else {
+            return;
+        };
+        let Ok(bytes) = pods::node_props_pod(linear, None) else {
+            return;
+        };
+        let Some(pod) = Pod::from_bytes(&bytes) else {
+            return;
+        };
         node.proxy.set_param(ParamType::Props, 0, pod);
     }
 
@@ -338,16 +381,21 @@ pub fn spawn(events: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Resul
     let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    let join = std::thread::Builder::new().name("pw-agent".into()).spawn(move || {
-        let result = run(cmd_rx, events, &ready_tx);
-        if let Err(e) = result {
-            tracing::error!("PipeWire thread stopped: {e}");
-            let _ = ready_tx.send(Err(e.to_string()));
-        }
-    })?;
+    let join = std::thread::Builder::new()
+        .name("pw-agent".into())
+        .spawn(move || {
+            let result = run(cmd_rx, events, &ready_tx);
+            if let Err(e) = result {
+                tracing::error!("PipeWire thread stopped: {e}");
+                let _ = ready_tx.send(Err(e.to_string()));
+            }
+        })?;
 
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(())) => Ok(Handle { cmd_tx, join: Some(join) }),
+        Ok(Ok(())) => Ok(Handle {
+            cmd_tx,
+            join: Some(join),
+        }),
         Ok(Err(e)) => Err(anyhow!("PipeWire thread failed to start: {e}")),
         Err(_) => Err(anyhow!("PipeWire thread did not come up within 5s")),
     }
@@ -360,9 +408,14 @@ fn run(
 ) -> anyhow::Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow!("mainloop: {e}"))?;
-    let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| anyhow!("context: {e}"))?;
-    let core = context.connect_rc(None).map_err(|e| anyhow!("connect to PipeWire: {e}"))?;
-    let registry = core.get_registry_rc().map_err(|e| anyhow!("get registry: {e}"))?;
+    let context =
+        pw::context::ContextRc::new(&mainloop, None).map_err(|e| anyhow!("context: {e}"))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| anyhow!("connect to PipeWire: {e}"))?;
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| anyhow!("get registry: {e}"))?;
 
     let state = Rc::new(RefCell::new(State {
         our_session: None,
@@ -405,7 +458,12 @@ fn run(
         let mainloop = mainloop.clone();
         let context = context.clone();
         move |cmd| match cmd {
-            Cmd::LoadReceiver { session, ifname, jitter_ms, reply } => {
+            Cmd::LoadReceiver {
+                session,
+                ifname,
+                jitter_ms,
+                reply,
+            } => {
                 let args = receiver::rtp_session_module_args(
                     ifname.as_deref(),
                     receiver::RECEIVE_NODE_NAME,
@@ -423,7 +481,13 @@ fn run(
                 tracing::info!("loading receiver for session '{session}': {args}");
                 // SAFETY: we are on the thread that owns `context`, which is
                 // pw_module's contract; the module is dropped on this thread too.
-                let loaded = unsafe { LoadedModule::load(context.as_raw_ptr(), receiver::RTP_SESSION_MODULE_NAME, &args) };
+                let loaded = unsafe {
+                    LoadedModule::load(
+                        context.as_raw_ptr(),
+                        receiver::RTP_SESSION_MODULE_NAME,
+                        &args,
+                    )
+                };
                 let result = match loaded {
                     Ok(module) => {
                         st.module = Some(module);
@@ -475,18 +539,27 @@ fn run(
 }
 
 /// Binds the objects the agent needs and starts tracking them.
-fn on_global(state: &Rc<RefCell<State>>, registry: &pw::registry::RegistryRc, global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>) {
+fn on_global(
+    state: &Rc<RefCell<State>>,
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
+) {
     match global.type_ {
         pw::types::ObjectType::Node => {
             let Some(props) = global.props else { return };
             let media_class = props.get("media.class").map(str::to_string);
             // Only sinks (candidate masters) and playback streams (ours + duck
             // candidates) matter; ignoring the rest keeps the bind count small.
-            let interesting = matches!(media_class.as_deref(), Some("Audio/Sink") | Some("Stream/Output/Audio"));
+            let interesting = matches!(
+                media_class.as_deref(),
+                Some("Audio/Sink") | Some("Stream/Output/Audio")
+            );
             if !interesting {
                 return;
             }
-            let Ok(node) = registry.bind::<pw::node::Node, _>(global) else { return };
+            let Ok(node) = registry.bind::<pw::node::Node, _>(global) else {
+                return;
+            };
             let id = global.id;
             let listener = node
                 .add_listener_local()
@@ -504,7 +577,10 @@ fn on_global(state: &Rc<RefCell<State>>, registry: &pw::registry::RegistryRc, gl
                             if let Some(v) = props.get("device.id").and_then(|v| v.parse().ok()) {
                                 entry.device_id = Some(v);
                             }
-                            if let Some(v) = props.get("card.profile.device").and_then(|v| v.parse().ok()) {
+                            if let Some(v) = props
+                                .get("card.profile.device")
+                                .and_then(|v| v.parse().ok())
+                            {
                                 entry.card_device = Some(v);
                             }
                             if let Some(v) = props.get("node.name") {
@@ -531,7 +607,9 @@ fn on_global(state: &Rc<RefCell<State>>, registry: &pw::registry::RegistryRc, gl
                         if param_type != ParamType::Props {
                             return;
                         }
-                        let Some(props) = pod.and_then(pods::parse_props) else { return };
+                        let Some(props) = pod.and_then(pods::parse_props) else {
+                            return;
+                        };
                         let mut st = state.borrow_mut();
                         if let Some(entry) = st.nodes.get_mut(&id) {
                             if !props.channel_volumes.is_empty() {
@@ -559,8 +637,12 @@ fn on_global(state: &Rc<RefCell<State>>, registry: &pw::registry::RegistryRc, gl
         }
         pw::types::ObjectType::Link => {
             let Some(props) = global.props else { return };
-            let out = props.get("link.output.node").and_then(|v| v.parse::<u32>().ok());
-            let inp = props.get("link.input.node").and_then(|v| v.parse::<u32>().ok());
+            let out = props
+                .get("link.output.node")
+                .and_then(|v| v.parse::<u32>().ok());
+            let inp = props
+                .get("link.input.node")
+                .and_then(|v| v.parse::<u32>().ok());
             if let (Some(out), Some(inp)) = (out, inp) {
                 let mut st = state.borrow_mut();
                 st.links.insert(global.id, (out, inp));
@@ -568,7 +650,9 @@ fn on_global(state: &Rc<RefCell<State>>, registry: &pw::registry::RegistryRc, gl
             }
         }
         pw::types::ObjectType::Device => {
-            let Ok(device) = registry.bind::<pw::device::Device, _>(global) else { return };
+            let Ok(device) = registry.bind::<pw::device::Device, _>(global) else {
+                return;
+            };
             let id = global.id;
             let listener = device
                 .add_listener_local()
@@ -578,7 +662,9 @@ fn on_global(state: &Rc<RefCell<State>>, registry: &pw::registry::RegistryRc, gl
                         if param_type != ParamType::Route {
                             return;
                         }
-                        let Some(entry) = pod.and_then(pods::parse_route) else { return };
+                        let Some(entry) = pod.and_then(pods::parse_route) else {
+                            return;
+                        };
                         let mut st = state.borrow_mut();
                         if let Some(dev) = st.devices.get_mut(&id) {
                             match dev.routes.iter_mut().find(|r| r.device == entry.device) {
@@ -593,10 +679,14 @@ fn on_global(state: &Rc<RefCell<State>>, registry: &pw::registry::RegistryRc, gl
                 })
                 .register();
             device.subscribe_params(&[ParamType::Route]);
-            state
-                .borrow_mut()
-                .devices
-                .insert(id, DeviceState { routes: Vec::new(), proxy: device, _listener: listener });
+            state.borrow_mut().devices.insert(
+                id,
+                DeviceState {
+                    routes: Vec::new(),
+                    proxy: device,
+                    _listener: listener,
+                },
+            );
         }
         _ => {}
     }
@@ -612,19 +702,29 @@ fn start_duck(state: &Rc<RefCell<State>>, depth: f32, ramp_ms: u64) {
     }
     let mut targets = HashMap::new();
     for id in streams {
-        let Some(node) = st.nodes.get(&id) else { continue };
+        let Some(node) = st.nodes.get(&id) else {
+            continue;
+        };
         let current = node.channel_volumes.clone();
         if current.is_empty() {
             continue;
         }
         // Baseline is captured once: a duck arriving while already ducked must not
         // treat the ducked level as the level to return to.
-        let baseline = st.duck_baseline.entry(id).or_insert_with(|| current.clone()).clone();
+        let baseline = st
+            .duck_baseline
+            .entry(id)
+            .or_insert_with(|| current.clone())
+            .clone();
         let to: Vec<f32> = baseline.iter().map(|v| v * depth).collect();
         targets.insert(id, (current, to));
     }
     let steps = ramp_steps(ramp_ms);
-    st.ramp = Some(Ramp { targets, step: 0, steps });
+    st.ramp = Some(Ramp {
+        targets,
+        step: 0,
+        steps,
+    });
     let ducked = !st.duck_baseline.is_empty();
     if ducked {
         st.publish();
@@ -639,14 +739,22 @@ fn start_unduck(state: &Rc<RefCell<State>>, ramp_ms: u64) {
     }
     let mut targets = HashMap::new();
     for (id, baseline) in st.duck_baseline.clone() {
-        let current = st.nodes.get(&id).map(|n| n.channel_volumes.clone()).unwrap_or_else(|| baseline.clone());
+        let current = st
+            .nodes
+            .get(&id)
+            .map(|n| n.channel_volumes.clone())
+            .unwrap_or_else(|| baseline.clone());
         if current.is_empty() {
             continue;
         }
         targets.insert(id, (current, baseline));
     }
     let steps = ramp_steps(ramp_ms);
-    st.ramp = Some(Ramp { targets, step: 0, steps });
+    st.ramp = Some(Ramp {
+        targets,
+        step: 0,
+        steps,
+    });
     // Baselines are cleared by the final step, so an interrupted unduck can still
     // be restored by `restore_now`.
 }
@@ -663,8 +771,11 @@ fn ramp_tick(state: &Rc<RefCell<State>>) {
     ramp.step += 1;
     let t = (ramp.step as f32 / ramp.steps as f32).min(1.0);
     let done = ramp.step >= ramp.steps;
-    let targets: Vec<(u32, Vec<f32>, Vec<f32>)> =
-        ramp.targets.iter().map(|(id, (from, to))| (*id, from.clone(), to.clone())).collect();
+    let targets: Vec<(u32, Vec<f32>, Vec<f32>)> = ramp
+        .targets
+        .iter()
+        .map(|(id, (from, to))| (*id, from.clone(), to.clone()))
+        .collect();
     if done {
         st.ramp = None;
     }

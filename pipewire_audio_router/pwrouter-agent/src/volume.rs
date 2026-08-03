@@ -15,11 +15,11 @@
 //!   globals are emitted once per proxy — so nodes must be bound *inside* the
 //!   registry callback.
 
-use crate::pods::{self, VolumeProps};
 use anyhow::anyhow;
 use pipewire as pw;
 use pw::spa::param::ParamType;
 use pw::spa::pod::Pod;
+use pw_control::pods::{self, VolumeProps};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -34,11 +34,22 @@ pub(crate) struct Session {
 impl Session {
     fn connect() -> anyhow::Result<Self> {
         pw::init();
-        let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow!("mainloop: {e}"))?;
-        let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| anyhow!("context: {e}"))?;
-        let core = context.connect_rc(None).map_err(|e| anyhow!("connect to PipeWire: {e}"))?;
-        let registry = core.get_registry_rc().map_err(|e| anyhow!("get registry: {e}"))?;
-        Ok(Self { mainloop, _context: context, core, registry })
+        let mainloop =
+            pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow!("mainloop: {e}"))?;
+        let context =
+            pw::context::ContextRc::new(&mainloop, None).map_err(|e| anyhow!("context: {e}"))?;
+        let core = context
+            .connect_rc(None)
+            .map_err(|e| anyhow!("connect to PipeWire: {e}"))?;
+        let registry = core
+            .get_registry_rc()
+            .map_err(|e| anyhow!("get registry: {e}"))?;
+        Ok(Self {
+            mainloop,
+            _context: context,
+            core,
+            registry,
+        })
     }
 
     /// Runs the loop until a `core.sync` roundtrip completes — enough to have
@@ -122,7 +133,8 @@ impl Graph {
                             // keeps the snapshot cheap.
                             if media_class.as_deref() == Some("Stream/Output/Audio") {
                                 if let Ok(node) = registry.bind::<pw::node::Node, _>(global) {
-                                    let value: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+                                    let value: Rc<RefCell<Option<String>>> =
+                                        Rc::new(RefCell::new(None));
                                     let listener = node
                                         .add_listener_local()
                                         .info({
@@ -152,8 +164,12 @@ impl Graph {
                             });
                         }
                         pw::types::ObjectType::Link => {
-                            let out = props.get("link.output.node").and_then(|v| v.parse::<u32>().ok());
-                            let inp = props.get("link.input.node").and_then(|v| v.parse::<u32>().ok());
+                            let out = props
+                                .get("link.output.node")
+                                .and_then(|v| v.parse::<u32>().ok());
+                            let inp = props
+                                .get("link.input.node")
+                                .and_then(|v| v.parse::<u32>().ok());
                             if let (Some(out), Some(inp)) = (out, inp) {
                                 collected.borrow_mut().1.push((out, inp));
                             }
@@ -200,7 +216,10 @@ impl Graph {
     /// The node our stream's output is linked into — the sink that actually plays
     /// it, and therefore the "master out" the agent controls.
     pub fn linked_sink(&self, stream_id: u32) -> Option<u32> {
-        self.links.iter().find(|(out, _)| *out == stream_id).map(|(_, inp)| *inp)
+        self.links
+            .iter()
+            .find(|(out, _)| *out == stream_id)
+            .map(|(_, inp)| *inp)
     }
 
     pub fn node(&self, id: u32) -> Option<&NodeInfo> {
@@ -219,13 +238,22 @@ pub enum Lever {
         channels: usize,
     },
     /// A virtual sink (loopback, null-sink): its own node `Props`.
-    NodeProps { session: Session, node: pw::node::Node, channels: usize },
+    NodeProps {
+        session: Session,
+        node: pw::node::Node,
+        channels: usize,
+    },
 }
 
 impl Lever {
     pub fn describe(&self) -> String {
         match self {
-            Lever::Route { index, card_device, channels, .. } => {
+            Lever::Route {
+                index,
+                card_device,
+                channels,
+                ..
+            } => {
                 format!("device Route (index={index}, device={card_device}, {channels}ch)")
             }
             Lever::NodeProps { channels, .. } => format!("node Props ({channels}ch, virtual sink)"),
@@ -234,9 +262,15 @@ impl Lever {
 
     pub fn read(&self) -> anyhow::Result<Option<VolumeProps>> {
         match self {
-            Lever::Route { session, device, card_device, .. } => {
-                Ok(read_routes(session, device).into_iter().find(|r| r.device == *card_device).map(|r| r.props))
-            }
+            Lever::Route {
+                session,
+                device,
+                card_device,
+                ..
+            } => Ok(read_routes(session, device)
+                .into_iter()
+                .find(|r| r.device == *card_device)
+                .map(|r| r.props)),
             Lever::NodeProps { session, node, .. } => Ok(read_node_props(session, node)),
         }
     }
@@ -245,16 +279,28 @@ impl Lever {
     /// level, so a mute toggle cannot resurrect a stale one.
     pub fn write(&self, volume: Option<f32>, mute: Option<bool>) -> anyhow::Result<()> {
         let current = self.read()?;
-        let cubic = volume.or_else(|| current.as_ref().and_then(|p| p.cubic())).unwrap_or(1.0);
+        let cubic = volume
+            .or_else(|| current.as_ref().and_then(|p| p.cubic()))
+            .unwrap_or(1.0);
         match self {
-            Lever::Route { session, device, index, card_device, channels } => {
+            Lever::Route {
+                session,
+                device,
+                index,
+                card_device,
+                channels,
+            } => {
                 let linear = pods::linear_channels(cubic, *channels);
                 let bytes = pods::route_pod(*index, *card_device, &linear, mute)?;
                 let pod = Pod::from_bytes(&bytes).ok_or_else(|| anyhow!("invalid Route pod"))?;
                 device.set_param(ParamType::Route, 0, pod);
                 session.roundtrip();
             }
-            Lever::NodeProps { session, node, channels } => {
+            Lever::NodeProps {
+                session,
+                node,
+                channels,
+            } => {
                 let linear = pods::linear_channels(cubic, *channels);
                 let bytes = pods::node_props_pod(&linear, mute)?;
                 let pod = Pod::from_bytes(&bytes).ok_or_else(|| anyhow!("invalid Props pod"))?;
@@ -273,7 +319,9 @@ pub fn master_lever(sink_id: u32) -> anyhow::Result<Option<Lever>> {
     // per proxy, so a second pass would see nothing).
     let sink: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
     let devices: Rc<RefCell<Vec<(u32, pw::device::Device)>>> = Rc::new(RefCell::new(Vec::new()));
-    let sink_props: Rc<RefCell<Option<(Option<u32>, Option<i32>)>>> = Rc::new(RefCell::new(None));
+    // `device.id` + `card.profile.device` of the sink, as read from its info event.
+    type SinkRoute = Rc<RefCell<Option<(Option<u32>, Option<i32>)>>>;
+    let sink_props: SinkRoute = Rc::new(RefCell::new(None));
     let listeners: Rc<RefCell<Vec<pw::node::NodeListener>>> = Rc::new(RefCell::new(Vec::new()));
 
     let _listener = session
@@ -296,7 +344,8 @@ pub fn master_lever(sink_id: u32) -> anyhow::Result<Option<Lever>> {
                                     if let Some(p) = info.props() {
                                         *sink_props.borrow_mut() = Some((
                                             p.get("device.id").and_then(|v| v.parse().ok()),
-                                            p.get("card.profile.device").and_then(|v| v.parse().ok()),
+                                            p.get("card.profile.device")
+                                                .and_then(|v| v.parse().ok()),
                                         ));
                                     }
                                 }
@@ -330,16 +379,31 @@ pub fn master_lever(sink_id: u32) -> anyhow::Result<Option<Lever>> {
         let position = devices.borrow().iter().position(|(id, _)| *id == device_id);
         let device = position.map(|i| devices.borrow_mut().remove(i));
         if let Some((_, device)) = device {
-            if let Some(entry) = read_routes(&session, &device).into_iter().find(|r| r.device == card_device) {
+            if let Some(entry) = read_routes(&session, &device)
+                .into_iter()
+                .find(|r| r.device == card_device)
+            {
                 let channels = entry.props.channel_volumes.len().max(1);
-                return Ok(Some(Lever::Route { session, device, index: entry.index, card_device, channels }));
+                return Ok(Some(Lever::Route {
+                    session,
+                    device,
+                    index: entry.index,
+                    card_device,
+                    channels,
+                }));
             }
         }
     }
 
-    let channels = read_node_props(&session, &node).map(|p| p.channel_volumes.len()).filter(|n| *n > 0);
+    let channels = read_node_props(&session, &node)
+        .map(|p| p.channel_volumes.len())
+        .filter(|n| *n > 0);
     match channels {
-        Some(channels) => Ok(Some(Lever::NodeProps { session, node, channels })),
+        Some(channels) => Ok(Some(Lever::NodeProps {
+            session,
+            node,
+            channels,
+        })),
         None => Ok(None),
     }
 }
@@ -391,7 +455,12 @@ mod tests {
     use super::*;
 
     fn node(id: u32, name: &str, session: Option<&str>) -> NodeInfo {
-        NodeInfo { id, name: name.into(), media_class: None, session: session.map(str::to_string) }
+        NodeInfo {
+            id,
+            name: name.into(),
+            media_class: None,
+            session: session.map(str::to_string),
+        }
     }
 
     #[test]
@@ -399,7 +468,11 @@ mod tests {
         // module-rtp-session publishes a send and a receive stream with the same
         // node.name; only the receive one is linked to a sink.
         let graph = Graph {
-            nodes: vec![node(40, "pwsink-in", None), node(41, "pwsink-in", None), node(50, "alsa-sink", None)],
+            nodes: vec![
+                node(40, "pwsink-in", None),
+                node(41, "pwsink-in", None),
+                node(50, "alsa-sink", None),
+            ],
             links: vec![(41, 50)],
         };
         assert_eq!(graph.find_receive_stream("pwsink-in", None).unwrap().id, 41);
@@ -410,15 +483,27 @@ mod tests {
     #[test]
     fn session_match_wins_over_name_so_two_routers_stay_apart() {
         let graph = Graph {
-            nodes: vec![node(40, "pwsink-in", Some("pwrouter-a")), node(41, "pwsink-in", Some("pwrouter-b"))],
+            nodes: vec![
+                node(40, "pwsink-in", Some("pwrouter-a")),
+                node(41, "pwsink-in", Some("pwrouter-b")),
+            ],
             links: vec![(40, 50), (41, 51)],
         };
-        assert_eq!(graph.find_receive_stream("pwsink-in", Some("pwrouter-b")).unwrap().id, 41);
+        assert_eq!(
+            graph
+                .find_receive_stream("pwsink-in", Some("pwrouter-b"))
+                .unwrap()
+                .id,
+            41
+        );
     }
 
     #[test]
     fn unlinked_stream_reports_no_sink() {
-        let graph = Graph { nodes: vec![node(40, "pwsink-in", None)], links: vec![] };
+        let graph = Graph {
+            nodes: vec![node(40, "pwsink-in", None)],
+            links: vec![],
+        };
         assert_eq!(graph.find_receive_stream("pwsink-in", None).unwrap().id, 40);
         assert_eq!(graph.linked_sink(40), None);
     }

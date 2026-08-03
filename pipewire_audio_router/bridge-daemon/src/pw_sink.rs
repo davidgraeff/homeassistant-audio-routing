@@ -4,7 +4,7 @@
 //! Unlike Sendspin/AP2 (which push a raw PCM channel to a receiver that cannot
 //! take a PipeWire stream), a remote PipeWire host speaks PipeWire/RTP natively,
 //! so the "sender" here is just two libpipewire modules loaded into the daemon's
-//! own context via `PwCommand::Load` (see pw_thread.rs / pw_module.rs), exactly
+//! own context via `PwCommand::Load` (see pw_thread.rs / `pw_control::module`), exactly
 //! like the rtp-source in rtp_source.rs:
 //!
 //!   * **`libpipewire-module-rtp-sink`** — one per target. A real `Audio/Sink`

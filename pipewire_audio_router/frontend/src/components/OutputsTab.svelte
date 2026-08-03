@@ -4,6 +4,7 @@
   import { routing } from '../lib/routing';
   import { run, toast } from '../lib/toast';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../lib/types';
+  import AgentsPanel from './AgentsPanel.svelte';
   import VolumeControl from './VolumeControl.svelte';
 
   // Two listings, because discovery only *offers* a device: `outputs` is what
@@ -650,6 +651,13 @@
       </article>
     {/each}
   {/if}
+
+  <!-- Receiver hosts (pwrouter-agent). Above Discovered on purpose: a remote
+       PipeWire host cannot appear as a discovered device until its agent is
+       paired, so this is the earlier step in the same flow. Refreshing both
+       listings on a decision keeps the two sections consistent without a
+       page reload. -->
+  <AgentsPanel onchange={refresh} />
 
   <div class="section-head">
     <h3>
