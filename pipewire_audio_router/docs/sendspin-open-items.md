@@ -100,15 +100,44 @@ all active), and identical during an announcement — correct, since the sendspi
 is mixed in-process with no node involved. Clock sync was healthy too:
 `received == replied` with 341k+ exchanges per device.
 
-**Ruled out — the group lead.** The working hypothesis was that firmware which reports
-neither `min_buffer_ms` nor `required_lead_time_ms` (item 6, F8) gets assumed at the
-codec minimum, and that the old firmware needed more lead than the 320 ms it was given.
-Raising the effective lead 320 → 900 ms did not settle it, because the restart
-intervened — **but the lead was then returned to an effective 320 ms with no restart and
-audio kept playing.** Same lead as when it was silent, now fine. That is good evidence
-the lead was never the cause, and F8 is not implicated.
+**Not the group lead — but the first version of this reasoning was wrong, so here is the
+corrected form.** The hypothesis was that firmware reporting neither `min_buffer_ms` nor
+`required_lead_time_ms` (item 7, F8) gets assumed at the codec minimum, and that the old
+firmware needed more than the 320 ms it was given. Raising the effective lead 320 → 900 ms
+was confounded by a restart.
 
-**So the cause was state that a restart cleared.** Two candidates, neither confirmed:
+It was then recorded here that "the lead was returned to an effective 320 ms with no
+restart and audio kept playing", and that this ruled the lead out. **That premise was
+false.** `GET /api/sync/settings` reported `effective 320 ms` while the running relay was
+still logging `lead 870..892 ms` — see item 6. Lowering the configured lead never
+re-armed anything, so the *running* lead never went back.
+
+The conclusion survives on better evidence: the running lead was **~880 ms in both the
+playing state and the silent state** (measured before and after the 2026-08-03 17:2x
+reproduction below), so it does not discriminate between them. F8 is still not implicated —
+but note that no test has yet run these devices at a genuinely low lead.
+
+**Reproduction (2026-08-03 17:2x) — the most useful fact so far.** Reconnecting the
+"Kitchen Zone" group from the *Music Now 2* input to *Bluetooth Bridge* and back, via the
+routing graph, reproduces it on demand. That is a **source switch**, which tears the sync
+group down and rebuilds it, so all members re-dial. Measured immediately afterwards, with
+music playing:
+
+- **every device receives real audio at an identical ~19 kB/s** on the wire (093ca8
+  19,194 · 096287 19,229 · 0966f3 19,128 · satellite1 19,112 B/s). Not silence — music.
+  So the daemon delivers to the silent devices exactly as it does to the working one.
+- the graph is correct: `airplay-in → sync-grp-… → bridge-sendspin-capture ×4`, one
+  anchor, fed by the current source.
+- the connections are ~5 min old with `replied == recv` and a healthy ~0.77/s cadence, i.e.
+  the re-dial and the clock sync both worked.
+
+So the trigger is a **group rebuild / re-dial**, and the failure is a device that has a
+healthy connection, a healthy clock and a full-rate audio stream, and renders nothing. A
+full add-on restart fixes it; a re-dial evidently does not, which is the sharpest clue
+available — whatever the restart clears is not connection state.
+
+**So the cause is state that a restart clears but a reconnect does not.** Two candidates,
+neither confirmed:
 
 - **The phantom routed member** (item 1). The group had a *routed but permanently absent*
   member, `sendspin-dev-satellite1_c4150c`. Worth checking whether an absent-but-routed
@@ -175,11 +204,32 @@ was the only option.
 > This is the first thing to try next time item 4 recurs — and it leaves the evidence
 > intact, which an add-on restart did not.
 
+### 6. `group_lead_effective_ms` does not report the lead actually in use
+
+`GET /api/sync/settings` reported `configured 0 / floor 320 / effective 320 ms` while the
+running relay logged `lead 870..892 ms` — the value left over from an earlier experiment
+that raised it to 900.
+
+That is §4.6's high-water mark behaving as designed: the send-ahead only ever rises, so
+*lowering* the configured lead re-arms nothing, and `SharedTimeline::send_ahead_us` is
+fixed at construction (builder-only, no setter — see the closed §4.15 note). It even
+survived the group rebuild at the source switch in item 4.
+
+The design is defensible; **the reporting is not.** The API presents
+`group_lead_effective_ms` as what is in force, and it silently was not. That directly cost
+this investigation a wrong conclusion — item 4's original "the lead was returned to 320
+and audio kept playing" was built on it.
+
+Fix: report the running value alongside the computed one — e.g. `group_lead_running_ms`
+read from the live timeline — and have the UI show both when they differ, with the reason
+("a lower lead applies on the next group restart"). §4.10 already warns that the API's
+number is not a predictor of blast radius; this is the same gap seen from the other side.
+
 ---
 
 ## P2 — worth doing, not urgent
 
-### 6. Four inert spec deviations
+### 7. Four inert spec deviations
 
 From the 2026-07-29 audit against [Sendspin/spec](https://github.com/Sendspin/spec)
 (HEAD `aa752f6`). Each was checked against the *pinned firmware* rather than assumed, and
@@ -193,7 +243,7 @@ all are currently inert — correctness debt, not live bugs. Full detail in the 
 | F7 | `buffer_capacity` is parsed and never read; our `MAX_QUEUED_AUDIO_FRAMES = 32` is a local invention where the spec supplies a negotiated number | a device advertises a smaller capacity than we assume |
 | F8 | `required_lead_time_ms` excluded from the send-ahead — correct against spec HEAD, a violation against the era spec | the firmware starts reporting it (i.e. on upgrade) |
 
-### 7. The device's API log subscription delivers nothing
+### 8. The device's API log subscription delivers nothing
 
 `aioesphomeapi-logs` against satellite1 handshakes fine and then produces **zero** lines —
 across a full stream stop/start, across a reboot that should have printed a boot banner,
@@ -208,7 +258,7 @@ determined.
 **Until this works, an empty ESPHome log is not evidence of anything.** Fixing it is the
 prerequisite for any future device-side debugging.
 
-### 8. The firmware pin is four months stale — but the ladder is the cost
+### 9. The firmware pin is four months stale — but the ladder is the cost
 
 `kahrendt/esphome` @ `7a6cf5c` (2026-03-23) from the **closed** WIP PR esphome#14933,
 predating `sendspin-cpp` v0.1.0. Upstream ESPHome now ships the component pinning
@@ -235,7 +285,7 @@ the fork pin is currently overriding two components for no reason). Do item 2 fi
 
 ## P3 — known rough edges, accepted for now
 
-### 9. §4.10's residual single-device gap
+### 10. §4.10's residual single-device gap
 
 A static-delay change now reconnects only its own device (archive §4.10), but that device
 still has a **≤3 s redial gap** while the retry pass re-supervises it, and
@@ -244,13 +294,13 @@ announcement aimed at it in that window is dropped. Same failure class as the ol
 group-wide restart, much smaller window, one device. A rapid nudge burst in the alignment
 panel can extend it, which is what its warning is for.
 
-### 10. Frontend copy edits were never type-checked
+### 11. Frontend copy edits were never type-checked
 
 `npm run check` was not run for the §4.10 wording changes in `SettingsTab.svelte` and
 `AlignTab.svelte` (the agent's worktree had no `node_modules`). They are comments and
 user-visible strings only, no logic — but the check is still owed.
 
-### 11. `.claude/` is untracked and unignored
+### 12. `.claude/` is untracked and unignored
 
 Agent worktrees land in `.claude/worktrees/`. Add it to `.gitignore` before someone
 commits one by accident.
