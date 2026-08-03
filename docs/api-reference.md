@@ -40,6 +40,7 @@ handler name, which is the authoritative place to check the exact body shape.
 | `GET` | `/api/sendspin/volumes` | all sendspin volumes |
 | `PUT` | `/api/sendspin/volume` | set one sendspin volume |
 | `PUT` | `/api/sendspin/mute` | mute one sendspin device |
+| `POST` | `/api/sendspin/clear` | `stream/clear` one device — discard its buffers and re-anchor |
 | `GET` | `/api/sendspin/delays` | per-device sendspin delays |
 | `PUT` | `/api/sendspin/delay` | set one sendspin delay |
 | `PUT` | `/api/ap2/volume` | set an AirPlay-2 receiver's volume |
@@ -396,6 +397,36 @@ stored (`"saved … (device not connected)"`).
 ### `PUT /api/sendspin/mute`
 Mute or unmute one sendspin device, same addressing as the volume call
 (`set_sendspin_mute`).
+
+### `POST /api/sendspin/clear`
+Ask one device to discard buffered-but-unplayed audio and re-anchor, **without ending
+its stream** — the protocol's `stream/clear`.
+
+```json
+// Request
+{ "node_name": "sendspin-dev-voice_pe_kitchen" }
+// Response
+{ "ok": true, "message": "cleared 'Kitchen' — it will re-anchor on the next audio" }
+```
+
+This is the recovery action for a device that is demonstrably being *sent* audio and
+renders none — the 2026-08-03 failure where three of four devices went silent while the
+daemon, the graph and the clock sync were all healthy (see
+[sendspin-open-items.md](../pipewire_audio_router/docs/sendspin-open-items.md)). Before it
+existed the only lever was restarting the add-on, which interrupted every other output
+and destroyed the evidence.
+
+It is one frame, and deliberately **per device**: it does *not* reset the group's shared
+timeline, so the other members of the group keep playing undisturbed. That is why it does
+not use the library's `Group::clear_stream` helper, which also re-anchors the timeline.
+
+Cheaper than the alternatives — a per-device *reconnect* (nudging its static delay) costs
+a full re-dial and a fresh clock filter for that device; a group restart costs that for
+everyone.
+
+`ok` is `false` with an explanatory message when the device has no live connection: there
+is nothing to clear, and its next stream starts fresh anyway. Exposed in the web UI as
+**Resync** on each connected sendspin output.
 
 ### `GET /api/sendspin/delays` / `PUT /api/sendspin/delay`
 Per-device playback delay in ms, used to time-align speakers within a group (a device

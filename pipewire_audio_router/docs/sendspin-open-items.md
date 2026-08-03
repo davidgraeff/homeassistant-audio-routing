@@ -140,7 +140,7 @@ is easy to read as "nothing played" — I did, mid-investigation, and briefly co
 daemon was delivering nothing. Use `test: true` (the committed speech clip) to ask whether
 a device makes sound at all.
 
-### 5. `stream/clear` exists in the protocol and the daemon never sends it
+### 5. `stream/clear` — now exposed ✅
 
 The submodule implements the spec's reset primitive — `Group::clear_stream`: *"Ask every
 member to discard buffered-but-unplayed audio without ending the stream, and reset the
@@ -159,8 +159,21 @@ curl -X PUT localhost:8099/api/sendspin/delay -H 'Content-Type: application/json
 ```
 
 That is heavier than `stream/clear` (a full reconnect rather than a buffer flush) but it
-is available now. A `POST /api/sendspin/clear` plus a UI button would be a small addition
-and the right tool for a wedged device.
+was the only option.
+
+> **Done 2026-08-03.** `POST /api/sendspin/clear` sends the frame to one device, and the
+> web UI offers it as **Resync** on each connected sendspin output. Deliberately *not*
+> the library's `Group::clear_stream` helper: that also calls `timeline.reset()`, and our
+> per-device groups share one `SharedTimeline`, so it would re-anchor every member of the
+> group to fix one of them. Sending the frame alone leaves the groupmates untouched.
+>
+> A disconnected device reports `ok: false` with a reason rather than pretending: there is
+> nothing to clear, and its next stream starts fresh anyway. Unlike volume/mute/delay a
+> clear stores no desired state, which is pinned by
+> `sendspin_volume::tests::clearing_a_disconnected_device_is_reported_not_stored`.
+>
+> This is the first thing to try next time item 4 recurs — and it leaves the evidence
+> intact, which an add-on restart did not.
 
 ---
 

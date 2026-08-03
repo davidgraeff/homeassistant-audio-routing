@@ -64,6 +64,34 @@ impl PendingCommands {
     }
 }
 
+/// One queued `stream/clear` for a device, awaiting [`PendingClear::apply`].
+///
+/// Separate from [`PendingCommands`] because `stream/clear` is a stream-lifecycle
+/// frame, not a `PlayerCommand` — it supersedes queued audio rather than overtaking
+/// it untouched. Same two-statement lock discipline: build it under the guard, drop
+/// the guard, then `apply().await`.
+#[must_use = "the clear is only sent when `apply` is awaited"]
+pub struct PendingClear {
+    node_name: String,
+    sender: Option<ServerSender>,
+}
+
+impl PendingClear {
+    /// Send it. `true` if it reached a live device.
+    pub async fn apply(self) -> bool {
+        let Some(sender) = self.sender else {
+            return false;
+        };
+        match sender.queue_stream_clear().await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("failed to clear the stream on '{}': {e}", self.node_name);
+                false
+            }
+        }
+    }
+}
+
 /// Shared handle to the volume control (API + every group server hold a clone).
 /// A device with no entry in `desired` is at full scale (100) — the UI shows
 /// sliders at 100 for those.
@@ -266,6 +294,27 @@ impl SendspinControl {
         self.pending(node_name, mute_cmd(muted))
     }
 
+    /// Ask one device to discard buffered-but-unplayed audio and re-anchor,
+    /// without ending its stream — the protocol's `stream/clear`.
+    ///
+    /// This is the recovery action for a device that is being sent audio and not
+    /// rendering it (see docs/sendspin-open-items.md). Deliberately **per device
+    /// and deliberately not `Group::clear_stream`**: that helper also calls
+    /// `timeline.reset()`, and our per-device groups share one `SharedTimeline`, so
+    /// it would re-anchor every member of the group to fix one of them. Sending the
+    /// frame alone leaves the shared timeline — and therefore the groupmates'
+    /// playback — untouched.
+    ///
+    /// Stores nothing: unlike volume/mute/delay there is no desired state to keep,
+    /// so a disconnected device simply reports `false` rather than queuing a clear
+    /// for a stream that will be freshly started anyway.
+    pub fn clear_stream(&self, node_name: &str) -> PendingClear {
+        PendingClear {
+            node_name: node_name.to_string(),
+            sender: self.senders.get(node_name).cloned(),
+        }
+    }
+
     /// Bundle one command for a device with its live sender, if any.
     fn pending(&self, node_name: &str, command: PlayerCommand) -> PendingCommands {
         match self.senders.get(node_name) {
@@ -285,6 +334,20 @@ impl SendspinControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clearing_a_disconnected_device_is_reported_not_stored() {
+        // The other setters persist desired state for a device's next register.
+        // A clear must not: there is no state to carry, and the device's next
+        // stream starts fresh anyway — so this reports false rather than
+        // silently promising a clear that will never be sent.
+        let c = SendspinControl::default();
+        let pending = c.clear_stream("sendspin-dev-kitchen");
+        assert!(!pending.apply().await);
+        assert!(c.volumes().is_empty(), "a clear stores nothing");
+        assert!(c.mutes().is_empty(), "a clear stores nothing");
+        assert!(c.delays().is_empty(), "a clear stores nothing");
+    }
 
     #[tokio::test]
     async fn set_volume_persists_desired_even_with_no_live_device() {

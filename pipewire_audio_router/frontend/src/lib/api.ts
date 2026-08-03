@@ -135,6 +135,11 @@ export const api = {
     request<OpResponse>('PUT', 'api/sendspin/volume', { node_name: nodeName, volume }),
   setSendspinMute: (nodeName: string, muted: boolean) =>
     request<OpResponse>('PUT', 'api/sendspin/mute', { node_name: nodeName, muted }),
+  /** Ask one sendspin device to discard buffered-but-unplayed audio and re-anchor
+   *  (`stream/clear`), without ending its stream or disturbing its groupmates.
+   *  The recovery action for a device that is being sent audio and renders none. */
+  sendspinClear: (nodeName: string) =>
+    request<OpResponse>('POST', 'api/sendspin/clear', { node_name: nodeName }),
 
   // AirPlay-2 per-device volume/mute (virtual outputs; volume is an in-band RTSP
   // SET_PARAMETER to the receiver). Volume is 0.0–1.0. No receiver→daemon

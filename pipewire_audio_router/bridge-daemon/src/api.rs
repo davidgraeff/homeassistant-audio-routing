@@ -223,6 +223,7 @@ pub fn router(
         .route("/api/sendspin/volumes", get(get_sendspin_volumes))
         .route("/api/sendspin/volume", put(set_sendspin_volume))
         .route("/api/sendspin/mute", put(set_sendspin_mute))
+        .route("/api/sendspin/clear", post(clear_sendspin_stream))
         .route("/api/ap2/volume", put(set_ap2_volume))
         .route("/api/ap2/mute", put(set_ap2_mute))
         .route("/api/sendspin/delays", get(get_sendspin_delays))
@@ -1547,6 +1548,48 @@ async fn set_sendspin_mute(
         format!("saved {verb} for '{}' (device not connected)", req.node_name)
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+}
+
+#[derive(Deserialize)]
+struct ClearSendspinRequest {
+    /// Virtual device node name, e.g. `sendspin-dev-voice_pe_kitchen`.
+    node_name: String,
+}
+
+/// Ask one sendspin device to discard buffered-but-unplayed audio and re-anchor,
+/// without ending its stream (`stream/clear`).
+///
+/// The recovery action for the failure mode where a device is demonstrably being
+/// *sent* audio and renders nothing — measured on 2026-08-03, when three of four
+/// devices went silent while the daemon, the graph and the clock sync were all
+/// healthy (docs/sendspin-open-items.md). Until this existed the only lever was
+/// restarting the whole add-on, which fixed it but destroyed the evidence and
+/// interrupted every other output.
+///
+/// Cheaper and more surgical than the alternatives: a per-device *reconnect* (nudge
+/// its static delay) costs a full re-dial and a fresh clock filter for that device,
+/// and a group restart costs it for everyone. This is one frame.
+///
+/// A disconnected device is reported honestly rather than treated as success — there
+/// is nothing to clear, and its next stream starts fresh anyway.
+async fn clear_sendspin_stream(
+    State(state): State<AppState>,
+    Json(req): Json<ClearSendspinRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    // Two statements, never one: holding the control guard across the await would
+    // block every other device's commands behind this device's socket.
+    let pending = state.sendspin_control.lock().await.clear_stream(&req.node_name);
+    let reached = pending.apply().await;
+    let display = crate::routing::output_display_name(&req.node_name);
+    if reached {
+        tracing::info!("USER ACTION: sendspin stream/clear -> '{}' (buffers discarded, re-anchoring)", req.node_name);
+    }
+    let message = if reached {
+        format!("cleared '{display}' — it will re-anchor on the next audio")
+    } else {
+        format!("'{display}' has no live connection, so there is nothing to clear")
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: reached, message }))
 }
 
 // ---- AirPlay-2 per-device volume/mute ------------------------------------
