@@ -573,7 +573,7 @@ pub async fn start_server_per_device(
     let node_name = server_name.to_string();
 
     let (capture_handle, mut pcm_rx) =
-        crate::sendspin_capture::spawn(sink_node_id).map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
+        crate::sendspin_capture::spawn("sendspin", sink_node_id).map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
 
     // One clock shared by the timeline and the dial manager, so the timestamps
     // stamped here are in the same domain as the `server/time` replies members

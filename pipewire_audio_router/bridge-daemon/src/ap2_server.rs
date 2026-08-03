@@ -358,7 +358,7 @@ pub fn start(
     // Capture at the group's negotiated rate: PipeWire resamples the 48 kHz anchor
     // to `rate` in-graph (its own RT thread), so no Rust-side SRC — a 48 kHz group
     // is passthrough, a 44.1 kHz group is PipeWire-downsampled.
-    let (capture, mut pcm_rx) = crate::sendspin_capture::spawn_with_rate(sink_node_id, rate)
+    let (capture, mut pcm_rx) = crate::sendspin_capture::spawn_with_rate("ap2", sink_node_id, rate)
         .map_err(|e| anyhow::anyhow!("failed to start capture for AP2 group: {e}"))?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let senders: Arc<Mutex<Vec<(String, LiveFrameSender)>>> = Arc::new(Mutex::new(Vec::new()));

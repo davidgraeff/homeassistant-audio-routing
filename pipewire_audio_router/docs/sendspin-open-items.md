@@ -131,10 +131,22 @@ music playing:
 - the connections are ~5 min old with `replied == recv` and a healthy ~0.77/s cadence, i.e.
   the re-dial and the clock sync both worked.
 
-So the trigger is a **group rebuild / re-dial**, and the failure is a device that has a
-healthy connection, a healthy clock and a full-rate audio stream, and renders nothing. A
-full add-on restart fixes it; a re-dial evidently does not, which is the sharpest clue
-available — whatever the restart clears is not connection state.
+**Confirmed workaround, and it sharpens the diagnosis considerably.** Nudging a device's
+static delay — a *per-device* re-dial (§4.10) — brings it back, verified on 093ca8 and then
+on all affected devices across a repeat of the reproduction. So:
+
+| operation | outcome |
+|---|---|
+| group rebuild (source switch) — every member re-dials into a **fresh** `SharedTimeline` | **silent** |
+| per-device re-dial — one member re-joins the **established** timeline | **plays** |
+| full add-on restart | plays |
+
+Both middle rows re-dial the device, so the re-dial is not what matters. **The variable is
+the timeline**: devices that join a newly-created `SharedTimeline` fail to render, devices
+that join one already running are fine. That is where to look next, and it is also exactly
+what `stream/clear` (item 5) addresses — it re-anchors without re-dialling, so it isolates
+"needs re-anchoring" from "needs a new connection" in one test. It was not deployed when
+this was reproduced; deploy it before the next attempt.
 
 **So the cause is state that a restart clears but a reconnect does not.** Two candidates,
 neither confirmed:
@@ -147,6 +159,15 @@ neither confirmed:
   starve three.
 - **Ordinary stale per-device state** in a connection 5.7 days old, cleared by the fresh
   connect (fresh time filter, fresh `stream/start`).
+
+> **Ruled out: the "two `bridge-sendspin-capture` streams".** Flagged twice as a possible
+> leaked capture from an earlier generation, which would have matched the
+> restart-fixes-it/re-dial-does-not asymmetry perfectly. It is not a leak: all three
+> consumers of `sendspin_capture` (the sendspin relay, the AP2 sender, the pw-sink sender)
+> hard-coded the *same* node name, so a graph with AP2 receivers routed showed two
+> identically-named captures — one sendspin, one AP2. Fixed by naming each after its owner
+> (`bridge-sendspin-capture` / `bridge-ap2-capture` / `bridge-pwsink-capture`), so the
+> graph no longer invites this mistake.
 
 **What would catch it next time.** The gap is that "this device is being sent audio" and
 "this device is rendering audio" were indistinguishable from the daemon, which is why

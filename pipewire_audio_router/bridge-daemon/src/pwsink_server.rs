@@ -131,7 +131,7 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
     // Capture the anchor monitor at the fixed 48 kHz / S16 / stereo bus rate —
     // pw-sink's wire format is fixed L16/48k (applemidi_sender byte-swaps to BE),
     // so unlike AP2 there is no rate negotiation.
-    let (capture, mut pcm_rx) = crate::sendspin_capture::spawn(sink_node_id)
+    let (capture, mut pcm_rx) = crate::sendspin_capture::spawn("pwsink", sink_node_id)
         .map_err(|e| anyhow::anyhow!("failed to start capture for pw-sink group: {e}"))?;
 
     // One AppleMIDI sender per target, each with its own std::mpsc PCM channel the

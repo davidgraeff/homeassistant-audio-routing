@@ -112,23 +112,29 @@ impl Drop for CaptureHandle {
 /// see `STREAM_CAPTURE_SINK` below) on a dedicated thread. Returns immediately;
 /// captured chunks arrive on the returned receiver as they're delivered by
 /// PipeWire's own graph clock — nothing here paces or buffers them further.
-pub fn spawn(target_node_id: u32) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
-    spawn_with_rate(target_node_id, SAMPLE_RATE)
+pub fn spawn(label: &'static str, target_node_id: u32) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
+    spawn_with_rate(label, target_node_id, SAMPLE_RATE)
 }
 
 /// Like [`spawn`], but requests capture at `rate` Hz. PipeWire resamples in-graph
 /// (on its own RT thread) between the monitor's native rate and `rate`, so a
 /// consumer that needs a specific rate (e.g. the AP2 sender's 44100) can avoid
 /// resampling on its own hot path. Chunks are S16LE / `CHANNELS` at `rate`.
-pub fn spawn_with_rate(target_node_id: u32, rate: u32) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
+pub fn spawn_with_rate(
+    label: &'static str,
+    target_node_id: u32,
+    rate: u32,
+) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
     let (pcm_tx, pcm_rx) = mpsc::channel(CAPTURE_CHANNEL_CAP);
     let (cmd_tx, cmd_rx) = pw::channel::channel::<CaptureCmd>();
 
     std::thread::Builder::new()
-        .name("sendspin-capture".into())
+        // Linux truncates thread names at 15 bytes, so "<label>-capture"
+        // rather than the full node name.
+        .name(format!("{label}-capture"))
         .spawn(move || {
-            if let Err(e) = run(target_node_id, rate, pcm_tx, cmd_rx) {
-                tracing::error!("sendspin capture thread for node {target_node_id} exited with error: {e}");
+            if let Err(e) = run(label, target_node_id, rate, pcm_tx, cmd_rx) {
+                tracing::error!("{label} capture thread for node {target_node_id} exited with error: {e}");
             }
         })
         .map_err(|e| format!("failed to spawn capture thread: {e}"))?;
@@ -164,20 +170,33 @@ fn set_capture_realtime_priority() {
 #[cfg(not(target_os = "linux"))]
 fn set_capture_realtime_priority() {}
 
-fn run(target_node_id: u32, rate: u32, pcm_tx: Sender<PooledBuf>, cmd_rx: pw::channel::Receiver<CaptureCmd>) -> Result<(), String> {
+fn run(
+    label: &str,
+    target_node_id: u32,
+    rate: u32,
+    pcm_tx: Sender<PooledBuf>,
+    cmd_rx: pw::channel::Receiver<CaptureCmd>,
+) -> Result<(), String> {
     set_capture_realtime_priority();
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| format!("context: {e}"))?;
     let core = context.connect_rc(None).map_err(|e| format!("connect to PipeWire: {e}"))?;
 
+    // `label` names this stream after the subsystem that owns it. All three
+    // consumers of this module (the sendspin relay, the AP2 sender, the pw-sink
+    // sender) used to hard-code "bridge-sendspin-capture", so a graph with an
+    // AP2 receiver routed showed two identically-named nodes and no way to tell
+    // which was which — it read as a leaked duplicate and cost real time chasing
+    // one during the 2026-08-03 investigation (docs/sendspin-open-items.md).
+    let node_name = format!("bridge-{label}-capture");
     let stream = pw::stream::StreamBox::new(
         &core,
-        "bridge-sendspin-capture",
+        &node_name,
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::NODE_NAME => "bridge-sendspin-capture",
+            *pw::keys::NODE_NAME => node_name.as_str(),
             // Tells the session manager to connect this capture stream to the
             // target's *monitor* ports rather than its (nonexistent, for a
             // plain sink) regular output ports — exactly what `pw-record
