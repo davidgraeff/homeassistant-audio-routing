@@ -433,9 +433,6 @@
         </button>
       </div>
     </div>
-    <p class="card-sub">
-      What each set of speakers is playing. Drag a source onto a group to play it there; click a line to stop it.
-    </p>
 
     {#if O.length === 0}
       <p class="empty">No speakers available yet — add one under the Outputs tab.</p>
@@ -571,10 +568,12 @@
     {/if}
   </div>
 
-  <!-- Wide screens only (see .side-help); the help button covers narrow ones. -->
+  <!-- Wide screens only (see .side-help): it lives in the page's left margin, so
+       the graph card itself stays aligned with the cards above. One section at a
+       time there — the whole document is what the Explain dialog is for. -->
   <aside class="card side-help">
     <h2>Reading the graph</h2>
-    <RoutingHelp {anyLatency} {anyXruns} />
+    <RoutingHelp {anyLatency} {anyXruns} tabbed />
   </aside>
 </div>
 
@@ -600,31 +599,28 @@
 {/if}
 
 <style>
-  /* Side-by-side once the viewport can hold the graph's two 240px columns plus a
-     comfortable text column; the wrapper then breaks out of the page's centered
-     960px column, staying centered on it. Below the breakpoint it's a plain
-     single-column block and the explanation moves into the dialog. */
+  /* The graph card keeps the page's column, aligned with the cards above it; the
+     explanation goes in the left margin, out of its way, and only once that margin
+     can hold a readable column of its own. `main` is a 960px box (920px of
+     content), so the space left of it is (100vw - 960px) / 2 — the width below
+     spends that, minus the gap and a little breathing room at the viewport edge.
+     Narrower than the breakpoint there's no side card at all and the Explain
+     dialog is the only copy (it's also still there when the side card shows: that
+     one is one-section-at-a-time). */
   .graph-area {
-    display: grid;
-    gap: 16px;
+    position: relative;
     margin-top: 16px;
   }
   .side-help {
     display: none;
   }
-  @media (min-width: 1240px) {
-    .graph-area {
-      --breakout: min(1180px, calc(100vw - 48px));
-      width: var(--breakout);
-      margin-left: calc((100% - var(--breakout)) / 2);
-      grid-template-columns: minmax(0, 1fr) 330px;
-      align-items: start;
-    }
+  @media (min-width: 1520px) {
     .side-help {
       display: block;
-    }
-    .help-btn {
-      display: none;
+      position: absolute;
+      top: 0;
+      right: calc(100% + 20px);
+      width: min(340px, calc((100vw - 960px) / 2 - 16px));
     }
   }
   .side-help h2 {
