@@ -9,8 +9,16 @@
   // paired. Each request shows the pairing **code** the agent also writes to its
   // own log — approving a request you cannot identify is how you'd hand control of
   // your audio to whoever else is on the network, so the code is the check.
-  import { onMount } from 'svelte';
+  //
+  // Liveness rides the **routing WebSocket**, not a timer of its own. The daemon
+  // pokes its change notifier on every pairing event (pwsink_agent.rs) exactly as
+  // it does for discovery, and that notifier is what pushes a matrix frame — so a
+  // frame arriving is the signal to re-read this list. Same channel the rest of
+  // the page already listens on; a separate poll was both redundant and the
+  // source of a visible flicker.
+  import { untrack } from 'svelte';
   import { api } from '../lib/api';
+  import { routing } from '../lib/routing';
   import { run } from '../lib/toast';
   import type { AgentInfo } from '../lib/types';
 
@@ -19,29 +27,58 @@
   let { onchange }: { onchange?: () => void } = $props();
 
   let agents = $state<AgentInfo[]>([]);
-  let loading = $state(true);
+  // Only ever true before the *first* answer. A poll must not put the card back
+  // into a loading state: with no hosts paired yet that made it alternate between
+  // “Loading…” and the empty text on every tick, which read as the page flickering.
+  let firstLoad = $state(true);
   let busy = $state<Record<string, boolean>>({});
 
   const pending = $derived(agents.filter((a) => !a.paired));
   const paired = $derived(agents.filter((a) => a.paired));
 
-  async function refresh() {
-    loading = true;
+  // Compared against the last payload so an unchanged poll — the normal case —
+  // doesn't reassign `agents` at all. Without this, every tick invalidated the
+  // derived lists and re-rendered the section for no reason.
+  let lastPayload = '';
+  // Polls can outlive their interval on a busy Pi; overlapping them would let an
+  // older answer land last. A refresh asked for while one is in flight is queued
+  // rather than dropped, so a click that changes something is never left showing
+  // stale rows until the next tick.
+  let inFlight = false;
+  let queued = false;
+
+  async function refresh(): Promise<void> {
+    if (inFlight) {
+      queued = true;
+      return;
+    }
+    inFlight = true;
     try {
-      agents = await api.agents().catch(() => [] as AgentInfo[]);
+      const next = await api.agents().catch(() => [] as AgentInfo[]);
+      const payload = JSON.stringify(next);
+      if (payload !== lastPayload) {
+        lastPayload = payload;
+        agents = next;
+      }
     } finally {
-      loading = false;
+      inFlight = false;
+      firstLoad = false;
+    }
+    if (queued) {
+      queued = false;
+      await refresh();
     }
   }
 
-  // A pairing request arrives whenever someone installs the agent, i.e. while this
-  // page is open and nobody has clicked anything. Poll so it shows up on its own —
-  // the routing WebSocket carries the matrix, not the pairing queue, and a request
-  // the user has to reload to see is a request they will miss.
-  onMount(() => {
-    refresh();
-    const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
+  // Fires once on mount (the store replays its last snapshot to a new subscriber)
+  // and then on every frame. `untrack` keeps the effect from depending on what
+  // `refresh` touches, so it reacts to frames only, never to its own writes.
+  $effect(() => {
+    $routing.matrix;
+    $routing.connected;
+    untrack(() => {
+      void refresh();
+    });
   });
 
   async function decide(a: AgentInfo, action: 'approve' | 'deny' | 'forget') {
@@ -84,14 +121,12 @@
   {/if}
 </div>
 
-{#if loading && agents.length === 0}
+{#if firstLoad && agents.length === 0}
   <div class="card"><p class="empty" style="padding:0">Loading…</p></div>
 {:else if agents.length === 0}
   <div class="card">
     <p class="empty" style="padding:0">
-      No receiver hosts yet. Install <code>pwrouter-agent</code> on a Linux machine you want to stream
-      to; it dials in here and appears below for you to approve. Nothing needs to listen on that
-      machine, and it needs no PipeWire configuration.
+      No receiver hosts yet — see <em>Explain receiver hosts</em> above to set one up.
     </p>
   </div>
 {/if}
@@ -101,9 +136,7 @@
     <div class="agent-main">
       <h4>{a.label}</h4>
       <p class="agent-sub">
-        Wants to pair. Check the code matches the one in the agent's log
-        (<code>journalctl --user -u pwrouter-agent</code>) before approving — it is how you tell this
-        host apart from anyone else's request.
+        Wants to pair. Only approve if this code matches the one that machine's agent printed.
       </p>
     </div>
     <div class="agent-code" title="Pairing code — also printed by the agent">{a.code ?? '—'}</div>

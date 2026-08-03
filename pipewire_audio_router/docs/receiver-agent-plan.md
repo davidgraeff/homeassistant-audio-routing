@@ -291,10 +291,13 @@ Worth an upstream report either way.
    there, because a host cannot become a discovered output until it is paired, so
    this is the earlier step of one flow. The row carries the pairing code, which
    the agent also logs: approving a request you cannot identify is how you would
-   hand your audio to someone else on the network, so the code is the check. The
-   panel polls (5 s) rather than waiting on the routing WebSocket, which carries
-   the matrix, not the pairing queue — a request you must reload to see is a
-   request you miss.
+   hand your audio to someone else on the network, so the code is the check.
+   The panel re-reads `/api/agents` on every **routing-WebSocket frame** rather than
+   on a timer of its own: the daemon pokes its change notifier on a pairing event
+   exactly as it does on discovery, and that notifier is what pushes a frame, so one
+   channel already carries "something changed" for both. An unchanged payload is
+   compared away and touches no state — a first version polled every 5 s and
+   re-rendered regardless, which read as the page flickering.
 4. Approving mints a token; the agent stores it `0600` in
    `~/.config/pwrouter-agent/config.json` and reconnects with it, backing off on
    failure. Manual override (`--daemon host:port`) for routed/non-mDNS setups.
@@ -331,13 +334,23 @@ desktop, a different feature; folding it into the agent is a separate decision.
 
 ## 10. Packaging
 
-* One binary per arch (x86_64, aarch64), dynamically linked against
-  `libpipewire-0.3.so` — present by definition on any target host.
+* One binary per arch — x86_64 **and** aarch64, both built regardless of the
+  add-on's own architecture, since the machine on the other end is usually not the
+  Pi. Dynamically linked against `libpipewire-0.3.so`: a static build is impossible
+  by nature, because the agent *is* a PipeWire client and must use the library the
+  host runs.
+* Built in the `Dockerfile`'s **`agent` stage** from `rust:1-slim-bookworm`, not the
+  trixie base the daemon uses. What reaches the user is not the builder's glibc but
+  the symbol versions the binaries reference, and a modern toolchain floors at
+  `GLIBC_2.34` — so bookworm buys the widest reach for free while still shipping
+  PipeWire 0.3.65 headers (new enough for pipewire-rs 0.10). The stage **asserts**
+  that floor with `objdump -T` and fails the build if a binary exceeds it, because
+  the in-app help text promises concrete minimums: **Ubuntu 22.04 LTS+, Fedora 35+,
+  Debian 12+** (measured: both binaries top out at exactly `GLIBC_2.34`).
+* Copied to `/app/www/agent/` and **served by the add-on itself**, so the download
+  in the help dialog needs no third-party fetch and always matches the daemon.
 * **systemd user unit** (`~/.config/systemd/user/pwrouter-agent.service`), since
   it needs the user's session PipeWire. `systemctl --user enable --now`.
-* Served **from the add-on's own frontend** ("download the helper for this
-  host"), so there is no third-party fetch to trust and the version always
-  matches the daemon.
 
 ## 11. Phases
 
@@ -398,14 +411,12 @@ Still deferred (open design questions, deliberately not implemented):
 
 * the send-twin cleanup / self-created link (§7.2) — includes "which sink" control;
 * §11 P4 host-scoped extras (named-sink targeting, xrun reporting);
-* shipping the agent binary from the add-on's own frontend (§10): needs a
-  cross-arch build stage in the `Dockerfile`, so installation is `cargo build
-  --release` for now (`pwrouter-agent/README.md`).
-
-Done since: the shared `pw-control` crate (§12) and the pairing UI (§8) are both
-implemented — the build-context question that blocked the crate is answered by one
-`COPY pw-control/ /pw-control/`, verified by resolving `cargo metadata` from a
-replica of the container layout.
+Done since: the shared `pw-control` crate (§12), the pairing UI (§8) and the shipped
+agent binaries (§10) are all implemented. The build-context question that blocked the
+crate is answered by one `COPY pw-control/ /pw-control/`, verified by resolving
+`cargo metadata` from a replica of the container layout; the two-arch agent build
+needed only the *foreign* architecture added to dpkg — adding the native one makes
+apt resolve unqualified package names against the wrong architecture.
 
 ## 14. Spike results
 

@@ -5,12 +5,20 @@
   import { run, toast } from '../lib/toast';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../lib/types';
   import AgentsPanel from './AgentsPanel.svelte';
+  import OutputsDocs from './OutputsDocs.svelte';
+  import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
   import VolumeControl from './VolumeControl.svelte';
 
   // Two listings, because discovery only *offers* a device: `outputs` is what
   // the user has added (routable, exposed to Home Assistant, tunable) and
   // `offered` is everything found but not added — both the undecided ones and
   // the ignored ones, which the checkbox below filters apart client-side.
+  // The two help documents behind the header buttons. The page keeps a sentence;
+  // the explanations (and the agent downloads) live in the dialogs, the same split
+  // the Music groups, Announcements and Sources pages use.
+  let outputsDocsOpen = $state(false);
+  let agentDocsOpen = $state(false);
+
   let outputs = $state<OutputInfo[]>([]);
   let offered = $state<OutputInfo[]>([]);
   let showIgnored = $state(false);
@@ -468,23 +476,31 @@
 {/snippet}
 
 <div class="card info">
-  <h2>Supported outputs</h2>
-  <p class="card-sub">
-    This router can stream to <strong>AirPlay 2</strong> receivers (AV receivers, HomePods, AirPlay
-    speakers) and <strong>Sendspin</strong> speakers — the open multi-room protocol used by ESPHome and
-    Home Assistant Voice PE. Compatible devices on your network are discovered automatically, but
-    discovery only <em>offers</em> them: a device does nothing until you <strong>add</strong> it below.
-    Route one source to several Sendspin devices — or a mix of Sendspin and AirPlay 2 — and they play in
-    one synchronized group.
-  </p>
+  <div class="info-head">
+    <h2>Supported outputs</h2>
+    <div class="info-actions">
+      <button
+        class="ghost"
+        type="button"
+        title="The kinds of output, what discovered vs added means, and what each state tells you"
+        onclick={() => (outputsDocsOpen = true)}
+      >
+        Explain outputs
+      </button>
+      <button
+        class="ghost"
+        type="button"
+        title="Turn a Linux machine into an output: download the agent, install it, pair it"
+        onclick={() => (agentDocsOpen = true)}
+      >
+        Explain receiver hosts
+      </button>
+    </div>
+  </div>
   <p class="card-sub" style="margin-bottom:0">
-    <strong>Your outputs</strong> are the devices you added: routable in the matrix, groupable, and — with
-    the setting on — each its own Home Assistant <code>media_player</code>. An
-    <span class="badge off">offline</span> one keeps its routing but isn't currently on the network; a
-    <span class="badge caution">not connected</span> PipeWire target is on the network but hasn't connected to the
-    session we advertise, so anything routed to it isn't being played yet.
-    <strong>Discovered</strong> devices are everything else found nearby; play a test tone to work out which
-    is which, then add it or ignore it. Expand any card for its connection details and test playback.
+    <strong>AirPlay 2</strong> receivers, <strong>Sendspin</strong> speakers, and Linux machines running
+    the receiver agent. Devices on your network are found automatically but only <em>offered</em> — one
+    does nothing until you <strong>add</strong> it.
   </p>
 </div>
 
@@ -739,7 +755,34 @@
   {/each}
 {/if}
 
+{#if outputsDocsOpen}
+  <OutputsDocs onClose={() => (outputsDocsOpen = false)} />
+{/if}
+
+{#if agentDocsOpen}
+  <ReceiverAgentDocs onClose={() => (agentDocsOpen = false)} />
+{/if}
+
 <style>
+  /* Card header with help buttons — same shape as the Input-sources card on the
+     Sources page, so the two pages read alike. */
+  .info-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .info-head h2 {
+    margin: 0;
+  }
+  .info-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
   /* ---- Section headings between the two listings ------------------------- */
   .section-head {
     display: flex;

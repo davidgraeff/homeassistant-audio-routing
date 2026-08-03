@@ -148,6 +148,80 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && cargo build --release \
     && cp "target/${CARGO_BUILD_TARGET}/release/bridge-daemon" /bridge-daemon
 
+# ---------------------------------------------------------------------------
+# pwrouter-agent — the receiver-side helper users install on the machines they
+# want to stream to (docs/receiver-agent-plan.md §10). Built for BOTH
+# architectures regardless of the add-on's own, because the add-on serves the
+# binaries for download and the machine on the other end is usually not the same
+# arch as the Pi.
+#
+# Bookworm, not the trixie base above: the binaries run on the *user's* distro,
+# so what matters is the glibc symbol versions they end up referencing. A modern
+# toolchain floors at GLIBC_2.34 (the release where pthread/dl merged into libc),
+# which is Ubuntu 22.04 LTS / Fedora 35 / Debian 12 — old enough to cover current
+# systems. Bookworm also ships PipeWire 0.3.65 headers, new enough for
+# pipewire-rs 0.10. Building on trixie instead would demand its much newer glibc
+# from every downloader for no benefit.
+FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS agent
+# Both targets' libs side by side. Only the *foreign* architecture is added:
+# `dpkg --add-architecture` for the native one makes apt resolve unqualified
+# package names against the wrong architecture, which fails as
+# "gcc-12-x86-64-linux-gnu:arm64 : Depends: … not installable". The native arch
+# comes from dpkg rather than a build ARG so this works the same under podman,
+# buildah and BuildKit.
+RUN set -eux; \
+    native="$(dpkg --print-architecture)"; \
+    case "$native" in \
+      amd64) foreign=arm64; foreign_gnu=aarch64-linux-gnu ;; \
+      arm64) foreign=amd64; foreign_gnu=x86_64-linux-gnu ;; \
+      *) echo "unsupported builder architecture $native" >&2; exit 1 ;; \
+    esac; \
+    dpkg --add-architecture "$foreign"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        pkg-config clang "gcc-${foreign_gnu}" \
+        libpipewire-0.3-dev libspa-0.2-dev \
+        "libc6-dev:${foreign}" "libpipewire-0.3-dev:${foreign}" "libspa-0.2-dev:${foreign}"; \
+    rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /agent
+# pw-control first: it changes less often than the agent itself, so an agent edit
+# still hits this layer's cache. Same reason the daemon stage copies it early.
+COPY pw-control/ /pw-control/
+COPY pwrouter-agent/ .
+# One loop per arch: build, strip, then assert the binary really does floor at
+# GLIBC_2.34 — shipping one that needs more would silently break the minimum
+# distro versions the in-app help text promises. The objdump must be the matching
+# target's, since a cross binutils only reliably reads its own architecture.
+#
+# No comments inside the RUN below: BuildKit strips comment lines before joining
+# continuations, which would break the loop.
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=agent-target,target=/agent/target,sharing=locked \
+    set -eux; \
+    export PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_SYSROOT_DIR=/; \
+    mkdir -p /agent-out; \
+    for arch in amd64 arm64; do \
+      case "$arch" in \
+        amd64) triple=x86_64-unknown-linux-gnu;  gnu=x86_64-linux-gnu;  out=pwrouter-agent-x86_64 ;; \
+        arm64) triple=aarch64-unknown-linux-gnu; gnu=aarch64-linux-gnu; out=pwrouter-agent-aarch64 ;; \
+      esac; \
+      up_triple="$(echo "$triple" | tr 'a-z-' 'A-Z_')"; \
+      env "CARGO_TARGET_${up_triple}_LINKER=${gnu}-gcc" \
+          "PKG_CONFIG_PATH=/usr/lib/${gnu}/pkgconfig" \
+          "BINDGEN_EXTRA_CLANG_ARGS=--target=${gnu} --sysroot=/ -I/usr/include/${gnu}" \
+          cargo build --release --target "$triple"; \
+      cp "target/${triple}/release/pwrouter-agent" "/agent-out/${out}"; \
+      "${gnu}-strip" "/agent-out/${out}"; \
+      max="$("${gnu}-objdump" -T "/agent-out/${out}" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)"; \
+      echo "${out} requires up to ${max}"; \
+      case "$max" in \
+        GLIBC_2.1?|GLIBC_2.2?|GLIBC_2.3|GLIBC_2.3[0-4]) ;; \
+        *) echo "ERROR: ${out} needs ${max}, above the GLIBC_2.34 floor the help text promises" >&2; exit 1 ;; \
+      esac; \
+    done
+
 FROM ubuntu:26.04
 # systemd-standalone-sysusers: `pipewire`'s Depends is `systemd |
 # systemd-standalone-sysusers` (either satisfies its need to create system
@@ -258,6 +332,9 @@ RUN set -eux; \
 COPY --from=build /bridge-daemon /usr/local/bin/bridge-daemon
 # Built web UI served by the daemon (default --static-dir /app/www).
 COPY --from=frontend /ui/dist /app/www
+# Downloadable receiver-agent binaries, served by the daemon's static file handler
+# (frontend/src/components/ReceiverAgentDocs.svelte links to them).
+COPY --from=agent /agent-out/ /app/www/agent/
 COPY rootfs/run.sh /run.sh
 # WirePlumber drop-in disabling unused hardware monitors (camera, bluetooth)
 # and the snap/logind integrations — silences their harmless "missing host
