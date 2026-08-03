@@ -13,6 +13,12 @@
 //
 // Ducking is implicit in the overlay mix for sendspin per-device, so the
 // scheduler's Duck/Unduck actions are no-ops here (RAOP per-output duck is O-E).
+//
+// One exception: a pw-sink target is a whole *host*, which may be playing music of
+// its own that isn't in our stream at all. Our overlay duck cannot reach that, so
+// start/stop on a `pwsink-dev-*` output is mirrored to that host's agent, which
+// attenuates the foreign streams on its sink (pwsink_agent::duck_output —
+// docs/receiver-agent-plan.md §11 P3).
 
 use crate::announce_arbiter::{Action, Admission, AnnounceScheduler, AnnouncementId, Effects, OnBusy, Request};
 use crate::overlay_mixer::OverlayMixer;
@@ -53,10 +59,13 @@ impl Inner {
                 Action::StartAnnouncement(output, id) => {
                     if let Some(clip) = self.clips.get(&id) {
                         mixer.start_with_grace(&output, id, (*clip.pcm).clone(), clip.duck, clip.grace);
+                        // No-op unless `output` is an agent-backed host.
+                        crate::pwsink_agent::duck_output(&output, clip.duck);
                     }
                 }
                 Action::StopAnnouncement(output, _id) => {
                     mixer.stop(&output);
+                    crate::pwsink_agent::unduck_output(&output);
                 }
                 // Duck is implicit in the mix for sendspin per-device.
                 Action::DuckMusic(_) | Action::UnduckMusic(_) => {}

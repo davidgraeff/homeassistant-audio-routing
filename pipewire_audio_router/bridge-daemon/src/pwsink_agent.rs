@@ -489,6 +489,75 @@ fn split_label(label: &str) -> (String, String) {
     }
 }
 
+// ---- remote duck relay -----------------------------------------------------
+//
+// The announce coordinator (announce.rs) is synchronous and process-global, while
+// sending to an agent needs the async registry lock. So announcements post duck
+// requests to this relay instead of blocking: a small task drains it and talks to
+// the agents.
+//
+// Two ducks compose per announcement, deliberately (plan §11 P3): `overlay_mixer`
+// attenuates *our own* music inside the stream we send, and this attenuates the
+// *other* applications playing on the receiver's sink. Neither touches the
+// announcement itself.
+
+/// Ramp for an announcement duck: fast enough not to talk over the clip's start,
+/// slow enough not to click.
+pub const ANNOUNCE_DUCK_RAMP_MS: u64 = 200;
+/// Coming back up may be leisurely — nothing is waiting on it.
+pub const ANNOUNCE_UNDUCK_RAMP_MS: u64 = 400;
+
+enum RemoteDuck {
+    Duck { node_name: String, depth: f32 },
+    Unduck { node_name: String },
+}
+
+static DUCK_TX: std::sync::OnceLock<mpsc::UnboundedSender<RemoteDuck>> = std::sync::OnceLock::new();
+
+/// Starts the relay. Called once from `main.rs` inside the runtime.
+pub fn spawn_duck_relay(agents: SharedAgents) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<RemoteDuck>();
+    if DUCK_TX.set(tx).is_err() {
+        return; // already running
+    }
+    tokio::spawn(async move {
+        while let Some(request) = rx.recv().await {
+            let agents = agents.lock().await;
+            match request {
+                RemoteDuck::Duck { node_name, depth } => {
+                    if !agents.duck(&node_name, depth, ANNOUNCE_DUCK_RAMP_MS) {
+                        tracing::debug!("duck for '{node_name}' dropped: no agent connected");
+                    }
+                }
+                RemoteDuck::Unduck { node_name } => {
+                    agents.unduck(&node_name, ANNOUNCE_UNDUCK_RAMP_MS);
+                }
+            }
+        }
+    });
+}
+
+/// Asks a host's agent to duck the *other* applications on its sink. Silently does
+/// nothing for non-pw-sink outputs, and never blocks the caller.
+pub fn duck_output(node_name: &str, depth: f32) {
+    if !node_name.starts_with(PWSINK_DEV_PREFIX) {
+        return;
+    }
+    if let Some(tx) = DUCK_TX.get() {
+        let _ = tx.send(RemoteDuck::Duck { node_name: node_name.to_string(), depth });
+    }
+}
+
+/// Releases a duck started by [`duck_output`].
+pub fn unduck_output(node_name: &str) {
+    if !node_name.starts_with(PWSINK_DEV_PREFIX) {
+        return;
+    }
+    if let Some(tx) = DUCK_TX.get() {
+        let _ = tx.send(RemoteDuck::Unduck { node_name: node_name.to_string() });
+    }
+}
+
 // ---- WebSocket endpoint ----------------------------------------------------
 
 /// `GET /api/agent/ws` — one connection per agent, dialled *by* the agent.

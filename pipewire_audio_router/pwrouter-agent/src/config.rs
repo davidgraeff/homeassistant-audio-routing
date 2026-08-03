@@ -66,18 +66,22 @@ pub fn save(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stable identity for this *session*: machine id plus user name (plan §13.2).
-///
-/// `/etc/machine-id` rather than the hostname: hostnames change on a whim (and
-/// mDNS renames them on collision, which is how this host became
-/// `david-local-2`), while the machine id survives renames and re-pairings.
-pub fn identity() -> String {
-    let machine = std::fs::read_to_string("/etc/machine-id")
+/// `/etc/machine-id` — the stable half of the pairing identity. Preferred over the
+/// hostname because hostnames change on a whim (and mDNS renames them on
+/// collision, which is how this host became `david-local-2`), while the machine id
+/// survives renames and re-pairings.
+pub fn machine_id() -> String {
+    std::fs::read_to_string("/etc/machine-id")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown-machine".to_string());
-    format!("{machine}:{}", user())
+        .unwrap_or_else(|| "unknown-machine".to_string())
+}
+
+/// Identity as the daemon derives it: machine id plus user (plan §13.2). Kept here
+/// for logging, so the operator can match a log line to an `/api/agents` row.
+pub fn identity() -> String {
+    format!("{}:{}", machine_id(), user())
 }
 
 /// Human label for the pairing UI.

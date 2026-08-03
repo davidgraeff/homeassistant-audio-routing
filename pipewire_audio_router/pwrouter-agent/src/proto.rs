@@ -26,14 +26,17 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMsg {
     /// First message on every connection. `token` is absent only when pairing.
+    ///
+    /// The three identity fields are sent raw rather than pre-combined: the daemon
+    /// derives the pairing identity (`machine_id:user` — one agent per logged-in
+    /// session, plan §13.2), the display label and the routing node name from them,
+    /// so that naming lives in one place.
     Hello {
         protocol: u32,
         agent_version: String,
-        /// Stable per-*session* identity: machine id + user (plan §13.2 — one
-        /// agent per logged-in session, so two users on one host are two targets).
-        identity: String,
-        /// Human label for the UI, e.g. `david-local (david)`.
-        label: String,
+        machine_id: String,
+        hostname: String,
+        user: String,
         token: Option<String>,
     },
     /// Pushed whenever anything changes, including local changes made by the user.
@@ -93,8 +96,9 @@ mod tests {
         let json = serde_json::to_string(&AgentMsg::Hello {
             protocol: PROTOCOL_VERSION,
             agent_version: "0.1.0".into(),
-            identity: "abc:david".into(),
-            label: "david-local (david)".into(),
+            machine_id: "abc".into(),
+            hostname: "david-local".into(),
+            user: "david".into(),
             token: None,
         })
         .unwrap();

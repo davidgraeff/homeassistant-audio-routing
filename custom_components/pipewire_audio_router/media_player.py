@@ -46,10 +46,13 @@ from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NON
 # routing-matrix outputs, and each becomes one media_player.
 SENDSPIN_DEV_PREFIX = "sendspin-dev-"
 AP2_DEV_PREFIX = "ap2-dev-"
+# A pw-sink output is a remote PipeWire *host* running the pwrouter-agent, which
+# reports and applies that host's master volume/mute.
+PWSINK_DEV_PREFIX = "pwsink-dev-"
 
 # All output kinds' prefixes. Used to derive a fallback display name for any
 # output regardless of kind.
-_OUTPUT_PREFIXES = (SENDSPIN_DEV_PREFIX, AP2_DEV_PREFIX)
+_OUTPUT_PREFIXES = (SENDSPIN_DEV_PREFIX, AP2_DEV_PREFIX, PWSINK_DEV_PREFIX)
 
 # Host/IP-ish keys that AV-receiver integrations commonly store the receiver
 # address under in their config entry (MusicCast, Onkyo/Pioneer, HEOS, …). Used
@@ -298,7 +301,7 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         # still-pending piece of work, so neither kind advertises PLAY_MEDIA
         # /MEDIA_ANNOUNCE — announcements fan out via the announcement group.
         features = MediaPlayerEntityFeature.SELECT_SOURCE | MediaPlayerEntityFeature.VOLUME_SET
-        if self._is_ap2:
+        if self._is_ap2 or self._is_pwsink:
             features |= MediaPlayerEntityFeature.VOLUME_MUTE
         self._attr_supported_features = features
 
@@ -338,11 +341,19 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         return self.node_name.startswith(AP2_DEV_PREFIX)
 
     @property
+    def _is_pwsink(self) -> bool:
+        """A remote PipeWire host with a paired pwrouter-agent. Its volume/mute is
+        the *host's master out*, applied by the agent — so unlike sendspin/AP2 the
+        slider moves the whole machine, which is what lets an announcement duck
+        music the router isn't playing."""
+        return self.node_name.startswith(PWSINK_DEV_PREFIX)
+
+    @property
     def _is_virtual(self) -> bool:
         """A virtual output (sendspin or AirPlay-2) has no PipeWire node: it
         never appears in the polled media_players feed, so its state comes from
         routing rather than the feed."""
-        return self._is_sendspin or self._is_ap2
+        return self._is_sendspin or self._is_ap2 or self._is_pwsink
 
     @property
     def _virtual_prefix(self) -> str | None:
@@ -352,6 +363,8 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
             return SENDSPIN_DEV_PREFIX
         if self._is_ap2:
             return AP2_DEV_PREFIX
+        if self._is_pwsink:
+            return PWSINK_DEV_PREFIX
         return None
 
     @property
@@ -416,6 +429,12 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         # from the daemon's per-device store (0-100), default full scale.
         if self._is_sendspin:
             return self.coordinator.sendspin_volumes.get(self.node_name, 100) / 100
+        # pw-sink: the host's own master volume, read back from its agent. `None`
+        # while no agent is connected — the value belongs to that desktop, so
+        # there is nothing honest to show when we cannot see it.
+        if self._is_pwsink:
+            meta = self.coordinator.outputs_meta.get(self.node_name)
+            return meta.pwsink_volume if meta else None
         return None
 
     @property
@@ -425,6 +444,9 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         if self._is_ap2:
             meta = self.coordinator.outputs_meta.get(self.node_name)
             return meta.ap2_muted if meta else None
+        if self._is_pwsink:
+            meta = self.coordinator.outputs_meta.get(self.node_name)
+            return meta.pwsink_muted if meta else None
         return None
 
     @property
@@ -494,16 +516,22 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         elif self._is_sendspin:
             # 0.0–1.0 → 0–100, sent in-band to the device (no PipeWire node vol).
             await self.coordinator.client.async_set_sendspin_volume(self.node_name, round(volume * 100))
+        elif self._is_pwsink:
+            # Applied by the host's agent to its own master out (device Route).
+            await self.coordinator.client.async_set_pwsink_volume(self.node_name, volume)
         else:
             raise HomeAssistantError(f"volume is not supported for {self.entity_id}")
         await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
-        if not self._is_ap2:
-            # Only AirPlay-2 advertises VOLUME_MUTE; guard so a direct service
-            # call on another kind fails loudly instead of silently no-op-ing.
+        if self._is_ap2:
+            await self.coordinator.client.async_set_ap2_mute(self.node_name, mute)
+        elif self._is_pwsink:
+            await self.coordinator.client.async_set_pwsink_mute(self.node_name, mute)
+        else:
+            # Only AirPlay-2 and pw-sink advertise VOLUME_MUTE; guard so a direct
+            # service call on another kind fails loudly instead of no-op-ing.
             raise HomeAssistantError(f"mute is not supported for {self.entity_id}")
-        await self.coordinator.client.async_set_ap2_mute(self.node_name, mute)
         await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
@@ -633,6 +661,8 @@ class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaP
                 await self.coordinator.client.async_set_sendspin_volume(name, round(volume * 100))
             elif name.startswith(AP2_DEV_PREFIX):
                 await self.coordinator.client.async_set_ap2_volume(name, volume)
+            elif name.startswith(PWSINK_DEV_PREFIX):
+                await self.coordinator.client.async_set_pwsink_volume(name, volume)
         await self.coordinator.async_request_refresh()
 
 

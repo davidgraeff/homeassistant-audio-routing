@@ -244,6 +244,95 @@ async def test_ap2_reports_device_authoritative_volume_and_mute(hass):
     assert dusche.attributes["is_volume_muted"] is True
 
 
+async def test_pwsink_host_reports_its_own_master_volume(hass):
+    """A `pwsink-dev-*` output is a remote PipeWire host with a paired agent. Its
+    volume/mute are the *host's* master out, reported by that agent — so they show
+    up when reported and stay `None` when no agent is connected (the value belongs
+    to that desktop; fabricating one would fight the user)."""
+    from homeassistant.components.media_player import MediaPlayerEntityFeature
+
+    entry = _make_entry(hass)
+    routing = RoutingMatrix(
+        sources=[RoutingNode(node_id=10, node_name="shairport-sync", display_name="shairport-sync")],
+        outputs=[RoutingNode(node_id=None, node_name="pwsink-dev-desk_dave", display_name="desk (dave)", configured=False)],
+        links=[("shairport-sync", "pwsink-dev-desk_dave")],
+    )
+    outputs = [
+        OutputMeta(
+            node_name="pwsink-dev-desk_dave", kind="pwsink", ip=None, pwsink_volume=0.37, pwsink_muted=False
+        )
+    ]
+    with _patch_daemon([], routing, outputs=outputs):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    host = hass.states.get("media_player.desk_dave")
+    assert host is not None
+    assert host.state == "playing"
+    assert host.attributes["volume_level"] == 0.37
+    assert host.attributes["is_volume_muted"] is False
+    features = host.attributes["supported_features"]
+    assert features & MediaPlayerEntityFeature.VOLUME_SET
+    assert features & MediaPlayerEntityFeature.VOLUME_MUTE
+
+
+async def test_pwsink_volume_is_none_without_a_connected_agent(hass):
+    """No agent connected → the daemon omits the level, and the entity reports
+    `None` rather than a fabricated full scale."""
+    entry = _make_entry(hass)
+    routing = RoutingMatrix(
+        sources=[],
+        outputs=[RoutingNode(node_id=None, node_name="pwsink-dev-desk_dave", display_name="desk (dave)", configured=False)],
+        links=[],
+    )
+    outputs = [OutputMeta(node_name="pwsink-dev-desk_dave", kind="pwsink", ip=None)]
+    with _patch_daemon([], routing, outputs=outputs):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    host = hass.states.get("media_player.desk_dave")
+    assert host is not None
+    assert host.attributes.get("volume_level") is None
+
+
+async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
+    """pw-sink volume/mute go through `PUT /api/pwsink/volume|mute`, never the
+    node-volume, sendspin or AP2 paths."""
+    entry = _make_entry(hass)
+    routing = RoutingMatrix(
+        sources=[],
+        outputs=[RoutingNode(node_id=None, node_name="pwsink-dev-desk_dave", display_name="desk (dave)", configured=False)],
+        links=[],
+    )
+    outputs = [OutputMeta(node_name="pwsink-dev-desk_dave", kind="pwsink", ip=None)]
+    with _patch_daemon([], routing, outputs=outputs):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        with (
+            patch(f"{API}.async_set_pwsink_volume", new=AsyncMock()) as mock_vol,
+            patch(f"{API}.async_set_pwsink_mute", new=AsyncMock()) as mock_mute,
+            patch(f"{API}.async_set_ap2_volume", new=AsyncMock()) as mock_ap2_vol,
+            patch(f"{API}.async_set_volume", new=AsyncMock()) as mock_node_vol,
+        ):
+            await hass.services.async_call(
+                "media_player",
+                "volume_set",
+                {"entity_id": "media_player.desk_dave", "volume_level": 0.6},
+                blocking=True,
+            )
+            await hass.services.async_call(
+                "media_player",
+                "volume_mute",
+                {"entity_id": "media_player.desk_dave", "is_volume_muted": True},
+                blocking=True,
+            )
+            mock_vol.assert_awaited_once_with("pwsink-dev-desk_dave", 0.6)
+            mock_mute.assert_awaited_once_with("pwsink-dev-desk_dave", True)
+            mock_ap2_vol.assert_not_awaited()
+            mock_node_vol.assert_not_awaited()
+
+
 async def test_set_volume_on_ap2_device_uses_ap2_api(hass):
     """AirPlay-2 volume_set must go through the AP2 control plane
     (`PUT /api/ap2/volume`, 0.0–1.0), not the node-volume or sendspin paths."""

@@ -183,8 +183,9 @@ async fn session(
     let hello = AgentMsg::Hello {
         protocol: PROTOCOL_VERSION,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
-        identity: config::identity(),
-        label: config::label(),
+        machine_id: config::machine_id(),
+        hostname: config::hostname(),
+        user: config::user(),
         token: config.token.clone(),
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;

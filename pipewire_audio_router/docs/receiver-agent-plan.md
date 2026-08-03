@@ -1,7 +1,11 @@
 # `pwrouter-agent` — receiver-side helper for pw-sink targets
 
-Status: **planning + spikes** (2026-08-03). Supersedes the static receiver
-drop-in described in [pipewire-sink-roadmap.md](pipewire-sink-roadmap.md) §10.
+Status: **implemented** (2026-08-03) — P1-P3 built, control plane verified live
+(§14.2); deferrals listed in §13. Supersedes the static receiver drop-in described
+in [pipewire-sink-roadmap.md](pipewire-sink-roadmap.md) §10.
+
+Code: `pwrouter-agent/` (the helper) and `bridge-daemon/src/pwsink_agent.rs` (the
+daemon side).
 
 ## 1. Why
 
@@ -124,13 +128,25 @@ commands it knows.
 
 | Direction | Message | Notes |
 |---|---|---|
-| agent→daemon | `hello { agent_version, protocol, host, machine_id, sinks[] }` | identity + capability list |
-| daemon→agent | `welcome { session_name, receiver_args }` | which session to receive (§7) |
-| daemon→agent | `set_volume { volume: 0.0–1.0 }` | cubic scale, HA's `volume_level` contract |
-| daemon→agent | `set_mute { muted: bool }` | |
-| daemon→agent | `ping` / agent→daemon `pong` | keepalive, drives §9 deadline |
-| agent→daemon | `state { volume, muted, sink_name }` | pushed on *any* change, incl. local (pavucontrol) |
-| daemon→agent | `duck { depth, ramp_ms }` / `unduck { ramp_ms }` | **P3**, foreign streams only |
+| agent→daemon | `hello { protocol, agent_version, machine_id, hostname, user, token? }` | no token = a pair request; the daemon derives identity (`machine_id:user`), label and node name |
+| daemon→agent | `pair_pending { code }` | logged by the agent so the approver can match it |
+| daemon→agent | `paired { token }` / `denied { reason }` | approval mints the token; a denial ends the agent's retry loop |
+| daemon→agent | `welcome { session_name, ifname?, jitter_ms?, keepalive_secs }` | become the receiver for that session (§7); also arms the §9.2 deadline |
+| daemon→agent | `release` | stop receiving (target removed) — stays paired |
+| daemon→agent | `set_volume { volume }` | cubic 0.0-1.0, HA's `volume_level` contract |
+| daemon→agent | `set_mute { muted }` | |
+| daemon→agent | `duck { depth, ramp_ms }` / `unduck { ramp_ms }` | *foreign* streams only |
+| daemon→agent | `ping` / agent→daemon `pong` | keepalive |
+| agent→daemon | `state { volume, muted, sink_name, receiving, ducked }` | pushed on *any* change, including local ones |
+| agent→daemon | `foreign_session { session }` | another router is also received here (§7.1) |
+
+### 5.1 Parameters, never a module-args string
+
+`welcome` carries *parameters* (session name, optional interface, optional jitter
+buffer); the agent builds the `rtp-session` argument string itself. Passing the
+args through would hand whatever is on the other end of the socket the ability to
+reconfigure the host's audio arbitrarily — which is precisely the property that
+disqualified the PulseAudio TCP route in §1.1, so it must not reappear here.
 
 Master volume is the sink our stream feeds (§6), so `set_volume` is deliberately
 *not* parameterised by node — the agent decides which node that is, and the
@@ -138,9 +154,11 @@ daemon never learns the remote graph.
 
 ## 6. Master volume: which node, and which param
 
-Do **not** read `default.audio.sink` metadata (pipewire-rs 0.10 has no typed
-Metadata proxy — it would need the same hand-rolled FFI as `profiler.rs`).
-Instead follow the graph from the node the agent itself created:
+Do **not** read `default.audio.sink` metadata (pipewire-rs 0.10 *does* have a
+typed Metadata proxy, so this is a choice, not a workaround): the default sink is
+not necessarily the sink our stream landed in — the user can move it, and on a
+multi-sink host they will. Follow the graph from the node the agent itself created
+instead:
 
 1. the receive stream node — identified by `rtp.session` (§7.1), not by name;
 2. find the `Link` global whose `link.output.node` is that id;
@@ -318,10 +336,10 @@ desktop, a different feature; folding it into the agent is a separate decision.
 | **S1b** (spike) | session-name scoping for `rtp-session` | ✅ answered — impossible in the module, done agent-side via `rtp.session` (§7.1) |
 | **S2** (spike) | link-walk to the target sink + volume get/set | ✅ walk + read verified; ❗ write must use the device `Route` param, not node `Props` (§6.1) |
 | **S2b** (spike) | `SPA_PARAM_Route` set on the Device (volume + mute), read-back observed by `wpctl` | `wpctl get-volume` reflects an agent-set value; local changes read back |
-| **P1** | `pw-control` crate; agent skeleton (config, reconnect, restore-on-exit); `pwsink_agent.rs` in the daemon; pairing + token; master volume/mute end-to-end into the HA `media_player` | HA slider moves the desktop's master volume |
-| **P2** | receiver config owned by the agent; targets sourced from paired agents (§3); drop-ins deleted; systemd unit + download button | fresh host: install binary, pair, audio flows — no config file |
-| **P3** | per-stream duck of *foreign* streams with local ramp, wired to `announce_arbiter` alongside the existing `overlay_mixer` duck of our own music | announcement over desktop music, no zipper noise, auto-restore on kill -9 |
-| **P4** | host-scoped extras now that a helper exists: report sinks (target a *named* sink, not just the default), report xruns into the profiler badges | — |
+| **P1** | agent (config, pairing, reconnect, restore rails); `pwsink_agent.rs`; master volume/mute through to the HA `media_player` | ✅ built; control plane verified live (§14.2). `pw-control` extraction deferred (§13) |
+| **P2** | receiver config owned by the agent; targets sourced from paired agents (§3); drop-in deleted; systemd unit | ✅ built; adoption gate verified live. Serving the binary from the add-on frontend deferred (needs a cross-arch build stage) |
+| **P3** | per-stream duck of *foreign* streams with local ramp, wired to the announce path alongside `overlay_mixer` | ✅ built (`duck_output`/`unduck_output` from `announce.rs`); not yet heard on real audio |
+| **P4** | host-scoped extras: report sinks (target a *named* sink), report xruns into the profiler badges | deferred |
 
 Note P3's two ducks coexist: our own music in the stream is ducked by
 `overlay_mixer` on the daemon side as today; the agent only touches *other*
@@ -424,6 +442,58 @@ volume:         0.446 (cubic, = wpctl/HA scale)
 * Registry `global` props are a reduced set; `rtp.session` needs a bound node, and
   the bind must happen inside the registry callback (§7.1 caveat).
 
+### S2b — the device `Route` lever: **works**
+
+```
+lever:          device Route (index=3, device=4, 2ch)
+volume:         0.368 (cubic)  [unmuted]
+set volume to   0.250  →  wpctl get-volume @DEFAULT_AUDIO_SINK@ = 0.25
+restored 0.370  →  wpctl = 0.37
+```
+
+`wpctl` now agrees with the agent exactly, which the node-`Props` path never did
+(§6.1). Mute rides along in the same pod.
+
+## 14.2 Control plane, verified live (2026-08-03)
+
+A daemon built from this tree on `127.0.0.1:8099` plus the real agent, both on the
+author's desktop:
+
+* **pairing** — tokenless `Hello` → pending row with code `F89CFE`, the *same*
+  code in the agent's log and in `GET /api/agents`; `POST /api/agents/approve`
+  minted a token, the agent persisted it `0600` and reconnected with it, and was
+  welcomed as `pwsink-dev-david_local_david`;
+* **receiver ownership** — on `Welcome` the agent loaded `rtp-session` for its own
+  session name; the host went from 2 `pwsink-in` nodes (the stale in-daemon module)
+  to 4, and back to 2 on `SIGTERM`. Module lifetime really is process lifetime;
+* **cross-talk detection** — the agent noticed the *other* session on the host
+  (`pwrouter-david_local`, from the production add-on) and reported it without
+  touching it, exactly as §7.1 specifies. This also proves the bound-node prop
+  reading works on the service path, not just in the spike;
+* **commands** — `PUT /api/pwsink/volume|mute` reached the agent (it logged the
+  attempt and why it could not apply it: this host was not receiving *its* session,
+  only the production one), and an unknown host returns `503` rather than pretending;
+* **adoption gate** — the paired host appears under `/api/outputs/discovered` as
+  `discovered`, and only after `adopt` in `/api/outputs`, with
+  `present: true` while the agent is connected and `present: false` after it exits.
+  Volume/mute are omitted while unknown rather than fabricated;
+* **HA** — `media_player` gains `VOLUME_SET`/`VOLUME_MUTE` for `pwsink-dev-*`,
+  reads the host-reported level, and routes both through `/api/pwsink/*`
+  (3 new tests; 29 pass in `test_media_player.py`).
+
+### Not yet verified live
+
+The **join** between the two verified halves: an agent controlling the master
+volume of the sink *its own* session lands in. It needs a daemon that actually
+advertises a session to this agent, i.e. a deployed add-on — the local test daemon
+had no routing. Both halves are proven separately with the same lever code
+(§14/S2b), and the graph-tracking half of the service path is proven by the
+cross-talk detection above, so what remains untested is `pw_thread`'s
+`target_sink()` resolution on a live session. First thing to check after deploying.
+
+Also unverified: an audible duck of foreign streams (P3) and the sleep/resume
+behaviour (§13.4), both of which need normal day-to-day use rather than a test rig.
+
 ### Host state after the spikes
 
 * `~/.config/pipewire/pipewire.conf.d/90-pwsink-receiver.conf` **removed** (§9.3).
@@ -436,3 +506,7 @@ volume:         0.446 (cubic, = wpctl/HA scale)
   volume was never written.
 * A `module-native-protocol-tcp` loaded on loopback for the §1.1 pulse-auth test
   was unloaded again.
+* The §14.2 test rig is gone: the local daemon and agent processes were stopped,
+  their `/data` lived in a scratch directory, and the desktop's volume is back at
+  the 0.37 the *user* set. The agent is **not** installed as a service on this host
+  yet (no systemd unit enabled).

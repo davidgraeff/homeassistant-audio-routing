@@ -42,13 +42,21 @@ class OutputMeta:
     receiver hasn't reported it and the user hasn't set one) — reported to HA as
     `volume_level = None` rather than fabricating a value. `ap2_muted` is the
     last-known mute flag (defaulting to False). Both are `None` for non-AP2
-    outputs (and for any daemon too old to send them)."""
+    outputs (and for any daemon too old to send them).
+
+    For pw-sink outputs (`kind == "pwsink"`) the same pair appears as
+    `pwsink_volume`/`pwsink_muted` — the *host's own master out*, as reported by
+    the pwrouter-agent running on it. The host owns that value (the user can turn
+    the knob on their desktop), so it is likewise `None` when no agent is
+    connected rather than a fabricated level."""
 
     node_name: str
     kind: str
     ip: str | None
     ap2_volume: float | None = None
     ap2_muted: bool | None = None
+    pwsink_volume: float | None = None
+    pwsink_muted: bool | None = None
 
 
 @dataclass
@@ -182,6 +190,8 @@ class PipewireRouterApiClient:
                 # coerce to a number) so the entity can report volume_level=None.
                 ap2_volume=item.get("ap2_volume"),
                 ap2_muted=item.get("ap2_muted"),
+                pwsink_volume=item.get("pwsink_volume"),
+                pwsink_muted=item.get("pwsink_muted"),
             )
             for item in data
         ]
@@ -234,6 +244,35 @@ class PipewireRouterApiClient:
                 resp.raise_for_status()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not set AirPlay-2 volume: {err}") from err
+
+    async def async_set_pwsink_volume(self, node_name: str, volume: float) -> None:
+        """Set a pw-sink host's *master* volume (`PUT /api/pwsink/volume`,
+        0.0-1.0 cubic). Applied by that host's pwrouter-agent to the sink our
+        stream actually plays into, via the device's Route param — the same lever
+        the user's own volume applet uses, so the two agree.
+
+        Unlike sendspin/AirPlay-2 volume there is no store-and-replay: an
+        unreachable host is a failure, not a saved intent, because the host owns
+        the value and reports it back."""
+        try:
+            async with self._session.put(
+                f"{self._base_url}/api/pwsink/volume",
+                json={"node_name": node_name, "volume": volume},
+            ) as resp:
+                resp.raise_for_status()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not set pw-sink volume: {err}") from err
+
+    async def async_set_pwsink_mute(self, node_name: str, muted: bool) -> None:
+        """Mute/unmute a pw-sink host's master out (`PUT /api/pwsink/mute`)."""
+        try:
+            async with self._session.put(
+                f"{self._base_url}/api/pwsink/mute",
+                json={"node_name": node_name, "muted": muted},
+            ) as resp:
+                resp.raise_for_status()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not set pw-sink mute: {err}") from err
 
     async def async_set_ap2_mute(self, node_name: str, muted: bool) -> None:
         """Mute/unmute one AirPlay-2 receiver (`PUT /api/ap2/mute`). Daemon-side
