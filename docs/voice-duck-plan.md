@@ -210,7 +210,7 @@ automatable:
 | **VD3** | REST API | `api.rs`, `docs/api-reference.md` | 4 endpoints, `announcement_group` resolution reusing the `/api/announce` code path, one `USER ACTION: duck -> N target(s)` log line per call |
 | **VD4** | HA voice ducking | `voice_duck.py`, `api.py`, `__init__.py`, `switch.py`, `number.py`, `select.py`, `const.py`, `strings.json` | satellite→area→outputs resolution, both scopes, renewal, release on idle; pytest: area via device, area overridden on entity, satellite with no area (no-op), scope `music_group` expands to all MG members, scope `area` does **not**, satellite's own output *included*, two satellites in different areas concurrently, release on `unavailable` |
 | **VD5** | UI + docs | `frontend/src/components/OutputsTab.svelte`, `docs/architecture.md` §5.3, `README.md` | a "ducked" badge on an output with a live hold; architecture note that duck now has two producers (AG overlay, duck hold) |
-| **L1–L6** | Legacy removal (§7) | see §7 | separable; do after VD3 lands, before or after VD4 |
+| ~~L1–L5~~ | Legacy removal (§7) | see §7 | **done 2026-08-03** (3 commits); L6 still deferred |
 
 VD1–VD3 are independently testable without HA (`curl` a hold onto a playing
 output). VD4 is where the blueprint actually dies.
@@ -263,6 +263,18 @@ which makes L1–L4 dead code paths kept alive by callers that never fire. L5
 (Wyoming TTS) is a different case — a live but redundant feature, removed because
 HA already does the job. Verified caller-by-caller; each item lists its full blast
 radius.
+
+> **Done 2026-08-03**, in three commits on `chore/drop-legacy-node-volume-api`:
+> L1+L2 together (`api:` drop the listing + per-node volume), L3+L4 together
+> (`announce:` drop the v1 ducked announce and delete `volume.rs` — separating
+> them would have left a commit with 9 dead-code warnings), and L5 (`announce:`
+> remove the Wyoming source). Net −1 470 lines. Each commit verified with the
+> daemon test suite (163 tests, zero build warnings), the integration tests (41
+> passing; two config-flow teardown errors pre-exist at HEAD) and `svelte-check`.
+> Two things the plan had not anticipated: the coordinator needed a *replacement*
+> authoritative call, so `GET /health` (which the config flow's docstring already
+> claimed it used) now serves both, and `player::play_wav_to_target` +
+> `decode::decode_file_to_wav` fell out as unreachable too. L6 remains deferred.
 
 **L1 — `GET /api/media_players`.** The handler already documents itself as
 "normally empty on the current architecture, and that is correct" — it filters on
