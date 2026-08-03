@@ -312,8 +312,12 @@ pub async fn refresh_probes(bridges: &SharedBtBridges) {
     }
     let mut results = Vec::new();
     while let Some(joined) = tasks.join_next().await {
-        if let Ok(r) = joined {
-            results.push(r);
+        match joined {
+            Ok(r) => results.push(r),
+            // A probe task that dies leaves the bridge's verdict *unset*, which
+            // the UI shows as "not answering" — so it gets logged rather than
+            // dropped (that silence hid a panicking probe client for a while).
+            Err(e) => tracing::warn!("bridge diagnostics probe task failed: {e}"),
         }
     }
     let mut map = bridges.lock_recover();
@@ -330,26 +334,65 @@ pub async fn refresh_probes(bridges: &SharedBtBridges) {
 
 /// The probe HTTP client, built once. A fresh `Client` per refresh would throw
 /// away the connection pool and re-do TLS-less setup for every check.
-fn probe_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder().timeout(PROBE_TIMEOUT).build().unwrap_or_else(|_| reqwest::Client::new())
-    })
+///
+/// `None` when a client cannot be built at all. That is not hypothetical: our
+/// reqwest uses the `rustls` feature, i.e. `rustls-platform-verifier`, which
+/// loads the **system** CA store — so in a runtime image without
+/// `ca-certificates` every `build()` fails with "No CA certificates were loaded
+/// from the system", even though this probe only ever speaks plain HTTP to a LAN
+/// address. This used to fall back to `Client::new()`, which *panics* on exactly
+/// that error; the panic happened inside a probe task, [`refresh_probes`]
+/// dropped the `JoinError` silently, no verdict was ever stored, and every
+/// bridge reported "diagnostics page not answering" while its page was perfectly
+/// reachable. Hence: no panic, and say so in the log.
+fn probe_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!("no HTTP client for bridge diagnostics probes ({e}) — diagnostics links stay hidden");
+                None
+            }
+        })
+        .as_ref()
 }
 
 /// One diagnostics probe: `GET <url>api/state` must answer 200 with a body that
 /// looks like the testing app.
+///
+/// Every negative verdict is logged: a probe that quietly returns `false` turns
+/// into a UI badge claiming the page is down, so the log has to be able to say
+/// whether that was a refused connection, an HTTP error, or a body that wasn't
+/// the testing app's.
 async fn probe(base_url: &str) -> bool {
-    let url = format!("{}api/state", if base_url.ends_with('/') { base_url.to_string() } else { format!("{base_url}/") });
-    let Ok(resp) = probe_client().get(&url).timeout(PROBE_TIMEOUT).send().await else {
+    let Some(client) = probe_client() else {
         return false;
     };
+    let url = format!("{}api/state", if base_url.ends_with('/') { base_url.to_string() } else { format!("{base_url}/") });
+    let resp = match client.get(&url).timeout(PROBE_TIMEOUT).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("bridge diagnostics probe {url}: {e}");
+            return false;
+        }
+    };
     if !resp.status().is_success() {
+        tracing::debug!("bridge diagnostics probe {url}: HTTP {}", resp.status());
         return false;
     }
     match resp.text().await {
-        Ok(body) => looks_like_diag_app(&body),
-        Err(_) => false,
+        Ok(body) => {
+            let ok = looks_like_diag_app(&body);
+            if !ok {
+                tracing::debug!("bridge diagnostics probe {url}: answered, but not the testing app");
+            }
+            ok
+        }
+        Err(e) => {
+            tracing::debug!("bridge diagnostics probe {url}: reading the body failed ({e})");
+            false
+        }
     }
 }
 

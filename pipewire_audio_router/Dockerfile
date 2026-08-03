@@ -250,6 +250,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dbus-x11 \
         procps \
         bash \
+        # The system CA store. Not optional: our reqwest uses the `rustls`
+        # feature, which is `rustls-platform-verifier` — it loads roots from the
+        # *system* store, and with an empty /etc/ssl/certs EVERY
+        # `Client::builder().build()` fails with "No CA certificates were loaded
+        # from the system". That broke two unrelated things at once: fetching an
+        # announcement/TTS clip by URL (`api.rs::fetch_to_file`) and the
+        # Bluetooth-bridge diagnostics probe, which reported every bridge's page
+        # as unreachable while it was serving fine (~400KB, and it is what makes
+        # any https:// clip URL work at all).
+        ca-certificates \
         # Runtime shared libs for the vendored libairptp (AirPlay-2 gPTP master,
         # src/ap2_ptp.rs) — it runs a libevent loop, so unlike libasound2 the
         # DT_NEEDED is NOT dropped and the .so must be present. Names carry the
