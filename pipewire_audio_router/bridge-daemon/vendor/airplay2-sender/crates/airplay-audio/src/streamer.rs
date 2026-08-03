@@ -336,7 +336,7 @@ fn sender_thread_main(
                     if packet_count % 500 < burst_size as u64 {
                         let bursts = packet_count / burst_size as u64;
                         let avg_jitter = if bursts > 1 { jitter_sum_ms / (bursts - 1) as f64 } else { 0.0 };
-                        tracing::info!(
+                        tracing::debug!(
                             "TIMING STATS after {} pkts ({} bursts): avg_jitter={:.3}ms max_jitter={:.3}ms exceeds={}",
                             packet_count, bursts, avg_jitter, max_jitter_ms, jitter_exceed_count
                         );
@@ -1156,7 +1156,7 @@ async fn run_streamer(
                         (sum / frame.samples.len() as f64).sqrt()
                     };
                     let max_abs = frame.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-                    tracing::info!(
+                    tracing::debug!(
                         "DIAG PCM frame #{}: samples={}, rms={:.1}, max_abs={}, first_4={:?}",
                         diag, frame.samples.len(), rms, max_abs,
                         &frame.samples[..frame.samples.len().min(4)]
@@ -1189,7 +1189,7 @@ async fn run_streamer(
                 // Diagnostic: log encoded ALAC data and timing for first few packets
                 if diag < 5 || diag % 500 == 0 {
                     let all_zero = packet.data.iter().all(|&b| b == 0);
-                    tracing::info!(
+                    tracing::debug!(
                         "DIAG ALAC packet #{}: encoded_len={}, all_zero={}, first_8={:02x?}, encode_time={:.2}ms",
                         diag, packet.data.len(), all_zero,
                         &packet.data[..packet.data.len().min(8)],
@@ -1276,7 +1276,7 @@ async fn run_streamer(
                         }
 
                         if diag < 5 || diag % 500 == 0 {
-                            tracing::info!(
+                            tracing::debug!(
                                 "DIAG timing #{}: encode={:.2}ms, targets={} (sender thread handles send timing)",
                                 diag,
                                 encode_elapsed.as_secs_f64() * 1000.0,
@@ -1333,7 +1333,7 @@ async fn run_streamer(
                         let send_elapsed = send_start.elapsed();
 
                         if diag < 5 || diag % 500 == 0 {
-                            tracing::info!(
+                            tracing::debug!(
                                 "DIAG timing #{}: encode={:.2}ms, send={:.2}ms, targets={}, total={:.2}ms",
                                 diag,
                                 encode_elapsed.as_secs_f64() * 1000.0,

@@ -485,7 +485,7 @@ impl RtpSender {
             // Debug: log nonce and tag for first few packets
             if seq_before % 500 == 0 {
                 if let (Some(nonce), Some(tag)) = (&encrypted.nonce, &encrypted.tag) {
-                    tracing::info!(
+                    tracing::debug!(
                         "Encrypted packet: seq={}, ts={}, ssrc={:08x}, nonce={:02x?}, tag_first4={:02x?}, payload_len={}",
                         seq_before, timestamp, self.ssrc, nonce, &tag[..4], payload.len()
                     );

@@ -8,6 +8,7 @@ use airplay_core::features::Features;
 use crate::ap2_ptp::SharedAp2Ptp;
 use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
+use crate::outputs_store::{OutputState, SharedOutputs};
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
 use crate::routing_store::SharedRouting;
@@ -78,6 +79,12 @@ pub struct AppState {
     /// PipeWire hosts running `module-rtp-session`, surfaced as virtual routing
     /// outputs (`pwsink-dev-*`) and driven by per-target AppleMIDI senders.
     pub pw_targets: crate::pw_target_discovery::SharedPwTargets,
+    /// Live mDNS-discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs).
+    /// Unlike the other discoveries these are *senders*, not outputs: they build
+    /// no audio path, they annotate an RTP source with which bridge feeds it and
+    /// offer that bridge's diagnostics page. Unconfigured ones are offered for
+    /// adoption on the Sources tab.
+    pub bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
     /// The daemon's single host-global AirPlay-2 PTP grandmaster (ap2_ptp.rs),
     /// reused by the AP2 tone spike (ap2_spike.rs) so it shares 319/320 rather
     /// than double-binding.
@@ -88,6 +95,10 @@ pub struct AppState {
     /// name, reconciled onto the live graph so routing survives node reloads
     /// and device disappearance/reappearance.
     pub routing: SharedRouting,
+    /// Which discovered outputs the user adopted (outputs_store.rs). Discovery
+    /// only *offers* a device; until it's added here it stays out of the routing
+    /// matrix, out of Home Assistant and out of the group reconciler.
+    pub outputs: SharedOutputs,
     /// Persistent sync/latency tuning (sync_settings.rs): the group presentation
     /// lead + per-sendspin-device static delays.
     pub sync_settings: crate::sync_settings::SharedSyncSettings,
@@ -96,7 +107,7 @@ pub struct AppState {
     pub settings: SharedSettings,
     /// Runtime mDNS on/off, driven by the discovery flag above.
     pub discovery: crate::discovery_supervisor::DiscoverySupervisor,
-    /// Latency-alignment session manager (calibrate.rs) for the Align page.
+    /// Latency-alignment session manager (calibrate.rs) for the alignment panel.
     pub align: crate::calibrate::AlignManager,
     /// Live sync-group layout (sync_group.rs) — used to restart a group's
     /// sendspin stream when a static-delay change needs it to take effect.
@@ -137,8 +148,10 @@ pub fn router(
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
     pw_targets: crate::pw_target_discovery::SharedPwTargets,
+    bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
     ap2_ptp: SharedAp2Ptp,
     routing: SharedRouting,
+    outputs: SharedOutputs,
     sendspin_control: crate::sendspin_volume::SharedSendspinControl,
     ap2_control: crate::ap2_volume::SharedAp2Control,
     sync_settings: crate::sync_settings::SharedSyncSettings,
@@ -164,8 +177,10 @@ pub fn router(
         sendspin_devices,
         ap2_devices,
         pw_targets,
+        bt_bridges,
         ap2_ptp,
         routing,
+        outputs,
         sendspin_control,
         ap2_control,
         sync_settings,
@@ -182,6 +197,15 @@ pub fn router(
         .route("/api/nodes", get(list_nodes))
         .route("/api/links", post(create_link))
         .route("/api/outputs", get(list_outputs))
+        // Discovery only *offers* a device; these three are how the user decides.
+        // `/discovered` is a static sibling of the `{node_name}` remove route below;
+        // matchit prefers the static segment, and registering both is accepted (see
+        // `discovered_listing_and_remove_routes_coexist` — a route conflict would
+        // panic here at startup, where nothing would catch it).
+        .route("/api/outputs/discovered", get(list_discovered_outputs))
+        .route("/api/outputs/{node_name}", delete(remove_output))
+        .route("/api/outputs/{node_name}/adopt", post(adopt_output))
+        .route("/api/outputs/{node_name}/ignore", post(ignore_output))
         .route("/api/outputs/{node_name}/latency", put(set_output_latency))
         .route("/api/outputs/{node_name}/ap2-rate", put(set_ap2_rate_mode))
         .route("/api/outputs/{node_name}/sendspin-codec", put(set_sendspin_codec))
@@ -418,11 +442,16 @@ async fn create_link(State(app): State<AppState>, Json(req): Json<CreateLinkRequ
 // or AirPlay-2 `ap2-dev-*`) — there is no manual output store and no runtime
 // module load/unload for outputs (the AirPlay-1/RAOP output path was removed).
 
-/// An output for the Outputs tab. Covers discovered sendspin devices and
-/// AirPlay-2 receivers, in both origins the UI shows:
+/// An output for the Outputs tab, in both origins the UI shows:
 /// - **discovered**: present via mDNS — `present: true`, `configured: false`.
-/// - **offline**: referenced by saved routing intent but not currently
-///   discovered — `present: false` (shown grayed; re-linked when it returns).
+/// - **offline**: adopted (or referenced by saved routing intent) but not
+///   currently discovered — `present: false` (shown grayed; re-linked when it
+///   returns).
+///
+/// The same shape serves both listings: `GET /api/outputs` (adopted only — the
+/// system's actual outputs, which is what the routing matrix, the group editors
+/// and the HA integration mean by "output") and `GET /api/outputs/discovered`
+/// (everything found but not adopted). `state` says which bucket an entry is in.
 /// Decoded AirPlay-2 capability flags (from the `features` TXT bitmask), surfaced
 /// in `/api/outputs` for the Diagnostics capability card. `raw` is the canonical
 /// `0xLOWER,0xUPPER` string for copy/paste + cross-referencing.
@@ -448,6 +477,11 @@ struct OutputInfo {
     /// Always `false` now that every output is mDNS auto-discovered (kept for
     /// the API shape / a possible future manually-added output kind).
     configured: bool,
+    /// The user's verdict on this discovered device (outputs_store.rs):
+    /// `"adopted"` (a real output), `"discovered"` (found, awaiting a decision)
+    /// or `"ignored"` (dismissed). Only `"adopted"` outputs are routable and
+    /// exposed to Home Assistant.
+    state: &'static str,
     /// Connection details (from the mDNS-resolved address).
     ip: Option<String>,
     port: Option<u16>,
@@ -587,16 +621,42 @@ fn sendspin_codec_info(
     (mode.as_str(), active, options)
 }
 
-async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
+/// Every output node name we know of *besides* what mDNS currently sees: the
+/// adopted set (so an adopted device that's off the network stays listed as
+/// offline) plus anything still referenced by saved routing intent or by a
+/// music/announcement group. The latter two matter because adoption starts
+/// empty on an upgrade — a device the user had routed must still be findable on
+/// the Outputs page (under "Discovered", offline if need be) so its saved
+/// routing can be picked back up or cleaned away, rather than becoming
+/// invisible state.
+fn remembered_output_names(state: &AppState) -> std::collections::BTreeSet<String> {
+    let mut names = state.outputs.lock_recover().adopted().clone();
+    names.extend(state.routing.lock_recover().referenced_outputs());
+    let groups = state.groups_config.lock_recover();
+    for g in groups.music() {
+        names.extend(g.members.iter().cloned());
+    }
+    for g in groups.announcement() {
+        names.extend(g.targets.iter().cloned());
+    }
+    names
+}
+
+/// Build the full output listing — every kind, every known device, each tagged
+/// with its adoption `state`. The two endpoints below are filtered views of this:
+/// `/api/outputs` keeps the adopted ones, `/api/outputs/discovered` the rest.
+async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
     use std::collections::BTreeSet;
 
     let mut outputs: Vec<OutputInfo> = Vec::new();
+    let remembered = remembered_output_names(state);
+    let adoption = |n: &str| state.outputs.lock_recover().state(n).as_str();
 
-    // Discovered sendspin devices (present) + any offline ones still referenced
-    // by saved routing intent — so users see every routable output.
+    // Discovered sendspin devices (present) + any offline ones we remember — so
+    // users see every output the system knows about.
     let devices = state.sendspin_devices.lock_recover().clone();
     let mut sendspin_names: BTreeSet<String> = devices.keys().cloned().collect();
-    sendspin_names.extend(state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(SENDSPIN_DEV_PREFIX)));
+    sendspin_names.extend(remembered.iter().filter(|n| n.starts_with(SENDSPIN_DEV_PREFIX)).cloned());
     for node_name in sendspin_names {
         let dev = devices.get(&node_name);
         let present = dev.is_some();
@@ -628,6 +688,7 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             kind: "sendspin",
             present,
             configured: false, // sendspin devices are always auto-discovered
+            state: adoption(&node_name),
             name,
             ip: addr.map(|a| a.ip().to_string()),
             port: addr.map(|a| a.port()),
@@ -653,9 +714,9 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
         });
     }
 
-    // Discovered AirPlay-2 receivers (present) + offline ones still referenced by
-    // saved routing intent. These are the RAOP-output replacement; like sendspin
-    // devices they're virtual (no PipeWire node) and always auto-discovered.
+    // Discovered AirPlay-2 receivers (present) + remembered offline ones. These
+    // are the RAOP-output replacement; like sendspin devices they're virtual (no
+    // PipeWire node) and always auto-discovered.
     let ap2_devices = state.ap2_devices.lock_recover().clone();
     // Per-output AP2 render-delay overrides (sync_settings.rs), keyed by node name
     // — the per-output latency field (`latency_ms`).
@@ -674,7 +735,7 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
         (c.volumes(), c.mutes())
     };
     let mut ap2_names: BTreeSet<String> = ap2_devices.keys().cloned().collect();
-    ap2_names.extend(state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(AP2_DEV_PREFIX)));
+    ap2_names.extend(remembered.iter().filter(|n| n.starts_with(AP2_DEV_PREFIX)).cloned());
     for node_name in ap2_names {
         let dev = ap2_devices.get(&node_name);
         let present = dev.is_some();
@@ -728,6 +789,7 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             kind: "airplay2",
             present,
             configured: false, // AP2 receivers are always auto-discovered
+            state: adoption(&node_name),
             name,
             ip: addr.map(|a| a.ip().to_string()),
             port: addr.map(|a| a.port()),
@@ -754,14 +816,14 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
         });
     }
 
-    // Discovered pw-sink targets (present) + offline ones still referenced by
-    // saved routing intent. Like sendspin/AP2 they're virtual (no local PipeWire
+    // Discovered pw-sink targets (present) + remembered offline ones. Like
+    // sendspin/AP2 they're virtual (no local PipeWire
     // node) and always auto-discovered; the audio path is a per-target AppleMIDI
     // sender (pwsink_server.rs). `present` = mDNS-visible; `pwsink_streaming` =
     // a receiver has actually completed the handshake (pw_sink_liveness.rs).
     let pw_targets = state.pw_targets.lock_recover().clone();
     let mut pwsink_names: BTreeSet<String> = pw_targets.keys().cloned().collect();
-    pwsink_names.extend(state.routing.lock_recover().referenced_outputs().into_iter().filter(|n| n.starts_with(PWSINK_DEV_PREFIX)));
+    pwsink_names.extend(remembered.iter().filter(|n| n.starts_with(PWSINK_DEV_PREFIX)).cloned());
     for node_name in pwsink_names {
         let tgt = pw_targets.get(&node_name);
         let present = tgt.map(|t| t.present).unwrap_or(false);
@@ -775,6 +837,7 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
             kind: "pwsink",
             present,
             configured: false, // pw-sink targets are always auto-discovered
+            state: adoption(&node_name),
             name,
             ip: addr.map(|a| a.to_string()),
             port: None, // the control port is internal/dynamic (pwsink_server.rs)
@@ -801,7 +864,100 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
         });
     }
 
+    outputs
+}
+
+/// The system's outputs: adopted only. Everything downstream — the routing
+/// matrix's counterpart listing, the group editors, the Align page, the HA
+/// integration's per-output metadata — means *these* by "output". A discovered
+/// device the user hasn't added yet is deliberately absent.
+async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
+    let mut outputs = collect_outputs(&state).await;
+    outputs.retain(|o| o.state == OutputState::Adopted.as_str());
     Json(outputs)
+}
+
+/// Devices discovery has *offered* but the user hasn't added: `state` is
+/// `"discovered"` or `"ignored"`. Both are returned in one listing so the
+/// Outputs page's "show ignored" checkbox is a client-side filter rather than a
+/// refetch. Carries the same connection details, codec picker and test-playback
+/// eligibility as an adopted output, because identifying a device ("which
+/// speaker is `ap2-dev-living-2`?") is exactly what you need before deciding.
+async fn list_discovered_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
+    let mut outputs = collect_outputs(&state).await;
+    outputs.retain(|o| o.state != OutputState::Adopted.as_str());
+    Json(outputs)
+}
+
+/// Drop every trace of an output from the *intent* stores: saved routing links
+/// and music/announcement group membership. Shared by remove and ignore — both
+/// mean "this is not one of my outputs", and leaving a stale link or group
+/// member behind would silently re-route it if it were added again later.
+/// Returns a human-readable note about what was cleaned, for the toast.
+fn forget_output_intent(state: &AppState, node_name: &str) -> String {
+    let mut notes: Vec<String> = Vec::new();
+    let links = state.routing.lock_recover().referenced_outputs().contains(node_name);
+    if links {
+        if let Err(e) = state.routing.lock_recover().remove_entity(node_name) {
+            tracing::warn!("removing routing intent for '{node_name}': {e}");
+        } else {
+            notes.push("routing".to_string());
+        }
+    }
+    match state.groups_config.lock_recover().remove_output(node_name) {
+        Ok(true) => notes.push("group membership".to_string()),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("removing '{node_name}' from groups: {e}"),
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" (also cleared its {})", notes.join(" and "))
+    }
+}
+
+/// Add a discovered device: from here on it's routable, tunable and — with the
+/// `expose_outputs_as_media_players` setting on — an HA `media_player`. Any
+/// routing it had from before (an upgrade, or a previous adoption) is still in
+/// the store and starts applying again on the next reconcile, which is why this
+/// nudges the change notifier.
+async fn adopt_output(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+    tracing::info!("USER ACTION: add output '{}'", node_name);
+    if let Err(e) = state.outputs.lock_recover().adopt(&node_name) {
+        return Json(OutputOpResponse { ok: false, message: format!("failed to add '{node_name}': {e}") });
+    }
+    let _ = state.changes.send(());
+    Json(OutputOpResponse { ok: true, message: format!("added '{}'", routing::output_display_name(&node_name)) })
+}
+
+/// Dismiss a discovered device: hidden from the Outputs page unless "show
+/// ignored" is ticked. The stronger form of remove — so it also clears any
+/// routing/group references it had.
+async fn ignore_output(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+    tracing::info!("USER ACTION: ignore output '{}'", node_name);
+    let cleaned = forget_output_intent(&state, &node_name);
+    if let Err(e) = state.outputs.lock_recover().ignore(&node_name) {
+        return Json(OutputOpResponse { ok: false, message: format!("failed to ignore '{node_name}': {e}") });
+    }
+    let _ = state.changes.send(());
+    Json(OutputOpResponse { ok: true, message: format!("ignoring '{}'{cleaned}", routing::output_display_name(&node_name)) })
+}
+
+/// Remove an output: back to undecided. It stops being routable, loses its HA
+/// media_player, and its routing + group membership are forgotten. A device
+/// that's still on the network reappears under "Discovered" (where it can be
+/// added again or ignored); one that's offline/gone simply disappears.
+async fn remove_output(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+    tracing::info!("USER ACTION: remove output '{}'", node_name);
+    let cleaned = forget_output_intent(&state, &node_name);
+    if let Err(e) = state.outputs.lock_recover().reset(&node_name) {
+        return Json(OutputOpResponse { ok: false, message: format!("failed to remove '{node_name}': {e}") });
+    }
+    // Un-adopting changes what the group reconciler is allowed to drive, so the
+    // device's stream/session has to be torn down now, not on the next unrelated
+    // registry event.
+    let _ = state.changes.send(());
+    Json(OutputOpResponse { ok: true, message: format!("removed '{}'{cleaned}", routing::output_display_name(&node_name)) })
 }
 
 // ---- AirPlay-receive source -----------------------------------------------
@@ -1081,17 +1237,80 @@ struct SourceView {
     airplay: Option<AirplaySourceConfig>,
     /// The RTP config when `kind == rtp`, else `null`.
     rtp: Option<RtpSourceConfig>,
+    /// The discovered Bluetooth bridge that feeds this RTP source, when exactly
+    /// one advertises this port (and group). `null` for AirPlay sources, when no
+    /// bridge advertises, or when two do — see `bt_bridge_discovery::match_bridge`.
+    bridge: Option<BridgeView>,
+}
+
+/// A discovered Bluetooth→RTP bridge, as the UI sees it. Used both nested on an
+/// RTP source (`bridge`) and standalone in `discovered_bridges`.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct BridgeView {
+    /// mDNS instance fullname — the stable identity the UI keys on.
+    fullname: String,
+    /// Human label from the advert (the bridge's Bluetooth/host name).
+    display_name: String,
+    /// mDNS hostname, for display when the address is uninformative.
+    hostname: String,
+    /// Resolved address, `null` until mDNS resolves one.
+    addr: Option<String>,
+    /// UDP port this bridge sends RTP to (what a source must listen on).
+    rtp_port: u16,
+    /// Its RTP destination: the HA host's address, or a multicast group.
+    rtp_dest: String,
+    rate: u32,
+    channels: u16,
+    /// Diagnostics page URL, `null` while the address is unresolved.
+    diag_url: Option<String>,
+    /// The diagnostics app answered on the last probe. **The UI must only offer
+    /// the link when this is true** — the advert is installed by
+    /// `setup_pi_bridge.py` and outlives any particular app run.
+    diag_ok: bool,
+}
+
+impl BridgeView {
+    fn of(b: &crate::bt_bridge_discovery::BtBridge) -> Self {
+        Self {
+            fullname: b.fullname.clone(),
+            display_name: b.display_name.clone(),
+            hostname: b.hostname.trim_end_matches('.').to_string(),
+            addr: b.addr.map(|a| a.to_string()),
+            rtp_port: b.stream.rtp_port,
+            rtp_dest: b.stream.rtp_dest.clone(),
+            rate: b.stream.rate,
+            channels: b.stream.channels,
+            diag_url: b.diag_url(),
+            diag_ok: b.diag_ok(),
+        }
+    }
 }
 
 /// Pure conversion: flat stored [`SourceEntry`] + a live `present` flag → the
 /// nested [`SourceView`] wire shape. Kept side-effect-free so it is unit-tested
 /// directly (see tests below).
-fn source_view(entry: &SourceEntry, present: bool) -> SourceView {
+///
+/// `bridges` is the discovered-bridge set to match an RTP source against; pass an
+/// empty slice to skip (AirPlay sources never match).
+fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::bt_bridge_discovery::BtBridge]) -> SourceView {
     let (airplay, rtp) = match &entry.config {
         SourceConfig::Airplay(a) => (Some(a.clone()), None),
         SourceConfig::Rtp(r) => (None, Some(r.clone())),
     };
-    SourceView { id: entry.id.clone(), label: entry.label.clone(), kind: entry.kind(), present, node_name: entry.node_name(), airplay, rtp }
+    let bridge = rtp
+        .as_ref()
+        .and_then(|r| crate::bt_bridge_discovery::match_bridge(bridges.iter(), r.port, &r.source_addr))
+        .map(BridgeView::of);
+    SourceView {
+        id: entry.id.clone(),
+        label: entry.label.clone(),
+        kind: entry.kind(),
+        present,
+        node_name: entry.node_name(),
+        airplay,
+        rtp,
+        bridge,
+    }
 }
 
 /// Whether a node with `node_name` is present in the live registry right now.
@@ -1122,6 +1341,12 @@ fn default_rtp_config() -> RtpSourceConfig {
 #[derive(Serialize)]
 struct SourcesListResponse {
     sources: Vec<SourceView>,
+    /// Discovered Bluetooth bridges that no configured RTP source is listening
+    /// for — offered on the Sources tab for one-click adoption, with their
+    /// advertised port/rate prefilled so the two ends cannot disagree by typo.
+    /// A bridge already matched by a source appears there (`sources[].bridge`)
+    /// and is omitted here, so the list is exactly "what is missing".
+    discovered_bridges: Vec<BridgeView>,
 }
 
 /// `POST /api/sources` body. `kind` selects which config object is honored; the
@@ -1161,10 +1386,29 @@ fn source_err(code: StatusCode, message: String) -> SourceError {
 }
 
 async fn list_sources(State(state): State<AppState>) -> Json<SourcesListResponse> {
+    // Probe stale diagnostics pages first, so `bridge.diag_ok` in this very
+    // response reflects a fresh check. Only when someone is looking (this
+    // handler), rate-limited by `PROBE_TTL` — no background polling of Pi Zeros.
+    crate::bt_bridge_discovery::refresh_probes(&state.bt_bridges).await;
+
     let entries = state.sources.lock_recover().list();
     let present = present_node_names(&state.pw);
-    let sources = entries.iter().map(|e| source_view(e, present.contains(&e.node_name()))).collect();
-    Json(SourcesListResponse { sources })
+    let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
+    let sources: Vec<SourceView> =
+        entries.iter().map(|e| source_view(e, present.contains(&e.node_name()), &bridges)).collect();
+    let discovered_bridges = unmatched_bridges(&bridges, &sources);
+    Json(SourcesListResponse { sources, discovered_bridges })
+}
+
+/// The bridges not already claimed by a source in `sources`, as views.
+///
+/// Pure so the "already configured disappears from the offer list" rule is
+/// unit-tested: a bridge visible in both lists would invite the user to add a
+/// duplicate source on a port that is already taken.
+fn unmatched_bridges(bridges: &[crate::bt_bridge_discovery::BtBridge], sources: &[SourceView]) -> Vec<BridgeView> {
+    let claimed: std::collections::HashSet<&str> =
+        sources.iter().filter_map(|s| s.bridge.as_ref()).map(|b| b.fullname.as_str()).collect();
+    bridges.iter().filter(|b| !claimed.contains(b.fullname.as_str())).map(BridgeView::of).collect()
 }
 
 async fn create_source(
@@ -1184,7 +1428,8 @@ async fn create_source(
     reconcile_sources(&state).await;
     let _ = state.changes.send(());
     let present = node_present(&state.pw, &entry.node_name());
-    Ok((StatusCode::CREATED, Json(source_view(&entry, present))))
+    let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
+    Ok((StatusCode::CREATED, Json(source_view(&entry, present, &bridges))))
 }
 
 async fn get_source(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<SourceView>, SourceError> {
@@ -1194,7 +1439,8 @@ async fn get_source(State(state): State<AppState>, Path(id): Path<String>) -> Re
         .get(&id)
         .ok_or_else(|| source_err(StatusCode::NOT_FOUND, format!("no source with id '{id}'")))?;
     let present = node_present(&state.pw, &entry.node_name());
-    Ok(Json(source_view(&entry, present)))
+    let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
+    Ok(Json(source_view(&entry, present, &bridges)))
 }
 
 async fn update_source(
@@ -1222,7 +1468,8 @@ async fn update_source(
     reconcile_sources(&state).await;
     let _ = state.changes.send(());
     let present = node_present(&state.pw, &entry.node_name());
-    Ok(Json(source_view(&entry, present)))
+    let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
+    Ok(Json(source_view(&entry, present, &bridges)))
 }
 
 async fn delete_source(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
@@ -1951,6 +2198,7 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
             pw: &state.pw,
             pw_cmd: &state.pw_cmd,
             routing: &state.routing,
+            outputs: &state.outputs,
             ap2_devices: &state.ap2_devices,
             ap2_ptp: &state.ap2_ptp,
             ap2_control: &state.ap2_control,
@@ -1998,6 +2246,9 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     };
 
     let target_count = targets.len();
+    // Display names captured before `targets` is moved into the coordinator, for
+    // the log line below.
+    let played: Vec<String> = targets.iter().map(|t| crate::routing::output_display_name(t)).collect();
     let admission =
         crate::announce::AnnounceCoordinator::global().announce(targets, pcm, duck, priority, on_busy, req.barge_in, req.ttl_ms, grace);
     use crate::announce_arbiter::Admission;
@@ -2006,6 +2257,21 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
         Admission::Queued { position } => ("queued", Some(position), None, true),
         Admission::Rejected(r) => ("rejected", None, Some(format!("{r:?}")), false),
     };
+    // Log the whole decision, once, at INFO. An announcement makes an admission
+    // decision and can silently drop targets, and until this line existed the
+    // daemon logged *nothing at all* for one — an 8 h window of the live log
+    // contained zero announce entries, so "the tone didn't play" could not be
+    // answered from the log and had to be reconstructed with tcpdump. Everything a
+    // future "it didn't play" report needs is here: what was asked for, what was
+    // admitted, what is still connecting, and what was dropped and why.
+    tracing::info!(
+        "USER ACTION: announce -> {} target(s) [{}]: {label}{}{}",
+        target_count,
+        played.join(", "),
+        if starting.is_empty() { String::new() } else { format!(" (on-demand: {})", starting.join(", ")) },
+        if skipped.is_empty() { String::new() } else { format!(" SKIPPED: {}", skipped.join("; ")) },
+    );
+
     let mut message = format!("announce to {target_count} target(s): {label}");
     if !starting.is_empty() {
         // Honest about the wait: the endpoint has to connect first (AP2: pair +
@@ -2503,6 +2769,21 @@ struct MediaPlayerInfo {
 }
 
 async fn list_media_players(State(pw_state): State<SharedState>) -> Json<Vec<MediaPlayerInfo>> {
+    // **Normally empty on the current architecture, and that is correct.** This
+    // endpoint is the volume/state overlay for outputs that are backed by a real
+    // PipeWire node, and it filters on `SENDSPIN_NODE_PREFIX` ("sendspin-out-").
+    // Nothing creates such nodes any more: RAOP outputs were dropped, and sendspin,
+    // AirPlay-2 and pw-sink outputs are all *virtual* (a per-device sender fed by
+    // the group relay, no node in the graph). The HA integration knows this and
+    // takes virtual outputs' state from the routing matrix instead — see
+    // `media_player.py`'s `_is_virtual`: "A virtual output ... has no PipeWire
+    // node: it never appears in the polled media_players feed."
+    //
+    // So do NOT "fix" an empty response by pointing this at `SENDSPIN_DEV_PREFIX`:
+    // that would hand the integration a second, conflicting source of truth for
+    // devices it already tracks. If node-backed outputs return, this starts
+    // reporting them again with no change.
+    //
     // Snapshot and release the lock before the async volume reads below —
     // std::sync::MutexGuard isn't safe to hold across an .await point.
     let candidates: Vec<(u32, String, bool)> = {
@@ -2751,6 +3032,22 @@ mod tests {
     use super::*;
     use crate::sources_store::LEGACY_RTP_ID;
 
+    /// `/api/outputs/discovered` is a *static* sibling of `/api/outputs/{node_name}`
+    /// (the remove route) — same segment count. axum panics on genuinely conflicting
+    /// routes at build time, i.e. at daemon startup where nothing would catch it, so
+    /// pin the pairing down here: registering both must be accepted, and the static
+    /// path must win for the listing.
+    #[test]
+    fn discovered_listing_and_remove_routes_coexist() {
+        let app: Router = Router::new()
+            .route("/api/outputs", get(|| async { "all" }))
+            .route("/api/outputs/discovered", get(|| async { "offered" }))
+            .route("/api/outputs/{node_name}", delete(|| async { "removed" }))
+            .route("/api/outputs/{node_name}/adopt", post(|| async { "added" }));
+        // Building it is the assertion (a conflict would have panicked above).
+        drop(app);
+    }
+
     fn airplay_entry() -> SourceEntry {
         SourceEntry {
             id: "kitchen-airplay".to_string(),
@@ -2775,7 +3072,7 @@ mod tests {
 
     #[test]
     fn source_view_airplay_shape() {
-        let view = source_view(&airplay_entry(), true);
+        let view = source_view(&airplay_entry(), true, &[]);
         assert_eq!(view.id, "kitchen-airplay");
         assert_eq!(view.kind, SourceKind::Airplay);
         assert!(view.present); // passed through verbatim
@@ -2799,7 +3096,7 @@ mod tests {
 
     #[test]
     fn source_view_rtp_shape() {
-        let view = source_view(&rtp_entry(), false);
+        let view = source_view(&rtp_entry(), false, &[]);
         assert_eq!(view.kind, SourceKind::Rtp);
         assert!(!view.present);
         assert_eq!(view.node_name, "rtp-in-garage-bridge");
@@ -2815,6 +3112,77 @@ mod tests {
         assert_eq!(json["rtp"]["source_addr"], "0.0.0.0");
         assert_eq!(json["rtp"]["ignore_ssrc"], true);
         assert_eq!(json["rtp"]["rate"], 48000);
+        // No discovered bridges passed in → no diagnostics offer.
+        assert_eq!(json["bridge"], serde_json::Value::Null);
+    }
+
+    /// A discovered bridge for `rtp_entry()`'s port (47000, unicast `0.0.0.0`).
+    fn discovered_bridge(name: &str, port: u16, dest: &str, diag_ok: bool) -> crate::bt_bridge_discovery::BtBridge {
+        crate::bt_bridge_discovery::BtBridge {
+            fullname: format!("{name}._pwrouter-btbridge._tcp.local."),
+            display_name: name.to_string(),
+            hostname: "bridge.local.".into(),
+            addr: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 178, 78))),
+            diag_port: 8080,
+            diag_path: "/".into(),
+            stream: crate::bt_bridge_discovery::BridgeStream {
+                rtp_port: port,
+                rtp_dest: dest.into(),
+                rate: 48_000,
+                channels: 2,
+                format: "S16LE".into(),
+            },
+            probe: Some((std::time::Instant::now(), diag_ok)),
+        }
+    }
+
+    #[test]
+    fn source_view_attaches_a_matching_bridge() {
+        let bridges = vec![discovered_bridge("Bathroom", 47000, "239.255.42.42", true)];
+        let view = source_view(&rtp_entry(), true, &bridges);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["bridge"]["display_name"], "Bathroom");
+        assert_eq!(json["bridge"]["rtp_port"], 47000);
+        assert_eq!(json["bridge"]["hostname"], "bridge.local", "trailing mDNS dot trimmed for display");
+        assert_eq!(json["bridge"]["diag_url"], "http://192.168.178.78:8080/");
+        assert_eq!(json["bridge"]["diag_ok"], true);
+    }
+
+    #[test]
+    fn source_view_reports_a_bridge_whose_page_is_down() {
+        // Still matched (so the UI can name the sender) but not linkable: the
+        // advert is installed by setup_pi_bridge.py and outlives the app.
+        let bridges = vec![discovered_bridge("Bathroom", 47000, "0.0.0.0", false)];
+        let view = source_view(&rtp_entry(), true, &bridges);
+        assert_eq!(serde_json::to_value(&view).unwrap()["bridge"]["diag_ok"], false);
+    }
+
+    #[test]
+    fn source_view_ignores_a_bridge_on_another_port() {
+        let bridges = vec![discovered_bridge("Elsewhere", 46000, "0.0.0.0", true)];
+        assert!(source_view(&rtp_entry(), true, &bridges).bridge.is_none());
+    }
+
+    #[test]
+    fn airplay_sources_never_get_a_bridge() {
+        let bridges = vec![discovered_bridge("Bathroom", 47000, "0.0.0.0", true)];
+        assert!(source_view(&airplay_entry(), true, &bridges).bridge.is_none());
+    }
+
+    #[test]
+    fn adopted_bridges_drop_out_of_the_discovered_offer() {
+        let bridges = vec![discovered_bridge("Bathroom", 47000, "0.0.0.0", true), discovered_bridge("Garage", 46000, "0.0.0.0", true)];
+        // rtp_entry() listens on 47000, so it claims "Bathroom".
+        let sources = vec![source_view(&rtp_entry(), true, &bridges)];
+        let offered = unmatched_bridges(&bridges, &sources);
+        assert_eq!(offered.iter().map(|b| b.display_name.as_str()).collect::<Vec<_>>(), ["Garage"],
+                   "an already-configured bridge must not be offered again on a taken port");
+    }
+
+    #[test]
+    fn every_bridge_is_offered_when_nothing_is_configured() {
+        let bridges = vec![discovered_bridge("Bathroom", 47000, "0.0.0.0", true)];
+        assert_eq!(unmatched_bridges(&bridges, &[]).len(), 1);
     }
 
     #[test]
@@ -2822,7 +3190,7 @@ mod tests {
         // Legacy ids collapse to the bare node names so routing links resolve.
         let mut e = rtp_entry();
         e.id = LEGACY_RTP_ID.to_string();
-        assert_eq!(source_view(&e, true).node_name, "bt-bridge-rtp");
+        assert_eq!(source_view(&e, true, &[]).node_name, "bt-bridge-rtp");
     }
 
     #[test]

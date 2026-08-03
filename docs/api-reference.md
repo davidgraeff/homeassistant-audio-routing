@@ -21,7 +21,11 @@ handler name, which is the authoritative place to check the exact body shape.
 | `GET` | `/api/status` | daemon status summary (`get_status`) |
 | `GET`/`PUT` | `/api/settings` | daemon settings (`get_settings` / `set_settings`) |
 | `GET`/`PUT` | `/api/sync/settings` | group lead + per-device delays (`get_sync_settings` / `set_sync_settings`) |
-| `GET` | `/api/outputs` | every discovered output + live state |
+| `GET` | `/api/outputs` | your outputs (adopted) + live state |
+| `GET` | `/api/outputs/discovered` | devices discovery is offering |
+| `POST` | `/api/outputs/{node_name}/adopt` | add a discovered device |
+| `POST` | `/api/outputs/{node_name}/ignore` | dismiss a discovered device |
+| `DELETE` | `/api/outputs/{node_name}` | remove an output (back to discovered) |
 | `PUT` | `/api/outputs/{node_name}/latency` | per-output latency |
 | `PUT` | `/api/outputs/{node_name}/ap2-rate` | AirPlay-2 rate mode |
 | `PUT` | `/api/outputs/{node_name}/sendspin-codec` | sendspin codec choice |
@@ -84,7 +88,7 @@ filtering, no HA-specific concepts.
 }
 ```
 
-## Outputs (discovered, not configured)
+## Outputs (discovered, then adopted)
 
 > **RAOP outputs are gone.** Earlier versions of this API let you `POST`/`DELETE`
 > `libpipewire-module-raop-sink` outputs by hand. AirPlay output is now the native
@@ -101,24 +105,42 @@ outputs:
 | `airplay2` | native AirPlay-2 receivers | mDNS (`ap2_discovery.rs`) |
 | `pwsink` | remote PipeWire hosts | mDNS |
 
+Discovery only **offers** a device, though: mDNS on a home network also finds the
+neighbours' AirPlay speakers, so each discovered device carries a user verdict
+(`outputs_store.rs`, `/data/outputs.json`) in its `state` field —
+
+| `state` | Meaning |
+|---|---|
+| `adopted` | one of your outputs: routable, groupable, an HA `media_player` |
+| `discovered` | found on the network, awaiting a decision — **inert** |
+| `ignored` | dismissed; hidden behind the Outputs page's "show ignored" |
+
+Only an adopted output is in the routing matrix (and therefore in Home Assistant),
+and only adopted intent forms a sync group — nothing is ever streamed to a merely
+discovered device. Routing intent is *filtered* by adoption, never deleted, so
+adding a device back restores the routing it had. The one exception is
+[`POST /api/announce`](#post-apiannounce), which will open an on-demand session for a
+discovered device: playing a test tone is how you identify it before adding it.
+
 Per-output *settings* are persisted; the outputs themselves are not created here.
 
 ### `GET /api/outputs`
-Every discovered output with its live state. Common fields: `node_name`, `name`,
-`kind`, `present` (in the live registry now), `configured` (has persisted settings),
-`ip`, `port`, `encryption`, `latency_ms`. Each backend adds its own:
+Your outputs — `state: "adopted"` only — with their live state. Common fields:
+`node_name`, `name`, `kind`, `present` (in the live registry now), `configured` (has
+persisted settings), `state`, `ip`, `port`, `encryption`, `latency_ms`. Each backend
+adds its own:
 
 ```json
 [
   { "node_name": "sendspin-dev-home_assistant_voice_093ca8", "name": "home-assistant-voice-093ca8",
-    "kind": "sendspin", "present": true, "configured": false,
+    "kind": "sendspin", "present": true, "configured": false, "state": "adopted",
     "ip": "192.168.178.52", "port": 8928, "encryption": "None", "latency_ms": null,
     "sendspin_codec": "opus", "sendspin_codec_active": "opus",
     "sendspin_codec_options": [ { "codec": "auto", "available": true } ],
     "sendspin_send_ahead_ms": 250 },
 
   { "node_name": "ap2-dev-pioneer_vsx_934_f11b89", "name": "Pioneer VSX-934 F11B89",
-    "kind": "airplay2", "present": true, "configured": false,
+    "kind": "airplay2", "present": true, "configured": false, "state": "adopted",
     "ip": "192.168.178.35", "port": 7000, "encryption": "HomeKit", "latency_ms": 200,
     "ptp_locked": true, "ptp_lock_age_s": 0, "ptp_supported": true, "ptp_relevant": true,
     "ap2_features": { "raw": "0x445F8A00,0x1C340", "ptp": true,
@@ -126,13 +148,35 @@ Every discovered output with its live state. Common fields: `node_name`, `name`,
     "ap2_rate_mode": "auto", "ap2_rate": 44100, "ap2_volume": 0.44, "ap2_muted": false },
 
   { "node_name": "pwsink-dev-david_local", "name": "david-local", "kind": "pwsink",
-    "present": true, "configured": false, "ip": "192.168.178.21", "port": null,
+    "present": true, "configured": false, "state": "adopted",
+    "ip": "192.168.178.21", "port": null,
     "encryption": "None", "latency_ms": null, "pwsink_streaming": false }
 ]
 ```
 
 `ptp_locked` is **runtime** state, not a capability — a receiver can advertise PTP and
 sit unlocked without anything being wrong outside a multi-room group.
+
+### `GET /api/outputs/discovered`
+The same shape, for everything found but **not** adopted (`state` is `discovered` or
+`ignored` — both, in one listing, so a UI can filter client-side). Carries the full
+connection details and codec picker, because identifying a device is exactly what you
+need before deciding about it.
+
+### `POST /api/outputs/{node_name}/adopt`
+Add a discovered device. It becomes routable, groupable and (with the
+`expose_outputs_as_media_players` setting on) an HA `media_player`; any routing it had
+starts applying again on the next reconcile. Clears an `ignored` verdict. Idempotent.
+
+### `POST /api/outputs/{node_name}/ignore`
+Dismiss a discovered device. The stronger form of remove: it also clears the device's
+routing intent and its music/announcement-group membership. Idempotent.
+
+### `DELETE /api/outputs/{node_name}`
+Remove an output — back to `discovered`. Clears its routing intent, group membership
+and HA entity. A device that's still on the network reappears in
+`/api/outputs/discovered`; an offline one disappears until it shows up again.
+Idempotent.
 
 ### `PUT /api/outputs/{node_name}/latency`
 Per-output latency in ms. Persisted, applied to the running sender.
@@ -185,7 +229,7 @@ Two kinds exist, both running **natively in-process** — no supervised subproce
 
 Creating or updating a source loads/starts it immediately; deleting one unloads it.
 Sendspin, AirPlay-2 and pw-sink **outputs** are auto-discovered, not configured — see
-[Outputs](#outputs-discovered-not-configured).
+[Outputs](#outputs-discovered-then-adopted).
 
 ### `GET /api/sources`
 Every configured source, with the kind-specific config **nested** under `airplay` or
@@ -375,6 +419,54 @@ Mute or unmute one receiver (`set_ap2_mute`).
 > force-sent maximum volume when a session opened, which made a receiver's real level
 > (e.g. −67 dB on a Pioneer) disagree with the UI slider after a restart.
 
+## Announcements
+
+### `POST /api/announce`
+Play a clip on explicit targets, ducking whatever is already playing on them. This is
+the backend-agnostic per-device path (sendspin + AirPlay 2 + pw-sink) and the one the
+Outputs tab's **Play tone** / **Play announcement** buttons use.
+
+```json
+// Request — targets plus one audio source
+{ "targets": ["sendspin-dev-kitchen"], "tone": true }
+{ "targets": ["ap2-dev-dusche"], "test": true }
+{ "announcement_group": "doorbell" }
+// Response
+{ "ok": true, "admission": "playing", "position": null, "reason": null,
+  "message": "announce to 1 target(s): playing" }
+```
+
+Targets come from `targets`, or from a named group via `announcement_group` (an explicit
+`targets`/`duck` in the request still wins). `duck` defaults to the daemon setting;
+`on_busy` is `"queue"` (default) or `"reject"`; `barge_in` and `ttl_ms` are honoured by
+the arbiter. `admission` is `playing`, `queued` (with `position`) or `rejected`.
+
+Two audio sources are built in, and they are **not** interchangeable as a functional
+test:
+
+| | What it is | Use it for |
+|---|---|---|
+| `"tone": true` | the calibration pattern: an alternating two-tone **8 ms click**, one per second in a 2 s loop (`calibrate.rs`, `CLICK_MS = 8.0`) | *aligning* two speakers — comparing arrival times |
+| `"test": true` | the committed speech clip `bridge-daemon/assets/test-announcement.mp3` | *"is this speaker working?"* |
+
+The tone is deliberately a tick, not a tone — at 20 ms blocks roughly one block in fifty
+carries audio. It is easy to mistake for "nothing played", so reach for `test` when the
+question is whether a device makes sound at all.
+
+**A target only hears the clip while a per-device sender is streaming it**, so before
+starting the clip the daemon makes sure one is: a sendspin device always has its idle
+sender, and an **AirPlay-2 receiver or pw-sink target with nothing routed into it gets an
+on-demand session** — audible a few seconds later (AP2: pairing + its render delay;
+pw-sink: the target discovering our advert and handshaking) and handed back after a 30 s
+lease. Targets that nothing can carry are **dropped and named in `message`** (with all of
+them unavailable the call is rejected), so a "playing" answer means audio is really going
+somewhere. See
+[architecture.md §5.4](../pipewire_audio_router/docs/architecture.md#54-announcing-to-an-output-with-nothing-routed-into-it).
+
+Every call logs one `USER ACTION: announce -> N target(s) [...]` line with the admission,
+any on-demand sessions being opened, and anything skipped and why — so an "it didn't
+play" report is answerable from the log.
+
 ## Linking
 
 ### `POST /api/links`
@@ -403,26 +495,41 @@ See "Routing matrix" below.
 ## Media players
 
 ### `GET /api/media_players`
-Returns the live **sendspin** nodes (`sendspin-dev-*`) with their state +
-node-level volume — the volume/state overlay the HA integration layers on top of the
-routing matrix.
+The volume/state overlay for outputs backed by a real **PipeWire node**, filtered on
+the `sendspin-out-` prefix.
+
+> **On the current architecture this is normally an empty list, and that is correct.**
+> Nothing creates `sendspin-out-*` nodes any more: RAOP outputs were dropped, and
+> sendspin, AirPlay-2 and pw-sink outputs are all **virtual** — a per-device sender fed
+> by the group relay, with no node in the graph. Verified live: the daemon's graph
+> contains only the source, the sync anchor, the relay captures and the peak taps.
+>
+> The HA integration knows this and takes virtual outputs' state from the **routing
+> matrix** instead — see `media_player.py`'s `_is_virtual`: *"A virtual output (sendspin
+> or AirPlay-2) has no PipeWire node: it never appears in the polled media_players feed,
+> so its state comes from routing rather than the feed."*
+>
+> So do **not** "fix" an empty response by pointing the filter at `sendspin-dev-`: that
+> would give the integration a second, conflicting source of truth for devices it
+> already tracks. An earlier revision of this document claimed the endpoint returns the
+> live `sendspin-dev-*` nodes — that was wrong on both counts (wrong prefix, and
+> sendspin devices deliberately never appear here).
 
 ```json
 [
-  { "node_id": 42, "node_name": "sendspin-dev-home_assistant_voice_093ca8",
-    "state": "playing", "volume": 0.62 }
+  { "node_id": 42, "node_name": "sendspin-out-kitchen", "state": "playing", "volume": 0.62 }
 ]
 ```
 
 `state` is `"playing"` if any link currently feeds the node, else `"idle"`. `volume` is
 read natively from the node's SPA `Props` param (`channelVolumes`, `volume.rs`); `null`
-if the node exposes no volume control.
+if the node exposes no volume control. If node-backed outputs ever return, this reports
+them again with no change.
 
-> **This list is sendspin-only.** `list_media_players` filters the registry on the
-> `sendspin-dev-` prefix, so AirPlay-2 and pw-sink outputs are **not** here — their
-> volume is in-band, via [`/api/ap2/volume`](#put-apiap2volume) and reported by
-> [`GET /api/outputs`](#get-apioutputs). The HA integration creates one `media_player`
-> per routing-matrix **output** across all backends, not from this list directly.
+For the volume of a *virtual* output, use the backend's own control:
+[`/api/sendspin/volume`](#put-apisendspinvolume) or
+[`/api/ap2/volume`](#put-apiap2volume), with current values from
+[`GET /api/outputs`](#get-apioutputs).
 
 ### `GET /api/media_players/{node_id}/volume`
 ```json
