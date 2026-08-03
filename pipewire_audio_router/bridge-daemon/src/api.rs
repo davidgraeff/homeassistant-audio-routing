@@ -2,7 +2,6 @@
 //! creation
 
 use crate::airplay_clients::AirplayClientStore;
-use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
 use crate::ap2_discovery::SharedAp2Devices;
 use airplay_core::features::Features;
 use crate::ap2_ptp::SharedAp2Ptp;
@@ -13,12 +12,11 @@ use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, Sha
 use crate::routing;
 use crate::routing_store::SharedRouting;
 use crate::rtp_source::{
-    rtp_source_module_args, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR,
-    RTP_SOURCE_MODULE_NAME, RTP_SOURCE_NODE_NAME,
+    DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR,
 };
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::settings_store::SharedSettings;
-use crate::sources_store::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore, LEGACY_AIRPLAY_ID};
+use crate::sources_store::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore};
 use axum::{
     body::{Body, Bytes},
     extract::{Extension, FromRef, Path, Query, State},
@@ -970,10 +968,6 @@ async fn remove_output(State(state): State<AppState>, Path(node_name): Path<Stri
 // seeding) and is then authoritative. Same "runtime, no restart" model as
 // /api/outputs, but backed by an in-process receiver rather than a module.
 
-fn default_airplay_source_latency_msec() -> u32 {
-    DEFAULT_AIRPLAY_LATENCY_MSEC
-}
-
 /// Reconcile BOTH source kinds after a `/api/sources` mutation: (un)load RTP
 /// modules (Phase 2) and start/stop AirPlay receivers (Phase 4) to match the
 /// persisted set. Idempotent, so it's safe to call after every add/update/
@@ -1177,42 +1171,16 @@ async fn set_source_policy(
 
 // ---- RTP source (Bluetooth bridge firmware target) ------------------------
 //
-// A single source, but — unlike the AirPlay source — a native PipeWire module,
-// not a subprocess. So it's loaded/unloaded via the PipeWire thread
-// (PwCommand::Load/Unload, keyed by RTP_SOURCE_NODE_NAME), rather than through
-// the process supervisor. Enable/disable and
-// re-point the port live, no restart. Once loaded, its node shows up in the
-// routing matrix automatically (routing.rs classifies it as a source).
-
-fn default_rtp_source_port() -> u16 {
-    DEFAULT_RTP_PORT
-}
-
-fn default_rtp_source_rate() -> u32 {
-    DEFAULT_RTP_RATE
-}
-
-fn default_rtp_source_latency_msec() -> u32 {
-    DEFAULT_RTP_LATENCY_MSEC
-}
-
-fn default_rtp_source_addr() -> String {
-    DEFAULT_RTP_SOURCE_ADDR.to_string()
-}
-
-fn default_rtp_source_ignore_ssrc() -> bool {
-    DEFAULT_RTP_IGNORE_SSRC
-}
-
-/// Whether the RTP source node is present in the live registry right now.
-fn rtp_source_loaded(pw: &SharedState) -> bool {
-    pw.lock_recover().nodes.values().any(|n| n.node_name == RTP_SOURCE_NODE_NAME)
-}
+// An RTP source is a native PipeWire module, not a subprocess, so it is
+// loaded/unloaded via the PipeWire thread (PwCommand::Load/Unload, keyed by the
+// entry's own node name) rather than through the process supervisor. Re-point it
+// live, no restart. Once loaded its node shows up in the routing matrix
+// automatically (routing.rs classifies it as a source).
 
 // ---- Multi-source collection CRUD (Phase 3) ------------------------------
 //
-// The generalized, keyed replacement for the two singular `/api/source/*`
-// routes above: a collection of AirPlay + RTP input sources, each with its own
+// The generalized, keyed replacement for the two singular `/api/source/*` routes
+// this daemon used to expose: a collection of AirPlay + RTP input sources, each with its own
 // stable id / node name (sources_store.rs). These handlers only mutate the
 // STORE — actually loading/unloading the PipeWire module (RTP) or starting/
 // stopping the embedded receiver (AirPlay) is done by the per-kind reconcilers
@@ -1230,8 +1198,7 @@ struct SourceView {
     label: String,
     kind: SourceKind,
     /// A node named `node_name` exists in the live PipeWire registry right now
-    /// (the source is actually loaded/running). Generalizes the singular
-    /// `rtp_source_loaded` / AirPlay `running` flags.
+    /// (the source is actually loaded/running).
     present: bool,
     node_name: String,
     /// The AirPlay config when `kind == airplay`, else `null`.
@@ -1315,7 +1282,6 @@ fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::bt_bridge_d
 }
 
 /// Whether a node with `node_name` is present in the live registry right now.
-/// Generalizes [`rtp_source_loaded`] to any source node.
 fn node_present(pw: &SharedState, node_name: &str) -> bool {
     pw.lock_recover().nodes.values().any(|n| n.node_name == node_name)
 }
@@ -3073,6 +3039,7 @@ async fn fetch_to_file(url: &str, path: &std::path::Path) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
     use crate::sources_store::LEGACY_RTP_ID;
 
     /// `/api/outputs/discovered` is a *static* sibling of `/api/outputs/{node_name}`

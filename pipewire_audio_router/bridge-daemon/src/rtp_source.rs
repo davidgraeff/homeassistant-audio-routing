@@ -25,15 +25,6 @@ use crate::sources_store::{RtpSourceConfig, SourceConfig, SourceEntry, LEGACY_RT
 use std::fmt::Write as _;
 use tokio::sync::oneshot;
 
-/// The stable PipeWire node name the received audio appears under. Legacy: with
-/// multiple RTP sources each entry now carries its own node name derived from
-/// its id (see [`crate::sources_store::source_node_name`]). This const is the
-/// bare name the migrated single RTP source keeps (equal to [`LEGACY_RTP_ID`]),
-/// retained for the back-compat API path in `api.rs`. routing.rs classifies any
-/// node with a non-monitor output port as a source, so an RTP node shows up in
-/// the routing matrix automatically once loaded, with no special-casing here.
-pub const RTP_SOURCE_NODE_NAME: &str = "bt-bridge-rtp";
-
 /// The PipeWire module that provides an RTP source.
 pub const RTP_SOURCE_MODULE_NAME: &str = "libpipewire-module-rtp-source";
 
@@ -198,6 +189,10 @@ pub async fn reconcile(sources: &[SourceEntry], pw_cmd: &PwCommandSender, pw: &S
         }
     }
 }
+
+/// Node name of the old single RTP source, kept as a fixture for the args tests.
+#[cfg(test)]
+const RTP_SOURCE_NODE_NAME: &str = "bt-bridge-rtp";
 
 #[cfg(test)]
 mod tests {

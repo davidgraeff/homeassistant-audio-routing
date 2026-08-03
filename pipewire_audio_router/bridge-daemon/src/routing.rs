@@ -413,22 +413,6 @@ pub(crate) fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32>
     state.nodes.values().filter(|n| n.node_name == node_name).map(|n| n.node_id).max()
 }
 
-/// All live `(node_id, node_name)` whose name contains `substr`, newest first.
-/// Used to find reactively-created nodes with auto-generated names (e.g.
-/// `module-rtp-session`'s `rtp_session.<sess>.<host>.local.ipv4` sink, which
-/// only appears once a receiver connects — pw_sink).
-pub fn nodes_matching(state: &SharedState, substr: &str) -> Vec<(u32, String)> {
-    let st = state.lock_recover();
-    let mut out: Vec<(u32, String)> = st
-        .nodes
-        .values()
-        .filter(|n| n.node_name.contains(substr))
-        .map(|n| (n.node_id, n.node_name.clone()))
-        .collect();
-    out.sort_by(|a, b| b.0.cmp(&a.0));
-    out
-}
-
 /// The set of sources feeding `output` in the intent (unique, sorted). Shared
 /// with sync_group.rs, which keys sync groups by this source-set.
 pub(crate) fn source_set_of<'a>(intent: &'a [RoutingLink], output: &str) -> std::collections::BTreeSet<&'a str> {

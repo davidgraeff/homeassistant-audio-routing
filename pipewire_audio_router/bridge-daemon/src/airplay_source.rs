@@ -31,13 +31,6 @@ use std::sync::{Arc, Mutex};
 /// policy without restarting the receiver.
 pub type SharedPreventTakeover = Arc<AtomicBool>;
 
-/// Stable PipeWire node name for the *legacy* single AirPlay source — kept as a
-/// const only for the legacy-id node-name mapping (routing.rs) and tests. It is
-/// **no longer** the source of truth for a running receiver: each receiver's
-/// node name is now passed to [`start`] per source (sources_store.rs derives it
-/// via `source_node_name`), so multiple receivers get distinct nodes.
-pub const AIRPLAY_NODE_NAME: &str = "airplay-in";
-
 /// Default RTSP port for an AirPlay receiver (the RAOP default). No longer the
 /// source of truth — each source's port is allocated + persisted in
 /// `AirplaySourceConfig.port` and passed to [`start`]; this const is only a
@@ -58,6 +51,11 @@ const CHANNELS: usize = 2;
 /// for one-way audio. Stored per install (sources_store.rs) and settable via
 /// `/api/sources`, so a noisy install can trade latency for fewer
 /// dropouts.
+/// Node name of the old single AirPlay source. Production names sources
+/// dynamically now; this survives purely as a fixture for the routing tests.
+#[cfg(test)]
+pub const AIRPLAY_NODE_NAME: &str = "airplay-in";
+
 pub const DEFAULT_AIRPLAY_LATENCY_MSEC: u32 = 150;
 
 /// After a mid-stream ring underrun, re-arm the jitter buffer to this much audio
@@ -313,14 +311,6 @@ pub async fn reconcile(map: &SharedAirplayMap, entries: &[SourceEntry], clients:
 }
 
 /// The uppercase-hex MAC (no separators) shairplay puts before `@` in its mDNS
-/// `_raop._tcp` instance name (e.g. `485D607CEE22@Music Via Airplay`). RAOP
-/// discovery uses this to recognize and skip our OWN receiver — stable even
-/// when mDNS appends ` (2)` to our name on a transient conflict, so it's more
-/// robust than matching the friendly name.
-pub fn mdns_mac(name: &str) -> String {
-    derive_hwaddr(name).iter().map(|b| format!("{b:02X}")).collect()
-}
-
 /// A locally-administered, deterministic MAC derived from the source name, so
 /// the AirPlay device identity is stable across restarts and unlikely to
 /// collide on a LAN with other installs.
