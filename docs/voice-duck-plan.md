@@ -203,19 +203,30 @@ automatable:
 
 ## 4. Work breakdown
 
-> **VD1–VD4 done 2026-08-03** (2 commits: `duck:` the daemon mechanism, `ha:`
-> the integration). 174 daemon tests, 55 integration tests, no build warnings,
-> `svelte-check` clean. **VD5 is split**: the docs half landed (api-reference
-> §"Duck holds", architecture §5.5, both READMEs), the **UI badge is deliberately
-> not built** — the Outputs tab is mid-rework in a parallel branch, and a cosmetic
-> badge is not worth a conflict there. `GET /api/duck` exists and is documented,
-> so the badge is a few lines whenever that rework settles.
+> **VD1–VD5 done 2026-08-03/04**, in four commits: `duck:` the daemon mechanism,
+> `ha:` the integration, `duck:` the pw-sink agent mirroring, `ui:` the badge.
+> 188 daemon tests, 55 integration tests, no build warnings, `svelte-check` clean
+> (checked both on this branch and against the parallel UI rework in the working
+> tree). The UI badge was held back for one round while the Outputs tab was being
+> rebuilt in parallel; once that landed it went in on top of it.
 >
-> What changed against the plan while building: `player`/`decode` helpers fell out
-> as dead (recorded in §7), and `media_player.find_output_ha_device` had to be
-> extracted so area resolution works when per-output entities are *not* exposed —
-> the plan assumed those entities always exist. Nothing else deviated. **Live
-> validation on the instance is still outstanding — §6 is the script.**
+> Three things changed against the plan while building:
+> * `player`/`decode` helpers fell out as dead (recorded in §7);
+> * `media_player.find_output_ha_device` had to be extracted, because the plan
+>   assumed per-output `media_player` entities always exist — they only do when
+>   the daemon's `expose_outputs_as_media_players` is on, so area resolution falls
+>   back to the same device correlation adoption uses;
+> * **the pw-sink receiver agent landed in parallel and had to be integrated.** An
+>   agent host ducks the music it plays *itself*, is told an absolute depth, and
+>   does no ref-counting — so a voice hold and an announcement on one host would
+>   have clobbered each other. `OverlayMixer::effective_duck` +
+>   `announce::sync_agent_duck` make the mixer the single source of truth for what
+>   any host is told. This was not in the plan at all; §3.1 predates that backend.
+>
+> **Live validation on the instance is still outstanding — §6 is the script.** Add
+> one case for the new backend: an announcement and a voice turn overlapping on an
+> agent-backed pw-sink host, checking the host's own music stays ducked until the
+> voice turn ends.
 
 | ID | Scope | Files | Done when |
 |---|---|---|---|
@@ -223,7 +234,7 @@ automatable:
 | ~~VD2~~ **done** | Hold registry + expiry tick | `announce.rs` (or a small `duck_holds.rs`), `main.rs` | ids allocated, TTL expiry driven from the existing 150 ms poll, `GET` snapshot |
 | ~~VD3~~ **done** | REST API | `api.rs`, `docs/api-reference.md` | 4 endpoints, `announcement_group` resolution reusing the `/api/announce` code path, one `USER ACTION: duck -> N target(s)` log line per call |
 | ~~VD4~~ **done** | HA voice ducking | `voice_duck.py`, `api.py`, `__init__.py`, `switch.py`, `number.py`, `select.py`, `const.py`, `strings.json` | satellite→area→outputs resolution, both scopes, renewal, release on idle; pytest: area via device, area overridden on entity, satellite with no area (no-op), scope `music_group` expands to all MG members, scope `area` does **not**, satellite's own output *included*, two satellites in different areas concurrently, release on `unavailable` |
-| ~VD5~ **docs done, UI badge deferred** | UI + docs | `frontend/src/components/OutputsTab.svelte`, `docs/architecture.md` §5.3, `README.md` | a "ducked" badge on an output with a live hold; architecture note that duck now has two producers (AG overlay, duck hold) |
+| ~~VD5~~ **done** | UI + docs | `frontend/src/components/OutputsTab.svelte`, `docs/architecture.md` §5.3, `README.md` | a "ducked" badge on an output with a live hold; architecture note that duck now has two producers (AG overlay, duck hold) |
 | ~~L1–L5~~ | Legacy removal (§7) | see §7 | **done 2026-08-03** (3 commits); L6 still deferred |
 
 VD1–VD3 are independently testable without HA (`curl` a hold onto a playing
