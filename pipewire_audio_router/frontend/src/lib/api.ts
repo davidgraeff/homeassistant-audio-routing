@@ -16,6 +16,7 @@ import type {
   AirplaySourceCfg,
   AppSettings,
   AppSettingsUpdate,
+  DuckHold,
   MusicGroup,
   NodesResponse,
   OpResponse,
@@ -145,6 +146,12 @@ export const api = {
   // the backend-agnostic path (Sendspin now, AirPlay 2 later), used by the
   // Outputs tab's Play tone / Play announcement diagnostics.
   announce: (req: AnnounceRequest) => request<AnnounceResponse>('POST', 'api/announce', req),
+
+  // Duck holds (overlay_mixer.rs) — read-only here. Voice ducking is driven by
+  // the Home Assistant integration, which is what knows a satellite's room; the
+  // UI only *shows* what is ducked, so a speaker that sounds quiet is
+  // explainable without reading the daemon log.
+  duckHolds: () => request<DuckHold[]>('GET', 'api/duck'),
 
   // Per-source AirPlay senders (clients). Each AirPlay source id has its own
   // receiver, so these are scoped by the source id (encodeURIComponent'd).

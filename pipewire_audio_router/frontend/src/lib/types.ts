@@ -461,6 +461,16 @@ export interface OpResponse {
   message: string;
 }
 
+/** One live duck hold (`GET /api/duck`, overlay_mixer.rs): an output whose music
+ * is attenuated with no clip of its own — voice ducking, while an assistant in
+ * that room talks through its own speaker. `level` is a gain (0.25 = quarter
+ * volume). Transient: holds are leased, and released when the turn ends. */
+export interface DuckHold {
+  output: string;
+  hold_id: number;
+  level: number;
+}
+
 /** Per-device announcement (`POST /api/announce`, announce.rs): play a clip to a
  * set of output node names with per-device duck/overlay. Backend-agnostic — it
  * targets per-device senders (Sendspin today, AirPlay 2 later), not PipeWire

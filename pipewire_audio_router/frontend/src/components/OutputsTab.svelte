@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { api, MIN_OUTPUT_NAME_CHARS } from '../lib/api';
   import { routing } from '../lib/routing';
   import { run, toast } from '../lib/toast';
@@ -178,6 +178,48 @@
       if (pushed) applyOffered(pushed);
     });
   });
+
+  // Outputs whose music is ducked right now → the gain in force on them
+  // (`GET /api/duck`). Voice ducking is driven by the Home Assistant integration
+  // (it resolves which room a satellite is in); this tab only reflects it, so a
+  // speaker that sounds quiet is explainable without reading the daemon log.
+  // On its own short interval, because a hold lasts one voice turn — a few
+  // seconds — and would otherwise almost never be on screen.
+  let ducks = $state<Record<string, number>>({});
+  async function refreshDucks() {
+    try {
+      const holds = await api.duckHolds();
+      const next: Record<string, number> = {};
+      for (const h of holds) {
+        // Several holds can overlap one output (two satellites, or a voice turn
+        // plus an announcement); the daemon mixes at the strongest, so show that.
+        const seen = next[h.output];
+        next[h.output] = seen == null ? h.level : Math.min(seen, h.level);
+      }
+      ducks = next;
+    } catch {
+      ducks = {};
+    }
+  }
+  onMount(refreshDucks);
+  const duckPoll = setInterval(refreshDucks, 2000);
+  onDestroy(() => clearInterval(duckPoll));
+
+  // "Ducked" badge: this output's music is attenuated right now with no clip of
+  // its own — a voice assistant in its room is talking (the integration's
+  // voice_duck.py). Informational, not a warning: it is the feature working.
+  function duckBadge(o: OutputInfo): { text: string; title: string } | null {
+    const level = ducks[o.node_name];
+    if (level == null) return null;
+    const pct = Math.round(level * 100);
+    return {
+      text: `ducked ${pct}%`,
+      title:
+        `Music on this output is playing at ${pct}% while a voice assistant in its room is talking. ` +
+        'Held by the Home Assistant integration and released when the turn ends; if that holder goes ' +
+        'away, the add-on un-ducks by itself when the lease expires.',
+    };
+  }
 
   // Per-row diagnostic playback ("Play tone" / "Play announcement") via the
   // per-device announce path (`/api/announce`) — the backend-agnostic route
@@ -632,8 +674,14 @@
           <!-- Badges sit at the right, in the order that keeps their columns
                aligned down the list: the two every output has (type, then
                status) are anchored against the volume control, and the optional
-               PTP badge hangs off to their left rather than displacing them. -->
+               ones hang off to their left rather than displacing them. "Ducked"
+               is leftmost because it is the most transient — it comes and goes
+               with a single voice turn, and should not shift the PTP badge. -->
           <div class="out-badges">
+            {#if duckBadge(o)}
+              {@const duck = duckBadge(o)!}
+              <span class="badge duck" title={duck.title}>{duck.text}</span>
+            {/if}
             {#if ptpBadge(o)}
               {@const ptp = ptpBadge(o)!}
               <span class={ptp.cls} title={ptp.title}>{ptp.text}</span>
@@ -1091,6 +1139,11 @@
   .out-title h3 :global(.rename) {
     font-size: inherit;
     font-weight: inherit;
+  }
+  /* Ducking is an expected, transient state — informational, never an alarm. */
+  .badge.duck {
+    color: var(--info-color, #4285f4);
+    border-color: currentColor;
   }
   .out-badges {
     display: flex;
