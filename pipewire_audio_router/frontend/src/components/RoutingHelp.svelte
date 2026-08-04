@@ -18,8 +18,13 @@
 {#snippet lines()}
   <p>
     <strong>Drag</strong> from a source on the left to a group on the right — or the other way — to make it play there;
-    <strong>click a line</strong> to stop it. A group plays one source at a time, the same thing its <em>Source</em>
-    dropdown does, so its speakers stay in sync.
+    <strong>click a line</strong> (the cursor turns to scissors) to stop it. A group plays one source at a time, the same
+    thing its <em>Source</em> dropdown does, so its speakers stay in sync.
+  </p>
+  <p>
+    <strong>Ctrl-drag</strong> (⌘ on a Mac) a handle that already has lines to pick those lines up instead of drawing a
+    new one, and drop them on another handle in the <em>same</em> column — one group's music onto another group, or
+    everything a source feeds onto a different source. Dropped anywhere else, nothing changes.
   </p>
   <h3>What a line says</h3>
   <ul>

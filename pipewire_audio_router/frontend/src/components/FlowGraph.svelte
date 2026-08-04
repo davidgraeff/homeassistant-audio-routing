@@ -9,7 +9,9 @@
 
   // Interactive bipartite routing graph: sources on the left, what they play on
   // on the right, links drawn as SVG curves between them. Drag from a handle to
-  // one on the opposite side to route; click a curve to remove that route.
+  // one on the opposite side to route; click a curve to remove that route;
+  // Ctrl-drag a handle to lift the wires already on it and drop them on another
+  // handle in the same column (move a group's music to a different group).
   //
   // The right column is **music groups** (each showing its speakers), plus one
   // node per ungrouped speaker. That's deliberate: a wire onto a group is the
@@ -72,7 +74,15 @@
 
   let canvasEl: HTMLDivElement | undefined = $state();
   let Wc = $state(0); // measured canvas width
-  let dragging = $state<{ kind: 'source' | 'target'; name: string; x: number; y: number } | null>(null);
+  // A drag in progress. `rewire` is empty for the ordinary "draw a new wire"
+  // drag; non-empty when the handle was Ctrl-grabbed, in which case it holds the
+  // *far* ends of the wires now in hand (target keys when a source handle was
+  // grabbed, source names when a target handle was) and the drop lands on the
+  // same column instead of the opposite one.
+  type Drag = { kind: 'source' | 'target'; name: string; x: number; y: number; rewire: string[] };
+  let dragging = $state<Drag | null>(null);
+  /** Ctrl/⌘ held: hints which handles can be grabbed to move their wires. */
+  let modHeld = $state(false);
 
   const S = $derived($routing.matrix.sources);
   const O = $derived($routing.matrix.outputs);
@@ -223,10 +233,48 @@
     for (const t of Object.values(xrunTimers)) clearTimeout(t);
   });
 
-  const ghost = $derived.by(() => {
-    if (!dragging || Wc === 0) return null;
-    const o = dragging.kind === 'source' ? srcByName.get(dragging.name) : targetByKey.get(dragging.name);
-    return o ? bezier(o.x, o.y, dragging.x, dragging.y) : null;
+  /** The far ends of every *drawn* wire on this handle — what a Ctrl-grab picks
+   *  up. Read off `edges` so it's exactly what the user sees on the handle. */
+  function attached(kind: 'source' | 'target', name: string): string[] {
+    return kind === 'source'
+      ? edges.filter((e) => e.source === name).map((e) => e.target.key)
+      : edges.filter((e) => e.target.key === name).map((e) => e.source);
+  }
+  /** Handles that have at least one wire, so a Ctrl-grab there does something. */
+  const busySources = $derived(new Set(edges.map((e) => e.source)));
+  const busyTargets = $derived(new Set(edges.map((e) => e.target.key)));
+
+  // Which column can accept the current drop: the opposite one for a new wire,
+  // the same one when wires are being moved.
+  const dropSide = $derived.by<'source' | 'target' | null>(() => {
+    if (!dragging) return null;
+    if (dragging.rewire.length) return dragging.kind;
+    return dragging.kind === 'source' ? 'target' : 'source';
+  });
+
+  // Wires drawn to the pointer: one for a new link, one per picked-up link while
+  // rewiring (each keeps its far end and follows the cursor at this end).
+  const ghosts = $derived.by<string[]>(() => {
+    const d = dragging;
+    if (!d || Wc === 0) return [];
+    if (d.rewire.length) {
+      return d.rewire
+        .map((far) => (d.kind === 'source' ? targetByKey.get(far) : srcByName.get(far)))
+        .filter((p): p is NonNullable<typeof p> => !!p)
+        .map((p) => (d.kind === 'source' ? bezier(d.x, d.y, p.x, p.y) : bezier(p.x, p.y, d.x, d.y)));
+    }
+    const o = d.kind === 'source' ? srcByName.get(d.name) : targetByKey.get(d.name);
+    return o ? [bezier(o.x, o.y, d.x, d.y)] : [];
+  });
+
+  const edgeKey = (source: string, targetKey: string) => `${source} ${targetKey}`;
+  /** Edges hidden because their end is currently in hand (a ghost replaces them). */
+  const lifted = $derived.by<Set<string>>(() => {
+    const d = dragging;
+    if (!d?.rewire.length) return new Set<string>();
+    return new Set(
+      d.kind === 'source' ? d.rewire.map((k) => edgeKey(d.name, k)) : d.rewire.map((s) => edgeKey(s, d.name)),
+    );
   });
 
   function pointerXY(e: PointerEvent): { x: number; y: number } {
@@ -236,46 +284,116 @@
 
   function startDrag(kind: 'source' | 'target', name: string, e: PointerEvent) {
     e.preventDefault();
-    dragging = { kind, name, ...pointerXY(e) };
+    // Ctrl/⌘-drag lifts the wires already on this handle instead of drawing a new
+    // one. With nothing on it there's nothing to lift, so it stays a plain drag.
+    const rewire = e.ctrlKey || e.metaKey ? attached(kind, name) : [];
+    dragging = { kind, name, rewire, ...pointerXY(e) };
   }
   function onMove(e: PointerEvent) {
     if (dragging) dragging = { ...dragging, ...pointerXY(e) };
   }
-  async function onUp(e: PointerEvent) {
-    if (!dragging) return;
-    const drag = dragging;
-    dragging = null;
-    const { x, y } = pointerXY(e);
-    const candidates: { name: string; x: number; y: number }[] = drag.kind === 'source' ? layout : srcPos;
-    let best: { name: string } | null = null;
+
+  /** Nearest handle to the drop point, or null if the drop was in open space —
+   *  in which case nothing changes and the wires snap back to where they were. */
+  function nearest(candidates: { name: string; x: number; y: number }[], x: number, y: number): string | null {
+    let best: string | null = null;
     let bestD = HIT * HIT;
     for (const t of candidates) {
       const d = (t.x - x) ** 2 + (t.y - y) ** 2;
       if (d <= bestD) {
         bestD = d;
-        best = t;
+        best = t.name;
       }
     }
+    return best;
+  }
+
+  async function onUp(e: PointerEvent) {
+    if (!dragging) return;
+    const drag = dragging;
+    dragging = null;
+    const { x, y } = pointerXY(e);
+    const sameSide = drag.rewire.length > 0;
+    // source column for a source-side drop, target column otherwise.
+    const toSources = (drag.kind === 'source') === sameSide;
+    const best = nearest(toSources ? srcPos : layout, x, y);
     if (!best) return;
-    const source = drag.kind === 'source' ? drag.name : best.name;
-    const targetKey = drag.kind === 'source' ? best.name : drag.name;
-    const target = targetByKey.get(targetKey)?.t;
+    if (sameSide) {
+      if (best !== drag.name) await rewireTo(drag, best);
+      return;
+    }
+    const source = drag.kind === 'source' ? drag.name : best;
+    const target = targetByKey.get(drag.kind === 'source' ? best : drag.name)?.t;
     if (!target) return;
     await route(source, target);
+  }
+
+  /** Move the wires lifted at one handle onto another handle in the same column:
+   *  the new endpoint is routed, then the old link dropped. Both halves go
+   *  through the same calls a plain drag makes, so group routing stays
+   *  exclusive — which is also why a group destination can only end up on one
+   *  source even if several were in hand. */
+  async function rewireTo(drag: Drag, to: string) {
+    if (drag.kind === 'target') {
+      const dst = targetByKey.get(to)?.t;
+      const src = targetByKey.get(drag.name)?.t;
+      if (!dst || !src) return;
+      for (const source of drag.rewire) {
+        const old = linkedMembers(src, source); // before routing: the store lags
+        if (!(await route(source, dst))) return;
+        for (const m of old) {
+          if (!(await run(() => api.unlink(source, m.node_name)))) return;
+        }
+      }
+      if (dst.kind === 'group' && drag.rewire.length > 1) {
+        toast(
+          'info',
+          `"${dst.name}" plays one source at a time — it kept ${disp(srcInfo, drag.rewire[drag.rewire.length - 1])}.`,
+        );
+      }
+    } else {
+      // The source end moved: everything this source fed now takes `to` instead.
+      for (const key of drag.rewire) {
+        const t = targetByKey.get(key)?.t;
+        if (!t) continue;
+        const old = linkedMembers(t, drag.name); // before routing: the store lags
+        if (t.kind === 'group') {
+          // One call does both halves — every member onto `to`, every other
+          // source (the lifted one included) dropped. Not via `route`, which
+          // would call it a no-op for a mixed group already carrying `to`.
+          if (!(await run(() => api.routeMusicGroup(t.id, to), `"${t.name}" now playing ${disp(srcInfo, to)}`))) return;
+        } else {
+          if (!(await route(to, t))) return;
+          for (const m of old) {
+            if (!(await run(() => api.unlink(drag.name, m.node_name)))) return;
+          }
+        }
+      }
+    }
   }
 
   /** Route `source` to a whole target. Groups go through the group endpoint (the
    *  same reconciling call as their Source dropdown: every member on that one
    *  source, any other source removed); a lone speaker takes an extra link, so
-   *  two sources can be mixed into one speaker deliberately. */
-  async function route(source: string, target: Target) {
-    const linked = linkedMembers(target, source);
-    if (linked.length === target.members.length) return; // already routed
-    if (target.kind === 'group') {
-      await run(() => api.routeMusicGroup(target.id, source), `"${target.name}" now playing ${disp(srcInfo, source)}`);
-    } else {
-      await run(() => api.link(source, target.members[0].node_name));
+   *  two sources can be mixed into one speaker deliberately. Returns whether the
+   *  route is in place (including "it already was"). */
+  async function route(source: string, target: Target): Promise<boolean> {
+    if (target.members.length === 0) {
+      // Nothing to link to. Says so rather than accepting the drop and doing
+      // nothing — and, moving wires, keeps them where they are instead of
+      // dropping them into a group that can't play them.
+      toast('info', `"${target.name}" has no speakers yet — add one first.`);
+      return false;
     }
+    const linked = linkedMembers(target, source);
+    if (linked.length === target.members.length) return true; // already routed
+    if (target.kind === 'group') {
+      return await run(
+        () => api.routeMusicGroup(target.id, source),
+        `"${target.name}" now playing ${disp(srcInfo, source)}`,
+      );
+    }
+    return await run(() => api.link(source, target.members[0].node_name));
   }
 
   const disp = (map: Map<string, RoutingNode>, name: string) => map.get(name)?.display_name ?? name;
@@ -400,6 +518,15 @@
     });
   });
 
+  // Ctrl/⌘ held is a UI hint only (the drag reads the modifier off the pointer
+  // event itself); Escape abandons a drag, leaving the wires as they were.
+  function onKey(e: KeyboardEvent) {
+    modHeld = e.ctrlKey || e.metaKey;
+    if (e.type !== 'keydown' || e.key !== 'Escape') return;
+    helpOpen = false;
+    dragging = null;
+  }
+
   async function onVolume(nodeName: string, pct: number) {
     try {
       if (nodeName.startsWith(AP2_DEV_PREFIX)) await api.setAp2Volume(nodeName, pct / 100);
@@ -420,7 +547,13 @@
   }
 </script>
 
-<svelte:window onpointermove={onMove} onpointerup={onUp} onkeydown={(e) => e.key === 'Escape' && (helpOpen = false)} />
+<svelte:window
+  onpointermove={onMove}
+  onpointerup={onUp}
+  onkeydown={onKey}
+  onkeyup={onKey}
+  onblur={() => (modHeld = false)}
+/>
 
 <!-- Folded away by default: the title row is the whole card until you open it,
      and the explanation is a dialog behind the Explain button. -->
@@ -462,18 +595,21 @@
           >
             <svg class="wires" width={Wc} height={canvasH}>
               {#each edges as e (e.source + ' ' + e.target.key)}
-                <!-- svelte-ignore a11y_click_events_have_key_events -->
-                <path class="hit" d={e.path} onclick={() => removeEdge(e)} role="button" tabindex="-1" aria-label="remove route"></path>
-                <path
-                  class="wire"
-                  class:off={e.off}
-                  class:partial={e.partial}
-                  class:waiting={e.waiting}
-                  class:active={flowing[e.source] && !e.off && !e.waiting}
-                  d={e.path}
-                ></path>
+                <!-- Hidden while this wire's end is in hand: its ghost stands in. -->
+                {#if !lifted.has(edgeKey(e.source, e.target.key))}
+                  <!-- svelte-ignore a11y_click_events_have_key_events -->
+                  <path class="hit" d={e.path} onclick={() => removeEdge(e)} role="button" tabindex="-1" aria-label="remove route"></path>
+                  <path
+                    class="wire"
+                    class:off={e.off}
+                    class:partial={e.partial}
+                    class:waiting={e.waiting}
+                    class:active={flowing[e.source] && !e.off && !e.waiting}
+                    d={e.path}
+                  ></path>
+                {/if}
               {/each}
-              {#if ghost}<path class="ghost" d={ghost}></path>{/if}
+              {#each ghosts as g, i (i)}<path class="ghost" d={g}></path>{/each}
             </svg>
 
             {#each S as n, i (n.node_name)}
@@ -498,11 +634,16 @@
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
                 <div
                   class="handle right"
+                  class:candidate={dropSide === 'source'}
+                  class:rewirable={modHeld && busySources.has(n.node_name)}
                   role="button"
                   tabindex="-1"
                   aria-label="Drag to a group to route"
-                  title="Drag to a group to route"
+                  title={busySources.has(n.node_name)
+                    ? 'Drag to a group to route — Ctrl-drag to move this source’s wires to another source'
+                    : 'Drag to a group to route'}
                   onpointerdown={(e) => startDrag('source', n.node_name, e)}
+                  oncontextmenu={(e) => e.preventDefault()}
                 ></div>
               </div>
             {/each}
@@ -513,11 +654,16 @@
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
                 <div
                   class="handle left"
+                  class:candidate={dropSide === 'target'}
+                  class:rewirable={modHeld && busyTargets.has(t.key)}
                   role="button"
                   tabindex="-1"
                   aria-label="Drag to a source to route"
-                  title="Drag to a source to route"
+                  title={busyTargets.has(t.key)
+                    ? `Drag to a source to route — Ctrl-drag to move what ${t.kind === 'group' ? 'this group' : 'this speaker'} is playing to another one`
+                    : 'Drag to a source to route'}
                   onpointerdown={(e) => startDrag('target', t.key, e)}
+                  oncontextmenu={(e) => e.preventDefault()}
                 ></div>
                 <div class="tbody">
                   {#if t.kind === 'group'}
@@ -721,16 +867,29 @@
     stroke-dasharray: 4 4;
     opacity: 0.7;
   }
-  /* Transparent fat overlay of each wire so it's easy to click to remove. */
+  /* Transparent fat overlay of each wire so it's easy to click to remove. The
+     cursor is scissors, because that's the only thing clicking a wire does — a
+     plain pointer would promise a selection that doesn't exist. Drawn twice, a
+     white halo under a red blade, so it reads on either theme; hotspot sits on
+     the blade crossing (12,12). Falls back to `pointer` where SVG cursors are
+     refused. */
   .hit {
     fill: none;
     stroke: transparent;
     stroke-width: 16;
     pointer-events: stroke;
-    cursor: pointer;
+    cursor:
+      url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke-width='2' stroke-linecap='round'><g stroke='%23fff' stroke-width='4.5'><circle cx='6' cy='6' r='3'/><circle cx='6' cy='18' r='3'/><path d='M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12'/></g><g stroke='%23d33'><circle cx='6' cy='6' r='3'/><circle cx='6' cy='18' r='3'/><path d='M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12'/></g></svg>")
+        12 12,
+      pointer;
   }
   .hit:hover + .wire {
     stroke: var(--error-color, #d33);
+  }
+  /* Mid-drag the wires aren't click targets: no scissors over them, and the
+     pointerup that ends the drag can't be read as a click on one. */
+  .canvas.dragging .hit {
+    pointer-events: none;
   }
 
   .node {
@@ -833,6 +992,16 @@
   }
   .handle:hover {
     box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary-color) 25%, transparent);
+  }
+  /* Ctrl/⌘ held: this handle carries wires, so grabbing it moves them instead of
+     drawing a new one. */
+  .handle.rewirable {
+    cursor: move;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary-color) 35%, transparent);
+  }
+  /* Where whatever is in hand can be dropped. */
+  .handle.candidate {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--primary-color) 22%, transparent);
   }
   .handle.right {
     left: 100%;
