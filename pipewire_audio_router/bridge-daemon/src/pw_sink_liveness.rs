@@ -12,7 +12,14 @@
 //!
 //! Mirrors overlay_mixer.rs's global-singleton shape (a `OnceLock` behind a
 //! mutex): cheap, lock-guarded, no per-call allocation.
+//!
+//! A status *change* also nudges the routing-matrix WebSocket (via the notifier
+//! main.rs installs, like sendspin_volume.rs's): the matrix reports this as each
+//! output's `streaming`, and the graph decides from it whether a wire is really
+//! carrying audio — so a handshake completing has to push a frame, not wait for
+//! some unrelated registry event.
 
+use crate::pw_thread::ChangeNotifier;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -31,6 +38,9 @@ pub struct PwSinkStatus {
 #[derive(Default)]
 pub struct PwSinkLiveness {
     map: Mutex<BTreeMap<String, PwSinkStatus>>,
+    /// Pushes a routing-matrix frame when `established` flips. Installed once at
+    /// startup; `None` in tests and before wiring.
+    notifier: Mutex<Option<ChangeNotifier>>,
 }
 
 impl PwSinkLiveness {
@@ -40,14 +50,34 @@ impl PwSinkLiveness {
         L.get_or_init(PwSinkLiveness::default)
     }
 
-    /// Publish (or update) a target's status.
+    /// Install the notifier nudged when a target's `established` changes.
+    pub fn set_change_notifier(&self, changes: ChangeNotifier) {
+        *self.notifier.lock().unwrap() = Some(changes);
+    }
+
+    /// Publish (or update) a target's status. The status task polls every second,
+    /// so only a *change* notifies — otherwise this would push a matrix frame per
+    /// target per second.
     pub fn set(&self, node_name: &str, status: PwSinkStatus) {
-        self.map.lock().unwrap().insert(node_name.to_string(), status);
+        let prev = self.map.lock().unwrap().insert(node_name.to_string(), status);
+        if prev.map(|p| p.established) != Some(status.established) {
+            self.notify_changed();
+        }
     }
 
     /// Forget a target (on group teardown / sender stop).
     pub fn remove(&self, node_name: &str) {
-        self.map.lock().unwrap().remove(node_name);
+        if let Some(prev) = self.map.lock().unwrap().remove(node_name) {
+            if prev.established {
+                self.notify_changed();
+            }
+        }
+    }
+
+    fn notify_changed(&self) {
+        if let Some(changes) = self.notifier.lock().unwrap().as_ref() {
+            let _ = changes.send(());
+        }
     }
 
     /// Current status for a target, or `None` if no sender is running for it

@@ -29,6 +29,7 @@ mod pw_sink;
 mod pw_sink_liveness;
 mod pw_sink_spike;
 mod pw_target_discovery;
+mod pw_target_liveness;
 mod pw_thread;
 mod pwsink_server;
 mod resample;
@@ -312,6 +313,10 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // task TCP-probes each and demotes/removes a powered-off receiver so its
         // sender is torn down (and its PTP peer released).
         ap2_liveness::spawn(ap2_devices.clone(), ap2_ptp.clone(), changes.clone());
+        // And for pw-sink targets, which have nothing to probe (the receiver dials
+        // us): presence follows the advert, debounced, with an established session
+        // as proof of life. Without this a target seen once stayed "online" forever.
+        pw_target_liveness::spawn(pw_targets.clone(), changes.clone());
 
         // Let device-reported sendspin volume changes (sendspin_server.rs) nudge
         // the routing-matrix WebSocket, so the UI slider syncs live to a physical
@@ -319,6 +324,10 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // feedback yet) but uses the same notifier so a set pushes immediately.
         sendspin_control.lock().await.set_change_notifier(changes.clone());
         ap2_control.lock().await.set_change_notifier(changes.clone());
+        // Same for the pw-sink handshake: the matrix reports it as each output's
+        // `streaming` (whether a route is really being carried), so a receiver
+        // attaching or dropping has to push a frame of its own.
+        pw_sink_liveness::PwSinkLiveness::global().set_change_notifier(changes.clone());
 
         // Seed persisted per-device static delays so they re-apply when each
         // device (re)connects, exactly like stored volumes (sendspin_volume.rs).

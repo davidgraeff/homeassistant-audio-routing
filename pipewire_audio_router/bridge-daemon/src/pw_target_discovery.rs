@@ -15,6 +15,12 @@
 //! pwsink_server.rs) is built by the grouping reconciler (sync_group.rs) from the
 //! routing intent.
 //!
+//! ## Presence
+//! This module only ever *adds* targets and marks them present; the offline
+//! decision belongs to pw_target_liveness.rs, mirroring sendspin_liveness.rs /
+//! ap2_liveness.rs. Without that task a target stayed present forever once seen —
+//! which made the routing graph show a powered-off host as a happy output.
+//!
 //! ## Filtering our own adverts
 //! The daemon itself advertises `_pipewire-audio._udp` sessions (one per routed
 //! target, `PWSINK_SESSION_PREFIX` = `pwrouter-`; plus the dev spike
@@ -28,6 +34,7 @@ use crate::pw_thread::ChangeNotifier;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The mDNS service type `module-rtp-session` uses for audio sessions.
 const PIPEWIRE_AUDIO_SERVICE_TYPE: &str = "_pipewire-audio._udp.local.";
@@ -46,9 +53,20 @@ pub struct PwTarget {
     /// does not dial it, since the *receiver* initiates the AppleMIDI handshake
     /// to our advertised session). `None` until resolved.
     pub addr: Option<std::net::IpAddr>,
-    /// mDNS presence (a resolve sets it `true`; TTL-flap removes are ignored —
-    /// liveness is really carried by the sender handshake, pwsink_liveness.rs).
+    /// mDNS presence: a resolve sets it `true`, and pw_target_liveness.rs owns the
+    /// demotion to `false` (never this browse loop — a TTL flap must not gray a
+    /// live target). Note this is *reachability*, not delivery: whether a receiver
+    /// has actually attached to the session we advertise is a separate question,
+    /// answered by pw_sink_liveness.rs.
     pub present: bool,
+    /// When the host's advert last went away — a goodbye packet (clean shutdown, or
+    /// the module being unloaded) or SRV-record expiry ~2 min after the host stops
+    /// answering. Cleared by the next resolve. `None` = advertised right now.
+    ///
+    /// The flag lives here rather than in the liveness task because only the browse
+    /// thread sees the events; the task owns what to *do* about it (debounce, then
+    /// demote/remove), exactly like the probe-driven sendspin/AP2 tasks.
+    pub withdrawn_since: Option<Instant>,
 }
 
 /// Live discovered targets, keyed by virtual output node name
@@ -81,45 +99,63 @@ fn is_own_advert(label: &str) -> bool {
 /// keeping `targets` in sync. Our own advertised sessions are filtered out; every
 /// other resolved session is surfaced as a directly-routable target. Mirrors
 /// sendspin_discovery::spawn / ap2_discovery::spawn.
+///
+/// A `ServiceRemoved` never demotes a target here — it only timestamps the
+/// withdrawal for pw_target_liveness.rs to debounce, so a TTL flap can't gray a
+/// target that is streaming fine.
 pub fn spawn(daemon: &ServiceDaemon, targets: SharedPwTargets, changes: ChangeNotifier) -> anyhow::Result<()> {
     let receiver = daemon.browse(PIPEWIRE_AUDIO_SERVICE_TYPE)?;
     std::thread::Builder::new().name("pwsink-discovery".into()).spawn(move || {
         while let Ok(event) = receiver.recv() {
-            if let ServiceEvent::ServiceResolved(info) = event {
-                let display_name = display_name_from_service(&info);
-                if display_name.is_empty() || is_own_advert(&display_name) {
-                    continue;
-                }
-                let node_name = target_node_name(&display_name);
-                let fullname = info.get_fullname().to_string();
-                let addr = addr_from_service(&info);
+            match event {
+                ServiceEvent::ServiceResolved(info) => {
+                    let display_name = display_name_from_service(&info);
+                    if display_name.is_empty() || is_own_advert(&display_name) {
+                        continue;
+                    }
+                    let node_name = target_node_name(&display_name);
+                    let fullname = info.get_fullname().to_string();
+                    let addr = addr_from_service(&info);
 
-                let mut tgts = targets.lock_recover();
-                let notify = match tgts.get_mut(&node_name) {
-                    Some(t) => {
-                        let came_online = !t.present;
-                        t.present = true;
-                        t.fullname = fullname;
-                        if addr.is_some() {
-                            t.addr = addr;
+                    let mut tgts = targets.lock_recover();
+                    let notify = match tgts.get_mut(&node_name) {
+                        Some(t) => {
+                            let came_online = !t.present;
+                            t.present = true;
+                            t.withdrawn_since = None;
+                            t.fullname = fullname;
+                            if addr.is_some() {
+                                t.addr = addr;
+                            }
+                            came_online
                         }
-                        came_online
+                        None => {
+                            tgts.insert(
+                                node_name.clone(),
+                                PwTarget { fullname, display_name: display_name.clone(), addr, present: true, withdrawn_since: None },
+                            );
+                            tracing::info!("discovered pw-sink target '{display_name}' ({node_name})");
+                            true
+                        }
+                    };
+                    drop(tgts);
+                    if notify {
+                        let _ = changes.send(());
                     }
-                    None => {
-                        tgts.insert(
-                            node_name.clone(),
-                            PwTarget { fullname, display_name: display_name.clone(), addr, present: true },
-                        );
-                        tracing::info!("discovered pw-sink target '{display_name}' ({node_name})");
-                        true
-                    }
-                };
-                drop(tgts);
-                if notify {
-                    let _ = changes.send(());
                 }
+                // Note the withdrawal but keep the target present: the liveness task
+                // decides (after a grace window, and only if no session is up).
+                ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                    let mut tgts = targets.lock_recover();
+                    if let Some((node_name, t)) = tgts.iter_mut().find(|(_, t)| t.fullname == fullname) {
+                        if t.withdrawn_since.is_none() {
+                            t.withdrawn_since = Some(Instant::now());
+                            tracing::debug!("pw-sink target '{node_name}' withdrew its advert; liveness will judge it");
+                        }
+                    }
+                }
+                _ => {}
             }
-            // ServiceRemoved ignored (TTL flap ≠ gone), same as sendspin/ap2.
         }
         tracing::info!("pwsink discovery loop ended");
     })?;

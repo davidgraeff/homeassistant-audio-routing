@@ -145,11 +145,16 @@ impl Ap2Control {
             let effective = self.effective_volume(&node_name);
             self.send(&node_name, effective).await;
         }
+        // The sender set IS this receiver's session state (`connected`), which the
+        // routing matrix reports as `streaming` — push a frame so the graph stops
+        // showing the wire as waiting the moment the session comes up.
+        self.notify_changed();
     }
 
     /// Drop a device whose group task is gone (desired state kept for reconnect).
     pub fn unregister(&mut self, node_name: &str) {
         self.senders.remove(node_name);
+        self.notify_changed();
     }
 
     /// Set a device's desired volume (0.0–1.0). Applies live unless muted (then it

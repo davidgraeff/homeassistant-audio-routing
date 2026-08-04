@@ -381,6 +381,38 @@ fn supports_on_demand_announce(output: &str) -> bool {
     output.starts_with(AP2_DEV_PREFIX) || output.starts_with(PWSINK_DEV_PREFIX)
 }
 
+/// **Is a session to `output` actually up right now?** — i.e. is audio dropped at
+/// its end of the graph really being carried to the device?
+///
+/// Only the two **dialed** backends can answer this, and for them mDNS presence is
+/// not the answer:
+/// - **AP2**: `ap2_connected` (from `Ap2Control::connected`) = its sender
+///   registered a command channel, i.e. the RTSP session is up. A receiver can be
+///   reachable (so `present`) while its session is still connecting or has failed.
+/// - **pw-sink**: [`PwSinkLiveness`](crate::pw_sink_liveness) `established` = a
+///   receiver completed the AppleMIDI handshake to the session we advertise. That
+///   handshake is *receiver*-initiated, so an advertised session with nobody
+///   attached carries nothing — a target can sit `present` (mDNS) forever without
+///   ever connecting.
+///
+/// `None` = the question doesn't apply: a sendspin device always has a sender
+/// reading its overlay while it's adopted (grouped, or via its idle sender), and a
+/// plain graph node has no session at all.
+///
+/// Shared by [`GroupReconciler::has_live_sender`] (which adds the sendspin cases it
+/// alone can see) and the routing matrix (routing.rs `RoutingNode::streaming`), so
+/// the graph, the Outputs page and the announce arbiter all judge delivery by the
+/// same rule.
+pub fn dialed_session_established(output: &str, ap2_connected: &HashSet<String>) -> Option<bool> {
+    if output.starts_with(AP2_DEV_PREFIX) {
+        return Some(ap2_connected.contains(output));
+    }
+    if output.starts_with(PWSINK_DEV_PREFIX) {
+        return Some(crate::pw_sink_liveness::PwSinkLiveness::global().get(output).is_some_and(|s| s.established));
+    }
+    None
+}
+
 /// The private silent sink backing an on-demand announce session for `output`.
 /// Shares [`IDLE_SINK_PREFIX`] with the sendspin idle sinks (so routing ignores it
 /// the same way) and keeps a per-kind marker, so the kinds can't collide.
@@ -534,18 +566,12 @@ impl GroupReconciler {
     ///
     /// For the two **dialed** backends, group membership is not the answer — it lists
     /// what the group *dialed*, including a receiver still connecting or one whose
-    /// session failed, neither of which consumes an overlay. So:
-    /// - **AP2**: `ap2_connected` (from `Ap2Control::connected`) = its sender
-    ///   registered a command channel, i.e. the session is up.
-    /// - **pw-sink**: `PwSinkLiveness` `established` = a receiver completed the
-    ///   AppleMIDI handshake to our advertised session (it is receiver-initiated, so
-    ///   an advertised session with nobody attached carries nothing).
+    /// session failed, neither of which consumes an overlay. That judgement is
+    /// [`dialed_session_established`] (shared with the routing matrix); the sendspin
+    /// cases below are the ones only this reconciler can see.
     fn has_live_sender(&self, output: &str, ap2_connected: &HashSet<String>) -> bool {
-        if output.starts_with(AP2_DEV_PREFIX) {
-            return ap2_connected.contains(output);
-        }
-        if output.starts_with(PWSINK_DEV_PREFIX) {
-            return crate::pw_sink_liveness::PwSinkLiveness::global().get(output).is_some_and(|s| s.established);
+        if let Some(established) = dialed_session_established(output, ap2_connected) {
+            return established;
         }
         if self.idle_senders.contains_key(output) {
             return true;

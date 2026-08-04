@@ -348,10 +348,34 @@ differs per backend:
   session-scoping decision, `docs/pipewire-sink-roadmap.md` §4/§10).
 
 **"Live" means connected, not dialed.** For both dialed backends, group
-membership only says what the group *dialed*: `has_live_sender` therefore reads
-`Ap2Control::connected` (its sender registered a command channel) and
-`PwSinkLiveness` `established` (a receiver completed the handshake). A routed
-endpoint that never came up is reported as such instead of counting as playable.
+membership only says what the group *dialed*: `sync_group::dialed_session_established`
+therefore reads `Ap2Control::connected` (its sender registered a command channel)
+and `PwSinkLiveness` `established` (a receiver completed the handshake), and
+`has_live_sender` builds on it. A routed endpoint that never came up is reported as
+such instead of counting as playable.
+
+### 5.5 Reachable, connected, playing — three states, one rule
+
+Every surface that shows an output's state has to answer two questions, and
+conflating them is how the UI came to contradict itself (the routing graph animated
+a wire to a pw-sink target that had never accepted a session, while announcements to
+that same target were correctly refused):
+
+| Question | Field | Owner |
+| --- | --- | --- |
+| Is it **reachable**? | `present` | the per-backend liveness tasks: `sendspin_liveness` (connection + TCP probe), `ap2_liveness` (RTSP-port probe), `pw_target_liveness` (advert withdrawal, debounced) — mDNS discovery only ever *adds* |
+| Is a **session up**? | `streaming` (matrix) / `pwsink_streaming` (`/api/outputs`) | `sync_group::dialed_session_established` — `Ap2Control::connected` + `PwSinkLiveness.established` |
+
+`streaming` is `None`/absent where the question doesn't apply: sources, and sendspin
+devices (which always have a sender while adopted). It matters most for pw-sink,
+where the handshake is *receiver*-initiated: a target can be reachable indefinitely
+without ever attaching, so the UI shows a third state ("not connected", amber)
+and the graph draws that wire **without** the flow animation — an animated wire is a
+claim that audio is being carried. A status flip nudges the routing-matrix
+WebSocket (`PwSinkLiveness::set_change_notifier`, `Ap2Control` register/unregister),
+so the graph and the Outputs page both update live rather than on the next unrelated
+registry event.
+
 
 **Nothing is silently swallowed.** Two mechanisms make that true: the API
 answers with what will actually carry each target (targets nothing can carry are

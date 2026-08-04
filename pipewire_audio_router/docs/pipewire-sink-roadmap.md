@@ -241,8 +241,9 @@ proven end-to-end against a stock receiver (`E@440`; see
 [spike-results](pipewire-sink-spike-results.md) "PROVEN" section).
 
 **Files.** `applemidi_sender.rs` (transport, frozen interface — Task 1),
-`pw_target_discovery.rs` (discovery), `pwsink_server.rs` (per-group audio path),
-`pw_sink_liveness.rs` (status registry), plus wiring in `sync_group.rs`,
+`pw_target_discovery.rs` (discovery), `pw_target_liveness.rs` (presence),
+`pwsink_server.rs` (per-group audio path),
+`pw_sink_liveness.rs` (session-status registry), plus wiring in `sync_group.rs`,
 `discovery_supervisor.rs`, `routing.rs`, `api.rs`, `main.rs`.
 
 **Data path.** Discovery browses `_pipewire-audio._udp` → `SharedPwTargets`
@@ -288,12 +289,28 @@ RTP. Liveness = `AppleMidiSender::status().established`, polled into
   2+ pw-sink targets on one LAN cross-connect (each receiver hears both sessions).
   The single separate-room target (the primary use case) is unaffected. A scoping
   mechanism (per-receiver session binding) is future work.
-- **Dedicated liveness probe.** mDNS removes are ignored (TTL-flap safe);
-  present-ness relies on re-resolve + handshake status. A TCP/timeout probe like
-  `sendspin_liveness`/`ap2_liveness` can be added if stale entries become an issue.
 - **PTP sample-lock** (§7) — unchanged, future.
 
+**Presence vs delivery (done 2026-08-05).** These are two questions and the UI now
+answers both, everywhere, by the same rule:
+- `present` = **reachable**. `pw_target_liveness.rs` owns it (the counterpart to
+  `sendspin_liveness`/`ap2_liveness`, which this backend had lacked, so a target
+  seen once stayed "online" for the daemon's lifetime). No active probe is possible
+  — the receiver dials *us*, so there's no port of ours on the target to poke, and
+  probing the host generally would only prove the machine answers. Instead
+  `pw_target_discovery` timestamps a `ServiceRemoved` (goodbye, or SRV expiry ~2 min
+  after the host goes quiet) in `PwTarget::withdrawn_since`, and the task demotes
+  after a 45 s grace window / removes after 5 min — unless a session is established,
+  which outranks the advert.
+- `streaming` = **a session is up**, from `PwSinkLiveness.established` (AP2's half
+  is `Ap2Control::connected`), shared by `sync_group::dialed_session_established`
+  with the announce arbiter. Carried on the routing matrix (`RoutingNode.streaming`)
+  and `/api/outputs` (`pwsink_streaming`), so the routing graph draws a wire to a
+  reachable-but-unattached target *still* (amber "not connected") instead of
+  animating it, and the Outputs page shows the same third state rather than calling
+  it "offline". A status flip nudges the matrix WebSocket, so both update live.
+
 **Not yet done:** live end-to-end deploy validation (needs the Fedora box running
-`module-rtp-session` + a routing link created); frontend badge for
-`pwsink_streaming`; `media_player` exposure parity (outputs appear via
-`/api/outputs`; HA `media_player` bridging follows the sendspin/AP2 pattern).
+`module-rtp-session` + a routing link created); `media_player` exposure parity
+(outputs appear via `/api/outputs`; HA `media_player` bridging follows the
+sendspin/AP2 pattern).
