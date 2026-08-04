@@ -4,10 +4,13 @@
   // Unlike music groups these overlap freely — a speaker may be in any number of
   // them — so the pool always lists every speaker and dragging from it copies.
   //
-  // The page is a stack of first-class cards: one explanation, the speaker pool,
-  // the dock that turns a dropped speaker into a new group, then one card per
-  // group (newest first, right under the dock it came out of). The long-form
-  // detail lives in the docs dialog, not on the page.
+  // The page is first-class cards laid out two to a row (`.groupgrid`, single
+  // column on a narrow screen): one explanation, then the speaker pool beside the
+  // dock that turns a dropped speaker into a new group, then the groups (newest
+  // first, so a new one lands right under the dock it came out of). A group card
+  // is a name, its speakers, and one action row at the foot; priority and duck are
+  // behind that row's Settings popover, since most groups never change them. The
+  // long-form detail lives in the docs dialog.
   import { onMount } from 'svelte';
   import { flip } from 'svelte/animate';
   import { api } from '../lib/api';
@@ -27,7 +30,7 @@
   let shown = $derived([...groups].reverse());
 
   // Priority a dock-created group starts with (its duck level is left to the
-  // daemon's configured default); both are editable on the group's own card.
+  // daemon's configured default); both are editable behind the card's Settings.
   const NEW_PRIORITY = 0;
 
   // The speaker currently being turned into a group (drives the dock animation),
@@ -141,6 +144,25 @@
     launchTimer = setTimeout(() => (creating = null), 220);
   }
 
+  // ── settings popover ──────────────────────────────────────────────────────
+  // Priority and duck are set once, if ever, so they don't earn two permanent
+  // lines in every card: they live behind the action row's Settings button. At
+  // most one popover is open (`settingsFor` is the group whose panel is up).
+  let settingsFor = $state<string | null>(null);
+
+  function toggleSettings(id: string) {
+    settingsFor = settingsFor === id ? null : id;
+  }
+  /** Light dismiss: a pointer down anywhere but the open panel or a Settings
+   *  button closes it (the button's own click then toggles, as it should). */
+  function maybeDismiss(e: PointerEvent) {
+    if (!settingsFor) return;
+    if (!(e.target instanceof Element) || !e.target.closest('.pop, .gearbtn')) settingsFor = null;
+  }
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') settingsFor = null;
+  }
+
   // ── inline edits ──────────────────────────────────────────────────────────
   async function rename(g: AnnouncementGroup, name: string) {
     if (await run(() => api.updateAnnouncementGroup(g.id, { name }), `Renamed to "${name}"`)) await refresh(true);
@@ -163,7 +185,13 @@
   }
 </script>
 
-<svelte:window onpointermove={dnd.move} onpointerup={dnd.end} onpointercancel={dnd.end} />
+<svelte:window
+  onpointermove={dnd.move}
+  onpointerup={dnd.end}
+  onpointercancel={dnd.end}
+  onpointerdown={maybeDismiss}
+  onkeydown={onKeydown}
+/>
 
 <div class="card">
   <div class="card-head">
@@ -182,61 +210,94 @@
 {#if loading}
   <div class="card"><p class="empty">Loading…</p></div>
 {:else}
-  <div class="card dropzone" data-dropzone="pool" class:hover={dnd.active && dnd.hover === 'pool'}>
-    <div class="card-head">
-      <h2>Available</h2>
-      <span class="hint">Every speaker — drag one into as many groups as you like</span>
-    </div>
-    <div class="pool">
-      {#each outputs as o (o.node_name)}
-        <DeviceChip label={displayName(o.node_name)} onDragStart={(e) => dnd.begin(e, { node: o.node_name, from: 'pool' }, displayName(o.node_name))} />
-      {/each}
-      {#if outputs.length === 0}<span class="drop-hint">No speakers configured</span>{/if}
-    </div>
-  </div>
-
-  <!-- The dock: no name, no priority, no duck. One drop makes a real group with
-       defaults, which the card below then edits. -->
-  <div class="card dropzone dock" data-dropzone="new" class:hover={dnd.active && dnd.hover === 'new'} class:launching={!!creating}>
-    <div class="dockrow">
-      <strong>New group</strong>
-      {#if creating}
-        <span class="hint">Creating a group for {displayName(creating)}…</span>
-      {:else}
-        <span class="hint">Drop a speaker here</span>
-      {/if}
-    </div>
-  </div>
-
-  {#each shown as g (g.id)}
-    <div
-      class="card dropzone"
-      class:hover={dnd.active && dnd.hover === `g:${g.id}`}
-      class:arriving={arriving === g.id}
-      data-dropzone={`g:${g.id}`}
-      animate:flip={{ duration: flipMs }}
-    >
-      <div class="grouptop">
-        <GroupTitle name={g.name} onRename={(name) => rename(g, name)} />
-        <div class="field">
-          <span class="muted">Priority</span>
-          <input type="number" step="1" value={g.priority} onchange={(e) => setPriority(g, Number(e.currentTarget.value))} />
-        </div>
-        <div class="field">
-          <span class="muted">Duck {g.duck.toFixed(2)}</span>
-          <input type="range" min="0" max="1" step="0.05" value={g.duck} onchange={(e) => setDuck(g, Number(e.currentTarget.value))} />
-        </div>
-        <button onclick={() => testAnnounce(g)} title="Play the built-in test clip to this group now">Test</button>
-        <button class="danger" onclick={() => remove(g)}>Delete</button>
+  <div class="groupgrid head">
+    <div class="card dropzone" data-dropzone="pool" class:hover={dnd.active && dnd.hover === 'pool'}>
+      <div class="card-head">
+        <strong>Available</strong>
+        <span class="hint">Drag/Copy a speaker into a group</span>
       </div>
-      <div class="chips">
-        {#each g.targets as n (n)}
-          <DeviceChip label={displayName(n)} onDragStart={(e) => dnd.begin(e, { node: n, from: `g:${g.id}` }, displayName(n))} />
+      <div class="pool">
+        {#each outputs as o (o.node_name)}
+          <DeviceChip label={displayName(o.node_name)} onDragStart={(e) => dnd.begin(e, { node: o.node_name, from: 'pool' }, displayName(o.node_name))} />
         {/each}
-        {#if g.targets.length === 0}<span class="drop-hint">Drop speakers here</span>{/if}
+        {#if outputs.length === 0}<span class="drop-hint">No speakers configured</span>{/if}
       </div>
     </div>
-  {/each}
+
+    <!-- The dock: no name, no priority, no duck. One drop makes a real group with
+         defaults, which the card below then edits. -->
+    <div class="card dropzone dock" data-dropzone="new" class:hover={dnd.active && dnd.hover === 'new'} class:launching={!!creating}>
+      <div class="dockrow">
+        <strong>New group</strong>
+        {#if creating}
+          <span class="hint">Creating a group for {displayName(creating)}…</span>
+        {:else}
+          <span class="hint">Drop a speaker here</span>
+        {/if}
+      </div>
+    </div>
+  </div>
+
+  {#if shown.length}
+    <div class="groupgrid">
+      {#each shown as g (g.id)}
+        <div
+          class="card dropzone groupcard"
+          class:hover={dnd.active && dnd.hover === `g:${g.id}`}
+          class:arriving={arriving === g.id}
+          data-dropzone={`g:${g.id}`}
+          animate:flip={{ duration: flipMs }}
+        >
+          <div class="grouptop">
+            <GroupTitle name={g.name} onRename={(name) => rename(g, name)} />
+          </div>
+          <div class="chips">
+            {#each g.targets as n (n)}
+              <DeviceChip label={displayName(n)} onDragStart={(e) => dnd.begin(e, { node: n, from: `g:${g.id}` }, displayName(n))} />
+            {/each}
+            {#if g.targets.length === 0}<span class="drop-hint">Drop speakers here</span>{/if}
+          </div>
+          <div class="groupactions">
+            <button
+              class="ghost gearbtn"
+              type="button"
+              aria-expanded={settingsFor === g.id}
+              title={`Priority ${g.priority}, duck ${g.duck.toFixed(2)}`}
+              onclick={() => toggleSettings(g.id)}
+            >
+              <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M2 5h6.4M11.6 5H14M2 11h2.4M7.6 11H14" />
+                <circle cx="10" cy="5" r="1.6" />
+                <circle cx="6" cy="11" r="1.6" />
+              </svg>
+              Settings
+            </button>
+            <button onclick={() => testAnnounce(g)} title="Play the built-in test clip to this group now">Test</button>
+            <button class="danger" onclick={() => remove(g)}>Delete</button>
+            {#if settingsFor === g.id}
+              <div class="pop" role="group" aria-label={`${g.name} settings`}>
+                <!-- On a short card the panel covers the name it belongs to, so it says it. -->
+                <div class="pophead">{g.name}</div>
+                <label class="ctlrow">
+                  <span class="ctllabel">Priority</span>
+                  <input type="number" step="1" value={g.priority} onchange={(e) => setPriority(g, Number(e.currentTarget.value))} />
+                </label>
+                <label class="ctlrow">
+                  <span class="ctllabel">Duck</span>
+                  <input type="range" min="0" max="1" step="0.05" value={g.duck} onchange={(e) => setDuck(g, Number(e.currentTarget.value))} />
+                  <span class="ctlval">{g.duck.toFixed(2)}</span>
+                </label>
+                <p class="pophint">
+                  <strong>Priority</strong> decides who wins when two clips collide; <strong>Duck</strong> is how far music drops while this
+                  group's clip plays.
+                </p>
+              </div>
+            {/if}
+          </div>
+        </div>
+      {/each}
+    </div>
+  {/if}
 {/if}
 
 {#if docsOpen}
@@ -248,24 +309,58 @@
 {/if}
 
 <style>
-  /* Priority / duck controls inside a group card: label above a narrow input. */
-  .field {
+  /* The settings popover: priority and duck, opened from the action row's gear
+     button. It's anchored to that row (`position: relative` on `.groupactions`)
+     rather than to the button, so it spans the card's width instead of hanging
+     off one edge, and it opens upward — the row sits at the foot of the card, so
+     downward would fall off the page on the last row of cards. */
+  .pop {
+    position: absolute;
+    z-index: 30;
+    bottom: calc(100% + 4px);
+    left: 0;
+    right: 0;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    margin-bottom: 0;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--divider-color);
+    background: var(--card-background-color, #fff);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
   }
-  .field input[type='number'] {
-    width: 70px;
-    padding: 3px 6px;
-    border-radius: 6px;
+  .pophead {
+    font-size: 0.8rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--divider-color);
   }
-  .field input[type='range'] {
-    width: 130px;
+  .pophint {
+    margin: 0;
+    font-size: 0.75rem;
+    line-height: 1.35;
+    color: var(--secondary-text-color);
   }
-  .muted {
-    opacity: 0.65;
-    font-size: 0.78rem;
+  /* Sliders glyph — "there are parameters behind this", not a cog. */
+  .gearbtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ico {
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+  }
+  .ico circle {
+    fill: currentColor;
+    stroke: none;
   }
   /* The dock is one line high — a target, not a form. */
   .dockrow {

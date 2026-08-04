@@ -4,9 +4,9 @@
   // most one music group), so the pool and the group cards are one exclusive
   // drag-and-drop surface.
   //
-  // Page shape mirrors Announcements: one explanation card, the speaker pool, the
-  // dock that turns a dropped speaker into a group, then one card per group
-  // (newest first). Long-form detail lives in the docs dialog.
+  // Page shape mirrors Announcements: one explanation card, then the speaker pool
+  // beside the dock that turns a dropped speaker into a group, then the group
+  // cards two to a row (newest first). Long-form detail lives in the docs dialog.
   //
   // The routing graph below is the same routing, one altitude lower: it shows
   // and edits the individual source→speaker links a group-level route expands
@@ -247,90 +247,98 @@
 {#if loading}
   <div class="card"><p class="empty">Loading…</p></div>
 {:else}
-  <div class="card dropzone" data-dropzone="pool" class:hover={dnd.active && dnd.hover === 'pool'}>
-    <div class="card-head">
-      <h2>Available</h2>
-      <span class="hint">Not in any group — drag one in, or drag a chip back here to release it</span>
-    </div>
-    <div class="pool">
-      {#each pool as o (o.node_name)}
-        <DeviceChip label={displayName(o.node_name)} onDragStart={(e) => dnd.begin(e, { node: o.node_name, from: 'pool' }, displayName(o.node_name))} />
-      {/each}
-      {#if pool.length === 0}<span class="drop-hint">All speakers are in a group</span>{/if}
-    </div>
-  </div>
-
-  <!-- The dock: no name field. One drop makes a real group, which the card below
-       then names, routes and fills. -->
-  <div class="card dropzone dock" data-dropzone="new" class:hover={dnd.active && dnd.hover === 'new'} class:launching={!!creating}>
-    <div class="dockrow">
-      <strong>New group</strong>
-      {#if creating}
-        <span class="hint">Creating a group for {displayName(creating)}…</span>
-      {:else}
-        <span class="hint">Drop a speaker here</span>
-      {/if}
-    </div>
-  </div>
-
-  {#each shown as g (g.id)}
-    {@const r = mgRouting(g)}
-    <div
-      class="card dropzone"
-      class:hover={dnd.active && dnd.hover === `g:${g.id}`}
-      class:arriving={arriving === g.id}
-      data-dropzone={`g:${g.id}`}
-      animate:flip={{ duration: flipMs }}
-    >
-      <div class="grouptop">
-        <GroupTitle name={g.name} onRename={(name) => rename(g, name)} />
-        {#if r.state === 'mixed'}
-          <button
-            class="mixed"
-            onclick={() => toggleBreakdown(g.id)}
-            aria-expanded={expandedMixed.has(g.id)}
-            title="Members are routed inconsistently — click for details"
-          >
-            ⚠ Mixed
-            <svg class="caret" class:open={expandedMixed.has(g.id)} viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
-          </button>
-        {/if}
-        <label class="srcpick">
-          <span class="muted">Source</span>
-          <select value={selectValue(r)} onchange={(e) => setSource(g, e.currentTarget.value)}>
-            {#if r.state === 'mixed'}<option value={MIXED} disabled>Mixed</option>{/if}
-            <option value={NONE}>{NONE}</option>
-            {#each matrix.sources as s (s.node_name)}
-              <option value={s.display_name}>{s.display_name}</option>
-            {/each}
-          </select>
-        </label>
-        <button class="danger" onclick={() => remove(g)}>Delete</button>
+  <div class="groupgrid head">
+    <div class="card dropzone" data-dropzone="pool" class:hover={dnd.active && dnd.hover === 'pool'}>
+      <div class="card-head">
+        <strong>Available</strong>
+        <span class="hint">Not in any group — drag one in</span>
       </div>
-      {#if r.state === 'mixed' && expandedMixed.has(g.id)}
-        <div class="breakdown">
-          {#each r.perMember as pm (pm.output)}
-            <div class="brow">
-              <span class="bname" title={displayName(pm.output)}>{displayName(pm.output)}</span>
-              <span class="barrow">←</span>
-              {#if pm.sources.length}
-                <span class="bsrc">{pm.sources.map((s) => s.display_name).join(' + ')}</span>
-              {:else}
-                <span class="bsrc muted">unrouted</span>
-              {/if}
-            </div>
-          {/each}
-          <p class="bfix">Pick a source above to put every member back on one stream.</p>
-        </div>
-      {/if}
-      <div class="chips">
-        {#each g.members as n (n)}
-          <DeviceChip label={displayName(n)} onDragStart={(e) => dnd.begin(e, { node: n, from: `g:${g.id}` }, displayName(n))} />
+      <div class="pool">
+        {#each pool as o (o.node_name)}
+          <DeviceChip label={displayName(o.node_name)} onDragStart={(e) => dnd.begin(e, { node: o.node_name, from: 'pool' }, displayName(o.node_name))} />
         {/each}
-        {#if g.members.length === 0}<span class="drop-hint">Drop speakers here</span>{/if}
+        {#if pool.length === 0}<span class="drop-hint">All speakers are in a group</span>{/if}
       </div>
     </div>
-  {/each}
+
+    <!-- The dock: no name field. One drop makes a real group, which the card below
+         then names, routes and fills. -->
+    <div class="card dropzone dock" data-dropzone="new" class:hover={dnd.active && dnd.hover === 'new'} class:launching={!!creating}>
+      <div class="dockrow">
+        <strong>New group</strong>
+        {#if creating}
+          <span class="hint">Creating a group for {displayName(creating)}…</span>
+        {:else}
+          <span class="hint">Drop a speaker here</span>
+        {/if}
+      </div>
+    </div>
+  </div>
+
+  {#if shown.length}
+    <div class="groupgrid">
+      {#each shown as g (g.id)}
+        {@const r = mgRouting(g)}
+        <div
+          class="card dropzone groupcard"
+          class:hover={dnd.active && dnd.hover === `g:${g.id}`}
+          class:arriving={arriving === g.id}
+          data-dropzone={`g:${g.id}`}
+          animate:flip={{ duration: flipMs }}
+        >
+          <div class="grouptop">
+            <GroupTitle name={g.name} onRename={(name) => rename(g, name)} />
+            {#if r.state === 'mixed'}
+              <button
+                class="mixed"
+                onclick={() => toggleBreakdown(g.id)}
+                aria-expanded={expandedMixed.has(g.id)}
+                title="Members are routed inconsistently — click for details"
+              >
+                ⚠ Mixed
+                <svg class="caret" class:open={expandedMixed.has(g.id)} viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
+              </button>
+            {/if}
+          </div>
+          {#if r.state === 'mixed' && expandedMixed.has(g.id)}
+            <div class="breakdown">
+              {#each r.perMember as pm (pm.output)}
+                <div class="brow">
+                  <span class="bname" title={displayName(pm.output)}>{displayName(pm.output)}</span>
+                  <span class="barrow">←</span>
+                  {#if pm.sources.length}
+                    <span class="bsrc">{pm.sources.map((s) => s.display_name).join(' + ')}</span>
+                  {:else}
+                    <span class="bsrc muted">unrouted</span>
+                  {/if}
+                </div>
+              {/each}
+              <p class="bfix">Pick a source above to put every member back on one stream.</p>
+            </div>
+          {/if}
+          <div class="chips">
+            {#each g.members as n (n)}
+              <DeviceChip label={displayName(n)} onDragStart={(e) => dnd.begin(e, { node: n, from: `g:${g.id}` }, displayName(n))} />
+            {/each}
+            {#if g.members.length === 0}<span class="drop-hint">Drop speakers here</span>{/if}
+          </div>
+          <div class="groupactions">
+            <label class="ctlrow">
+              <span class="ctllabel">Source</span>
+              <select value={selectValue(r)} onchange={(e) => setSource(g, e.currentTarget.value)}>
+                {#if r.state === 'mixed'}<option value={MIXED} disabled>Mixed</option>{/if}
+                <option value={NONE}>{NONE}</option>
+                {#each matrix.sources as s (s.node_name)}
+                  <option value={s.display_name}>{s.display_name}</option>
+                {/each}
+              </select>
+            </label>
+            <button class="danger" onclick={() => remove(g)}>Delete</button>
+          </div>
+        </div>
+      {/each}
+    </div>
+  {/if}
 
   <!-- Same routing, drawn as wires: the graph's right column is these groups, so
        a wire onto one is the same call as its Source dropdown above. -->
@@ -410,15 +418,6 @@
     margin: 4px 0 0;
     font-size: 0.78rem;
     opacity: 0.75;
-  }
-  .srcpick {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .srcpick select {
-    padding: 4px 6px;
-    border-radius: 6px;
   }
   /* The dock is one line high — a target, not a form. */
   .dockrow {

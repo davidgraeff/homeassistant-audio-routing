@@ -264,6 +264,31 @@ th {
    scoped) because both pages render the same object and the chips live in a
    shared component (DeviceChip.svelte). */
 
+/* Two columns once there's room: the pool and the dock share the first row, then
+   two group cards per row. A group card is a narrow object — a name, a couple of
+   controls, a handful of chips — so one per row left most of the width empty.
+   Below the breakpoint it degrades to the original single column. */
+.groupgrid {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+@media (min-width: 820px) {
+  .groupgrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+/* Inside a grid the gap does the spacing; `.card + .card`'s margin would add to
+   it, and only between the cards that happen to be DOM siblings. */
+.groupgrid > .card + .card {
+  margin-top: 0;
+}
+/* The pool/dock row only: the dock is one line high, so it must not stretch to
+   the pool's height. Group cards do stretch, so a row of them lines up. */
+.groupgrid.head {
+  align-items: start;
+}
+
 /* A card that takes dropped speakers: lights up while the pointer is over it. */
 .card.dropzone {
   transition: border-color 0.12s, background 0.12s;
@@ -292,6 +317,69 @@ th {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+/* One labelled control on a line, label column first so several of them line up.
+   Used in a group card's action row (Source) and in the announcement settings
+   popover (Priority, Duck) — not down the card body: at half the page width
+   every permanent control is width the chips and the name need more. */
+.ctlrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--secondary-text-color);
+}
+.ctlrow .ctllabel {
+  flex: 0 0 4.5rem;
+}
+.ctlrow input,
+.ctlrow select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+/* A number is read at a glance — it doesn't need the whole line. */
+.ctlrow input[type='number'] {
+  flex: 0 0 5rem;
+}
+.ctlrow input[type='range'] {
+  padding: 0;
+}
+/* The slider's readout: fixed width and tabular figures, so the slider doesn't
+   resize as the value changes. */
+.ctlval {
+  flex: 0 0 2.4rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* A column, so the actions can be pushed to the foot: cards in a grid row are
+   the same height, and their buttons should sit on the same line rather than
+   wherever that card's chips happened to end. */
+.card.groupcard {
+  display: flex;
+  flex-direction: column;
+}
+/* The card's foot: everything that acts on the group as a whole — its source, a
+   test, delete, the settings popover — on one line, right-aligned. */
+.groupactions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 10px;
+  /* The anchor for a popover opened from this row (see `.pop` in
+     AnnouncementsTab): the row, not the button, so the panel spans the card's
+     width and can't be pushed off the side of a narrow screen. */
+  position: relative;
+}
+/* A control in that row (the source picker) takes the free space, which is what
+   pushes the buttons to the right edge. */
+.groupactions .ctlrow {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 /* Rename affordance: the group name is a button that becomes an input. */
 .gtitle {
@@ -333,6 +421,39 @@ th {
 }
 .gtitle:hover .pencil {
   opacity: 0.8;
+}
+/* The clear-the-name control beside a `.gtitle` (only rendered where a default
+   name exists to fall back to). Deliberately quiet — it undoes a rename, so it
+   sits at the same weight as the pencil rather than reading as a delete. */
+.gclear {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.gclear .x {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  opacity: 0.45;
+}
+.gclear:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+.gclear:hover .x {
+  opacity: 0.9;
+  stroke: var(--error-color, #db4437);
 }
 .rename {
   flex: 1;
