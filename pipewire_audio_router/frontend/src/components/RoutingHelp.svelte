@@ -1,35 +1,18 @@
 <script lang="ts">
-  // The routing graph's explanation, as a component so it can be rendered in two
-  // places from one source: as a side card beside the graph on wide screens, and
-  // inside the graph's help dialog. It used to be two paragraphs printed above and
-  // below the graph, which is where nobody reads them.
-  //
-  // `tabbed` is for the side card only: read whole, the document is taller than
-  // the graph it explains, so beside it we show one section at a time. The dialog
-  // renders everything at once — it has the room, and it's where you go to read
-  // rather than to glance.
+  // The routing graph's explanation, kept in its own component: it's the body of
+  // the graph's help dialog, which is where you go to read rather than to glance.
+  // It used to be two paragraphs printed above and below the graph, which is where
+  // nobody reads them, and then also a side card beside it, which was noise.
   interface Props {
     /** Whether any node reports a latency estimate — gates the ~ms section. */
     anyLatency?: boolean;
     /** Whether any node reports xruns — gates the ⚠-count section. */
     anyXruns?: boolean;
-    /** Show one section at a time behind a tab strip (side-card mode). */
-    tabbed?: boolean;
   }
-  let { anyLatency = false, anyXruns = false, tabbed = false }: Props = $props();
+  let { anyLatency = false, anyXruns = false }: Props = $props();
 
-  type TabId = 'lines' | 'nodes' | 'badges';
-  // The badge section only exists when there are badges to explain, so the tab
-  // comes and goes with it.
+  // The badges section only exists when there are badges to explain.
   let showBadges = $derived(anyLatency || anyXruns);
-  let tabs = $derived([
-    { id: 'lines' as TabId, label: 'Lines' },
-    { id: 'nodes' as TabId, label: 'Nodes' },
-    ...(showBadges ? [{ id: 'badges' as TabId, label: 'Badges' }] : []),
-  ]);
-  let sel = $state<TabId>('lines');
-  // Fall back if the selected tab has just disappeared (badges stopped arriving).
-  let active = $derived(tabs.some((t) => t.id === sel) ? sel : 'lines');
 </script>
 
 {#snippet lines()}
@@ -69,9 +52,7 @@
 {/snippet}
 
 {#snippet badges()}
-  {#if !tabbed}
-    <h3>Badges</h3>
-  {/if}
+  <h3>Badges</h3>
   {#if anyLatency}
     <p>
       The <strong>~ms</strong> figures estimate the buffering each node adds — the configured jitter/playout buffer, not
@@ -91,32 +72,15 @@
 {/snippet}
 
 <div class="help">
-  {#if tabbed}
-    <div class="tabs" role="tablist">
-      {#each tabs as t (t.id)}
-        <button type="button" role="tab" class:on={active === t.id} aria-selected={active === t.id} onclick={() => (sel = t.id)}>
-          {t.label}
-        </button>
-      {/each}
-    </div>
-    {#if active === 'lines'}
-      {@render lines()}
-    {:else if active === 'nodes'}
-      {@render nodes()}
-    {:else}
-      {@render badges()}
-    {/if}
-  {:else}
-    {@render lines()}
-    {@render nodes()}
-    {#if showBadges}
-      {@render badges()}
-    {/if}
+  {@render lines()}
+  {@render nodes()}
+  {#if showBadges}
+    {@render badges()}
   {/if}
 </div>
 
 <style>
-  /* Document type: secondary text, same scale in the side card and the dialog. */
+  /* Document type: secondary text, one scale down from the page. */
   .help p,
   .help li {
     font-size: 0.85rem;
@@ -147,37 +111,5 @@
   }
   .xrun-inline {
     color: var(--warning-color, #b26a00);
-  }
-
-  /* Section picker (side-card mode). Same underline idiom as the app's own tabs,
-     one size down. */
-  .tabs {
-    display: flex;
-    gap: 2px;
-    margin-bottom: 10px;
-    border-bottom: 1px solid var(--divider-color);
-  }
-  .tabs button {
-    background: none;
-    border: none;
-    border-radius: 0;
-    border-bottom: 2px solid transparent;
-    padding: 4px 8px;
-    font-size: 0.8rem;
-    color: var(--secondary-text-color);
-  }
-  .tabs button:hover {
-    box-shadow: none;
-    color: var(--primary-text-color);
-  }
-  .tabs button.on {
-    color: var(--primary-color);
-    border-bottom-color: var(--primary-color);
-    font-weight: 500;
-  }
-  /* The first heading of a pane sits right under the tab strip. */
-  .tabs + p,
-  .tabs + h3 {
-    margin-top: 0;
   }
 </style>

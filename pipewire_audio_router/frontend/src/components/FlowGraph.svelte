@@ -40,9 +40,16 @@
   /** Expert view: bypass groups and wire individual speakers. */
   let showSpeakers = $state(false);
 
-  // The explanation. It's a side card on wide screens (always rendered, hidden by
-  // CSS below the breakpoint) and this dialog on narrow ones — one component
-  // either way, so the two can't drift apart.
+  // The graph is the lower-altitude view of routing the group cards above already
+  // express, so it starts folded away and the choice is remembered — a returning
+  // user gets the page they left, not the page we guessed.
+  const OPEN_KEY = 'par-graph-open';
+  let open = $state(localStorage.getItem(OPEN_KEY) === '1');
+  $effect(() => {
+    localStorage.setItem(OPEN_KEY, open ? '1' : '0');
+  });
+
+  // The explanation, in a dialog behind the Explain button.
   let helpOpen = $state(false);
   let helpEl = $state<HTMLDivElement>();
   $effect(() => {
@@ -415,14 +422,17 @@
 
 <svelte:window onpointermove={onMove} onpointerup={onUp} onkeydown={(e) => e.key === 'Escape' && (helpOpen = false)} />
 
-<!-- Graph and its explanation side by side once there's room for both; below that
-     the explanation is a dialog behind the help button. The wrapper breaks out of
-     the page's 960px column on wide screens so the side card costs the graph
-     nothing. -->
-<div class="graph-area">
-  <div class="card">
-    <div class="card-head">
-      <h2>Routing graph</h2>
+<!-- Folded away by default: the title row is the whole card until you open it,
+     and the explanation is a dialog behind the Explain button. -->
+<div class="card graph-card">
+  <div class="card-head">
+    <h2>
+      <button class="collapse-toggle" type="button" aria-expanded={open} aria-controls="routing-graph" title={open ? 'Hide the routing graph' : 'Show the routing graph'} onclick={() => (open = !open)}>
+        <span class="chevron">▶</span>
+        Routing graph
+      </button>
+    </h2>
+    {#if open}
       <div class="actions">
         <label class="expert">
           <input type="checkbox" bind:checked={showSpeakers} />
@@ -432,149 +442,144 @@
           Explain
         </button>
       </div>
-    </div>
-
-    {#if O.length === 0}
-      <p class="empty">No speakers available yet — add one under the Outputs tab.</p>
-    {:else if S.length === 0}
-      <p class="empty">No sources present right now (nothing is playing into the router).</p>
-    {:else}
-      <div class="flow">
-        <div
-          class="canvas"
-          class:dragging={!!dragging}
-          bind:this={canvasEl}
-          bind:clientWidth={Wc}
-          style="height:{canvasH}px"
-        >
-          <svg class="wires" width={Wc} height={canvasH}>
-            {#each edges as e (e.source + ' ' + e.target.key)}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <path class="hit" d={e.path} onclick={() => removeEdge(e)} role="button" tabindex="-1" aria-label="remove route"></path>
-              <path
-                class="wire"
-                class:off={e.off}
-                class:partial={e.partial}
-                class:waiting={e.waiting}
-                class:active={flowing[e.source] && !e.off && !e.waiting}
-                d={e.path}
-              ></path>
-            {/each}
-            {#if ghost}<path class="ghost" d={ghost}></path>{/if}
-          </svg>
-
-          {#each S as n, i (n.node_name)}
-            <div class="node src" class:offline={!n.present} style="top:{TOP + i * (ROW_SRC + GAP)}px; height:{ROW_SRC}px; width:{COL_W}px">
-              <div class="body">
-                <span class="nm" title={n.display_name}>{n.display_name}</span>
-                {#if !n.present}
-                  <span class="tag off">offline</span>
-                  <button class="x" title="Forget saved routing" onclick={() => forget(n)}>✕</button>
-                {:else}
-                  <div class="meter" title="input level {Math.round(n.peak * 100)}%">
-                    <div class="meter-fill" style="width:{Math.min(100, Math.round(n.peak * 100))}%"></div>
-                  </div>
-                  {#if fmtLat(n.latency_ms)}
-                    <span class="lat" title="Estimated input jitter buffer this source adds">{fmtLat(n.latency_ms)}</span>
-                  {/if}
-                  {#if (n.xruns ?? 0) > 0}
-                    <span class="xrun" class:hot={xrunHot[n.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now, i.e. dropping out.">⚠ {n.xruns}</span>
-                  {/if}
-                {/if}
-              </div>
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div
-                class="handle right"
-                role="button"
-                tabindex="-1"
-                aria-label="Drag to a group to route"
-                title="Drag to a group to route"
-                onpointerdown={(e) => startDrag('source', n.node_name, e)}
-              ></div>
-            </div>
-          {/each}
-
-          {#each layout as box (box.t.key)}
-            {@const t = box.t}
-            <div class="node out" class:group={t.kind === 'group'} style="top:{box.top}px; height:{box.h}px; width:{COL_W}px">
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div
-                class="handle left"
-                role="button"
-                tabindex="-1"
-                aria-label="Drag to a source to route"
-                title="Drag to a source to route"
-                onpointerdown={(e) => startDrag('target', t.key, e)}
-              ></div>
-              <div class="tbody">
-                {#if t.kind === 'group'}
-                  {@const mixed = isMixed(t)}
-                  <div class="ghead" style="height:{HEAD_H}px">
-                    <span class="nm" title={t.name}>{t.name}</span>
-                    {#if mixed}
-                      <span class="tag mix" title="Members are on different sources — pick this group's source again to reconcile">⚠ mixed</span>
-                    {:else}
-                      <!-- The speaker count is the low-value item: drop it rather
-                           than squeeze the name when the mixed pill is present. -->
-                      <span class="cnt">{t.members.length} {t.members.length === 1 ? 'speaker' : 'speakers'}</span>
-                    {/if}
-                  </div>
-                {/if}
-                {#if t.members.length === 0}
-                  <div class="member empty-row" style="height:{MEM_H}px"><span class="cnt">no speakers yet</span></div>
-                {/if}
-                {#each t.members as m (m.node_name)}
-                  <div class="member" class:offline={!m.present} style="height:{memberH(m)}px">
-                    <span class="head-name">
-                      <span class="nm" title={m.display_name}>{m.display_name}</span>
-                      {#if showSpeakers && syncGroupOf.get(m.node_name)}
-                        <span class="tag grp" title="Plays in sync with the other speakers on this source set">sync {syncGroupOf.get(m.node_name)}</span>
-                      {/if}
-                      {#if fmtLat(m.latency_ms)}
-                        <span class="lat" title="Estimated playout buffer this speaker adds (group lead + any per-device delay)">{fmtLat(m.latency_ms)}</span>
-                      {/if}
-                      {#if (m.xruns ?? 0) > 0}
-                        <span class="xrun" class:hot={xrunHot[m.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now.">⚠ {m.xruns}</span>
-                      {/if}
-                      {#if !m.present}
-                        <span class="tag off">offline</span>
-                        <button class="x" title="Remove this output" onclick={() => removeOutput(m)}>✕</button>
-                      {:else if m.streaming === false}
-                        <!-- Reachable but nothing attached: distinct from offline,
-                             and the reason an announcement here would be refused. -->
-                        <span
-                          class="tag wait"
-                          title="On the network, but no session is up — nothing routed here is being played. A PipeWire target has to connect to us (its module-rtp-session initiates the handshake); an AirPlay-2 receiver may still be connecting or have refused the session."
-                          >not connected</span
-                        >
-                      {/if}
-                    </span>
-                    {#if m.present && isVirtual(m.node_name)}
-                      <VolumeControl
-                        percent={m.volume == null ? null : Math.round(m.volume * 100)}
-                        muted={muted[m.node_name] ?? false}
-                        onVolume={(pct) => onVolume(m.node_name, pct)}
-                        onMute={() => onMute(m.node_name)}
-                      />
-                    {/if}
-                  </div>
-                {/each}
-              </div>
-            </div>
-          {/each}
-        </div>
-      </div>
-
     {/if}
   </div>
 
-  <!-- Wide screens only (see .side-help): it lives in the page's left margin, so
-       the graph card itself stays aligned with the cards above. One section at a
-       time there — the whole document is what the Explain dialog is for. -->
-  <aside class="card side-help">
-    <h2>Reading the graph</h2>
-    <RoutingHelp {anyLatency} {anyXruns} tabbed />
-  </aside>
+  {#if open}
+    <div id="routing-graph">
+      {#if O.length === 0}
+        <p class="empty">No speakers available yet — add one under the Outputs tab.</p>
+      {:else if S.length === 0}
+        <p class="empty">No sources present right now (nothing is playing into the router).</p>
+      {:else}
+        <div class="flow">
+          <div
+            class="canvas"
+            class:dragging={!!dragging}
+            bind:this={canvasEl}
+            bind:clientWidth={Wc}
+            style="height:{canvasH}px"
+          >
+            <svg class="wires" width={Wc} height={canvasH}>
+              {#each edges as e (e.source + ' ' + e.target.key)}
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <path class="hit" d={e.path} onclick={() => removeEdge(e)} role="button" tabindex="-1" aria-label="remove route"></path>
+                <path
+                  class="wire"
+                  class:off={e.off}
+                  class:partial={e.partial}
+                  class:waiting={e.waiting}
+                  class:active={flowing[e.source] && !e.off && !e.waiting}
+                  d={e.path}
+                ></path>
+              {/each}
+              {#if ghost}<path class="ghost" d={ghost}></path>{/if}
+            </svg>
+
+            {#each S as n, i (n.node_name)}
+              <div class="node src" class:offline={!n.present} style="top:{TOP + i * (ROW_SRC + GAP)}px; height:{ROW_SRC}px; width:{COL_W}px">
+                <div class="body">
+                  <span class="nm" title={n.display_name}>{n.display_name}</span>
+                  {#if !n.present}
+                    <span class="tag off">offline</span>
+                    <button class="x" title="Forget saved routing" onclick={() => forget(n)}>✕</button>
+                  {:else}
+                    <div class="meter" title="input level {Math.round(n.peak * 100)}%">
+                      <div class="meter-fill" style="width:{Math.min(100, Math.round(n.peak * 100))}%"></div>
+                    </div>
+                    {#if fmtLat(n.latency_ms)}
+                      <span class="lat" title="Estimated input jitter buffer this source adds">{fmtLat(n.latency_ms)}</span>
+                    {/if}
+                    {#if (n.xruns ?? 0) > 0}
+                      <span class="xrun" class:hot={xrunHot[n.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now, i.e. dropping out.">⚠ {n.xruns}</span>
+                    {/if}
+                  {/if}
+                </div>
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div
+                  class="handle right"
+                  role="button"
+                  tabindex="-1"
+                  aria-label="Drag to a group to route"
+                  title="Drag to a group to route"
+                  onpointerdown={(e) => startDrag('source', n.node_name, e)}
+                ></div>
+              </div>
+            {/each}
+
+            {#each layout as box (box.t.key)}
+              {@const t = box.t}
+              <div class="node out" class:group={t.kind === 'group'} style="top:{box.top}px; height:{box.h}px; width:{COL_W}px">
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div
+                  class="handle left"
+                  role="button"
+                  tabindex="-1"
+                  aria-label="Drag to a source to route"
+                  title="Drag to a source to route"
+                  onpointerdown={(e) => startDrag('target', t.key, e)}
+                ></div>
+                <div class="tbody">
+                  {#if t.kind === 'group'}
+                    {@const mixed = isMixed(t)}
+                    <div class="ghead" style="height:{HEAD_H}px">
+                      <span class="nm" title={t.name}>{t.name}</span>
+                      {#if mixed}
+                        <span class="tag mix" title="Members are on different sources — pick this group's source again to reconcile">⚠ mixed</span>
+                      {:else}
+                        <!-- The speaker count is the low-value item: drop it rather
+                             than squeeze the name when the mixed pill is present. -->
+                        <span class="cnt">{t.members.length} {t.members.length === 1 ? 'speaker' : 'speakers'}</span>
+                      {/if}
+                    </div>
+                  {/if}
+                  {#if t.members.length === 0}
+                    <div class="member empty-row" style="height:{MEM_H}px"><span class="cnt">no speakers yet</span></div>
+                  {/if}
+                  {#each t.members as m (m.node_name)}
+                    <div class="member" class:offline={!m.present} style="height:{memberH(m)}px">
+                      <span class="head-name">
+                        <span class="nm" title={m.display_name}>{m.display_name}</span>
+                        {#if showSpeakers && syncGroupOf.get(m.node_name)}
+                          <span class="tag grp" title="Plays in sync with the other speakers on this source set">sync {syncGroupOf.get(m.node_name)}</span>
+                        {/if}
+                        {#if fmtLat(m.latency_ms)}
+                          <span class="lat" title="Estimated playout buffer this speaker adds (group lead + any per-device delay)">{fmtLat(m.latency_ms)}</span>
+                        {/if}
+                        {#if (m.xruns ?? 0) > 0}
+                          <span class="xrun" class:hot={xrunHot[m.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now.">⚠ {m.xruns}</span>
+                        {/if}
+                        {#if !m.present}
+                          <span class="tag off">offline</span>
+                          <button class="x" title="Remove this output" onclick={() => removeOutput(m)}>✕</button>
+                        {:else if m.streaming === false}
+                          <!-- Reachable but nothing attached: distinct from offline,
+                               and the reason an announcement here would be refused. -->
+                          <span
+                            class="tag wait"
+                            title="On the network, but no session is up — nothing routed here is being played. A PipeWire target has to connect to us (its module-rtp-session initiates the handshake); an AirPlay-2 receiver may still be connecting or have refused the session."
+                            >not connected</span
+                          >
+                        {/if}
+                      </span>
+                      {#if m.present && isVirtual(m.node_name)}
+                        <VolumeControl
+                          percent={m.volume == null ? null : Math.round(m.volume * 100)}
+                          muted={muted[m.node_name] ?? false}
+                          onVolume={(pct) => onVolume(m.node_name, pct)}
+                          onMute={() => onMute(m.node_name)}
+                        />
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 {#if helpOpen}
@@ -599,32 +604,41 @@
 {/if}
 
 <style>
-  /* The graph card keeps the page's column, aligned with the cards above it; the
-     explanation goes in the left margin, out of its way, and only once that margin
-     can hold a readable column of its own. `main` is a 960px box (920px of
-     content), so the space left of it is (100vw - 960px) / 2 — the width below
-     spends that, minus the gap and a little breathing room at the viewport edge.
-     Narrower than the breakpoint there's no side card at all and the Explain
-     dialog is the only copy (it's also still there when the side card shows: that
-     one is one-section-at-a-time). */
-  .graph-area {
-    position: relative;
+  /* The preceding sibling on the page is the group grid, not a card, so the
+     `.card + .card` rule can't give this one its gap. */
+  .graph-card {
     margin-top: 16px;
   }
-  .side-help {
-    display: none;
+  /* Disclosure title: the whole heading is the hit target (same chevron idiom as
+     the Sources/Outputs cards). */
+  .collapse-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
   }
-  @media (min-width: 1520px) {
-    .side-help {
-      display: block;
-      position: absolute;
-      top: 0;
-      right: calc(100% + 20px);
-      width: min(340px, calc((100vw - 960px) / 2 - 16px));
-    }
+  .collapse-toggle:hover {
+    box-shadow: none;
+    color: var(--primary-color);
   }
-  .side-help h2 {
-    margin: 0 0 10px;
+  .chevron {
+    font-size: 0.7rem;
+    line-height: 1;
+    color: var(--secondary-text-color);
+    transition: transform 0.15s ease;
+  }
+  .collapse-toggle[aria-expanded='true'] .chevron {
+    transform: rotate(90deg);
+  }
+  /* Collapsed, the card is just its title row. */
+  #routing-graph {
+    margin-top: 8px;
   }
 
   /* The per-speaker escape hatch, deliberately understated. */
