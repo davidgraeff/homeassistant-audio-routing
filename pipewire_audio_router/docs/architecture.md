@@ -146,6 +146,30 @@ anchor capture. With RAOP gone there are exactly two impls —
 
 ## 5. Outputs (audio out of the graph)
 
+### 5.0 Adoption — discovery only *offers* a device
+
+Every output kind below is mDNS-discovered, which on a real home network
+also finds the neighbours' HomePods and any laptop running
+`module-rtp-session`. So discovery is an **offer**, not an enrolment:
+`outputs_store.rs` records one verdict per stable node name — *adopted*,
+*discovered* (undecided) or *ignored* — and only an **adopted** output is
+real. The gate is applied in exactly three places, all of which read
+routing intent through the adopted set:
+
+- `routing.rs::build_matrix` — an unadopted device isn't in the matrix, so
+  it can't be routed **and** the HA integration (which builds its
+  `media_player` entities from that listing) never sees it;
+- `sync_group.rs::reconcile` — intent whose output isn't adopted is
+  dormant, so no group forms and no stream/session is ever opened to it;
+- `api.rs` — `/api/outputs` returns the adopted ones,
+  `/api/outputs/discovered` the rest (the Outputs page's second list).
+
+Intent is *filtered*, never deleted, so adopting a device restores the
+routing it had. The one deliberate exception to the gate is the on-demand
+announce path (`ensure_announce_transport`): a discovered device can still
+be sent a test tone, because that's how the user works out which speaker
+`ap2-dev-living-2` actually is before adding it.
+
 ### 5.1 Sendspin (ESPHome speakers, e.g. HA Voice PE)
 
 Devices are **auto-discovered** over mDNS (`sendspin_discovery.rs`) and

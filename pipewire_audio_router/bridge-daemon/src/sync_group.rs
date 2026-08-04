@@ -327,6 +327,10 @@ pub struct AnnounceDeps<'a> {
     pub pw: &'a SharedState,
     pub pw_cmd: &'a PwCommandSender,
     pub routing: &'a SharedRouting,
+    /// Adoption verdicts (outputs_store.rs) — needed to read routing intent the
+    /// same way `reconcile` does, so a *discovered* device's leftover intent
+    /// doesn't look like a group that owns its session.
+    pub outputs: &'a crate::outputs_store::SharedOutputs,
     pub ap2_devices: &'a crate::ap2_discovery::SharedAp2Devices,
     pub ap2_ptp: &'a crate::ap2_ptp::SharedAp2Ptp,
     pub ap2_control: &'a crate::ap2_volume::SharedAp2Control,
@@ -339,7 +343,11 @@ pub struct AnnounceDeps<'a> {
 /// — they have the on-demand path.
 fn no_transport_reason(output: &str) -> String {
     if output.starts_with(SENDSPIN_DEV_PREFIX) {
-        "sendspin device is offline (no sender running for it)".into()
+        // Either it's offline, or it hasn't been added on the Outputs page — an
+        // unadopted sendspin speaker gets no idle sender, and there's no on-demand
+        // path for one (a fresh sendspin connection takes tens of seconds to start
+        // rendering, so a "test tone" over it would arrive far too late to help).
+        "sendspin device has no sender running for it — it's offline, or not added on the Outputs page yet".into()
     } else {
         "output has no per-device sender (only sendspin, AirPlay-2 and PipeWire targets can be announced to individually)".into()
     }
@@ -577,8 +585,12 @@ impl GroupReconciler {
         // Only for an endpoint with NO wired input. A routed one belongs to the group
         // reconciler, which owns (and retries) its session; a second AP2 session would
         // collide (a receiver accepts one), and a second pw-sink advert would give the
-        // receiver two sessions to attach to.
-        let intent = routing_store::snapshot(deps.routing);
+        // receiver two sessions to attach to. Read through the adoption gate exactly
+        // as `reconcile` does — an unadopted device's intent is dormant, so nothing
+        // owns its session and the on-demand path is the only way to reach it (which
+        // is precisely the "which speaker is this?" test-tone case).
+        let adopted = crate::outputs_store::adopted_snapshot(deps.outputs);
+        let intent: Vec<RoutingLink> = routing_store::snapshot(deps.routing).into_iter().filter(|l| adopted.contains(&l.output)).collect();
         if !routing::source_set_of(&intent, output).is_empty() {
             return AnnounceTransport::Unavailable(if output.starts_with(AP2_DEV_PREFIX) {
                 "routed, but its AirPlay-2 sender isn't streaming (receiver unreachable, or still connecting)".into()
@@ -985,6 +997,7 @@ impl GroupReconciler {
         pw: &SharedState,
         pw_cmd: &PwCommandSender,
         routing: &SharedRouting,
+        adopted: &crate::outputs_store::SharedOutputs,
         devices: &SharedSendspinDevices,
         control: &crate::sendspin_volume::SharedSendspinControl,
         send_ahead_us: i64,
@@ -997,7 +1010,14 @@ impl GroupReconciler {
         // Re-earned every pass: whatever failed last time either succeeds now or
         // sets this again.
         self.retry_wanted = false;
-        let intent = routing_store::snapshot(routing);
+        // Adoption gates the audio path, not just the UI: intent whose output the
+        // user hasn't added on the Outputs page is dormant, so it forms no group
+        // and no stream/session is ever opened to that device. Filtering the
+        // intent (rather than the device maps) keeps the *on-demand* announce
+        // path — the test tone that tells you which speaker this is — working for
+        // a merely discovered device.
+        let adopted_set = crate::outputs_store::adopted_snapshot(adopted);
+        let intent: Vec<RoutingLink> = routing_store::snapshot(routing).into_iter().filter(|l| adopted_set.contains(&l.output)).collect();
         let devices_map = devices.lock_recover().clone();
         let ap2_map = ap2_devices.lock_recover().clone();
         let ap2_latencies = sync_settings.lock_recover().ap2_latencies();
@@ -1081,14 +1101,22 @@ impl GroupReconciler {
             }
         }
 
-        // 1b. Idle-sender teardown. Every discovered device that isn't in a group
+        // 1b. Idle-sender teardown. Every **adopted** device that isn't in a group
         //     keeps a standalone sender (so it's always reachable — e.g.
         //     announcements to an idle speaker). Drop the sender of any device that
         //     is now grouped or gone, BEFORE the group servers below dial, so a
         //     newly-grouped device isn't dialed by both its idle sender and its
         //     group at once.
+        //
+        //     Adoption gates this as strictly as it gates grouping: an idle sender
+        //     is a live WebSocket streaming silence into the device, so without the
+        //     gate the daemon would connect to — and continuously feed — every
+        //     sendspin speaker on the LAN, including ones the user never added. A
+        //     device removed on the Outputs page therefore also gets its idle
+        //     sender dropped here, with the usual `stream/end` goodbye.
         let grouped: HashSet<String> = desired.values().flat_map(|d| d.sendspin_node_names.iter().cloned()).collect();
-        let want_idle: HashSet<String> = devices_map.keys().filter(|d| !grouped.contains(*d)).cloned().collect();
+        let want_idle: HashSet<String> =
+            devices_map.keys().filter(|d| !grouped.contains(*d) && adopted_set.contains(*d)).cloned().collect();
         let drop_idle: Vec<String> = self.idle_senders.keys().filter(|d| !want_idle.contains(*d)).cloned().collect();
         for dev in drop_idle {
             if let Some(s) = self.idle_senders.remove(&dev) {

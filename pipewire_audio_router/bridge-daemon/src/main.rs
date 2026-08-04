@@ -19,6 +19,7 @@ mod groups_store;
 mod host_assessment;
 mod locks;
 mod metering;
+mod outputs_store;
 mod overlay_mixer;
 mod per_device_spike;
 mod player;
@@ -164,6 +165,17 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let routing = routing_store::RoutingStore::load(routing_path)?;
     tracing::info!("{} persisted routing link(s) in {}", routing.links().count(), routing_path.display());
     let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
+
+    // Which discovered outputs the user has adopted (outputs_store.rs) — the
+    // gate that keeps a freshly discovered device out of the routing matrix and
+    // out of Home Assistant until it's added on the Outputs page. Beside the
+    // other /data stores; empty on a fresh install *and* on upgrade, so an
+    // existing deployment comes up with its routing intact but dormant until
+    // each device is added once.
+    let outputs_path = routing_path.with_file_name("outputs.json");
+    let outputs = outputs_store::OutputsStore::load(&outputs_path)?;
+    tracing::info!("{} adopted output(s) in {}", outputs.adopted().len(), outputs_path.display());
+    let outputs: outputs_store::SharedOutputs = std::sync::Arc::new(std::sync::Mutex::new(outputs));
 
     // Sync/latency tuning (group lead + per-device static delays), kept next to
     // routing.json in /data. Derived from the routing path so there's no extra
@@ -336,6 +348,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             let pw = pw_state.clone();
             let cmd = pw_cmd.clone();
             let routing = routing.clone();
+            let adopted = outputs.clone();
             let devices = sendspin_devices.clone();
             let control = sendspin_control.clone();
             let ap2_devices = ap2_devices.clone();
@@ -371,7 +384,8 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                     routing::reconcile(&pw, &cmd, &routing).await;
                     let retry = {
                         let mut g = groups.lock().await;
-                        g.reconcile(&pw, &cmd, &routing, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets).await;
+                        g.reconcile(&pw, &cmd, &routing, &adopted, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets)
+                            .await;
                         g.retry_wanted()
                     };
                     // Wait for the next change — or for the retry delay, whichever
@@ -454,6 +468,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             bt_bridges,
             ap2_ptp.clone(),
             routing,
+            outputs,
             sendspin_control,
             ap2_control,
             sync_settings,
