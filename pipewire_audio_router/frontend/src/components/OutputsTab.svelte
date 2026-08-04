@@ -110,38 +110,75 @@
       await refresh();
   }
 
+  // True only until the first listing arrives. A re-read must not put the page
+  // back into its loading card: with the fingerprint-driven refreshes below, that
+  // would blank the whole list every time a device appeared or a level changed.
+  let everLoaded = $state(false);
+
+  // Sendspin static delays are the one piece not pushed over the socket, so the
+  // last fetched map is kept to re-seed the editable fields when a listing arrives.
+  let delayMap: Record<string, number> = {};
+
+  /** Adopted list → local state + the editable sync fields. */
+  function applyOutputs(outs: OutputInfo[]) {
+    outputs = outs;
+    // Seed the editable sync fields. Adopted outputs only: the sync knobs are
+    // for outputs that are part of the system, not for a device we're still
+    // deciding about. Volume/mute are NOT seeded here — they ride the live
+    // matrix (above), which is why they stay correct after page load.
+    const next: Record<string, number | ''> = {};
+    for (const o of outs) {
+      // AP2 seeds to the running value rather than blank: its control is a
+      // slider, which has no blank position (see resetDelay for clearing).
+      next[o.node_name] =
+        o.kind === 'sendspin' ? (delayMap[o.node_name] ?? 0) : (o.latency_ms ?? AP2_DELAY_DEFAULT);
+    }
+    edit = next;
+  }
+
+  /** Offered list → local state, present devices first: a long discovered list on
+   * a busy network is mostly things reachable *now*, and those are the ones you
+   * can identify with a test tone. */
+  function applyOffered(disc: OutputInfo[]) {
+    offered = [...disc].sort((a, b) => Number(b.present) - Number(a.present) || a.name.localeCompare(b.name));
+  }
+
   async function refresh() {
-    loading = true;
+    loading = !everLoaded;
     try {
       const [outs, disc, delays] = await Promise.all([
         api.outputs(),
         api.discoveredOutputs().catch(() => [] as OutputInfo[]),
         api.sendspinDelays().catch(() => ({}) as Record<string, number>),
       ]);
-      outputs = outs;
-      // Present devices first — a long discovered list on a busy network is
-      // mostly things that are reachable *now*, and those are the ones you can
-      // identify with a test tone.
-      offered = disc.sort((a, b) => Number(b.present) - Number(a.present) || a.name.localeCompare(b.name));
-      // Seed the editable sync fields. Adopted outputs only: the sync knobs are
-      // for outputs that are part of the system, not for a device we're still
-      // deciding about. Volume/mute are NOT seeded here — they ride the live
-      // matrix (above), which is why they stay correct after page load.
-      const next: Record<string, number | ''> = {};
-      for (const o of outs) {
-        // AP2 seeds to the running value rather than blank: its control is a
-        // slider, which has no blank position (see resetDelay for clearing).
-        next[o.node_name] =
-          o.kind === 'sendspin' ? (delays[o.node_name] ?? 0) : (o.latency_ms ?? AP2_DELAY_DEFAULT);
-      }
-      edit = next;
+      delayMap = delays;
+      applyOutputs(outs);
+      applyOffered(disc);
     } catch {
       outputs = [];
       offered = [];
     }
+    everLoaded = true;
     loading = false;
   }
   onMount(refresh);
+
+  // Live listings with no polling and no second round-trip: the daemon pushes each
+  // listing on the routing socket when it changes (bridge-daemon/src/routing.rs),
+  // so this adopts the payload rather than re-fetching. The fetch above stays as
+  // the first paint; a daemon too old to push simply never lands here.
+  $effect(() => {
+    const pushed = $routing.outputs;
+    untrack(() => {
+      if (pushed) applyOutputs(pushed);
+    });
+  });
+  $effect(() => {
+    const pushed = $routing.discovered;
+    untrack(() => {
+      if (pushed) applyOffered(pushed);
+    });
+  });
 
   // Per-row diagnostic playback ("Play tone" / "Play announcement") via the
   // per-device announce path (`/api/announce`) — the backend-agnostic route

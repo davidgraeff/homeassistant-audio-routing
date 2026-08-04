@@ -16,7 +16,7 @@
   // frame arriving is the signal to re-read this list. Same channel the rest of
   // the page already listens on; a separate poll was both redundant and the
   // source of a visible flicker.
-  import { untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { api } from '../lib/api';
   import { routing } from '../lib/routing';
   import { run } from '../lib/toast';
@@ -47,6 +47,18 @@
   let inFlight = false;
   let queued = false;
 
+  /** Adopts a list, from either the mount fetch or a pushed frame. Identical
+   * payloads are compared away so a re-send costs no re-render. */
+  function apply(next: AgentInfo[]) {
+    const payload = JSON.stringify(next);
+    if (payload !== lastPayload) {
+      lastPayload = payload;
+      agents = next;
+    }
+    firstLoad = false;
+  }
+
+  /** First paint only — afterwards the socket pushes (see the effect below). */
   async function refresh(): Promise<void> {
     if (inFlight) {
       queued = true;
@@ -54,12 +66,7 @@
     }
     inFlight = true;
     try {
-      const next = await api.agents().catch(() => [] as AgentInfo[]);
-      const payload = JSON.stringify(next);
-      if (payload !== lastPayload) {
-        lastPayload = payload;
-        agents = next;
-      }
+      apply(await api.agents().catch(() => [] as AgentInfo[]));
     } finally {
       inFlight = false;
       firstLoad = false;
@@ -69,15 +76,16 @@
       await refresh();
     }
   }
+  onMount(refresh);
 
-  // Fires once on mount (the store replays its last snapshot to a new subscriber)
-  // and then on every frame. `untrack` keeps the effect from depending on what
-  // `refresh` touches, so it reacts to frames only, never to its own writes.
+  // The daemon pushes this list on the routing socket whenever it changes — a
+  // pairing request arriving, a host connecting, a host reporting a new level — so
+  // there is nothing to poll and nothing to re-fetch. Note it must *not* react to
+  // the matrix frame, which also arrives every 250 ms for the live meters.
   $effect(() => {
-    $routing.matrix;
-    $routing.connected;
+    const pushed = $routing.agents;
     untrack(() => {
-      void refresh();
+      if (pushed) apply(pushed);
     });
   });
 

@@ -679,12 +679,30 @@ stops appearing (grayed) in the matrix. A real device that later reappears
 comes back unrouted.
 
 ### `GET /api/routing/ws`
-WebSocket. Sends one JSON `RoutingMatrix` snapshot (same shape as
-`GET /api/routing`) immediately on connect, then a fresh snapshot every
-time the PipeWire registry actually changes (node/port/link add or
-remove) — driven by a broadcast channel the registry-observer thread
-pings synchronously, not polling. A slow client that misses a ping just
-gets caught up by the next snapshot it does receive; there's no event
+WebSocket. Carries **typed frames**, each a JSON object with a `type`:
+
+| `type` | Payload | When it is sent |
+|---|---|---|
+| `matrix` | the `RoutingMatrix` fields at the top level (same shape as `GET /api/routing`, plus `type`) | on connect, on every registry change, and every 250 ms while watched so the input meters and volumes stay live |
+| `outputs` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs` | on connect, then whenever that listing's payload changes |
+| `discovered` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs/discovered` | ditto |
+| `agents` | `{ agents: AgentInfo[] }` — same as `GET /api/agents` | ditto |
+
+The matrix frame is *internally* tagged so its fields stay at the top
+level: a client written against the older protocol, which parsed every
+frame as a bare `RoutingMatrix`, still works and simply ignores the
+listing frames.
+
+The listing frames exist so a UI does not have to poll those endpoints.
+They are only sent when the built payload differs from the last one sent
+on that socket — comparing the payload rather than tracking which events
+affect which listing, so a new field cannot be forgotten and a burst of
+unrelated changes stays quiet. The REST endpoints remain the way to get a
+listing on first paint; the socket keeps it fresh afterwards.
+
+Change frames are driven by a broadcast channel the registry-observer
+thread pings synchronously, not by polling. A slow client that misses a
+ping is caught up by the next frame it does receive; there is no event
 replay. The client never needs to send anything.
 
 ## `GET /` (and other non-API paths)

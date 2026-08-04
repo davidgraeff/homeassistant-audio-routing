@@ -292,12 +292,13 @@ Worth an upstream report either way.
    this is the earlier step of one flow. The row carries the pairing code, which
    the agent also logs: approving a request you cannot identify is how you would
    hand your audio to someone else on the network, so the code is the check.
-   The panel re-reads `/api/agents` on every **routing-WebSocket frame** rather than
-   on a timer of its own: the daemon pokes its change notifier on a pairing event
-   exactly as it does on discovery, and that notifier is what pushes a frame, so one
-   channel already carries "something changed" for both. An unchanged payload is
-   compared away and touches no state — a first version polled every 5 s and
-   re-rendered regardless, which read as the page flickering.
+   The panel does not poll: the daemon **pushes the agent list** on the routing
+   WebSocket whenever it changes, as a typed `agents` frame (see
+   docs/api-reference.md). `/api/agents` is still what the page reads on mount.
+   Two wrong turns on the way here, both worth remembering: polling every 5 s
+   re-rendered the card on every tick (which read as flickering), and then reacting
+   to *any* WebSocket frame fetched four times a second, because the matrix frame is
+   also the meter tick.
 4. Approving mints a token; the agent stores it `0600` in
    `~/.config/pwrouter-agent/config.json` and reconnects with it, backing off on
    failure. Manual override (`--daemon host:port`) for routed/non-mDNS setups.

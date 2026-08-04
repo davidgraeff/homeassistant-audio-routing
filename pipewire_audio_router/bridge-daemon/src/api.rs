@@ -480,7 +480,7 @@ struct Ap2FeaturesInfo {
 }
 
 #[derive(Serialize)]
-struct OutputInfo {
+pub(crate) struct OutputInfo {
     node_name: String,
     name: String,
     /// Is `name` the user's own (a rename), rather than the one discovery
@@ -949,14 +949,23 @@ fn output_label(state: &AppState, node_name: &str) -> String {
         .unwrap_or_else(|| routing::output_display_name(node_name))
 }
 
+/// Both listings from one pass: `(adopted, offered)`.
+///
+/// Split out of the two handlers below so the routing WebSocket can push these
+/// listings when they change (routing.rs) instead of the UI polling for them. One
+/// `collect_outputs` call serves both halves, which is what the handlers did
+/// individually anyway.
+pub(crate) async fn outputs_listings(state: &AppState) -> (Vec<OutputInfo>, Vec<OutputInfo>) {
+    let outputs = collect_outputs(state).await;
+    outputs.into_iter().partition(|o| o.state == OutputState::Adopted.as_str())
+}
+
 /// The system's outputs: adopted only. Everything downstream — the routing
 /// matrix's counterpart listing, the group editors, the Align page, the HA
 /// integration's per-output metadata — means *these* by "output". A discovered
 /// device the user hasn't added yet is deliberately absent.
 async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
-    let mut outputs = collect_outputs(&state).await;
-    outputs.retain(|o| o.state == OutputState::Adopted.as_str());
-    Json(outputs)
+    Json(outputs_listings(&state).await.0)
 }
 
 /// Devices discovery has *offered* but the user hasn't added: `state` is
@@ -966,9 +975,7 @@ async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
 /// eligibility as an adopted output, because identifying a device ("which
 /// speaker is `ap2-dev-living-2`?") is exactly what you need before deciding.
 async fn list_discovered_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {
-    let mut outputs = collect_outputs(&state).await;
-    outputs.retain(|o| o.state != OutputState::Adopted.as_str());
-    Json(outputs)
+    Json(outputs_listings(&state).await.1)
 }
 
 /// Drop every trace of an output from the *intent* stores: saved routing links

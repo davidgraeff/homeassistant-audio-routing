@@ -727,6 +727,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         teardown(&state);
         return;
     }
+    // The listings the Outputs page would otherwise re-fetch. Sent once up front
+    // and then only when they actually change, so the page never polls for them.
+    let mut sent = SentListings::default();
+    if push_listings(&mut socket, &state, &mut sent).await.is_err() {
+        teardown(&state);
+        return;
+    }
     loop {
         tokio::select! {
             changed = changes.recv() => {
@@ -736,6 +743,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let matrix = build_snapshot(&state).await;
                         state.meters.reconcile_sources(&present_source_meters(&matrix));
                         if send_matrix(&mut socket, &matrix).await.is_err() {
+                            break;
+                        }
+                        // A change is also the only thing that can move the
+                        // listings — a discovered device, an adoption, a pairing.
+                        if push_listings(&mut socket, &state, &mut sent).await.is_err() {
                             break;
                         }
                     }
@@ -761,14 +773,125 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     teardown(&state);
 }
 
-async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(), axum::Error> {
-    let json = serde_json::to_string(matrix).unwrap_or_else(|_| "{}".to_string());
+/// One frame on the routing socket.
+///
+/// **Internally tagged on purpose.** The matrix frame historically *was* the whole
+/// frame — a bare `{sources, outputs, links}` — so tagging it internally keeps
+/// those fields at the top level and only adds `type`. A cached older UI that
+/// parses every frame as a matrix therefore keeps working; it just ignores the
+/// listing frames it doesn't know.
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Frame<'a> {
+    Matrix(&'a RoutingMatrix),
+    /// `/api/outputs` — the adopted devices.
+    Outputs { outputs: &'a [crate::api::OutputInfo] },
+    /// `/api/outputs/discovered` — offered but not added (plus ignored).
+    Discovered { outputs: &'a [crate::api::OutputInfo] },
+    /// `/api/agents` — paired receiver hosts and pending pair requests.
+    Agents { agents: &'a [crate::pwsink_agent::AgentInfo] },
+}
+
+async fn send_frame(socket: &mut WebSocket, frame: Frame<'_>) -> Result<(), axum::Error> {
+    let json = match serde_json::to_string(&frame) {
+        Ok(json) => json,
+        // Unreachable in practice; dropping one frame beats killing the socket.
+        Err(e) => {
+            tracing::warn!("could not serialise a routing frame: {e}");
+            return Ok(());
+        }
+    };
     socket.send(Message::Text(json.into())).await
+}
+
+async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(), axum::Error> {
+    send_frame(socket, Frame::Matrix(matrix)).await
+}
+
+/// The listing frames this socket has already sent, as serialized JSON.
+///
+/// The change notifier fires for *any* daemon change — a link, a node appearing, a
+/// volume — while these listings only change for some of them. Comparing the built
+/// payload is what keeps the socket quiet without anyone maintaining a list of
+/// "which events affect which listing", which is exactly the kind of bookkeeping
+/// that goes stale when a column is added later.
+#[derive(Default)]
+struct SentListings {
+    outputs: Option<String>,
+    discovered: Option<String>,
+    agents: Option<String>,
+}
+
+/// Sends a listing frame only if its payload differs from the last one sent on this
+/// socket. `slot` holds that last payload.
+async fn push_if_changed(
+    socket: &mut WebSocket,
+    slot: &mut Option<String>,
+    frame: Frame<'_>,
+) -> Result<(), axum::Error> {
+    let json = match serde_json::to_string(&frame) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!("could not serialise a listing frame: {e}");
+            return Ok(());
+        }
+    };
+    if slot.as_deref() == Some(json.as_str()) {
+        return Ok(());
+    }
+    *slot = Some(json.clone());
+    socket.send(Message::Text(json.into())).await
+}
+
+/// Rebuilds the three listings and pushes the ones that changed.
+///
+/// Called on connect and on every change notification — never on the meter tick,
+/// which would rebuild them four times a second for values that did not move.
+async fn push_listings(
+    socket: &mut WebSocket,
+    state: &AppState,
+    sent: &mut SentListings,
+) -> Result<(), axum::Error> {
+    let (adopted, offered) = crate::api::outputs_listings(state).await;
+    let agents = state.agents.lock().await.snapshot();
+    push_if_changed(socket, &mut sent.outputs, Frame::Outputs { outputs: &adopted }).await?;
+    push_if_changed(socket, &mut sent.discovered, Frame::Discovered { outputs: &offered }).await?;
+    push_if_changed(socket, &mut sent.agents, Frame::Agents { agents: &agents }).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The matrix frame must keep its historical top-level shape: a cached older UI
+    /// parses every frame as a bare `{sources, outputs, links}`, so `type` may be
+    /// added beside those fields but must not nest them.
+    #[test]
+    fn the_matrix_frame_stays_flat_and_gains_a_type() {
+        let matrix = matrix_with(&[], &[]);
+        let json = serde_json::to_value(Frame::Matrix(&matrix)).unwrap();
+        assert_eq!(json["type"], "matrix");
+        assert!(json.get("sources").is_some(), "sources must stay at the top level: {json}");
+        assert!(json.get("outputs").is_some());
+        assert!(json.get("links").is_some());
+        assert!(json.get("matrix").is_none(), "the matrix must not be nested under a key");
+    }
+
+    #[test]
+    fn listing_frames_are_tagged_by_kind() {
+        let empty: Vec<crate::api::OutputInfo> = Vec::new();
+        let agents: Vec<crate::pwsink_agent::AgentInfo> = Vec::new();
+        for (frame, expected_type, payload_key) in [
+            (Frame::Outputs { outputs: &empty }, "outputs", "outputs"),
+            (Frame::Discovered { outputs: &empty }, "discovered", "outputs"),
+            (Frame::Agents { agents: &agents }, "agents", "agents"),
+        ] {
+            let json = serde_json::to_value(frame).unwrap();
+            assert_eq!(json["type"], expected_type);
+            assert!(json[payload_key].is_array(), "{expected_type} frame must carry an array: {json}");
+        }
+    }
+
     use crate::airplay_source::AIRPLAY_NODE_NAME;
 
     fn link(source: &str, output: &str) -> RoutingLink {
