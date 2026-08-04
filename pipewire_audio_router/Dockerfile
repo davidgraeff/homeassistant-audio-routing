@@ -119,8 +119,10 @@ RUN test -f /submodules/sendspin/Cargo.toml || { \
 # daemon and the receiver-side agent). `bridge-daemon/Cargo.toml` reaches it as
 # `../pw-control`, which from WORKDIR /build resolves to /pw-control — same
 # outside-of-/build trick as the submodule above, and copied before bridge-daemon/
-# for the same cache reason.
-COPY pw-control/ /pw-control/
+# for the same cache reason. Manifest + sources only, like the agent stage: nothing
+# else in that directory (rustfmt.toml) is read by the build.
+COPY pw-control/Cargo.toml /pw-control/
+COPY pw-control/src/ /pw-control/src/
 COPY bridge-daemon/ .
 # BuildKit cache mounts make this incremental. Without them every deploy
 # recompiled all ~600 dependency crates (plus bundled libopus via cmake and
@@ -185,10 +187,18 @@ RUN set -eux; \
     rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /agent
-# pw-control first: it changes less often than the agent itself, so an agent edit
-# still hits this layer's cache. Same reason the daemon stage copies it early.
-COPY pw-control/ /pw-control/
-COPY pwrouter-agent/ .
+# Only what cargo actually reads, not the whole directory: this stage cross-builds
+# TWO binaries and its target/ cache mount is not exported to the registry cache,
+# so on a fresh builder (CI, or after a GC pass) an invalidated layer here means
+# both arches compile from zero. Copying `pwrouter-agent/` wholesale spent that on
+# a README.md or pwrouter-agent.service edit, neither of which the build reads.
+# pw-control's own Cargo.lock is deliberately not copied — cargo resolves a path
+# dependency through the *root* crate's lock, so that file is build-irrelevant
+# churn. pw-control comes first because it changes less often than the agent.
+COPY pw-control/Cargo.toml /pw-control/
+COPY pw-control/src/ /pw-control/src/
+COPY pwrouter-agent/Cargo.toml pwrouter-agent/Cargo.lock ./
+COPY pwrouter-agent/src/ ./src/
 # One loop per arch: build, strip, then assert the binary really does floor at
 # GLIBC_2.34 — shipping one that needs more would silently break the minimum
 # distro versions the in-app help text promises. The objdump must be the matching

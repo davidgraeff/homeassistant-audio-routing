@@ -93,11 +93,26 @@ preflight_ghcr() {
 # a registry cache and is awkward for cross-arch). Created once, reused after.
 # Cross-arch emulation needs QEMU binfmt registered on the host; install it if
 # the target platform isn't already advertised.
+#
+# --buildkitd-config: BuildKit's default GC policy caps cache mounts at 512MB/48h,
+# which silently deletes the cargo caches this build leans on — see
+# scripts/buildkitd.toml for the full reasoning. The config only takes effect at
+# creation time, so a builder made before this existed keeps the default policy;
+# that case gets a warning rather than a surprise recreate (recreating throws the
+# whole cache away, which is the caller's call to make).
 ensure_builder() {
   local platform="$1"
   if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
     echo "--- creating buildx builder '$BUILDER' (docker-container driver) ---"
-    docker buildx create --name "$BUILDER" --driver docker-container --bootstrap >/dev/null
+    docker buildx create --name "$BUILDER" --driver docker-container \
+      --buildkitd-config "$REPO_ROOT/scripts/buildkitd.toml" \
+      --buildkitd-flags '--allow-insecure-entitlement=network.host' \
+      --bootstrap >/dev/null
+  elif ! docker buildx inspect "$BUILDER" | grep -qE 'Filters:[[:space:]]+type==exec\.cachemount$'; then
+    echo "warning: builder '$BUILDER' predates scripts/buildkitd.toml, so BuildKit's" >&2
+    echo "  default GC still caps its cargo cache mounts at 512MB/48h — a deploy after" >&2
+    echo "  a two-day pause will recompile everything. Recreate it once (costs one full" >&2
+    echo "  build) with:  docker buildx rm $BUILDER" >&2
   fi
   if ! docker buildx inspect "$BUILDER" | grep -q "$platform"; then
     echo "--- registering QEMU binfmt for cross-arch builds ---"

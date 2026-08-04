@@ -1,0 +1,45 @@
+# BuildKit config for the `ha-addon-builder` buildx builder (scripts/deploy-dev.sh
+# creates it with --buildkitd-config pointing here).
+#
+# This file exists for exactly one reason: BuildKit's DEFAULT garbage-collection
+# policy caps the record types it considers "easily reproducible" — which includes
+# every `--mount=type=cache` — at **512MB total with a 48h grace period**. The
+# add-on build's cache mounts are the shared cargo registry plus one target/ dir
+# per Rust stage: bridge-daemon (per target arch, ~1GB) and pwrouter-agent (~550MB,
+# it cross-builds both arches). That is ~2GB today, four times over the default
+# cap, so the moment those records fall outside the 48h window the GC deletes them
+# and the next deploy recompiles all ~600 dependency crates plus both agent
+# binaries from scratch — the exact cost the cache mounts exist to avoid. Symptom
+# is a deploy after a couple of quiet days doing full apt + cargo work again.
+#
+# Defining ANY [[worker.oci.gcpolicy]] replaces the whole default set, so the
+# rules below must cover everything and end with a catch-all. Rules are applied in
+# order and the first matching one governs a record.
+[worker.oci]
+  gc = true
+
+  # The cargo caches — the ones the default policy was throwing away. A real
+  # budget and a long duration: they are pure speed, they hold no build output,
+  # and re-earning them costs ~15 minutes of cross-compilation.
+  [[worker.oci.gcpolicy]]
+    filters = ["type==exec.cachemount"]
+    keepDuration = "2160h"
+    maxUsedSpace = "16GB"
+
+  # Build contexts and git checkouts: genuinely cheap to re-transfer (the context
+  # is ~6MB after .dockerignore), so they keep the default's short leash.
+  [[worker.oci.gcpolicy]]
+    filters = ["type==source.local", "type==source.git.checkout"]
+    keepDuration = "48h"
+    maxUsedSpace = "2GB"
+
+  # Everything else: image layers, the apt/rustup layers, exec snapshots. Bounded
+  # well under the ~100GB the default ceiling let this builder drift to (where
+  # crossing it starts evicting the apt layers by least-recent-use, which reads as
+  # "why is it running apt-get again"), while still holding several full builds of
+  # every stage.
+  [[worker.oci.gcpolicy]]
+    all = true
+    reservedSpace = "8GB"
+    maxUsedSpace = "50GB"
+    minFreeSpace = "50GB"

@@ -12,6 +12,10 @@
 **/node_modules
 **/dist
 **/*.tsbuildinfo
+# Test-runner scratch dirs: no COPY needs them, and their presence in the context
+# means running the tests invalidates the Rust stage's layer for nothing.
+**/.pytest_cache
+**/__pycache__
 # This also drops the submodule's `.git` *file* (the gitlink pointing back into
 # the superproject's .git/modules). Deliberate: cargo builds a path dependency
 # from its files alone and never consults git.
