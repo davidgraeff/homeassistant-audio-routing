@@ -209,6 +209,7 @@ pub fn router(
         .route("/api/outputs/{node_name}", delete(remove_output))
         .route("/api/outputs/{node_name}/adopt", post(adopt_output))
         .route("/api/outputs/{node_name}/ignore", post(ignore_output))
+        .route("/api/outputs/{node_name}/name", put(set_output_name))
         .route("/api/outputs/{node_name}/latency", put(set_output_latency))
         .route("/api/outputs/{node_name}/ap2-rate", put(set_ap2_rate_mode))
         .route("/api/outputs/{node_name}/sendspin-codec", put(set_sendspin_codec))
@@ -482,6 +483,11 @@ struct Ap2FeaturesInfo {
 struct OutputInfo {
     node_name: String,
     name: String,
+    /// Is `name` the user's own (a rename), rather than the one discovery
+    /// reported? Only then is there anything for a UI's "use the discovered
+    /// name again" control to clear, so it can offer that honestly instead of
+    /// showing a button that does nothing.
+    renamed: bool,
     /// `"sendspin"` or `"airplay2"` — for the Type column / badge.
     kind: &'static str,
     /// Node/device is live right now.
@@ -716,6 +722,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             configured: false, // sendspin devices are always auto-discovered
             state: adoption(&node_name),
             name,
+            // Set by the rename pass at the end of collect_outputs.
+            renamed: false,
             ip: addr.map(|a| a.ip().to_string()),
             port: addr.map(|a| a.port()),
             encryption: Some("None".to_string()),
@@ -821,6 +829,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             configured: false, // AP2 receivers are always auto-discovered
             state: adoption(&node_name),
             name,
+            // Set by the rename pass at the end of collect_outputs.
+            renamed: false,
             ip: addr.map(|a| a.ip().to_string()),
             port: addr.map(|a| a.port()),
             // AirPlay 2 always uses HomeKit transient pairing + encryption.
@@ -880,6 +890,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             configured: false, // a pairing, not a hand-written config
             state: adoption(&node_name),
             name,
+            // Set by the rename pass at the end of collect_outputs.
+            renamed: false,
             ip: None, // the agent dials us; we never need its address
             port: None,
             encryption: Some("None".to_string()), // L16 RTP is unencrypted
@@ -910,7 +922,31 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         });
     }
 
+    // The user's own name for an output wins over whatever discovery reported —
+    // applied once here rather than per kind above, since every kind derives its
+    // name differently but overrides the same way.
+    let renamed = crate::outputs_store::names_snapshot(&state.outputs);
+    for o in &mut outputs {
+        if let Some(name) = renamed.get(&o.node_name) {
+            o.name = name.clone();
+            o.renamed = true;
+        }
+    }
+
     outputs
+}
+
+/// An output's user-facing name for a message: the user's own name if they gave
+/// one, else the name derived from the node name. Discovery's mDNS name isn't
+/// consulted — this is for toasts, where the store lookup is cheap and reaching
+/// into three discovery maps isn't.
+fn output_label(state: &AppState, node_name: &str) -> String {
+    state
+        .outputs
+        .lock_recover()
+        .name(node_name)
+        .map(str::to_string)
+        .unwrap_or_else(|| routing::output_display_name(node_name))
 }
 
 /// The system's outputs: adopted only. Everything downstream — the routing
@@ -973,7 +1009,7 @@ async fn adopt_output(State(state): State<AppState>, Path(node_name): Path<Strin
         return Json(OutputOpResponse { ok: false, message: format!("failed to add '{node_name}': {e}") });
     }
     let _ = state.changes.send(());
-    Json(OutputOpResponse { ok: true, message: format!("added '{}'", routing::output_display_name(&node_name)) })
+    Json(OutputOpResponse { ok: true, message: format!("added '{}'", output_label(&state, &node_name)) })
 }
 
 /// Dismiss a discovered device: hidden from the Outputs page unless "show
@@ -986,7 +1022,7 @@ async fn ignore_output(State(state): State<AppState>, Path(node_name): Path<Stri
         return Json(OutputOpResponse { ok: false, message: format!("failed to ignore '{node_name}': {e}") });
     }
     let _ = state.changes.send(());
-    Json(OutputOpResponse { ok: true, message: format!("ignoring '{}'{cleaned}", routing::output_display_name(&node_name)) })
+    Json(OutputOpResponse { ok: true, message: format!("ignoring '{}'{cleaned}", output_label(&state, &node_name)) })
 }
 
 /// Remove an output: back to undecided. It stops being routable, loses its HA
@@ -1003,7 +1039,7 @@ async fn remove_output(State(state): State<AppState>, Path(node_name): Path<Stri
     // device's stream/session has to be torn down now, not on the next unrelated
     // registry event.
     let _ = state.changes.send(());
-    Json(OutputOpResponse { ok: true, message: format!("removed '{}'{cleaned}", routing::output_display_name(&node_name)) })
+    Json(OutputOpResponse { ok: true, message: format!("removed '{}'{cleaned}", output_label(&state, &node_name)) })
 }
 
 // ---- AirPlay-receive source -----------------------------------------------
@@ -1593,7 +1629,7 @@ async fn clear_sendspin_stream(
     // block every other device's commands behind this device's socket.
     let pending = state.sendspin_control.lock().await.clear_stream(&req.node_name);
     let reached = pending.apply().await;
-    let display = crate::routing::output_display_name(&req.node_name);
+    let display = output_label(&state, &req.node_name);
     if reached {
         tracing::info!("USER ACTION: sendspin stream/clear -> '{}' (buffers discarded, re-anchoring)", req.node_name);
     }
@@ -2369,14 +2405,14 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     let skipped: Vec<String> = transports
         .iter()
         .filter_map(|(t, s)| match s {
-            AnnounceTransport::Unavailable(why) => Some(format!("{} ({why})", crate::routing::output_display_name(t))),
+            AnnounceTransport::Unavailable(why) => Some(format!("{} ({why})", output_label(&state, t))),
             _ => None,
         })
         .collect();
     let starting: Vec<String> = transports
         .iter()
         .filter(|(_, s)| matches!(s, AnnounceTransport::Starting))
-        .map(|(t, _)| crate::routing::output_display_name(t))
+        .map(|(t, _)| output_label(&state, t))
         .collect();
     // A clip may sit unconsumed while an on-demand session pairs up; give the
     // mixer's stall watchdog a matching grace so it isn't reaped mid-connect.
@@ -2403,7 +2439,7 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     let target_count = targets.len();
     // Display names captured before `targets` is moved into the coordinator, for
     // the log line below.
-    let played: Vec<String> = targets.iter().map(|t| crate::routing::output_display_name(t)).collect();
+    let played: Vec<String> = targets.iter().map(|t| output_label(&state, t)).collect();
     let admission =
         crate::announce::AnnounceCoordinator::global().announce(targets, pcm, duck, priority, on_busy, req.barge_in, req.ttl_ms, grace);
     use crate::announce_arbiter::Admission;
@@ -2745,6 +2781,39 @@ async fn set_sendspin_delay_handler(
         format!("set '{}' static delay to {ms} ms (reconnecting just this speaker to apply)", req.node_name)
     } else {
         format!("set '{}' static delay to {ms} ms", req.node_name)
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+}
+
+#[derive(Deserialize)]
+struct SetOutputNameRequest {
+    /// The user's name for this output; `null`/omitted drops the override so the
+    /// output goes back to the name discovery reports.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Rename an output (persisted in outputs_store.rs, keyed by node name).
+///
+/// A device's own mDNS name is often useless in a house (`ap2-dev-living-2`, or
+/// four speakers all called "Yamaha"), so the name shown everywhere — Outputs,
+/// the routing graph, group chips, the HA `media_player` — is the user's if they
+/// set one. The store trims and enforces the minimum length; nothing needs to
+/// restart, so this just nudges the change notifier and every matrix subscriber
+/// picks the new name up on the next frame.
+async fn set_output_name(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+    Json(req): Json<SetOutputNameRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    tracing::info!("USER ACTION: rename output '{}' to {:?}", node_name, req.name);
+    if let Err(e) = state.outputs.lock_recover().set_name(&node_name, req.name.as_deref()) {
+        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e.to_string() }));
+    }
+    let _ = state.changes.send(());
+    let message = match req.name {
+        Some(_) => format!("renamed to '{}'", output_label(&state, &node_name)),
+        None => format!("'{}' uses its discovered name again", output_label(&state, &node_name)),
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }

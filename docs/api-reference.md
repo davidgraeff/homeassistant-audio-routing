@@ -26,6 +26,7 @@ handler name, which is the authoritative place to check the exact body shape.
 | `POST` | `/api/outputs/{node_name}/adopt` | add a discovered device |
 | `POST` | `/api/outputs/{node_name}/ignore` | dismiss a discovered device |
 | `DELETE` | `/api/outputs/{node_name}` | remove an output (back to discovered) |
+| `PUT` | `/api/outputs/{node_name}/name` | rename an output |
 | `PUT` | `/api/outputs/{node_name}/latency` | per-output latency |
 | `PUT` | `/api/outputs/{node_name}/ap2-rate` | AirPlay-2 rate mode |
 | `PUT` | `/api/outputs/{node_name}/sendspin-codec` | sendspin codec choice |
@@ -127,7 +128,8 @@ Per-output *settings* are persisted; the outputs themselves are not created here
 
 ### `GET /api/outputs`
 Your outputs — `state: "adopted"` only — with their live state. Common fields:
-`node_name`, `name`, `kind`, `present` (in the live registry now), `configured` (has
+`node_name`, `name`, `renamed` (`name` is the user's, not the device's — see
+`PUT …/name`), `kind`, `present` (in the live registry now), `configured` (has
 persisted settings), `state`, `ip`, `port`, `encryption`, `latency_ms`. Each backend
 adds its own:
 
@@ -178,6 +180,16 @@ Remove an output — back to `discovered`. Clears its routing intent, group memb
 and HA entity. A device that's still on the network reappears in
 `/api/outputs/discovered`; an offline one disappears until it shows up again.
 Idempotent.
+
+### `PUT /api/outputs/{node_name}/name`
+`{"name": "Shower"}` renames an output; `{"name": null}` drops the override so it goes
+back to the name discovery reports. Trimmed, and at least 3 characters — a shorter one
+is a `400`, because this name becomes an HA entity name and a routing-graph label,
+where a slip is hard to notice. Stored against the stable `node_name`, so it survives
+the device dropping off the network, and it is what every listing shows from then on:
+`/api/outputs`, the routing matrix (and therefore the graph, the group editors and Home
+Assistant). Independent of the adoption verdict — removing or un-ignoring a device
+keeps the name you gave it. Nothing restarts.
 
 ### `PUT /api/outputs/{node_name}/latency`
 Per-output latency in ms. Persisted, applied to the running sender.

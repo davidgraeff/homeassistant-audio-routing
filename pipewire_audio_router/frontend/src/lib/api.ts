@@ -45,6 +45,11 @@ export function wsUrl(path: string): string {
   return u.toString();
 }
 
+/** Shortest name an output may be renamed to, mirroring the daemon's rule
+ *  (outputs_store.rs `MIN_NAME_CHARS`) so the UI can refuse before the round trip
+ *  instead of surfacing a 400. */
+export const MIN_OUTPUT_NAME_CHARS = 3;
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -128,6 +133,11 @@ export const api = {
    * network ⇒ it reappears under "Discovered". */
   removeOutput: (nodeName: string) =>
     request<OpResponse>('DELETE', `api/outputs/${encodeURIComponent(nodeName)}`),
+  /** Rename an output. The name is shown everywhere the output appears (here, the
+   * routing graph, group chips, the HA media_player); `null` drops the override so
+   * it goes back to its discovered name. Rejected below MIN_OUTPUT_NAME_CHARS. */
+  renameOutput: (nodeName: string, name: string | null) =>
+    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/name`, { name }),
   /** Per-output render delay in ms (AirPlay 2); null resets to default. */
   setOutputLatency: (nodeName: string, latencyMs: number | null) =>
     request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/latency`, { latency_ms: latencyMs }),

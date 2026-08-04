@@ -59,6 +59,15 @@
       a discovered device too, before you add it.
     </p>
 
+    <h3>Naming</h3>
+    <p class="card-sub">
+      Click an added output's name to rename it (at least three characters). The name you give it is
+      the one used everywhere — the routing graph, the group cards, and Home Assistant — and it sticks
+      to the device rather than to its network address, so it survives the speaker being switched off,
+      and removing or re-adding it. The <strong>✕</strong> beside a name you have given drops it again,
+      and the device goes back to announcing its own.
+    </p>
+
     <h3>What the states mean</h3>
     <p class="card-sub">
       <span class="badge off">offline</span> — not on the network right now. Its routing is kept and

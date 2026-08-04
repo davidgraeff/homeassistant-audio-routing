@@ -48,7 +48,22 @@ pub struct RoutingNode {
     /// Whether the node is in the live graph right now. `false` = configured or
     /// previously-routed but currently absent — shown grayed in the UI; its
     /// routing intent is kept and reapplied by reconcile() when it returns.
+    ///
+    /// For the dialed backends this is *reachability*, not delivery: an AP2
+    /// receiver answers on :7000 and a pw-sink target advertises over mDNS long
+    /// before (or without ever) accepting a session. See `streaming`.
     present: bool,
+    /// Outputs only: **is a session to this output actually up**, i.e. is audio
+    /// routed to it really being carried? `Some(false)` = present/reachable but
+    /// nothing is attached, so a route to it exists on paper and delivers nothing —
+    /// the UI must not animate that wire (this is the state that had the routing
+    /// graph showing a happy flowing link while announcements to the same output
+    /// were correctly refused). `None` = the question doesn't apply (sources; a
+    /// sendspin device, which always has a sender while adopted). Same rule as the
+    /// announce arbiter and the Outputs page, via
+    /// [`crate::sync_group::dialed_session_established`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streaming: Option<bool>,
     /// Live PipeWire node id when present (needed for per-node ops like
     /// volume). `None` for offline entities.
     node_id: Option<u32>,
@@ -155,25 +170,40 @@ fn channel_suffix(port_name: &str) -> &str {
     port_name.rsplit('_').next().unwrap_or(port_name)
 }
 
-/// Build the matrix from live registry + configured outputs + persisted intent.
+/// Build the matrix from live registry + adopted outputs + persisted intent.
 ///
 /// Every routable entity is included even when it isn't in the graph right
-/// now: an output that's configured or has saved routing, and any source
+/// now: an adopted output (whether or not it has saved routing), and any source
 /// referenced by intent, appear as `present: false` (grayed in the UI) so its
 /// routing survives disappearance and is reapplied on return. Outputs also
 /// carry `configured` (store entry vs mDNS auto-discovered) for the badge.
+///
+/// **`adopted` is the gate**: a discovered device the user hasn't added on the
+/// Outputs page is not routable, so it must not appear here — this listing is
+/// also what the Home Assistant integration turns into `media_player` entities,
+/// and an unadopted device must get neither a route nor an entity. Links whose
+/// output isn't adopted are filtered out too (rather than dropped from the
+/// store), so adding a device back restores the routing it had.
 fn build_matrix(
     reg: &RegistryState,
     devices: &BTreeMap<String, SendspinDevice>,
     ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
     pw_targets: &BTreeMap<String, crate::pw_target_discovery::PwTarget>,
+    adopted: &std::collections::BTreeSet<String>,
     source_labels: &std::collections::HashMap<String, String>,
+    // User-chosen output names (outputs_store.rs), keyed by node name. Wins over
+    // whatever discovery reported — it is the whole point of a rename.
+    output_labels: &BTreeMap<String, String>,
     meters: &crate::metering::MeterHub,
     intent: &[RoutingLink],
     sendspin_volumes: &std::collections::HashMap<String, u8>,
     sendspin_mutes: &std::collections::HashMap<String, bool>,
     ap2_volumes: &std::collections::HashMap<String, f32>,
     ap2_mutes: &std::collections::HashMap<String, bool>,
+    // `ap2_connected`: AP2 outputs whose sender has a live command channel
+    // (`Ap2Control::connected`) — half of the `streaming` verdict below; the
+    // pw-sink half is a process-global, so it needs no parameter.
+    ap2_connected: &std::collections::HashSet<String>,
     lat: &LatencyConfig,
     xruns: &std::collections::HashMap<String, u32>,
 ) -> RoutingMatrix {
@@ -200,16 +230,23 @@ fn build_matrix(
     // Every output is now virtual + auto-discovered (sendspin + AP2 devices) —
     // audio reaches them via a group sink (sync_group.rs), not a live node here.
 
-    // Union of every output/source name to show: present ∪ discovered devices ∪
-    // intent.
+    // Union of every output name to show: present ∪ discovered devices ∪ intent
+    // ∪ adopted — then narrowed to the adopted ones, the only routable outputs.
+    // An adopted-but-undiscovered output is kept (grayed) so its routing is
+    // visible and survives the device being off.
     let mut output_names: BTreeSet<String> = present_outputs.keys().cloned().collect();
     output_names.extend(devices.keys().cloned());
     output_names.extend(ap2_devices.keys().cloned());
     output_names.extend(pw_targets.keys().cloned());
     output_names.extend(intent.iter().map(|l| l.output.clone()));
+    output_names.extend(adopted.iter().cloned());
+    output_names.retain(|n| adopted.contains(n));
 
+    // Sources of dormant intent (an output that isn't adopted) don't count as
+    // referenced — otherwise a source with nothing but such links would sit in
+    // the matrix with no visible link to explain it.
     let mut source_names: BTreeSet<String> = present_sources.keys().cloned().collect();
-    source_names.extend(intent.iter().map(|l| l.source.clone()));
+    source_names.extend(intent.iter().filter(|l| adopted.contains(&l.output)).map(|l| l.source.clone()));
 
     let mut outputs: Vec<RoutingNode> = output_names
         .into_iter()
@@ -218,8 +255,10 @@ fn build_matrix(
             let device = devices.get(&name);
             let ap2 = ap2_devices.get(&name);
             let pwt = pw_targets.get(&name);
-            let display_name = device
-                .map(|d| d.display_name.clone())
+            let display_name = output_labels
+                .get(&name)
+                .cloned()
+                .or_else(|| device.map(|d| d.display_name.clone()))
                 .or_else(|| ap2.map(|d| d.display_name.clone()))
                 .or_else(|| pwt.map(|t| t.display_name.clone()))
                 .unwrap_or_else(|| output_display_name(&name));
@@ -232,6 +271,10 @@ fn build_matrix(
                     || device.is_some_and(|d| d.present)
                     || ap2.is_some_and(|d| d.present)
                     || pwt.is_some_and(|t| t.present),
+                // Reachable is not the same as connected for the dialed backends —
+                // report the session state separately so the UI can tell the two
+                // apart instead of implying delivery from mere presence.
+                streaming: crate::sync_group::dialed_session_established(&name, ap2_connected),
                 node_id,
                 // Every output is now auto-discovered (sendspin + AP2); nothing is
                 // manually configured anymore (the RAOP store is gone).
@@ -240,7 +283,13 @@ fn build_matrix(
                 // Virtual outputs (sendspin + AP2) carry their in-band volume/mute
                 // here so the UI syncs live over the routing WS.
                 volume: if name.starts_with(SENDSPIN_DEV_PREFIX) {
-                    Some(sendspin_volumes.get(&name).map_or(1.0, |v| *v as f32 / 100.0))
+                    // `None` when unknown, exactly like AP2 below: the sendspin
+                    // store holds levels the device *reported* (`client/state`) or
+                    // the user set, so an absent entry means we have never heard a
+                    // level for this speaker. Reporting 1.0 there fabricated full
+                    // scale — the one thing the volume control must never show,
+                    // since these are dB scales where the top is near-max power.
+                    sendspin_volumes.get(&name).map(|v| *v as f32 / 100.0)
                 } else if name.starts_with(AP2_DEV_PREFIX) {
                     // AP2 volume is device-authoritative: `None` (unknown) when we
                     // haven't read it from the receiver and the user hasn't set it —
@@ -275,14 +324,29 @@ fn build_matrix(
             let peak = meters.peak(&name);
             let latency_ms = node_latency_ms(&name, lat);
             let node_xruns = xruns.get(&name).copied();
-            RoutingNode { present: node_id.is_some(), node_id, configured: true, display_name, node_name: name, peak, volume: None, muted: None, latency_ms, xruns: node_xruns }
+            RoutingNode {
+                present: node_id.is_some(),
+                // Sources feed the graph locally — there is no session to be up.
+                streaming: None,
+                node_id,
+                configured: true,
+                display_name,
+                node_name: name,
+                peak,
+                volume: None,
+                muted: None,
+                latency_ms,
+                xruns: node_xruns,
+            }
         })
         .collect();
 
     outputs.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     sources.sort_by(|a, b| a.display_name.cmp(&b.display_name));
 
-    let mut links = intent.to_vec();
+    // Only links between listed entities; intent pointing at an unadopted output
+    // stays in the store, dormant, and reappears when that output is added.
+    let mut links: Vec<RoutingLink> = intent.iter().filter(|l| adopted.contains(&l.output)).cloned().collect();
     links.sort();
 
     RoutingMatrix { sources, outputs, links }
@@ -299,11 +363,15 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         let c = state.sendspin_control.lock().await;
         (c.volumes(), c.mutes())
     };
-    let (ap2_volumes, ap2_mutes) = {
+    // `connected()` comes from the same guard as the volumes: it's what makes an
+    // AP2 output's `streaming` verdict (routing.rs `RoutingNode::streaming`).
+    let (ap2_volumes, ap2_mutes, ap2_connected) = {
         let c = state.ap2_control.lock().await;
-        (c.volumes(), c.mutes())
+        (c.volumes(), c.mutes(), c.connected())
     };
     let intent = routing_store::snapshot(&state.routing);
+    let adopted = crate::outputs_store::adopted_snapshot(&state.outputs);
+    let output_labels = crate::outputs_store::names_snapshot(&state.outputs);
     let devices = state.sendspin_devices.lock_recover().clone();
     let ap2_devices = state.ap2_devices.lock_recover().clone();
     let pw_targets = state.pw_targets.lock_recover().clone();
@@ -335,7 +403,24 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
     };
     let xruns = state.xruns.lock_recover().clone();
     let reg = state.pw.lock_recover();
-    build_matrix(&reg, &devices, &ap2_devices, &pw_targets, &source_labels, &state.meters, &intent, &sendspin_volumes, &sendspin_mutes, &ap2_volumes, &ap2_mutes, &lat, &xruns)
+    build_matrix(
+        &reg,
+        &devices,
+        &ap2_devices,
+        &pw_targets,
+        &adopted,
+        &source_labels,
+        &output_labels,
+        &state.meters,
+        &intent,
+        &sendspin_volumes,
+        &sendspin_mutes,
+        &ap2_volumes,
+        &ap2_mutes,
+        &ap2_connected,
+        &lat,
+        &xruns,
+    )
 }
 
 /// Present source nodes as `(node_name, node_id)` — the set the meter hub taps
@@ -502,6 +587,17 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
     // actions can be told apart from stack-driven churn (reconcile, discovery,
     // source cycling) when reading logs. Grep `USER ACTION`.
     tracing::info!("USER ACTION: link '{}' → '{}' (routing graph)", req.source, req.output);
+    // Only an adopted output is routable. The matrix never offers an unadopted
+    // one, so this only fires for a direct API call (an automation, or a UI tab
+    // left open while the device was removed) — but it must be refused rather
+    // than persisted, or the link would sit in the store and quietly take effect
+    // the moment the device were added.
+    if !state.outputs.lock_recover().is_adopted(&req.output) {
+        return Json(LinkOpResponse {
+            ok: false,
+            message: format!("'{}' isn't one of your outputs — add it on the Outputs page first", req.output),
+        });
+    }
     // Persist the desired route first; it's the source of truth and reconcile()
     // (re)applies it whenever both endpoints are present.
     if let Err(e) = state.routing.lock_recover().add(&req.source, &req.output) {
@@ -690,5 +786,120 @@ mod tests {
         assert!(kitchen.contains(AIRPLAY_NODE_NAME) && kitchen.contains("other-source") && kitchen.len() == 2);
         let dusche = source_set_of(&intent, "ap2-dev-dusche");
         assert_eq!(dusche.len(), 1);
+    }
+
+    /// The matrix is what the UI offers *and* what the HA integration turns into
+    /// `media_player` entities, so an unadopted device must be absent from it —
+    /// including any saved links pointing at it, which stay dormant in the store
+    /// rather than being shown (or applied).
+    fn matrix_with(adopted: &[&str], intent: &[RoutingLink]) -> RoutingMatrix {
+        matrix_with_connected(adopted, intent, &[])
+    }
+
+    /// As [`matrix_with`], with `ap2_connected` naming the AP2 outputs whose sender
+    /// has a live session (what `streaming` reports).
+    fn matrix_with_connected(adopted: &[&str], intent: &[RoutingLink], ap2_connected: &[&str]) -> RoutingMatrix {
+        matrix_of(adopted, intent, ap2_connected, &BTreeMap::new())
+    }
+
+    /// As [`matrix_with`], with the user's renames (outputs_store.rs).
+    fn matrix_with_names(adopted: &[&str], intent: &[RoutingLink], names: &[(&str, &str)]) -> RoutingMatrix {
+        let names: BTreeMap<String, String> = names.iter().map(|(n, l)| (n.to_string(), l.to_string())).collect();
+        matrix_of(adopted, intent, &[], &names)
+    }
+
+    fn matrix_of(
+        adopted: &[&str],
+        intent: &[RoutingLink],
+        ap2_connected: &[&str],
+        output_labels: &BTreeMap<String, String>,
+    ) -> RoutingMatrix {
+        let empty_names: std::collections::BTreeSet<String> = adopted.iter().map(|s| s.to_string()).collect();
+        let ap2_connected: std::collections::HashSet<String> = ap2_connected.iter().map(|s| s.to_string()).collect();
+        build_matrix(
+            &RegistryState::default(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &empty_names,
+            &std::collections::HashMap::new(),
+            output_labels,
+            &crate::metering::MeterHub::default(),
+            intent,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &ap2_connected,
+            &LatencyConfig {
+                source_latencies: std::collections::HashMap::new(),
+                group_lead_ms: 0,
+                sendspin_delays: std::collections::BTreeMap::new(),
+                ap2_delays: std::collections::BTreeMap::new(),
+                ap2_default_ms: 0,
+            },
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    /// A rename has to reach the matrix, not just the Outputs page: this listing is
+    /// what the routing graph draws, what the group editors label their chips with,
+    /// and what the HA integration turns into `media_player` metadata.
+    #[test]
+    fn a_renamed_output_carries_its_name_into_the_matrix() {
+        let m = matrix_with_names(&["ap2-dev-dusche"], &[], &[("ap2-dev-dusche", "Shower")]);
+        assert_eq!(m.outputs.len(), 1);
+        assert_eq!(m.outputs[0].display_name, "Shower");
+        // Without one, the derived name still applies.
+        let plain = matrix_with(&["ap2-dev-dusche"], &[]);
+        assert_eq!(plain.outputs[0].display_name, "dusche");
+    }
+
+    #[test]
+    fn unadopted_outputs_and_their_saved_links_stay_out_of_the_matrix() {
+        let intent = vec![link(AIRPLAY_NODE_NAME, "ap2-dev-dusche")];
+        let m = matrix_with(&[], &intent);
+        assert!(m.outputs.is_empty(), "an unadopted output must not be routable");
+        assert!(m.links.is_empty(), "its saved link must not show (nor be applied)");
+        assert!(m.sources.is_empty(), "and it must not drag its source in on its own");
+    }
+
+    #[test]
+    fn adopting_an_output_restores_the_routing_it_had() {
+        let intent = vec![link(AIRPLAY_NODE_NAME, "ap2-dev-dusche"), link(AIRPLAY_NODE_NAME, "ap2-dev-pioneer")];
+        let m = matrix_with(&["ap2-dev-dusche"], &intent);
+        assert_eq!(m.outputs.len(), 1);
+        // Offline (nothing in the registry) but listed, so its routing is visible.
+        assert_eq!(m.outputs[0].node_name, "ap2-dev-dusche");
+        assert!(!m.outputs[0].present);
+        assert_eq!(m.links, vec![link(AIRPLAY_NODE_NAME, "ap2-dev-dusche")]);
+        assert_eq!(m.sources.len(), 1);
+    }
+
+    /// `present` (reachable) and `streaming` (session up) are different questions for
+    /// the dialed backends, and the matrix must answer both — reporting only presence
+    /// is what let the routing graph animate a wire to a pw-sink target that had
+    /// never accepted a session, while announcements to it were refused.
+    #[test]
+    fn dialed_outputs_report_session_state_separately_from_presence() {
+        let intent = vec![link(AIRPLAY_NODE_NAME, "ap2-dev-dusche"), link(AIRPLAY_NODE_NAME, "pwsink-dev-david_local")];
+        let m = matrix_with_connected(&["ap2-dev-dusche", "pwsink-dev-david_local"], &intent, &["ap2-dev-dusche"]);
+        let by_name = |n: &str| m.outputs.iter().find(|o| o.node_name == n).expect("output listed");
+        assert_eq!(by_name("ap2-dev-dusche").streaming, Some(true), "a connected AP2 sender is streaming");
+        // No sender ever published a status for this target (pw_sink_liveness) — the
+        // receiver-initiated handshake hasn't happened, so nothing is carried.
+        assert_eq!(by_name("pwsink-dev-david_local").streaming, Some(false));
+    }
+
+    /// A source has no session to be up — `streaming` must stay absent rather than
+    /// claim `false` (which the UI would render as "not delivering").
+    #[test]
+    fn sources_carry_no_session_state() {
+        let intent = vec![link(AIRPLAY_NODE_NAME, "sendspin-dev-kitchen")];
+        let m = matrix_with(&["sendspin-dev-kitchen"], &intent);
+        assert_eq!(m.sources.len(), 1);
+        assert_eq!(m.sources[0].streaming, None);
+        // Nor does a sendspin device: it always has a sender while it's adopted.
+        assert_eq!(m.outputs[0].streaming, None);
     }
 }

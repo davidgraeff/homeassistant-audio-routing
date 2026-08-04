@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import { api } from '../lib/api';
+  import { api, MIN_OUTPUT_NAME_CHARS } from '../lib/api';
   import { routing } from '../lib/routing';
   import { run, toast } from '../lib/toast';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../lib/types';
   import AgentsPanel from './AgentsPanel.svelte';
+  import GroupTitle from './GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
   import VolumeControl from './VolumeControl.svelte';
@@ -349,6 +350,21 @@
     return decide(o, () => api.removeOutput(o.node_name));
   }
 
+  // Rename an output. The daemon stores the name against the output's stable node
+  // name, so it survives the device dropping off the network and re-resolving —
+  // and it is the name every other page (and Home Assistant) then shows. Nothing
+  // restarts; the refresh is only so this card stops showing the old name.
+  async function rename(o: OutputInfo, name: string) {
+    if (await run(() => api.renameOutput(o.node_name, name), `Renamed to '${name}'`)) await refresh();
+  }
+
+  // Drop the rename: the output goes back to the name its device announces. Only
+  // offered for an output that actually carries one (`renamed`) — the discovered
+  // name isn't in this listing, so there's nothing to preview and no point
+  // offering the control otherwise. Routed through `decide` for its toast of the
+  // daemon's own message, which is what names the result.
+  const resetName = (o: OutputInfo) => decide(o, () => api.renameOutput(o.node_name, null));
+
   // AirPlay-2 wire sample-rate mode (auto vs forced 44.1 kHz). Restarts the group.
   async function setRateMode(o: OutputInfo, e: Event) {
     const mode = (e.currentTarget as HTMLSelectElement).value as 'auto' | 'fixed_44100';
@@ -535,26 +551,49 @@
             <span class="chevron">▶</span>
           </button>
           <div class="out-title">
-            <h3>{o.name}</h3>
-            <div class="out-badges">
-              <span class="badge">{kindLabel(o)}</span>
-              <span class={st.cls} title={st.title}>{st.text}</span>
-              {#if ptpBadge(o)}
-                {@const ptp = ptpBadge(o)!}
-                <span class={ptp.cls} title={ptp.title}>{ptp.text}</span>
-              {/if}
-            </div>
+            <!-- Renamed in place, the same control the group cards use: a
+                 device's mDNS name is often no help in a house (four speakers
+                 all called "Yamaha"), and this name is what the routing graph,
+                 the group chips and Home Assistant show. The clear icon appears
+                 only once a name of your own is stored, and asks first — the
+                 device's own name isn't shown anywhere to type back. -->
+            <h3>
+              <GroupTitle
+                name={o.name}
+                minLength={MIN_OUTPUT_NAME_CHARS}
+                title="Rename this output"
+                onRename={(name) => rename(o, name)}
+                onReset={o.renamed ? () => resetName(o) : undefined}
+                resetTitle="Use the name this device announces"
+                resetConfirm={`Drop the name '${o.name}' and use the one this device announces?`}
+              />
+            </h3>
           </div>
-          {#if o.present && (o.kind === 'airplay2' || o.kind === 'sendspin')}
-            <div class="out-vol">
+          <!-- Badges sit at the right, in the order that keeps their columns
+               aligned down the list: the two every output has (type, then
+               status) are anchored against the volume control, and the optional
+               PTP badge hangs off to their left rather than displacing them. -->
+          <div class="out-badges">
+            {#if ptpBadge(o)}
+              {@const ptp = ptpBadge(o)!}
+              <span class={ptp.cls} title={ptp.title}>{ptp.text}</span>
+            {/if}
+            <span class={st.cls} title={st.title}>{st.text}</span>
+            <span class="badge">{kindLabel(o)}</span>
+          </div>
+          <!-- The volume column is kept even for an output that has no volume to
+               control (pw-sink, or anything offline), so the badges beside it line
+               up with every other row's instead of sliding right. -->
+          <div class="out-vol">
+            {#if o.present && (o.kind === 'airplay2' || o.kind === 'sendspin')}
               <VolumeControl
                 percent={liveVol.get(o.node_name) ?? null}
                 muted={muted[o.node_name] ?? false}
                 onVolume={(pct) => onVolume(o, pct)}
                 onMute={() => onMute(o)}
               />
-            </div>
-          {/if}
+            {/if}
+          </div>
         </header>
 
         {#if !isCollapsed(o)}
@@ -883,6 +922,8 @@
     min-width: 0;
     flex: 1 1 auto;
   }
+  /* Always laid out, empty or not — it is the column the badges are aligned
+     against (see the header markup). */
   .out-vol {
     flex: 0 0 auto;
     width: 160px;
@@ -925,12 +966,33 @@
     margin: 0;
     font-size: 1.05rem;
     font-weight: 500;
+    min-width: 0;
+  }
+  /* <GroupTitle> brings the group cards' sizing with it (`.gtitle` in app.css);
+     inside this heading it should read as the heading, editing or not. The
+     padding it needs for its hover target is pulled back off the left so the
+     name still lines up with the badges under it. */
+  .out-title h3 :global(.gtitle) {
+    margin-left: -4px;
+  }
+  .out-title h3 :global(.gtitle strong) {
+    font-size: inherit;
+    font-weight: inherit;
+  }
+  .out-title h3 :global(.rename) {
+    font-size: inherit;
+    font-weight: inherit;
   }
   .out-badges {
     display: flex;
     gap: 6px;
     align-items: center;
     flex-wrap: wrap;
+    /* In an adopted card's header this is a column of its own between the name
+       and the volume control: it keeps its content width but may shrink and wrap
+       internally on a narrow card, staying right-aligned as it does. */
+    flex: 0 1 auto;
+    justify-content: flex-end;
   }
 
   /* Connection details */

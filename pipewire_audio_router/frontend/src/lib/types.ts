@@ -87,6 +87,10 @@ export type OutputAdoption = 'adopted' | 'discovered' | 'ignored';
 export interface OutputInfo {
   node_name: string;
   name: string;
+  /** Is `name` one the user typed, rather than the one the device announces?
+   *  Only then is there anything to clear, so only then does the Outputs page
+   *  offer "use the announced name again". */
+  renamed: boolean;
   /** 'airplay2' (AirPlay 2), 'sendspin', or 'pwsink' (remote PipeWire host via
    * module-rtp-session) — for the Type column / badge. */
   kind: 'airplay2' | 'sendspin' | 'pwsink';
