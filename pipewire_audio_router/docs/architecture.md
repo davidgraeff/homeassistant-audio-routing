@@ -242,7 +242,8 @@ connect fail, and leaves the receiver's one AirPlay input busy for phones in
 between. `run.sh` (PID 1) waits up to ~8 s for the daemon before stopping
 PipeWire, so the bound fits inside the supervisor's ~10 s stop grace.
 
-**Alignment.** An AP2 group is alignable on the Align page (`calibrate.rs`):
+**Alignment.** An AP2 group is alignable from its source card on the Sources page
+(`calibrate.rs`, `frontend/src/components/AlignPanel.svelte`):
 members are muted/soloed via `ap2_control` (device-authoritative mute) and
 each one's offset is tuned by ear with its **live render delay** — there is
 no node-volume path (AP2 outputs are virtual).
@@ -375,7 +376,6 @@ claim that audio is being carried. A status flip nudges the routing-matrix
 WebSocket (`PwSinkLiveness::set_change_notifier`, `Ap2Control` register/unregister),
 so the graph and the Outputs page both update live rather than on the next unrelated
 registry event.
-
 
 **Nothing is silently swallowed.** Two mechanisms make that true: the API
 answers with what will actually carry each target (targets nothing can carry are

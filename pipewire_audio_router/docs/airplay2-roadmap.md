@@ -55,8 +55,8 @@ RAOP is already removed, so this is now acceptance, not a pre-removal gate:
   Confirm by ear: tone on an unrouted receiver (audible a few seconds later, the
   pair + render-delay cost), a second tone within the lease (fast, warm session),
   then that the receiver frees its AirPlay input afterwards (a phone can connect).
-- **AP2 alignment**: on the Align page, soloing two receivers and sweeping one's
-  render delay by ear brings them into coincidence.
+- **AP2 alignment**: in the source card's alignment panel, soloing two receivers
+  and sweeping one's render delay by ear brings them into coincidence.
 - Routing + grouping survive an add-on restart (the `raop_migration` shim + no
   dangling links). *(Migration was a verified no-op on the live store — kept for
   safety; it can be deleted after one clean boot.)*

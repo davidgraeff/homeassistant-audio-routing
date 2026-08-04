@@ -1,4 +1,5 @@
-//! Latency-alignment ("calibration") session — the backend for the Align page.
+//! Latency-alignment ("calibration") session — the backend for the alignment
+//! panel on each source card (frontend `AlignPanel.svelte`).
 //!
 //! Aligning a sync group is done **by ear** (the daemon has no latency
 //! *measurement*): a test signal plays on every member off the group's one
@@ -48,7 +49,7 @@ const CLICK_AMP: f64 = 0.5;
 /// Default level (0–100) audible members play at during calibration — the same
 /// for both compared members so the ear judges timing, not loudness. Kept
 /// modest (calibration clicks are loud and it's usually a hands-on, close-range
-/// task); the user can raise/lower it live from the Align page.
+/// task); the user can raise/lower it live from the alignment panel.
 const DEFAULT_CAL_VOLUME: u8 = 50;
 
 /// Safety net: never leave a group muted with a click looping if the UI

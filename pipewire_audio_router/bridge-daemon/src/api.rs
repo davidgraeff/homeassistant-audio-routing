@@ -961,7 +961,7 @@ pub(crate) async fn outputs_listings(state: &AppState) -> (Vec<OutputInfo>, Vec<
 }
 
 /// The system's outputs: adopted only. Everything downstream — the routing
-/// matrix's counterpart listing, the group editors, the Align page, the HA
+/// matrix's counterpart listing, the group editors, the alignment panel, the HA
 /// integration's per-output metadata — means *these* by "output". A discovered
 /// device the user hasn't added yet is deliberately absent.
 async fn list_outputs(State(state): State<AppState>) -> Json<Vec<OutputInfo>> {

@@ -134,8 +134,8 @@ there is no reason to reconnect for it: `ap2_control` now sends a live
 `SetRenderDelay` to the running streamer (`Connection::set_render_delay_live`),
 which shifts the next anchor, and the value is dropped from the restart identity
 (only receiver-set + wire-rate changes reconnect). This also makes the delay
-actually *sweepable* by ear — which is what the Align page's AP2 support relies
-on. The persisted value is still used as the initial delay on the next real
+actually *sweepable* by ear — which is what the alignment panel's AP2 support
+relies on. The persisted value is still used as the initial delay on the next real
 (membership/rate) reconnect.
 
 ## Sample-rate harmonization: no steady Rust resampling; the graph carries rate conversion
