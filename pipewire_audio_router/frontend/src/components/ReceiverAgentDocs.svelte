@@ -116,8 +116,7 @@
     <pre><code
         >chmod +x pwrouter-agent-* &amp;&amp; install -Dm755 pwrouter-agent-* ~/.local/bin/pwrouter-agent
 mkdir -p ~/.config/systemd/user
-curl -sSL -o ~/.config/systemd/user/pwrouter-agent.service \\
-  https://raw.githubusercontent.com/davidgraeff/homeassistant-pipewire-audio-routing/main/pipewire_audio_router/pwrouter-agent/pwrouter-agent.service
+curl -sSL -o ~/.config/systemd/user/pwrouter-agent.service https://raw.githubusercontent.com/davidgraeff/homeassistant-audio-routing/refs/heads/main/pipewire_audio_router/pwrouter-agent/pwrouter-agent.service
 systemctl --user daemon-reload
 systemctl --user enable --now pwrouter-agent</code
       ></pre>

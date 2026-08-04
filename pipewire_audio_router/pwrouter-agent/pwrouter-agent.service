@@ -23,7 +23,16 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/pwrouter-agent
+# ConfigurationDirectory=, *not* ReadWritePaths=: with ProtectHome=read-only the
+# config dir has to be writable, but ReadWritePaths= requires the path to already
+# exist at namespace-setup time and the agent only creates it when a pairing is
+# saved — so a fresh install died with 226/NAMESPACE before it ever ran.
+# ConfigurationDirectory= creates $XDG_CONFIG_HOME/pwrouter-agent (i.e.
+# ~/.config/pwrouter-agent for a user unit) up front and binds it read-write.
+ConfigurationDirectory=pwrouter-agent
+# The dir holds a bearer token (the file itself is 0600); no reason for anyone
+# else to even list it.
+ConfigurationDirectoryMode=0700
 PrivateTmp=yes
 
 [Install]

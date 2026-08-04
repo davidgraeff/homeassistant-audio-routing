@@ -24,13 +24,13 @@ mod overlay_mixer;
 mod per_device_spike;
 mod player;
 mod profiler;
-mod pw_module;
 mod pw_sink;
 mod pw_sink_liveness;
 mod pw_sink_spike;
 mod pw_target_discovery;
 mod pw_target_liveness;
 mod pw_thread;
+mod pwsink_agent;
 mod pwsink_server;
 mod resample;
 mod routing;
@@ -254,6 +254,14 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 
     let (pw_state, changes, pw_cmd, xruns) = pw_thread::spawn()?;
 
+    // Paired receiver agents (pwsink_agent.rs): the token store *and* the source
+    // of truth for pw-sink targets — a pw-sink output exists because a helper on
+    // that host paired, not because something answered an mDNS browse
+    // (docs/receiver-agent-plan.md §3).
+    let agents_path = routing_path.with_file_name("agents.json");
+    let agents = pwsink_agent::Agents::shared(agents_path.clone(), changes.clone());
+    let agents_for_duck = agents.clone();
+
     // mDNS auto-discovery (sendspin devices + AirPlay-2 receivers), runtime
     // toggleable from the Settings page (discovery_supervisor.rs). Discovery only
     // populates the shared registries — the grouping reconciler (sync_group.rs)
@@ -474,6 +482,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             sendspin_devices,
             ap2_devices,
             pw_targets,
+            agents,
             bt_bridges,
             ap2_ptp.clone(),
             routing,
@@ -491,6 +500,15 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             static_dir.to_path_buf(),
         );
         let listener = tokio::net::TcpListener::bind(listen).await?;
+        // Tell receiver agents where to dial in (docs/receiver-agent-plan.md §8).
+        // After bind, so the port in the advert is one that is actually listening.
+        if let Ok(addr) = listener.local_addr() {
+            pwsink_agent::advertise(addr.port());
+        }
+        // Relay for announcement ducks on agent-backed hosts: announce.rs is
+        // synchronous, so it posts requests here instead of taking the async
+        // registry lock (pwsink_agent.rs).
+        pwsink_agent::spawn_duck_relay(agents_for_duck);
         tracing::info!("listening on {listen}");
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 

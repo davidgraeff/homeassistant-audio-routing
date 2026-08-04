@@ -26,9 +26,14 @@ Design and rationale: [`../docs/receiver-agent-plan.md`](../docs/receiver-agent-
 
 ## Install
 
-Requires PipeWire (any 1.x) and, to build, a Rust toolchain plus
-`libpipewire-0.3` headers (`pipewire-devel` on Fedora,
-`libpipewire-0.3-dev` on Debian/Ubuntu).
+The easy way: open the add-on's **Outputs** page → *Explain receiver hosts*, and
+download the binary for your architecture. The add-on serves the build that matches
+it, so there is nothing to compile and no third-party download. Those binaries need
+glibc 2.34+ (Ubuntu 22.04 LTS, Fedora 35, Debian 12 or newer) and PipeWire 0.3.
+
+To build it yourself instead — older distro, or you are working on the agent —
+requires PipeWire (any 1.x) and a Rust toolchain plus `libpipewire-0.3` headers
+(`pipewire-devel` on Fedora, `libpipewire-0.3-dev` on Debian/Ubuntu).
 
 ```sh
 cargo build --release
@@ -46,10 +51,10 @@ prints a short code:
 WARN waiting for approval in the add-on UI — pairing code: 4F2A9C
 ```
 
-Approve it in the add-on (the same code is shown there, so you can tell two
-requests apart), and the agent reconnects with a token stored `0600` in
-`~/.config/pwrouter-agent/config.json`. Until the add-on ships the approval UI,
-approve over its API:
+Approve it under **Receiver hosts** on the add-on's Outputs page (the same code is
+shown there, so you can tell two requests apart), and the agent reconnects with a
+token stored `0600` in `~/.config/pwrouter-agent/config.json`. The same thing over
+the API, if you prefer:
 
 ```sh
 curl -s http://<addon-host>:8099/api/agents            # find your identity
