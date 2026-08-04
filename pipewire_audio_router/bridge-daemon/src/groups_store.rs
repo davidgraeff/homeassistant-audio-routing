@@ -185,6 +185,31 @@ impl GroupsStore {
         self.persist()
     }
 
+    /// Drop `node_name` from every music group's members and every announcement
+    /// group's targets — used when an output is removed or ignored on the Outputs
+    /// page, so a stale member can't silently re-route it if it's ever added
+    /// again. The groups themselves are kept even if they end up empty (a named,
+    /// empty group is a valid thing to refill; deleting the user's group because
+    /// its last speaker went away would be a surprise). Returns whether anything
+    /// changed; persists only then.
+    pub fn remove_output(&mut self, node_name: &str) -> anyhow::Result<bool> {
+        let mut changed = false;
+        for g in &mut self.config.music {
+            let before = g.members.len();
+            g.members.retain(|m| m != node_name);
+            changed |= g.members.len() != before;
+        }
+        for g in &mut self.config.announcement {
+            let before = g.targets.len();
+            g.targets.retain(|t| t != node_name);
+            changed |= g.targets.len() != before;
+        }
+        if changed {
+            self.persist()?;
+        }
+        Ok(changed)
+    }
+
     fn persist(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -241,6 +266,28 @@ mod tests {
         let b = s.create_announcement("Everywhere", v(&["kitchen", "bedroom"]), 10, 0.3).unwrap();
         assert_ne!(a.id, b.id);
         assert_eq!(s.announcement_by_id(&b.id).unwrap().priority, 10);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_output_strips_it_from_every_group_but_keeps_the_groups() {
+        let path = temp("rmout");
+        let _ = std::fs::remove_file(&path);
+        let mut s = GroupsStore::load(&path).unwrap();
+        let mg = s.create_music("Downstairs", v(&["kitchen", "hall"])).unwrap();
+        let solo = s.create_music("Kitchen Only", v(&["kitchen-2"])).unwrap();
+        let ag = s.create_announcement("Everywhere", v(&["kitchen", "bedroom"]), 0, 0.25).unwrap();
+
+        assert!(s.remove_output("kitchen").unwrap());
+        assert!(!s.remove_output("kitchen").unwrap(), "second removal is a no-op");
+        assert_eq!(s.music().iter().find(|g| g.id == mg.id).unwrap().members, v(&["hall"]));
+        assert_eq!(s.announcement_by_id(&ag.id).unwrap().targets, v(&["bedroom"]));
+        // A near-miss name is untouched, and emptying a group doesn't delete it.
+        assert_eq!(s.music().iter().find(|g| g.id == solo.id).unwrap().members, v(&["kitchen-2"]));
+        s.remove_output("kitchen-2").unwrap();
+        let reloaded = GroupsStore::load(&path).unwrap();
+        assert_eq!(reloaded.music().len(), 2);
+        assert!(reloaded.music().iter().find(|g| g.id == solo.id).unwrap().members.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

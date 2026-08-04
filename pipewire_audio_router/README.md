@@ -33,13 +33,10 @@ There are **no add-on options** to fill in. Everything user-facing is
 configured at runtime via the daemon's REST API / web UI and persisted
 under `/data`, so it survives restarts.
 
-- **RAOP (AirPlay) outputs** — AV receivers this add-on streams *out* to
-  (e.g. Yamaha/Pioneer). Managed via `/api/outputs`, and auto-discovered
-  over mDNS. `port` defaults to `7000` (RAOP's advertised RTSP port is
-  often *not* 5000); `encryption` defaults to `auth_setup` — the only mode
-  that worked against real hardware tested here (`none`/`RSA` are
-  fallbacks, for a reason — see
-  [decisions.md](../docs/decisions.md#raop-quirks-found-only-by-testing-against-real-hardware)).
+- **AirPlay-2 outputs** — AV receivers, HomePods and AirPlay speakers this
+  add-on streams *out* to (e.g. Yamaha/Pioneer), surfaced as virtual routing
+  outputs `ap2-dev-<slug>`. Auto-discovered over mDNS, then **added by you**
+  (see [Adding outputs](#adding-outputs) below).
 - **AirPlay-receive source** — the name phones/PCs cast *in* to. A single
   source, managed via `/api/source/airplay` (empty name = disabled).
 - **Bluetooth bridge (RTP) source** — receives the RTP stream from the
@@ -50,38 +47,43 @@ under `/data`, so it survives restarts.
   RAOP outputs.
 - **Sendspin outputs** — ESPHome speaker devices (e.g. HA Voice PE) that
   connect *in* to this add-on (no IP needed). Auto-discovered over mDNS and
-  surfaced as virtual routing outputs; you route to them through the routing
-  matrix and set per-device volume via `/api/sendspin/volume`. Devices fed by
-  the same set of sources are automatically formed into one synchronized
+  surfaced as virtual routing outputs; once added you route to them through the
+  routing matrix and set per-device volume via `/api/sendspin/volume`. Devices
+  fed by the same set of sources are automatically formed into one synchronized
   group.
 
-See [Managing outputs at runtime](#managing-outputs-at-runtime) below and
-the [full API reference](../docs/api-reference.md).
+See [Adding outputs](#adding-outputs) below and the
+[full API reference](../docs/api-reference.md).
 
-## Managing outputs at runtime
+## Adding outputs
 
-RAOP outputs are hot-reloadable: the daemon loads one
-`libpipewire-module-raop-sink` module per output into its own PipeWire
-context at runtime, so adding or removing one doesn't restart PipeWire or
-interrupt audio on the other outputs (see
-[decisions.md](../docs/decisions.md#loading-pipewire-modules-at-runtime)
-for how this works). The set is persisted to `/data/raop-outputs.json`.
+Discovery finds every compatible device on the LAN — which on a real network
+includes the neighbours' AirPlay speakers — so it only **offers** them.
+A discovered device is inert: not routable, no Home Assistant
+`media_player`, no audio ever sent to it. On the web UI's **Outputs** page
+it appears under *Discovered devices* with its connection details and a
+test-tone button (so you can tell which speaker it is), and you either
+**add** it or **ignore** it. Adding is what makes it a real output;
+removing one puts it back on the offer list and clears its routing, group
+membership and HA entity. The verdicts live in `/data/outputs.json`.
+
+Adoption is per stable node name, and routing intent is only *filtered* by
+it — never deleted — so re-adding a device restores the routing it had.
 
 ```bash
-# list outputs (and whether each is loaded right now)
+# your outputs (adopted) …
 curl http://<add-on-host>:8099/api/outputs
+# … and what discovery is offering (state: discovered | ignored)
+curl http://<add-on-host>:8099/api/outputs/discovered
 
-# add one — appears in the graph live, no restart
-curl -X POST http://<add-on-host>:8099/api/outputs \
-  -H 'content-type: application/json' \
-  -d '{"name":"Pioneer VSX-934","ip":"192.168.178.35","port":7000,"encryption":"auth_setup"}'
-
-# remove one by node name — its sink node disappears live
-curl -X DELETE http://<add-on-host>:8099/api/outputs/raop-out-pioneer_vsx_934
+# add / ignore / remove, by stable node name
+curl -X POST   http://<add-on-host>:8099/api/outputs/ap2-dev-pioneer_vsx_934/adopt
+curl -X POST   http://<add-on-host>:8099/api/outputs/ap2-dev-pioneer_vsx_934/ignore
+curl -X DELETE http://<add-on-host>:8099/api/outputs/ap2-dev-pioneer_vsx_934
 ```
 
 Full endpoint reference (status codes, failure modes):
-[api-reference.md](../docs/api-reference.md#outputs-raop-hot-reloadable).
+[api-reference.md](../docs/api-reference.md).
 
 ## What's inside
 
