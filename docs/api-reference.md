@@ -684,9 +684,9 @@ WebSocket. Carries **typed frames**, each a JSON object with a `type`:
 | `type` | Payload | When it is sent |
 |---|---|---|
 | `matrix` | the `RoutingMatrix` fields at the top level (same shape as `GET /api/routing`, plus `type`) | on connect, on every registry change, and every 250 ms while watched so the input meters and volumes stay live |
-| `outputs` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs` | on connect, then whenever that listing's payload changes |
+| `outputs` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs` | on connect, then on the first 250 ms tick after a change moves that listing's payload |
 | `discovered` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs/discovered` | ditto |
-| `agents` | `{ agents: AgentInfo[] }` — same as `GET /api/agents` | ditto |
+| `agents` | `{ agents: AgentInfo[] }` — same as `GET /api/agents`; receiver hosts, paired and pending. Diagnostic: the pairing UI reads the two output listings, where a host waiting to pair is a `discovered` `pwsink` output | ditto |
 
 The matrix frame is *internally* tagged so its fields stay at the top
 level: a client written against the older protocol, which parsed every
@@ -699,6 +699,13 @@ on that socket — comparing the payload rather than tracking which events
 affect which listing, so a new field cannot be forgotten and a burst of
 unrelated changes stays quiet. The REST endpoints remain the way to get a
 listing on first paint; the socket keeps it fresh afterwards.
+
+A change does not rebuild the listings immediately: it marks them dirty
+and the next 250 ms tick does the work, so a reconcile burst costs one
+rebuild instead of one per notification (measured against 20 rapid
+mutations: 19 listing frames before coalescing, 1 after). The price is up
+to 250 ms of latency on a background change — a client that just made a
+mutation re-reads the endpoint itself and never waits for this path.
 
 Change frames are driven by a broadcast channel the registry-observer
 thread pings synchronously, not by polling. A slow client that misses a

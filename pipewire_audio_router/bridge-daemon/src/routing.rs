@@ -734,6 +734,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         teardown(&state);
         return;
     }
+    // Set by the change arm, flushed by the tick arm: see `push_listings`.
+    let mut listings_dirty = false;
     loop {
         tokio::select! {
             changed = changes.recv() => {
@@ -745,20 +747,27 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if send_matrix(&mut socket, &matrix).await.is_err() {
                             break;
                         }
-                        // A change is also the only thing that can move the
-                        // listings — a discovered device, an adoption, a pairing.
-                        if push_listings(&mut socket, &state, &mut sent).await.is_err() {
-                            break;
-                        }
+                        // A change is the only thing that can move the listings —
+                        // a discovered device, an adoption, a pairing — but a burst
+                        // of them should cost one rebuild, not one each, so the tick
+                        // below does the work.
+                        listings_dirty = true;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Live peak refresh (levels move without graph changes).
+            // Live peak refresh (levels move without graph changes), and the
+            // point where any listing changes since the last tick are flushed.
             _ = tick.tick() => {
                 let matrix = build_snapshot(&state).await;
                 if send_matrix(&mut socket, &matrix).await.is_err() {
                     break;
+                }
+                if listings_dirty {
+                    listings_dirty = false;
+                    if push_listings(&mut socket, &state, &mut sent).await.is_err() {
+                        break;
+                    }
                 }
             }
             // This UI never sends messages; we only poll the socket here
@@ -845,8 +854,13 @@ async fn push_if_changed(
 
 /// Rebuilds the three listings and pushes the ones that changed.
 ///
-/// Called on connect and on every change notification — never on the meter tick,
-/// which would rebuild them four times a second for values that did not move.
+/// Called on connect, and thereafter from the meter tick when a change has marked
+/// the listings dirty — never from the change arm directly. Rebuilding there meant
+/// a reconcile burst of fifty notifications rebuilt and re-serialized all three
+/// listings fifty times, for a payload the dedupe below then discarded forty-nine
+/// times. Coalescing onto the tick that already runs costs at most 250 ms of
+/// latency on a *background* change; anything the user just clicked is re-read by
+/// the page itself, so it never waits for this path.
 async fn push_listings(
     socket: &mut WebSocket,
     state: &AppState,
