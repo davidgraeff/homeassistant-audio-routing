@@ -117,8 +117,9 @@ fn host_state(master: &MasterState) -> HostState {
     }
 }
 
-/// Runs until the process is asked to stop. Reconnects on its own; only a
-/// hard-denied pairing or a protocol mismatch is fatal.
+/// Runs until the process is asked to stop. Reconnects on its own, always: no
+/// answer from the daemon ends this loop, because the daemon is the end that may
+/// have been reinstalled, restored from a snapshot, or had this host unpaired.
 pub async fn run(
     handle: Handle,
     mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
@@ -126,6 +127,15 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut config = config::load()?;
     let mut backoff = BACKOFF_START;
+    // Minted once per process, so the code the approver compares is the one this
+    // host printed at startup and keeps printing across reconnects. Deliberately
+    // not persisted: restarting the agent is then the way to ask for a fresh code.
+    let pair_code = new_pair_code();
+    if config.token.is_none() {
+        tracing::warn!("not paired yet — pairing code for this host: {pair_code}");
+    } else {
+        tracing::info!("pairing code, should this host ever need to pair again: {pair_code}");
+    }
 
     loop {
         let addr = match daemon_address(&mut config, override_addr.as_deref()).await {
@@ -138,7 +148,7 @@ pub async fn run(
             }
         };
 
-        match session(&addr, &mut config, &handle, &mut events).await {
+        match session(&addr, &mut config, &pair_code, &handle, &mut events).await {
             Ok(Outcome::Reconnect) => {
                 backoff = BACKOFF_START;
             }
@@ -148,9 +158,20 @@ pub async fn run(
                 continue;
             }
             Ok(Outcome::Denied(reason)) => {
-                // A denial is a decision, not a transport failure: stop bothering
-                // the daemon and let the user re-pair deliberately.
-                return Err(anyhow!("daemon refused this agent: {reason}"));
+                // Never fatal. A token we hold that the daemon does not honour is
+                // worthless — it was revoked by an unpair, or its store was lost —
+                // so drop it and let the next hello be a pair request. That is what
+                // makes this host show up as pairable again in the add-on, with no
+                // login on this machine (plan §8).
+                if config.token.take().is_some() {
+                    let _ = config::save(&config);
+                    tracing::warn!(
+                        "the add-on no longer accepts this host's pairing ({reason}); \
+                         asking to pair again with code {pair_code}"
+                    );
+                } else {
+                    tracing::warn!("the add-on refused this host: {reason}; retrying in {backoff:?}");
+                }
             }
             Err(e) => {
                 tracing::warn!("connection to {addr} ended: {e}");
@@ -177,13 +198,31 @@ enum Outcome {
     Reconnect,
     /// A token was just minted and persisted; reconnect immediately with it.
     Paired,
-    /// The daemon refused us.
+    /// The daemon refused us. Handled, not fatal — see `run`.
     Denied(String),
+}
+
+/// Six uppercase hex characters, the shape the daemon validates. Read straight
+/// from `/dev/urandom` rather than pulling in an RNG crate for one string; an
+/// unreadable `/dev/urandom` yields `None` so the daemon mints the code instead of
+/// this offering something predictable.
+fn new_pair_code() -> String {
+    let mut buf = [0u8; 3];
+    match std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+    {
+        Ok(()) => buf.iter().map(|b| format!("{b:02X}")).collect(),
+        Err(e) => {
+            tracing::warn!("cannot read /dev/urandom ({e}); letting the add-on pick the pairing code");
+            String::new()
+        }
+    }
 }
 
 async fn session(
     addr: &str,
     config: &mut Config,
+    pair_code: &str,
     handle: &Handle,
     events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
 ) -> anyhow::Result<Outcome> {
@@ -200,6 +239,7 @@ async fn session(
         hostname: config::hostname(),
         user: config::user(),
         token: config.token.clone(),
+        pair_code: (!pair_code.is_empty()).then(|| pair_code.to_string()),
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;

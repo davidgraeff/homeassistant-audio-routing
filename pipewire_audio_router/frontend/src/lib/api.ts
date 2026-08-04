@@ -97,20 +97,10 @@ export const api = {
   setVolume: (nodeId: number, volume: number) =>
     request<VolumeResponse>('POST', `api/media_players/${nodeId}/volume`, { volume }),
 
-  // Receiver agents (pwrouter-agent). A pw-sink output *is* a paired agent, so
-  // pairing is a prerequisite for the host showing up under Discovered at all.
+  // Receiver agents (pwrouter-agent). Diagnostics only: a host waiting to pair is a
+  // discovered `pwsink` output, so the *decisions* are the output calls below —
+  // `adoptOutput` pairs it, `unpairOutput` revokes, `ignoreOutput` hides it.
   agents: () => request<AgentInfo[]>('GET', 'api/agents'),
-  /** Approve a pending pairing: mints the host's token, after which it reconnects
-   * on its own and becomes a discovered output. */
-  approveAgent: (identity: string) =>
-    request<OpResponse>('POST', 'api/agents/approve', { identity }),
-  /** Decline a pending pairing. The agent stops retrying until it is restarted. */
-  denyAgent: (identity: string) =>
-    request<OpResponse>('POST', 'api/agents/deny', { identity }),
-  /** Revoke a pairing: the token stops working and the host stops receiving.
-   * Routing entries survive, so re-pairing the same machine+user restores them. */
-  forgetAgent: (identity: string) =>
-    request<OpResponse>('POST', 'api/agents/forget', { identity }),
 
   // Outputs: the devices the user has *added* (adopted). Everything else in the
   // app — the routing matrix, group editors, Align, the HA integration — means
@@ -121,9 +111,17 @@ export const api = {
    * checkbox filters client-side instead of refetching. */
   discoveredOutputs: () => request<OutputInfo[]>('GET', 'api/outputs/discovered'),
   /** Add a discovered device: routable from now on, and (with the setting on) an
-   * HA media_player. Any routing it had before starts applying again. */
+   * HA media_player. Any routing it had before starts applying again.
+   *
+   * For a receiver host this is also the pairing: the daemon mints its token first
+   * (plan §8), so "Pair" and "Add" are one click rather than two decisions. */
   adoptOutput: (nodeName: string) =>
     request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/adopt`),
+  /** Unpair a receiver host — the pw-sink form of removing. Revokes the token *and*
+   * clears routing, group membership and adoption. Its agent keeps dialling in, so
+   * the host returns under "Discovered" as pairable. */
+  unpairOutput: (nodeName: string) =>
+    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/unpair`),
   /** Dismiss a discovered device — hidden unless "show ignored" is on. Also
    * clears any routing / group membership it had. */
   ignoreOutput: (nodeName: string) =>

@@ -16,6 +16,13 @@
 //!   reported state, and the outgoing command channel per host;
 //! * **the WebSocket endpoint** — one connection per agent, pinged on a timer.
 //!
+//! A host asking to pair is not a separate kind of thing from an output: it is a
+//! *discovered* one, and pairing it is the "Add" (`hosts`, and `api::adopt_output`).
+//! Unpairing puts it back to discovered rather than making it vanish, because its
+//! agent keeps dialling in — exactly how an unadopted speaker that is still on the
+//! network behaves. Nothing the daemon answers ever makes an agent give up, so a
+//! lost `agents.json` costs a click per host, not a login per host.
+//!
 //! Identity is *machine id + user*, not the hostname: one agent per logged-in
 //! session (§13.2), so two users on one machine are two independent targets, and a
 //! renamed host keeps its pairing.
@@ -45,7 +52,20 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMsg {
-    Hello { protocol: u32, agent_version: String, machine_id: String, hostname: String, user: String, token: Option<String> },
+    /// `pair_code` is the code the agent's *process* offers (minted at its startup
+    /// and logged there), so it survives reconnects. `#[serde(default)]` keeps an
+    /// older agent working — the daemon mints one itself then. Never trusted as an
+    /// authenticator: see [`valid_pair_code`].
+    Hello {
+        protocol: u32,
+        agent_version: String,
+        machine_id: String,
+        hostname: String,
+        user: String,
+        token: Option<String>,
+        #[serde(default)]
+        pair_code: Option<String>,
+    },
     State(HostState),
     ForeignSession { session: String },
     Pong,
@@ -141,6 +161,25 @@ fn save_store(path: &Path, agents: &[PairedAgent]) {
     }
 }
 
+/// Length of a pairing code, in characters: 3 random bytes as hex.
+const PAIR_CODE_CHARS: usize = 6;
+
+/// Accepts an agent-offered pairing code, or `None` if it isn't one.
+///
+/// The code is only ever *compared by a human* across two channels — the host's
+/// own log and the add-on UI — so letting the agent choose it costs nothing:
+/// approval is still a click, and the token is still minted here. What would cost
+/// something is rendering whatever arrived: a rogue agent could offer a long
+/// string, or one dressed up to be mistaken for the desktop next to it. So the
+/// shape is pinned to exactly what this daemon would have generated, and anything
+/// else is replaced by a code of our own rather than rejected — the host is not at
+/// fault for running an older agent.
+fn valid_pair_code(offered: Option<&str>) -> Option<String> {
+    let code = offered?.trim();
+    let ok = code.len() == PAIR_CODE_CHARS && code.chars().all(|c| c.is_ascii_hexdigit() && !c.is_lowercase());
+    ok.then(|| code.to_ascii_uppercase())
+}
+
 /// Random hex from the kernel. Used for tokens and pairing codes — a
 /// time-derived value would be guessable by anyone who can see the LAN.
 fn random_hex(bytes: usize) -> String {
@@ -193,6 +232,10 @@ pub fn advertise(port: u16) {
 struct Pending {
     identity: String,
     label: String,
+    /// Resolved at `hello`, not at approval, because a pending host **is** a
+    /// discovered output on the Outputs page and that page keys every row by node
+    /// name. Deriving it early is what lets pairing be an ordinary "Add".
+    node_name: String,
     /// Short code shown in the UI *and* logged by the agent, so the person
     /// approving can tell two simultaneous requests apart.
     code: String,
@@ -217,6 +260,21 @@ pub struct Agents {
 
 pub type SharedAgents = Arc<Mutex<Agents>>;
 
+/// The identifying half of a `Hello`, borrowed from the message as it arrived.
+///
+/// One struct rather than six parameters: the fields travel together, and `hello`
+/// derives the identity, label and node name from them in one place (§5) — which is
+/// exactly why they are passed raw instead of pre-combined by the caller.
+pub struct HelloClaim<'a> {
+    pub protocol: u32,
+    pub machine_id: &'a str,
+    pub hostname: &'a str,
+    pub user: &'a str,
+    pub token: Option<&'a str>,
+    /// The code the agent's process offers; validated, never trusted.
+    pub pair_code: Option<&'a str>,
+}
+
 /// What a `Hello` resolves to.
 pub enum HelloOutcome {
     /// Approved: this is the host's node name and the session it should receive.
@@ -234,13 +292,27 @@ pub enum HelloOutcome {
 pub struct AgentInfo {
     pub identity: String,
     pub label: String,
-    /// `None` for a pending request — it has no routing identity until approved.
-    pub node_name: Option<String>,
+    /// Known for a pending request too (see [`Pending::node_name`]), so the row can
+    /// be matched to the output card it will become.
+    pub node_name: String,
     pub paired: bool,
     pub connected: bool,
     /// Pairing code, only for pending requests.
     pub code: Option<String>,
     pub state: Option<HostState>,
+}
+
+/// One host for the Outputs listing: paired or merely asking to be. A pending host
+/// is a *discovered* output — pairing it is what adds it (plan §7/§8) — so both
+/// come from one call rather than the page stitching two lists together.
+pub struct HostRow {
+    pub node_name: String,
+    pub label: String,
+    /// An agent is on the socket right now.
+    pub connected: bool,
+    pub paired: bool,
+    /// `Some` only while the host is waiting to be paired.
+    pub pair_code: Option<String>,
 }
 
 impl Agents {
@@ -266,16 +338,46 @@ impl Agents {
         format!("{hostname} ({user})")
     }
 
+    /// The node name this identity should use — resolved for pending requests too,
+    /// so a host is a listable output from its first hello.
+    ///
+    /// Three rules, in order. A host that paired before keeps its stored name, or
+    /// its routing and HA entity ids would break on a re-pairing. Otherwise it gets
+    /// the name derived from hostname + user. And if *another* identity already
+    /// holds that name — two machines that share both a hostname and a username,
+    /// which `node_name_for` alone cannot tell apart — the machine id disambiguates,
+    /// because two hosts folded into one card would silently share a card, a routing
+    /// row and an HA entity.
+    fn node_name_for_identity(&self, identity: &str, hostname: &str, user: &str) -> String {
+        if let Some(agent) = self.paired.iter().find(|a| a.identity == identity) {
+            return agent.node_name.clone();
+        }
+        let base = Self::node_name_for(hostname, user);
+        let taken = |candidate: &str| {
+            self.paired.iter().any(|a| a.node_name == candidate)
+                || self.pending.iter().any(|p| p.identity != identity && p.node_name == candidate)
+        };
+        if !taken(&base) {
+            return base;
+        }
+        let machine = slugify(identity.split(':').next().unwrap_or(identity));
+        for len in [6, 12, machine.len()] {
+            if len == 0 || len > machine.len() {
+                continue;
+            }
+            let candidate = format!("{base}_{}", &machine[..len]);
+            if !taken(&candidate) {
+                return candidate;
+            }
+        }
+        // Same machine id *and* hostname *and* user as an existing entry but a
+        // different identity is not reachable; fall back rather than loop.
+        format!("{base}_{}", random_hex(3))
+    }
+
     /// Handles a `Hello`. `tx` is this connection's outgoing queue.
-    pub fn hello(
-        &mut self,
-        protocol: u32,
-        machine_id: &str,
-        hostname: &str,
-        user: &str,
-        token: Option<&str>,
-        tx: mpsc::UnboundedSender<DaemonMsg>,
-    ) -> HelloOutcome {
+    pub fn hello(&mut self, claim: HelloClaim<'_>, tx: mpsc::UnboundedSender<DaemonMsg>) -> HelloOutcome {
+        let HelloClaim { protocol, machine_id, hostname, user, token, pair_code: offered_code } = claim;
         if protocol != PROTOCOL_VERSION {
             return HelloOutcome::Denied(format!("protocol {protocol} is not {PROTOCOL_VERSION}; update the agent or the add-on"));
         }
@@ -301,22 +403,44 @@ impl Agents {
             return HelloOutcome::Welcome { node_name: agent.node_name, label };
         }
 
-        // No token: a pair request. Replace any earlier request from the same
-        // identity (a restarted agent) so the list can't fill up with stale rows.
-        let code = random_hex(3).to_uppercase();
-        if code.is_empty() {
-            return HelloOutcome::Denied("daemon could not generate a pairing code".into());
-        }
+        // No token: a pair request. Note what this does *not* do — it never disturbs
+        // an existing pairing for the same identity. A tokenless hello is unauthenticated
+        // and the identity in it is not a secret (machine id + user), so treating one as
+        // "this host lost its token, re-pair it" would let anyone on the LAN knock a
+        // paired desktop out of the outputs. Such a request becomes a pending row that
+        // the already-paired card hides; the way out is Unpair, then Pair.
+        //
+        // The code is the agent's own where it offered a usable one — that is what keeps
+        // it stable while it reconnects — else the one an earlier request from this
+        // identity already showed, else ours.
+        let previous = self.pending.iter().find(|p| p.identity == identity).map(|p| p.code.clone());
+        let code = match valid_pair_code(offered_code).or(previous) {
+            Some(code) => code,
+            None => {
+                let minted = random_hex(3).to_uppercase();
+                if minted.is_empty() {
+                    return HelloOutcome::Denied("daemon could not generate a pairing code".into());
+                }
+                minted
+            }
+        };
+        let node_name = self.node_name_for_identity(&identity, hostname, user);
+        // Replace any earlier request from the same identity (a restarted agent) so
+        // the list can't fill up with stale rows.
         self.pending.retain(|p| p.identity != identity);
         let _ = tx.send(DaemonMsg::PairPending { code: code.clone() });
-        tracing::info!("pairing requested by '{label}' ({identity}), code {code}");
-        self.pending.push(Pending { identity, label, code, tx });
+        tracing::info!("pairing requested by '{label}' ({identity}) as {node_name}, code {code}");
+        self.pending.push(Pending { identity, label, node_name, code, tx });
         let _ = self.changes.send(());
         HelloOutcome::Pending
     }
 
     /// Approves a pending request: mints a token, persists it, and pushes it to
     /// the waiting agent (which reconnects with it).
+    ///
+    /// The caller adopts the output in the same breath (`api::adopt_output`):
+    /// pairing a host *is* adding it, since a human ran the agent there and a human
+    /// approved it here — there is no third intention left to express.
     pub fn approve(&mut self, identity: &str) -> Result<PairedAgent, String> {
         let Some(index) = self.pending.iter().position(|p| p.identity == identity) else {
             return Err("no pending pair request for that identity".into());
@@ -326,15 +450,9 @@ impl Agents {
         if token.is_empty() {
             return Err("daemon could not generate a token".into());
         }
-        // A host that is re-pairing keeps its node name, so existing routing and
-        // HA entities keep working.
-        let (hostname, user) = split_label(&pending.label);
-        let node_name = self
-            .paired
-            .iter()
-            .find(|a| a.identity == identity)
-            .map(|a| a.node_name.clone())
-            .unwrap_or_else(|| Self::node_name_for(&hostname, &user));
+        // The name was settled at `hello` (and a re-pairing host kept its old one),
+        // so existing routing and HA entities keep working.
+        let node_name = pending.node_name;
 
         let agent = PairedAgent { identity: identity.to_string(), label: pending.label, node_name, token: token.clone() };
         self.paired.retain(|a| a.identity != identity);
@@ -346,20 +464,28 @@ impl Agents {
         Ok(agent)
     }
 
-    /// Denies (and drops) a pending request.
-    pub fn deny(&mut self, identity: &str) -> Result<(), String> {
-        let Some(index) = self.pending.iter().position(|p| p.identity == identity) else {
-            return Err("no pending pair request for that identity".into());
-        };
-        let pending = self.pending.remove(index);
-        let _ = pending.tx.send(DaemonMsg::Denied { reason: "pairing was declined".into() });
-        let _ = self.changes.send(());
-        Ok(())
+    pub fn is_paired(&self, identity: &str) -> bool {
+        self.paired.iter().any(|a| a.identity == identity)
+    }
+
+    /// The identity behind an output's node name, paired or pending. Lets the
+    /// Outputs API act on a card without the UI having to know about identities.
+    pub fn identity_for_node(&self, node_name: &str) -> Option<String> {
+        self.paired
+            .iter()
+            .find(|a| a.node_name == node_name)
+            .map(|a| a.identity.clone())
+            .or_else(|| self.pending.iter().find(|p| p.node_name == node_name).map(|p| p.identity.clone()))
     }
 
     /// Revokes a pairing: the token stops working and the live connection (if
     /// any) is told it is no longer a receiver.
-    pub fn forget(&mut self, identity: &str) -> Result<(), String> {
+    ///
+    /// The agent does **not** die of this. It drops the token it can no longer use
+    /// and goes back to asking, so the host reappears as a pairable (discovered)
+    /// output — the same thing an unadopted AirPlay speaker does when it is still on
+    /// the network. Getting it back is a click here, never a login there.
+    pub fn unpair(&mut self, identity: &str) -> Result<(), String> {
         let Some(agent) = self.paired.iter().find(|a| a.identity == identity).cloned() else {
             return Err("no such paired agent".into());
         };
@@ -369,6 +495,7 @@ impl Agents {
             let _ = live.tx.send(DaemonMsg::Release);
             let _ = live.tx.send(DaemonMsg::Denied { reason: "pairing was removed".into() });
         }
+        tracing::info!("unpaired '{}' ({})", agent.label, agent.node_name);
         let _ = self.changes.send(());
         Ok(())
     }
@@ -429,19 +556,34 @@ impl Agents {
         self.live.contains_key(node_name)
     }
 
-    /// Every paired host: `(node_name, label, connected)`. This is the source of
-    /// truth for pw-sink outputs (§3) — discovery no longer is.
-    pub fn targets(&self) -> Vec<(String, String, bool)> {
-        self.paired
+    /// Every host the Outputs page shows: paired ones (real pw-sink targets, §3)
+    /// and hosts still asking to pair, which are *discovered* outputs. This is the
+    /// source of truth for pw-sink outputs — discovery no longer is.
+    pub fn hosts(&self) -> Vec<HostRow> {
+        let mut rows: Vec<HostRow> = self
+            .paired
             .iter()
-            .map(|a| {
-                let label = self.live.get(&a.node_name).map(|l| l.label.clone()).unwrap_or_else(|| a.label.clone());
-                (a.node_name.clone(), label, self.live.contains_key(&a.node_name))
+            .map(|a| HostRow {
+                node_name: a.node_name.clone(),
+                label: self.live.get(&a.node_name).map(|l| l.label.clone()).unwrap_or_else(|| a.label.clone()),
+                connected: self.live.contains_key(&a.node_name),
+                paired: true,
+                pair_code: None,
             })
-            .collect()
+            .collect();
+        rows.extend(self.pending.iter().map(|p| HostRow {
+            node_name: p.node_name.clone(),
+            label: p.label.clone(),
+            // A pending row only exists while its socket does.
+            connected: true,
+            paired: false,
+            pair_code: Some(p.code.clone()),
+        }));
+        rows
     }
 
-    /// Paired agents plus pending requests, for the API/UI.
+    /// Paired agents plus pending requests, for `/api/agents` (diagnostics; the
+    /// Outputs page reads the output listings instead).
     pub fn snapshot(&self) -> Vec<AgentInfo> {
         let mut rows: Vec<AgentInfo> = self
             .paired
@@ -449,7 +591,7 @@ impl Agents {
             .map(|a| AgentInfo {
                 identity: a.identity.clone(),
                 label: a.label.clone(),
-                node_name: Some(a.node_name.clone()),
+                node_name: a.node_name.clone(),
                 paired: true,
                 connected: self.live.contains_key(&a.node_name),
                 code: None,
@@ -459,22 +601,13 @@ impl Agents {
         rows.extend(self.pending.iter().map(|p| AgentInfo {
             identity: p.identity.clone(),
             label: p.label.clone(),
-            node_name: None,
+            node_name: p.node_name.clone(),
             paired: false,
             connected: true,
             code: Some(p.code.clone()),
             state: None,
         }));
         rows
-    }
-}
-
-/// Splits `hostname (user)` back into its parts. The label is built by this
-/// module, so this is a round-trip, not a parse of foreign input.
-fn split_label(label: &str) -> (String, String) {
-    match label.rsplit_once(" (") {
-        Some((host, rest)) => (host.to_string(), rest.trim_end_matches(')').to_string()),
-        None => (label.to_string(), "unknown".to_string()),
     }
 }
 
@@ -581,13 +714,21 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
             _ => None,
         }
     };
-    let Some(AgentMsg::Hello { protocol, agent_version, machine_id, hostname, user, token }) = hello else {
+    let Some(AgentMsg::Hello { protocol, agent_version, machine_id, hostname, user, token, pair_code }) = hello else {
         let _ = tx.send(DaemonMsg::Denied { reason: "expected a hello message".into() });
         writer.abort();
         return;
     };
 
-    let outcome = state.agents.lock().await.hello(protocol, &machine_id, &hostname, &user, token.as_deref(), tx.clone());
+    let claim = HelloClaim {
+        protocol,
+        machine_id: &machine_id,
+        hostname: &hostname,
+        user: &user,
+        token: token.as_deref(),
+        pair_code: pair_code.as_deref(),
+    };
+    let outcome = state.agents.lock().await.hello(claim, tx.clone());
 
     let (node_name, label) = match outcome {
         HelloOutcome::Welcome { node_name, label } => (node_name, label),
@@ -689,6 +830,12 @@ mod tests {
         mpsc::unbounded_channel().0
     }
 
+    /// A well-formed hello from `machine`/`user`, tokenless unless given one. Tests
+    /// that care about a field override it: `HelloClaim { pair_code: .., ..claim(..) }`.
+    fn claim<'a>(machine: &'a str, user: &'a str, token: Option<&'a str>) -> HelloClaim<'a> {
+        HelloClaim { protocol: PROTOCOL_VERSION, machine_id: machine, hostname: "host", user, token, pair_code: None }
+    }
+
     #[test]
     fn node_name_includes_the_user_so_two_sessions_dont_collide() {
         let a = Agents::node_name_for("david-local", "david");
@@ -698,34 +845,89 @@ mod tests {
     }
 
     #[test]
-    fn label_round_trips_through_split() {
-        let label = Agents::label_for("david-local", "david");
-        assert_eq!(split_label(&label), ("david-local".to_string(), "david".to_string()));
-    }
-
-    #[test]
     fn a_tokenless_hello_becomes_a_pending_request() {
         let mut agents = registry();
-        let outcome = agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        let outcome = agents.hello(claim("m1", "dave", None), channel());
         assert!(matches!(outcome, HelloOutcome::Pending));
         let snapshot = agents.snapshot();
         assert_eq!(snapshot.len(), 1);
         assert!(!snapshot[0].paired);
         assert!(snapshot[0].code.is_some());
-        // Not a target until approved (plan §3: discovered ≠ usable).
-        assert!(agents.targets().is_empty());
+        // Listed as a host from the first hello — that is the discovered output the
+        // user pairs — but not paired, so nothing can route to it yet.
+        let hosts = agents.hosts();
+        assert_eq!(hosts.len(), 1);
+        assert!(!hosts[0].paired);
+        assert!(hosts[0].pair_code.is_some());
+        assert!(hosts[0].node_name.starts_with(PWSINK_DEV_PREFIX));
+    }
+
+    #[test]
+    fn the_pending_node_name_is_the_one_approval_uses() {
+        // The Outputs page keys its rows by node name, so the card the user pairs
+        // and the target it becomes must be the same row.
+        let mut agents = registry();
+        agents.hello(claim("m1", "dave", None), channel());
+        let pending_name = agents.hosts()[0].node_name.clone();
+        let paired = agents.approve("m1:dave").unwrap();
+        assert_eq!(paired.node_name, pending_name);
+    }
+
+    #[test]
+    fn two_hosts_sharing_a_hostname_and_user_get_distinct_node_names() {
+        // Same derived name, different machines: folding them together would share
+        // one card, one routing row and one HA entity between two hosts.
+        let mut agents = registry();
+        agents.hello(claim("m1", "dave", None), channel());
+        agents.approve("m1:dave").unwrap();
+        agents.hello(claim("m2", "dave", None), channel());
+        let names: Vec<String> = agents.hosts().into_iter().map(|h| h.node_name).collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn the_agents_own_code_is_kept_and_survives_a_reconnect() {
+        // The code the host logged at startup is the one the approver must see, so a
+        // reconnect must not rotate it.
+        let mut agents = registry();
+        agents.hello(HelloClaim { pair_code: Some("A1B2C3"), ..claim("m1", "dave", None) }, channel());
+        assert_eq!(agents.hosts()[0].pair_code.as_deref(), Some("A1B2C3"));
+        agents.hello(HelloClaim { pair_code: Some("A1B2C3"), ..claim("m1", "dave", None) }, channel());
+        assert_eq!(agents.hosts().len(), 1);
+        assert_eq!(agents.hosts()[0].pair_code.as_deref(), Some("A1B2C3"));
+    }
+
+    #[test]
+    fn a_malformed_offered_code_is_replaced_not_shown() {
+        // Anything that isn't the shape we'd have generated is ours instead: the code
+        // is rendered in the UI next to a host's name, so a rogue agent must not get
+        // to write that text.
+        assert_eq!(valid_pair_code(Some("A1B2C3")).as_deref(), Some("A1B2C3"));
+        assert_eq!(valid_pair_code(Some("a1b2c3")), None);
+        assert_eq!(valid_pair_code(Some("A1B2C3 — Kitchen")), None);
+        assert_eq!(valid_pair_code(Some("ZZZZZZ")), None);
+        assert_eq!(valid_pair_code(Some("A1B2")), None);
+        assert_eq!(valid_pair_code(None), None);
+
+        let mut agents = registry();
+        agents.hello(HelloClaim { pair_code: Some("nope, not a code"), ..claim("m1", "dave", None) }, channel());
+        let code = agents.hosts()[0].pair_code.clone().unwrap();
+        assert_eq!(code.len(), PAIR_CODE_CHARS);
+        assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn approval_mints_a_token_that_then_authenticates() {
         let mut agents = registry();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         let paired = agents.approve("m1:dave").expect("approve");
         assert!(!paired.token.is_empty());
-        assert_eq!(agents.targets().len(), 1);
+        assert_eq!(agents.hosts().len(), 1);
+        assert!(agents.hosts()[0].paired);
 
         // Reconnect with the token: welcomed, and now connected.
-        let outcome = agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", Some(&paired.token), channel());
+        let outcome = agents.hello(claim("m1", "dave", Some(&paired.token)), channel());
         match outcome {
             HelloOutcome::Welcome { node_name, .. } => {
                 assert_eq!(node_name, paired.node_name);
@@ -738,9 +940,9 @@ mod tests {
     #[test]
     fn a_wrong_token_is_denied() {
         let mut agents = registry();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         agents.approve("m1:dave").unwrap();
-        let outcome = agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", Some("not-the-token"), channel());
+        let outcome = agents.hello(claim("m1", "dave", Some("not-the-token")), channel());
         assert!(matches!(outcome, HelloOutcome::Denied(_)));
     }
 
@@ -749,46 +951,66 @@ mod tests {
         // Same token, different user: pairing is per session, so this must fail
         // even though the secret is genuine.
         let mut agents = registry();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         let paired = agents.approve("m1:dave").unwrap();
-        let outcome = agents.hello(PROTOCOL_VERSION, "m1", "host", "eve", Some(&paired.token), channel());
+        let outcome = agents.hello(claim("m1", "eve", Some(&paired.token)), channel());
         assert!(matches!(outcome, HelloOutcome::Denied(_)));
     }
 
     #[test]
     fn protocol_mismatch_is_denied() {
         let mut agents = registry();
-        let outcome = agents.hello(PROTOCOL_VERSION + 1, "m1", "host", "dave", None, channel());
+        let outcome = agents.hello(HelloClaim { protocol: PROTOCOL_VERSION + 1, ..claim("m1", "dave", None) }, channel());
         assert!(matches!(outcome, HelloOutcome::Denied(_)));
     }
 
     #[test]
     fn re_pairing_keeps_the_node_name_so_routing_survives() {
         let mut agents = registry();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         let first = agents.approve("m1:dave").unwrap();
         // Agent lost its config and pairs again.
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         let second = agents.approve("m1:dave").unwrap();
         assert_eq!(first.node_name, second.node_name);
         assert_ne!(first.token, second.token);
     }
 
     #[test]
-    fn forget_revokes_the_token() {
+    fn unpairing_revokes_the_token_and_leaves_the_host_pairable_again() {
         let mut agents = registry();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         let paired = agents.approve("m1:dave").unwrap();
-        agents.forget("m1:dave").unwrap();
-        assert!(agents.targets().is_empty());
-        let outcome = agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", Some(&paired.token), channel());
+        agents.unpair("m1:dave").unwrap();
+        assert!(agents.hosts().is_empty());
+
+        // The revoked token is refused...
+        let outcome = agents.hello(claim("m1", "dave", Some(&paired.token)), channel());
         assert!(matches!(outcome, HelloOutcome::Denied(_)));
+        // ...and the agent, which drops it rather than dying, comes back as a
+        // discovered host that keeps the node name its routing used.
+        agents.hello(claim("m1", "dave", None), channel());
+        let hosts = agents.hosts();
+        assert_eq!(hosts.len(), 1);
+        assert!(!hosts[0].paired);
+        assert_eq!(hosts[0].node_name, paired.node_name);
+    }
+
+    #[test]
+    fn an_output_card_resolves_to_an_identity_whether_paired_or_pending() {
+        let mut agents = registry();
+        agents.hello(claim("m1", "dave", None), channel());
+        let node_name = agents.hosts()[0].node_name.clone();
+        assert_eq!(agents.identity_for_node(&node_name).as_deref(), Some("m1:dave"));
+        agents.approve("m1:dave").unwrap();
+        assert_eq!(agents.identity_for_node(&node_name).as_deref(), Some("m1:dave"));
+        assert_eq!(agents.identity_for_node("pwsink-dev-nobody"), None);
     }
 
     #[test]
     fn commands_to_a_disconnected_host_report_failure_rather_than_queueing() {
         let mut agents = registry();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         let paired = agents.approve("m1:dave").unwrap();
         assert!(!agents.set_volume(&paired.node_name, 0.5));
         assert!(!agents.set_mute(&paired.node_name, true));
@@ -798,13 +1020,13 @@ mod tests {
     #[test]
     fn state_updates_only_apply_to_connected_hosts() {
         let mut agents = registry();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", None, channel());
+        agents.hello(claim("m1", "dave", None), channel());
         let paired = agents.approve("m1:dave").unwrap();
         agents.update_state(&paired.node_name, HostState { volume: Some(0.4), ..Default::default() });
         assert_eq!(agents.state(&paired.node_name), None);
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        agents.hello(PROTOCOL_VERSION, "m1", "host", "dave", Some(&paired.token), tx);
+        agents.hello(claim("m1", "dave", Some(&paired.token)), tx);
         agents.update_state(&paired.node_name, HostState { volume: Some(0.4), ..Default::default() });
         assert_eq!(agents.state(&paired.node_name).and_then(|s| s.volume), Some(0.4));
     }

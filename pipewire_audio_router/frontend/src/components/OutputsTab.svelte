@@ -4,7 +4,6 @@
   import { routing } from '../lib/routing';
   import { run, toast } from '../lib/toast';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../lib/types';
-  import AgentsPanel from './AgentsPanel.svelte';
   import GroupTitle from './GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
@@ -378,10 +377,34 @@
   const ignore = (o: OutputInfo) => decide(o, () => api.ignoreOutput(o.node_name));
   const unignore = (o: OutputInfo) => decide(o, () => api.removeOutput(o.node_name), `'${o.name}' is back in the discovered list`);
 
+  // A receiver host is added by *pairing* it, so its button says so and its card
+  // shows the code to check first. Same call either way — the daemon mints the
+  // token as part of adopting (plan §8), which is why there is no separate
+  // pairing step to click.
+  const isUnpaired = (o: OutputInfo) => o.kind === 'pwsink' && o.pwsink_paired === false;
+  const addLabel = (o: OutputInfo) => (isUnpaired(o) ? 'Pair' : 'Add');
+  // Pairing hands the token to a live agent, so there has to be one. This is the
+  // ignored-then-stopped case: the row is remembered, the machine is not there.
+  const cannotPairYet = (o: OutputInfo) => isUnpaired(o) && !o.present;
+
   // Removing is destructive of configuration (routing links, group membership,
   // the HA media_player), and the daemon can't undo it, so ask first. A device
   // that's still on the network comes back as a discovered offer.
+  //
+  // For a receiver host this is **Unpair**: it also revokes the token, because
+  // "take this out of my outputs" and "stop trusting that machine" are not two
+  // things a user wants separately. Its agent keeps dialling in, so it returns
+  // below as pairable — ignore it there to put it away for good.
   function remove(o: OutputInfo) {
+    if (o.kind === 'pwsink') {
+      if (
+        !confirm(
+          `Unpair '${o.name}'?\n\nIts pairing is revoked, and its routing, group membership and Home Assistant media_player are removed. The agent on that machine keeps asking to pair, so it reappears below as a discovered device — ignore it there if you don't want it back.`,
+        )
+      )
+        return;
+      return decide(o, () => api.unpairOutput(o.node_name));
+    }
     const back = o.present ? `'${o.name}' stays on the network and will reappear below as a discovered device.` : `'${o.name}' is offline, so it will disappear from this page until it shows up again.`;
     if (!confirm(`Remove '${o.name}' from your outputs?\n\nIts routing, group membership and Home Assistant media_player are removed. ${back}`)) return;
     return decide(o, () => api.removeOutput(o.node_name));
@@ -734,8 +757,19 @@
           <div class="out-actions">
             {@render playActions(o)}
             <div class="out-remove">
-              <button class="danger" disabled={deciding[o.node_name]} onclick={() => remove(o)}>
-                {deciding[o.node_name] ? 'Removing…' : 'Remove'}
+              <button
+                class="danger"
+                disabled={deciding[o.node_name]}
+                title={o.kind === 'pwsink'
+                  ? 'Revoke this host’s pairing and remove it from your outputs'
+                  : 'Remove this output, its routing and its Home Assistant media_player'}
+                onclick={() => remove(o)}
+              >
+                {#if deciding[o.node_name]}
+                  {o.kind === 'pwsink' ? 'Unpairing…' : 'Removing…'}
+                {:else}
+                  {o.kind === 'pwsink' ? 'Unpair' : 'Remove'}
+                {/if}
               </button>
             </div>
           </div>
@@ -744,13 +778,10 @@
     {/each}
   {/if}
 
-  <!-- Receiver hosts (pwrouter-agent). Above Discovered on purpose: a remote
-       PipeWire host cannot appear as a discovered device until its agent is
-       paired, so this is the earlier step in the same flow. Refreshing both
-       listings on a decision keeps the two sections consistent without a
-       page reload. -->
-  <AgentsPanel onchange={refresh} />
-
+  <!-- One section for everything on offer, receiver hosts included: a host whose
+       agent has dialled in but isn't paired yet *is* a discovered device, and
+       pairing it is the Add. It used to have a section of its own above this one,
+       which meant two decisions (pair, then add) for one intention. -->
   <div class="section-head">
     <h3>
       Discovered devices
@@ -770,8 +801,8 @@
         {#if ignored.length}
           Nothing new — {ignored.length} discovered {ignored.length === 1 ? 'device is' : 'devices are'} ignored.
         {:else}
-          Nothing new. Compatible AirPlay 2 / Sendspin / PipeWire devices appear here automatically when
-          they're on the network.
+          Nothing new. Compatible AirPlay 2 / Sendspin devices appear here automatically when they're on
+          the network, and a Linux machine appears once its receiver agent is running.
         {/if}
       </p>
     </div>
@@ -799,11 +830,32 @@
             {/if}
           </div>
         </div>
+        <!-- The pairing code, next to the button that uses it: this is the check
+             that the host asking is the one you think it is, and it is worthless
+             if you have to go looking for it. Same code that machine's own agent
+             logged at startup, and it doesn't change while it reconnects. -->
+        {#if o.pwsink_pair_code}
+          <div class="pair-code" title="Pairing code — compare with the one this machine's agent logged">
+            {o.pwsink_pair_code}
+          </div>
+        {/if}
         <!-- The decision itself is one click from the collapsed row: you
              shouldn't have to expand a card to dismiss a neighbour's speaker. -->
         <div class="out-decide">
-          <button class="primary" disabled={deciding[o.node_name]} onclick={() => add(o)}>
-            {deciding[o.node_name] ? 'Working…' : 'Add'}
+          <!-- Pairing needs the host's agent on the socket to hand the token to, so
+               an offline one (an ignored host whose agent has since stopped, say)
+               says why instead of offering a button that can only fail. -->
+          <button
+            class="primary"
+            disabled={deciding[o.node_name] || cannotPairYet(o)}
+            title={cannotPairYet(o)
+              ? 'Its agent is not connected — start pwrouter-agent on that machine first'
+              : isUnpaired(o)
+                ? 'Pair this machine and add it as an output — check the code first'
+                : 'Add this device as an output'}
+            onclick={() => add(o)}
+          >
+            {deciding[o.node_name] ? 'Working…' : addLabel(o)}
           </button>
           {#if o.state === 'ignored'}
             <button class="ghost" disabled={deciding[o.node_name]} title="Move back to the discovered list" onclick={() => unignore(o)}>
@@ -824,7 +876,13 @@
           {@render codecField(o)}
         </div>
         <p class="muted offer-note">
-          Not routable and not in Home Assistant until you add it. Delay tuning and volume become available then.
+          {#if isUnpaired(o)}
+            This machine's agent is asking to pair. Check the code above against the one it logged
+            (<code>journalctl --user -u pwrouter-agent</code> on that machine) — approving a request you can't
+            identify hands your audio to whoever else is on the network. Pairing it adds it as an output.
+          {:else}
+            Not routable and not in Home Assistant until you add it. Delay tuning and volume become available then.
+          {/if}
         </p>
       {/if}
     </article>
@@ -970,6 +1028,20 @@
     flex: 0 0 auto;
     display: flex;
     gap: 8px;
+  }
+
+  /* The pairing code, monospaced and spaced out: it exists to be read off one
+     screen and compared with another, so legibility beats compactness. */
+  .pair-code {
+    flex: 0 0 auto;
+    font-family: var(--code-font-family, monospace);
+    font-size: 1.05rem;
+    letter-spacing: 0.18em;
+    padding: 4px 10px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+    color: var(--primary-color);
+    white-space: nowrap;
   }
 
   /* Connected, segmented play actions: a non-interactive "Play:" label segment

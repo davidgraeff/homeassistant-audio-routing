@@ -23,8 +23,9 @@ handler name, which is the authoritative place to check the exact body shape.
 | `GET`/`PUT` | `/api/sync/settings` | group lead + per-device delays (`get_sync_settings` / `set_sync_settings`) |
 | `GET` | `/api/outputs` | your outputs (adopted) + live state |
 | `GET` | `/api/outputs/discovered` | devices discovery is offering |
-| `POST` | `/api/outputs/{node_name}/adopt` | add a discovered device |
+| `POST` | `/api/outputs/{node_name}/adopt` | add a discovered device (for `pwsink`, this pairs it) |
 | `POST` | `/api/outputs/{node_name}/ignore` | dismiss a discovered device |
+| `POST` | `/api/outputs/{node_name}/unpair` | `pwsink` only: revoke the pairing *and* remove the output |
 | `DELETE` | `/api/outputs/{node_name}` | remove an output (back to discovered) |
 | `PUT` | `/api/outputs/{node_name}/name` | rename an output |
 | `PUT` | `/api/outputs/{node_name}/latency` | per-output latency |
@@ -105,7 +106,7 @@ outputs:
 |---|---|---|
 | `sendspin` | ESPHome sendspin speakers (e.g. HA Voice PE) | mDNS (`sendspin_discovery.rs`) |
 | `airplay2` | native AirPlay-2 receivers | mDNS (`ap2_discovery.rs`) |
-| `pwsink` | remote PipeWire hosts | mDNS |
+| `pwsink` | remote PipeWire hosts | a `pwrouter-agent` on that host dials in (`pwsink_agent.rs`) — not a browse |
 
 Discovery only **offers** a device, though: mDNS on a home network also finds the
 neighbours' AirPlay speakers, so each discovered device carries a user verdict
@@ -153,7 +154,8 @@ adds its own:
   { "node_name": "pwsink-dev-david_local", "name": "david-local", "kind": "pwsink",
     "present": true, "configured": false, "state": "adopted",
     "ip": "192.168.178.21", "port": null,
-    "encryption": "None", "latency_ms": null, "pwsink_streaming": false }
+    "encryption": "None", "latency_ms": null,
+    "pwsink_paired": true, "pwsink_streaming": false }
 ]
 ```
 
@@ -171,9 +173,27 @@ Add a discovered device. It becomes routable, groupable and (with the
 `expose_outputs_as_media_players` setting on) an HA `media_player`; any routing it had
 starts applying again on the next reconcile. Clears an `ignored` verdict. Idempotent.
 
+For a `pwsink` host this is also the **pairing** step: the daemon mints that host's
+token first, so "pair" and "add" are one call. It fails (leaving the host unadopted)
+if no agent is currently asking to pair as that node name. A host whose agent has
+dialled in but isn't paired is listed under `/api/outputs/discovered` with
+`pwsink_paired: false` and a `pwsink_pair_code` — the code that host's own agent
+logged, to be compared before pairing.
+
 ### `POST /api/outputs/{node_name}/ignore`
 Dismiss a discovered device. The stronger form of remove: it also clears the device's
 routing intent and its music/announcement-group membership. Idempotent.
+
+### `POST /api/outputs/{node_name}/unpair`
+`pwsink` only. Revokes the host's pairing *and* does everything `DELETE` does
+(routing intent, group membership, adoption). Idempotent, and it does not require a
+pairing to exist: an output can outlive one (a lost `agents.json`), and this is that
+card's only removal button.
+
+The host's agent is not stopped by this and does not give up: it drops the token it
+can no longer use and keeps dialling in, so the host reappears in
+`/api/outputs/discovered` as pairable — the same thing an un-adopted speaker that is
+still on the network does. Use `/ignore` to keep it out of the way.
 
 ### `DELETE /api/outputs/{node_name}`
 Remove an output — back to `discovered`. Clears its routing intent, group membership

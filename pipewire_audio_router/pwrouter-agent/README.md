@@ -44,23 +44,22 @@ systemctl --user enable --now pwrouter-agent
 journalctl --user -u pwrouter-agent -f
 ```
 
-On first start the agent finds the add-on over mDNS and requests pairing. The log
-prints a short code:
+On start the agent finds the add-on over mDNS and asks to pair. The log prints a
+short code, minted once per run — so it stays the same across reconnects, and a
+restart is how you ask for a new one:
 
 ```
-WARN waiting for approval in the add-on UI — pairing code: 4F2A9C
+WARN not paired yet — pairing code for this host: 4F2A9C
 ```
 
-Approve it under **Receiver hosts** on the add-on's Outputs page (the same code is
-shown there, so you can tell two requests apart), and the agent reconnects with a
-token stored `0600` in `~/.config/pwrouter-agent/config.json`. The same thing over
-the API, if you prefer:
+The host then shows up under **Discovered devices** on the add-on's Outputs page,
+like any other speaker, with that same code on its card. Compare the two and press
+**Pair**: that adds it as an output *and* stores the token, `0600`, in
+`~/.config/pwrouter-agent/config.json`. The same thing over the API, if you prefer:
 
 ```sh
-curl -s http://<addon-host>:8099/api/agents            # find your identity
-curl -s -X POST http://<addon-host>:8099/api/agents/approve \
-     -H 'content-type: application/json' \
-     -d '{"identity":"<machine-id>:<user>"}'
+curl -s http://<addon-host>:8099/api/outputs/discovered   # find its node_name
+curl -s -X POST http://<addon-host>:8099/api/outputs/pwsink-dev-<host>_<user>/adopt
 ```
 
 If mDNS does not reach the add-on (routed VLANs, a container without host
@@ -104,5 +103,9 @@ rm ~/.local/bin/pwrouter-agent ~/.config/systemd/user/pwrouter-agent.service
 rm -r ~/.config/pwrouter-agent          # forgets the pairing token
 ```
 
-Remove the pairing in the add-on too (`POST /api/agents/forget`), which revokes
-the token.
+Unpairing is done in the add-on, on the output's card (**Unpair**, or
+`POST /api/outputs/<node_name>/unpair`): it revokes the token and clears the
+host's routing, group membership and Home Assistant player. A running agent whose
+token was revoked does not give up — it drops the dead token and goes back to
+asking, so the host reappears under Discovered devices and letting it back in is
+one click. Stopping it as above is what makes it stay gone.

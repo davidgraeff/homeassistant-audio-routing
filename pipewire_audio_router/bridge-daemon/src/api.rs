@@ -209,6 +209,8 @@ pub fn router(
         .route("/api/outputs/{node_name}", delete(remove_output))
         .route("/api/outputs/{node_name}/adopt", post(adopt_output))
         .route("/api/outputs/{node_name}/ignore", post(ignore_output))
+        // pw-sink only: the removal that also revokes the pairing (plan §8).
+        .route("/api/outputs/{node_name}/unpair", post(unpair_output))
         .route("/api/outputs/{node_name}/name", put(set_output_name))
         .route("/api/outputs/{node_name}/latency", put(set_output_latency))
         .route("/api/outputs/{node_name}/ap2-rate", put(set_ap2_rate_mode))
@@ -260,11 +262,11 @@ pub fn router(
         .route("/api/routing/entity/{node_name}", delete(routing::forget_entity))
         .route("/api/routing/ws", get(routing::routing_ws))
         // The receiver agents' own control plane: the agent dials in here.
+        // Pairing decisions are *output* operations (`/adopt`, `/ignore`, `/unpair`)
+        // — a host asking to pair is a discovered output, so it is decided where
+        // every other output is. This listing is left for diagnostics.
         .route("/api/agent/ws", get(crate::pwsink_agent::agent_ws))
         .route("/api/agents", get(get_agents))
-        .route("/api/agents/approve", post(approve_agent))
-        .route("/api/agents/deny", post(deny_agent))
-        .route("/api/agents/forget", post(forget_agent))
         .route("/api/pwsink/volume", put(set_pwsink_volume))
         .route("/api/pwsink/mute", put(set_pwsink_mute))
         // Everything else (`/`, `/assets/*`, favicon, …) is the built Svelte SPA,
@@ -582,6 +584,17 @@ pub(crate) struct OutputInfo {
     /// group lead raised to the largest member requirement.
     #[serde(skip_serializing_if = "Option::is_none")]
     sendspin_send_ahead_ms: Option<u32>,
+    /// pw-sink only: has this host's agent been paired? `Some(false)` = it is asking
+    /// to be, which is what a *discovered* pw-sink output is; pairing it is the "Add"
+    /// for this kind. `None` = not a pw-sink output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwsink_paired: Option<bool>,
+    /// pw-sink only: the code to check against the one the host's own agent logged,
+    /// before pairing it. `Some` only while the host is waiting to be paired —
+    /// approving a request you cannot identify is how you would hand your audio to a
+    /// stranger on the network, so the card shows it next to the button.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pwsink_pair_code: Option<String>,
     /// pw-sink only: is a remote `module-rtp-session` receiver actually connected
     /// and being streamed to right now (the AppleMIDI handshake completed)?
     /// `Some(false)` = discovered + routed but the receiver hasn't connected yet;
@@ -743,6 +756,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_min_buffer_ms: min_buffer_ms,
             sendspin_required_lead_ms: required_lead_ms,
             sendspin_send_ahead_ms: Some(send_ahead_ms),
+            pwsink_paired: None,
+            pwsink_pair_code: None,
             pwsink_streaming: None,
             pwsink_volume: None,
             pwsink_muted: None,
@@ -851,6 +866,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_min_buffer_ms: None,
             sendspin_required_lead_ms: None,
             sendspin_send_ahead_ms: None,
+            pwsink_paired: None,
+            pwsink_pair_code: None,
             pwsink_streaming: None,
             pwsink_volume: None,
             pwsink_muted: None,
@@ -860,28 +877,32 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         });
     }
 
-    // pw-sink targets = **paired agents** (docs/receiver-agent-plan.md §3). A host
-    // is a target because a helper on it paired and can be controlled, not because
-    // something answered an mDNS browse — which is why `present` here means "the
-    // agent is connected" and `pwsink_streaming` still means "a receiver completed
-    // the AppleMIDI handshake" (pw_sink_liveness.rs). Remembered-but-unpaired names
-    // are listed too, so a target whose agent was removed doesn't silently vanish
-    // from the Outputs page while its routing entries still exist.
-    let (agent_targets, agent_rows) = {
+    // pw-sink hosts = **receiver agents** (docs/receiver-agent-plan.md §3). A host is
+    // here because a helper on it dialled in, not because something answered an mDNS
+    // browse — which is why `present` means "the agent is connected" and
+    // `pwsink_streaming` still means "a receiver completed the AppleMIDI handshake"
+    // (pw_sink_liveness.rs).
+    //
+    // A host that has only *asked* to pair is listed too, as a `discovered` output
+    // carrying its pairing code: pairing is this kind's "Add" (`adopt_output`), so
+    // one section and one button serve every output kind. Remembered names are listed
+    // as well, so an unpaired host with routing entries doesn't silently vanish.
+    let (agent_hosts, agent_rows) = {
         let agents = state.agents.lock().await;
-        (agents.targets(), agents.snapshot())
+        (agents.hosts(), agents.snapshot())
     };
-    let mut pwsink_names: BTreeSet<String> = agent_targets.iter().map(|(node_name, _, _)| node_name.clone()).collect();
+    let mut pwsink_names: BTreeSet<String> = agent_hosts.iter().map(|h| h.node_name.clone()).collect();
     pwsink_names.extend(remembered.iter().filter(|n| n.starts_with(PWSINK_DEV_PREFIX)).cloned());
     for node_name in pwsink_names {
-        let target = agent_targets.iter().find(|(n, _, _)| *n == node_name);
-        let connected = target.map(|(_, _, connected)| *connected).unwrap_or(false);
-        let name = target
-            .map(|(_, label, _)| label.clone())
+        let host = agent_hosts.iter().find(|h| h.node_name == node_name);
+        let connected = host.map(|h| h.connected).unwrap_or(false);
+        let paired = host.map(|h| h.paired).unwrap_or(false);
+        let name = host
+            .map(|h| h.label.clone())
             .unwrap_or_else(|| node_name.strip_prefix(PWSINK_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
         let host_state = agent_rows
             .iter()
-            .find(|row| row.node_name.as_deref() == Some(node_name.as_str()))
+            .find(|row| row.node_name == node_name)
             .and_then(|row| row.state.clone());
         let streaming = crate::pw_sink_liveness::PwSinkLiveness::global().get(&node_name).map(|s| s.established);
         outputs.push(OutputInfo {
@@ -911,6 +932,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_min_buffer_ms: None,
             sendspin_required_lead_ms: None,
             sendspin_send_ahead_ms: None,
+            pwsink_paired: Some(paired),
+            pwsink_pair_code: host.and_then(|h| h.pair_code.clone()),
             pwsink_streaming: if connected { Some(streaming.unwrap_or(false)) } else { None },
             // Host-reported, never fabricated: the user's own desktop owns these
             // values and the agent pushes changes back (plan §9.4).
@@ -1010,13 +1033,77 @@ fn forget_output_intent(state: &AppState, node_name: &str) -> String {
 /// routing it had from before (an upgrade, or a previous adoption) is still in
 /// the store and starts applying again on the next reconcile, which is why this
 /// nudges the change notifier.
+///
+/// For a receiver host this is also the **pairing** step: a pw-sink output that is
+/// waiting to be paired gets its token minted here first (plan §8). One button, one
+/// intention — a human ran the agent on that host and a human is clicking Add here,
+/// so asking twice would only be ceremony. Pairing that fails leaves the output
+/// unadopted rather than adopting a host the daemon cannot drive.
 async fn adopt_output(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
     tracing::info!("USER ACTION: add output '{}'", node_name);
+    let mut paired_note = String::new();
+    if node_name.starts_with(PWSINK_DEV_PREFIX) {
+        let mut agents = state.agents.lock().await;
+        match agents.identity_for_node(&node_name) {
+            Some(identity) => {
+                // Already paired (a re-add after Remove) → nothing to mint.
+                if !agents.is_paired(&identity) {
+                    match agents.approve(&identity) {
+                        Ok(agent) => paired_note = format!(" (paired '{}')", agent.label),
+                        Err(e) => {
+                            return Json(OutputOpResponse { ok: false, message: format!("failed to pair '{node_name}': {e}") })
+                        }
+                    }
+                }
+            }
+            None => {
+                return Json(OutputOpResponse {
+                    ok: false,
+                    message: format!("no receiver agent is asking to pair as '{node_name}' — is it still running?"),
+                })
+            }
+        }
+    }
     if let Err(e) = state.outputs.lock_recover().adopt(&node_name) {
         return Json(OutputOpResponse { ok: false, message: format!("failed to add '{node_name}': {e}") });
     }
     let _ = state.changes.send(());
-    Json(OutputOpResponse { ok: true, message: format!("added '{}'", output_label(&state, &node_name)) })
+    Json(OutputOpResponse { ok: true, message: format!("added '{}'{paired_note}", output_label(&state, &node_name)) })
+}
+
+/// Unpair a receiver host: revoke its token, forget its routing and group
+/// membership, and un-adopt it — one action, because "remove this output" and "stop
+/// trusting this host" are not two intentions a user has separately.
+///
+/// Its agent keeps dialling in, so the host comes back under Discovered as pairable,
+/// exactly like an un-added speaker that is still on the network. Ignore it there if
+/// it should stay out of the way.
+async fn unpair_output(State(state): State<AppState>, Path(node_name): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+    tracing::info!("USER ACTION: unpair output '{}'", node_name);
+    let label = output_label(&state, &node_name);
+    {
+        // Idempotent, and deliberately not fussy about finding a pairing to revoke:
+        // an output can outlive its pairing (a lost `agents.json`, a host whose agent
+        // was reinstalled), and that card's only removal button is this one. Refusing
+        // would leave it stuck on the page with nothing that could clear it.
+        let mut agents = state.agents.lock().await;
+        match agents.identity_for_node(&node_name) {
+            Some(identity) => {
+                if let Err(e) = agents.unpair(&identity) {
+                    tracing::warn!("revoking the pairing of '{node_name}': {e}");
+                }
+            }
+            None => tracing::info!("'{node_name}' had no pairing to revoke; removing it anyway"),
+        }
+    }
+    let cleaned = forget_output_intent(&state, &node_name);
+    if let Err(e) = state.outputs.lock_recover().reset(&node_name) {
+        // The pairing is already revoked, so report the leftover rather than
+        // claiming the host is still an output.
+        tracing::warn!("unpaired '{node_name}' but could not reset its adoption: {e}");
+    }
+    let _ = state.changes.send(());
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("unpaired '{label}'{cleaned}") }))
 }
 
 /// Dismiss a discovered device: hidden from the Outputs page unless "show
@@ -1700,54 +1787,17 @@ async fn set_ap2_mute(
 
 // ---- Receiver agents (pwsink_agent.rs) -----------------------------------
 //
-// A pw-sink target is a paired agent (docs/receiver-agent-plan.md §3), so these
-// endpoints cover both the pairing queue and the per-host volume/mute the agent
-// applies on the receiver's *own* master out. Unlike sendspin/AP2 volume there is
-// nothing to "save for later": the host owns the value and reports it back, so an
-// unreachable host is an error rather than a stored intent (§9.4).
+// A pw-sink output is a receiver agent (docs/receiver-agent-plan.md §3). The pairing
+// *decisions* are output operations — `/api/outputs/{n}/adopt` pairs, `/unpair`
+// revokes, `/ignore` hides — because a host asking to pair is a discovered output and
+// nothing is gained by giving it a second vocabulary. What is left here is the
+// listing (diagnostics) and the per-host volume/mute the agent applies on the
+// receiver's *own* master out. Unlike sendspin/AP2 volume there is nothing to "save
+// for later": the host owns the value and reports it back, so an unreachable host is
+// an error rather than a stored intent (§9.4).
 
 async fn get_agents(State(state): State<AppState>) -> Json<Vec<crate::pwsink_agent::AgentInfo>> {
     Json(state.agents.lock().await.snapshot())
-}
-
-#[derive(Deserialize)]
-struct AgentIdentityRequest {
-    identity: String,
-}
-
-async fn approve_agent(
-    State(state): State<AppState>,
-    Json(req): Json<AgentIdentityRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    match state.agents.lock().await.approve(&req.identity) {
-        Ok(agent) => (
-            StatusCode::OK,
-            Json(OutputOpResponse { ok: true, message: format!("paired '{}' as {}", agent.label, agent.node_name) }),
-        ),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
-    }
-}
-
-async fn deny_agent(
-    State(state): State<AppState>,
-    Json(req): Json<AgentIdentityRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    match state.agents.lock().await.deny(&req.identity) {
-        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "pairing declined".into() })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
-    }
-}
-
-/// Revokes a pairing. The host stops being a target; its routing entries stay
-/// (dormant) so re-pairing the same machine+user restores them.
-async fn forget_agent(
-    State(state): State<AppState>,
-    Json(req): Json<AgentIdentityRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    match state.agents.lock().await.forget(&req.identity) {
-        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "agent removed".into() })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
-    }
 }
 
 #[derive(Deserialize)]

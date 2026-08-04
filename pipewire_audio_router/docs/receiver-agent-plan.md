@@ -287,14 +287,25 @@ Worth an upstream report either way.
 1. Daemon advertises `_pwrouter-ctl._tcp` over the shared storm-safe mDNS daemon
    (`discovery_supervisor.rs`, LAN-restricted per the mDNS-storm fix).
 2. `pwrouter-agent run` browses for it, connects, sends `hello` without a token.
-3. The **Outputs tab** shows the request above "Discovered devices" — deliberately
-   there, because a host cannot become a discovered output until it is paired, so
-   this is the earlier step of one flow. The row carries the pairing code, which
-   the agent also logs: approving a request you cannot identify is how you would
-   hand your audio to someone else on the network, so the code is the check.
-   The panel does not poll: the daemon **pushes the agent list** on the routing
-   WebSocket whenever it changes, as a typed `agents` frame (see
-   docs/api-reference.md). `/api/agents` is still what the page reads on mount.
+   The hello carries a **pairing code the agent mints once per process** and logs at
+   startup. The daemon validates its shape (6 uppercase hex, `valid_pair_code`) and
+   mints its own if it is missing or malformed — the code is a string a human
+   compares across two screens, not an authenticator, so the agent may choose it,
+   but a rogue agent must not get to write arbitrary text next to a host's name.
+   Earlier the daemon minted it per hello, which rotated it on every reconnect and
+   left the code in the host's journal stale.
+3. A host that has asked to pair **is a discovered output**: the Outputs tab lists it
+   under "Discovered devices" with every other kind, its card carrying the code, and
+   pairing it is that card's **Add** (labelled *Pair*). There is no separate pairing
+   section, and no second decision: a human ran the agent on that host and a human is
+   clicking here, so `adopt_output` mints the token and adopts in one step.
+   That means the node name has to be settled at `hello`, not at approval
+   (`node_name_for_identity`), since the page keys every row by it — with a machine-id
+   suffix when two hosts share both a hostname and a username, who would otherwise
+   fold into one card, one routing row and one HA entity.
+   The listing does not poll: the daemon pokes its change notifier on every pairing
+   event, which is what pushes the output listings on the routing WebSocket. (A
+   typed `agents` frame exists too and mirrors `/api/agents`, kept for diagnostics.)
    Two wrong turns on the way here, both worth remembering: polling every 5 s
    re-rendered the card on every tick (which read as flickering), and then reacting
    to *any* WebSocket frame fetched four times a second, because the matrix frame is
@@ -302,8 +313,18 @@ Worth an upstream report either way.
 4. Approving mints a token; the agent stores it `0600` in
    `~/.config/pwrouter-agent/config.json` and reconnects with it, backing off on
    failure. Manual override (`--daemon host:port`) for routed/non-mDNS setups.
-5. The same panel lists paired hosts with what each reports (receiving, which sink,
-   level, muted, ducked) and a Remove that revokes the token.
+5. Paired hosts are ordinary output cards (level, mute, which sink, ducked — all
+   host-reported), whose destructive action is **Unpair**: revoke the token, clear
+   routing and group membership, un-adopt. One action, because "take this out of my
+   outputs" and "stop trusting that machine" are not intentions a user has apart.
+6. **No answer from the daemon ever ends an agent.** A denial — revoked token, a lost
+   `agents.json`, a protocol bump — makes it drop the token it cannot use and keep
+   dialling in, so the host returns as pairable on its own. It used to exit instead,
+   which meant `Restart=always` respawning it every 5 s into the same refusal
+   forever, and any add-on reinstall demanding a login on *every* receiver host to
+   get the outputs back. Unpairing therefore behaves like un-adopting a speaker
+   that is still on the network: it reappears under Discovered, and **Ignore** is
+   how you put it away.
 
 ## 9. Safety rails
 
@@ -379,7 +400,7 @@ applications' streams on that sink, never `pwsink-in`.
 | `pwrouter-agent/src/pw_thread.rs` | the service path: graph tracking, master lever, duck ramps |
 | `pwrouter-agent/src/volume.rs` | the diagnostic path (`spike-*`): snapshot, stream→sink walk, lever |
 | `pw-control/` (own workspace root) | shared with the daemon: volume/route pods, the cubic scale, and the `pw_context_load_module` FFI neither `pipewire-rs` wraps nor either side should duplicate |
-| `frontend/src/components/AgentsPanel.svelte` | the pairing UI: pending requests with their code, paired hosts with what each reports |
+| `frontend/src/components/OutputsTab.svelte` | the pairing UI, such as it is: a host waiting to pair is a discovered output card carrying the code, and Add/Unpair are its decisions. (`AgentsPanel.svelte` used to own a section of its own; deleted — see §8.3) |
 | `pw-control/` (new crate, P1) | `channelVolumes` get/set + cubic scale, shared with the daemon |
 | `bridge-daemon/src/pwsink_agent.rs` (new) | daemon side: WS endpoint, token store, per-host command channel, keepalive |
 | `bridge-daemon/src/volume.rs` | source of the shared volume code (moves to `pw-control`) |
@@ -488,9 +509,11 @@ A daemon built from this tree on `127.0.0.1:8099` plus the real agent, both on t
 author's desktop:
 
 * **pairing** — tokenless `Hello` → pending row with code `F89CFE`, the *same*
-  code in the agent's log and in `GET /api/agents`; `POST /api/agents/approve`
-  minted a token, the agent persisted it `0600` and reconnected with it, and was
-  welcomed as `pwsink-dev-david_local_david`;
+  code in the agent's log and in `GET /api/agents`; approving minted a token, the
+  agent persisted it `0600` and reconnected with it, and was welcomed as
+  `pwsink-dev-david_local_david`. (Verified against the then-current
+  `POST /api/agents/approve`; approval is now `POST /api/outputs/{node_name}/adopt`
+  and the code comes from the agent — §8, re-verification pending.)
 * **receiver ownership** — on `Welcome` the agent loaded `rtp-session` for its own
   session name; the host went from 2 `pwsink-in` nodes (the stale in-daemon module)
   to 4, and back to 2 on `SIGTERM`. Module lifetime really is process lifetime;
@@ -501,10 +524,12 @@ author's desktop:
 * **commands** — `PUT /api/pwsink/volume|mute` reached the agent (it logged the
   attempt and why it could not apply it: this host was not receiving *its* session,
   only the production one), and an unknown host returns `503` rather than pretending;
-* **adoption gate** — the paired host appears under `/api/outputs/discovered` as
+* **adoption gate** — the host appears under `/api/outputs/discovered` as
   `discovered`, and only after `adopt` in `/api/outputs`, with
   `present: true` while the agent is connected and `present: false` after it exits.
-  Volume/mute are omitted while unknown rather than fabricated;
+  Volume/mute are omitted while unknown rather than fabricated. (Then: paired, then
+  adopted. Now the same gate is reached by pairing — `adopt` does both — so an
+  unpaired host is exactly a `discovered` one, §8.3);
 * **HA** — `media_player` gains `VOLUME_SET`/`VOLUME_MUTE` for `pwsink-dev-*`,
   reads the host-reported level, and routes both through `/api/pwsink/*`
   (3 new tests; 29 pass in `test_media_player.py`).

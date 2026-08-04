@@ -12,9 +12,9 @@
 //!   anything else. Even the receiver module's arguments are built by the agent
 //!   from the parameters in `Welcome` (§5.1), never sent as a string.
 //! * **Pairing happens on this same socket.** A first connection without a token
-//!   becomes a pending pair request; the daemon answers with a short code that the
-//!   agent logs, so the person approving in the UI can check they are approving
-//!   *this* host and not a stranger's.
+//!   becomes a pending pair request, carrying a short code the agent logs, so the
+//!   person approving in the UI can check they are approving *this* host and not a
+//!   stranger's.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,20 @@ pub enum AgentMsg {
         hostname: String,
         user: String,
         token: Option<String>,
+        /// The pairing code this agent *process* offers, minted once at startup
+        /// and logged there. Sent on every hello so a reconnect — a daemon
+        /// restart, a ping timeout, a revoked token — keeps showing the code the
+        /// host's journal already printed, instead of rotating it under the
+        /// approver's feet.
+        ///
+        /// It is a **verification** string, not a secret: it is compared by a
+        /// human across two channels (this host's log ↔ the add-on UI), and
+        /// approval is still a human click that mints a daemon-side token. The
+        /// daemon therefore validates its shape and mints its own if this is
+        /// missing or malformed, so an older agent — or a rogue one offering a
+        /// lookalike string — changes nothing.
+        #[serde(default)]
+        pair_code: Option<String>,
     },
     /// Pushed whenever anything changes, including local changes made by the user.
     State(HostState),
@@ -52,7 +66,8 @@ pub enum AgentMsg {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMsg {
-    /// Pairing accepted as pending: show/log `code`, then wait for `paired`.
+    /// Pairing accepted as pending: show/log `code`, then wait for `paired`. It is
+    /// the code the agent offered in `Hello`, unless the daemon had to mint one.
     PairPending {
         code: String,
     },
@@ -60,7 +75,10 @@ pub enum DaemonMsg {
     Paired {
         token: String,
     },
-    /// Refused: unknown token, denied pairing, or protocol mismatch.
+    /// Refused: unknown token, or a protocol mismatch. Never fatal to the agent —
+    /// it drops a token the daemon no longer honours and keeps dialling in, so a
+    /// host that was unpaired (or whose daemon lost its store) comes back as
+    /// pairable on its own instead of needing a hand on that machine.
     Denied {
         reason: String,
     },
@@ -117,10 +135,24 @@ mod tests {
             hostname: "david-local".into(),
             user: "david".into(),
             token: None,
+            pair_code: Some("A1B2C3".into()),
         })
         .unwrap();
         assert!(json.contains("\"type\":\"hello\""));
         assert!(json.contains("\"token\":null"));
+        assert!(json.contains("\"pair_code\":\"A1B2C3\""));
+    }
+
+    #[test]
+    fn a_hello_from_an_older_agent_still_parses() {
+        // `pair_code` is `#[serde(default)]` precisely so this keeps working: the
+        // daemon mints a code itself for an agent that offers none.
+        let json = r#"{"type":"hello","protocol":1,"agent_version":"0.1.0","machine_id":"abc",
+                       "hostname":"h","user":"u","token":null}"#;
+        match serde_json::from_str::<AgentMsg>(json).unwrap() {
+            AgentMsg::Hello { pair_code, .. } => assert_eq!(pair_code, None),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

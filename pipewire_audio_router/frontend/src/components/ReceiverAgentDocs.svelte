@@ -128,17 +128,18 @@ systemctl --user enable --now pwrouter-agent</code
 
     <h3>3. Pair</h3>
     <p class="card-sub">
-      On first start the helper looks for this add-on on the network and asks to pair. Its log prints a
-      short code:
+      On start the helper looks for this add-on on the network and asks to pair. Its log prints a short
+      code, minted once per run — restart it and you get a fresh one, but reconnects keep this one:
     </p>
     <pre><code>journalctl --user -u pwrouter-agent -f
-… waiting for approval in the add-on UI — pairing code: 4F2A9C</code></pre>
+… not paired yet — pairing code for this host: 4F2A9C</code></pre>
     <p class="card-sub">
-      The request then appears under <strong>Receiver hosts</strong> on this page with the same code.
-      Compare them before approving: that check is what stops you from handing control of your audio to
-      someone else's machine on the network. Approving stores a token on that machine
-      (<code>~/.config/pwrouter-agent/config.json</code>, readable only by that user), and the host
-      shows up under Discovered devices for you to add like any other speaker.
+      The machine then appears under <strong>Discovered devices</strong> on this page, like any other
+      speaker, with the same code on its card. Compare them before pressing <strong>Pair</strong>: that
+      check is what stops you from handing control of your audio to someone else's machine on the
+      network. Pairing stores a token on that machine
+      (<code>~/.config/pwrouter-agent/config.json</code>, readable only by that user) and adds it as an
+      output — routable, and a Home Assistant <code>media_player</code> if that setting is on.
     </p>
     <p class="card-sub hint">
       If the machine cannot find the add-on — a routed VLAN, or mDNS blocked — point it straight at the
@@ -152,10 +153,17 @@ systemctl --user enable --now pwrouter-agent</code
 
     <h3>Removing a host</h3>
     <p class="card-sub">
-      <strong>Remove</strong> under Receiver hosts revokes the token — that machine stops receiving
-      immediately. On the machine itself:
+      <strong>Unpair</strong> on the output's card revokes the token: that machine stops receiving
+      immediately and loses its routing, group membership and Home Assistant player. Its helper keeps
+      running and keeps asking, so it comes back under Discovered devices — press <strong>Ignore</strong>
+      there to put it away, or <strong>Pair</strong> to let it back in.
+    </p>
+    <p class="card-sub hint">
+      To be rid of it for good, stop it on the machine itself:
       <code>systemctl --user disable --now pwrouter-agent</code>, then delete the binary, the unit and
-      <code>~/.config/pwrouter-agent</code>.
+      <code>~/.config/pwrouter-agent</code>. Nothing you do in this add-on can stop a helper from
+      asking — that is deliberate, so a lost add-on configuration never means logging in to every
+      machine to get your outputs back.
     </p>
   </div>
 </div>

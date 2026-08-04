@@ -151,6 +151,13 @@ export interface OutputInfo {
   ap2_volume?: number | null;
   /** AirPlay 2 only: mute state. undefined for non-AP2. */
   ap2_muted?: boolean | null;
+  /** pw-sink only: is this host's agent paired? false = it is asking to be, which
+   * is what a *discovered* pw-sink output is — pairing it is the Add for this kind.
+   * undefined = not a pw-sink output. */
+  pwsink_paired?: boolean;
+  /** pw-sink only: the code to compare with the one that machine's own agent logged,
+   * before pairing it. Present only while it is waiting to be paired. */
+  pwsink_pair_code?: string;
   /** pw-sink only: a remote module-rtp-session receiver has completed the
    * AppleMIDI handshake and is being streamed to right now. false = discovered +
    * routed but the receiver hasn't connected yet; undefined = not a pw-sink
@@ -470,20 +477,22 @@ export interface VolumeResponse {
   message: string | null;
 }
 
-/** One row of `GET /api/agents`: a paired receiver host, or a pending pairing
- * request waiting for someone to approve it (docs/receiver-agent-plan.md §8).
+/** One row of `GET /api/agents`: a paired receiver host, or one asking to be
+ * (docs/receiver-agent-plan.md §8).
  *
- * A pending row has no `node_name` — it has no routing identity until approved —
- * and carries the `code` the agent also logs, so the person approving can check
- * they are approving *that* host and not a stranger's request. */
+ * Diagnostics only — the Outputs page reads the output listings instead, where a
+ * host waiting to pair appears as a discovered `pwsink` output carrying the same
+ * code. Every row has a `node_name`, pending ones included: it is settled at the
+ * first hello so the card the user pairs is the target it becomes. */
 export interface AgentInfo {
-  /** `<machine-id>:<user>`; the handle every agent endpoint takes. */
+  /** `<machine-id>:<user>`; how the daemon identifies one agent. */
   identity: string;
   /** `hostname (user)`. */
   label: string;
-  node_name: string | null;
+  node_name: string;
   paired: boolean;
   connected: boolean;
+  /** The pairing code, while it is waiting to be paired. */
   code: string | null;
   state: {
     volume: number | null;
