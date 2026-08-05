@@ -33,6 +33,12 @@ ConfigurationDirectory=pwrouter-agent
 # The dir holds a bearer token (the file itself is 0600); no reason for anyone
 # else to even list it.
 ConfigurationDirectoryMode=0700
+# So the agent can install and remove *this file*: the autostart switch in its tray
+# menu writes (or deletes) ~/.config/systemd/user/pwrouter-agent.service, which
+# ProtectHome=read-only would otherwise refuse. The `-` prefix makes a missing path
+# non-fatal, which matters for a unit started from anywhere but here — without it a
+# host with no ~/.config/systemd/user dies with 226/NAMESPACE before it ever runs.
+ReadWritePaths=-%h/.config/systemd/user
 PrivateTmp=yes
 
 [Install]

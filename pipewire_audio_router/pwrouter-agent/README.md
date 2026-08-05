@@ -38,11 +38,23 @@ requires PipeWire (any 1.x) and a Rust toolchain plus `libpipewire-0.3` headers
 ```sh
 cargo build --release
 install -Dm755 target/release/pwrouter-agent ~/.local/bin/pwrouter-agent
-install -Dm644 pwrouter-agent.service ~/.config/systemd/user/pwrouter-agent.service
-systemctl --user daemon-reload
-systemctl --user enable --now pwrouter-agent
+~/.local/bin/pwrouter-agent autostart enable   # writes the systemd user unit
+systemctl --user start pwrouter-agent
 journalctl --user -u pwrouter-agent -f
 ```
+
+The unit file is **built into the binary**, so there is nothing to download or
+copy: `autostart enable` writes
+`~/.config/systemd/user/pwrouter-agent.service`, points its `ExecStart` at the
+binary you just ran it from, and enables it for the next login. `autostart
+disable` removes it again, and `autostart` on its own says which it currently is.
+Neither starts or stops a running agent — that is `systemctl --user start|stop
+pwrouter-agent`, on purpose: an agent that installs its own unit is usually
+already running, and two agents in one session would fight over its volume. The
+same switch sits in the tray menu under **Autostart**.
+
+Re-running `autostart enable` also refreshes an older unit file, which is how a
+host picks up changes to its hardening after an upgrade.
 
 On start the agent finds the add-on over mDNS and asks to pair. The log prints a
 short code, minted once per run — so it stays the same across reconnects, and a
@@ -51,6 +63,27 @@ restart is how you ask for a new one:
 ```
 WARN not paired yet — pairing code for this host: 4F2A9C
 ```
+
+On a desktop you do not have to read the journal for it: the agent also raises a
+notification with the code and puts a status icon in the tray whose menu keeps
+showing it, along with the add-on it found, the sink your audio lands in and
+whether an announcement is currently turning other audio down. The menu is
+read-only — the add-on drives this machine, not the tray.
+
+Both need the desktop to provide them, and neither is required: with no
+notification server the notification is skipped, and the tray icon needs a
+[StatusNotifierItem] host — KDE, Xfce, Cinnamon, MATE and most WM bars have one
+built in, GNOME needs its [AppIndicator extension]. A headless server has neither
+and behaves exactly as before. To find out what a given session supports, without
+involving the add-on at all:
+
+```sh
+pwrouter-agent spike-desktop            # shows both for a fake code; Ctrl-C to stop
+RUST_LOG=debug pwrouter-agent spike-desktop   # ... and says why either is missing
+```
+
+[StatusNotifierItem]: https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/
+[AppIndicator extension]: https://extensions.gnome.org/extension/615/appindicator-support/
 
 The host then shows up under **Discovered devices** on the add-on's Outputs page,
 like any other speaker, with that same code on its card. Compare the two and press
@@ -77,9 +110,12 @@ neither can drive the other's audio. Run one agent per session.
 
 ## Diagnosing a host by hand
 
-Both commands work without a paired add-on:
+All three commands work without a paired add-on:
 
 ```sh
+# Does this session show a tray icon and a notification? (See "Pair" above.)
+pwrouter-agent spike-desktop
+
 # Load the receive module in the foreground and watch the nodes/links it creates.
 pwrouter-agent spike-receiver --ifname enp5s0
 
@@ -98,8 +134,9 @@ route.
 ## Uninstall
 
 ```sh
-systemctl --user disable --now pwrouter-agent
-rm ~/.local/bin/pwrouter-agent ~/.config/systemd/user/pwrouter-agent.service
+pwrouter-agent autostart disable        # removes and disables the unit
+systemctl --user stop pwrouter-agent
+rm ~/.local/bin/pwrouter-agent
 rm -r ~/.config/pwrouter-agent          # forgets the pairing token
 ```
 

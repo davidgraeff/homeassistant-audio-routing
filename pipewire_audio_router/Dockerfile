@@ -191,13 +191,16 @@ WORKDIR /agent
 # TWO binaries and its target/ cache mount is not exported to the registry cache,
 # so on a fresh builder (CI, or after a GC pass) an invalidated layer here means
 # both arches compile from zero. Copying `pwrouter-agent/` wholesale spent that on
-# a README.md or pwrouter-agent.service edit, neither of which the build reads.
+# a README.md edit, which the build does not read.
+# `pwrouter-agent.service` *is* read: `autostart.rs` `include_str!`s it so the
+# binary can install its own systemd unit with nothing to download. Editing it
+# therefore does — correctly — mean recompiling both arches.
 # pw-control's own Cargo.lock is deliberately not copied — cargo resolves a path
 # dependency through the *root* crate's lock, so that file is build-irrelevant
 # churn. pw-control comes first because it changes less often than the agent.
 COPY pw-control/Cargo.toml /pw-control/
 COPY pw-control/src/ /pw-control/src/
-COPY pwrouter-agent/Cargo.toml pwrouter-agent/Cargo.lock ./
+COPY pwrouter-agent/Cargo.toml pwrouter-agent/Cargo.lock pwrouter-agent/pwrouter-agent.service ./
 COPY pwrouter-agent/src/ ./src/
 # One loop per arch: build, strip, then assert the binary really does floor at
 # GLIBC_2.34 — shipping one that needs more would silently break the minimum

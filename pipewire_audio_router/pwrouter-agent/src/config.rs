@@ -19,17 +19,23 @@ pub struct Config {
     pub token: Option<String>,
 }
 
-/// `~/.config/pwrouter-agent/config.json`, honouring `XDG_CONFIG_HOME`.
-pub fn config_path() -> anyhow::Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+/// `~/.config`, honouring `XDG_CONFIG_HOME`. Also where the systemd user unit goes
+/// (`autostart::unit_path`), so the two cannot disagree about where "the user's
+/// config" is.
+pub fn config_home() -> anyhow::Result<PathBuf> {
+    match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
         _ => {
             let home = std::env::var_os("HOME")
                 .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME is set"))?;
-            PathBuf::from(home).join(".config")
+            Ok(PathBuf::from(home).join(".config"))
         }
-    };
-    Ok(base.join("pwrouter-agent").join("config.json"))
+    }
+}
+
+/// `~/.config/pwrouter-agent/config.json`, honouring `XDG_CONFIG_HOME`.
+pub fn config_path() -> anyhow::Result<PathBuf> {
+    Ok(config_home()?.join("pwrouter-agent").join("config.json"))
 }
 
 pub fn load() -> anyhow::Result<Config> {

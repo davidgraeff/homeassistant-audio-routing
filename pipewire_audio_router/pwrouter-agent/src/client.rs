@@ -14,8 +14,14 @@
 //! The receive-side module is deliberately *not* torn down on disconnect: audio
 //! should keep playing while control is briefly unavailable. It is reloaded on the
 //! next `Welcome`, which doubles as the sleep/resume remedy (plan §13.4).
+//!
+//! Every state change logged here is also pushed to [`Desktop`], which mirrors it
+//! into a tray icon and (for pairing) a notification on sessions that have them.
+//! That is presentation only: the log lines remain the record, and a host without a
+//! desktop behaves exactly as before.
 
 use crate::config::{self, Config};
+use crate::desktop::Desktop;
 use crate::proto::{AgentMsg, DaemonMsg, HostState, PROTOCOL_VERSION};
 use crate::pw_thread::{ramp_schedule, Cmd, Event, Handle, MasterState};
 use anyhow::{anyhow, Context as _};
@@ -137,18 +143,38 @@ pub async fn run(
         tracing::info!("pairing code, should this host ever need to pair again: {pair_code}");
     }
 
+    // Never fails: a host with no tray and no notification server gets a `Desktop`
+    // whose every method is a no-op.
+    let desktop = Desktop::start(
+        config::label(),
+        (!pair_code.is_empty()).then(|| pair_code.clone()),
+        config.token.is_some(),
+    )
+    .await;
+
     loop {
         let addr = match daemon_address(&mut config, override_addr.as_deref()).await {
             Ok(addr) => addr,
             Err(e) => {
                 tracing::warn!("cannot locate the daemon: {e}; retrying in {backoff:?}");
+                desktop.set_daemon(None).await;
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
             }
         };
+        desktop.set_daemon(Some(addr.clone())).await;
 
-        match session(&addr, &mut config, &pair_code, &handle, &mut events).await {
+        match session(
+            &addr,
+            &mut config,
+            &pair_code,
+            &handle,
+            &mut events,
+            &desktop,
+        )
+        .await
+        {
             Ok(Outcome::Reconnect) => {
                 backoff = BACKOFF_START;
             }
@@ -169,8 +195,12 @@ pub async fn run(
                         "the add-on no longer accepts this host's pairing ({reason}); \
                          asking to pair again with code {pair_code}"
                     );
+                    // Back to offering a code, so the tray stops claiming this host
+                    // is paired and starts showing what to approve.
+                    desktop.unpaired().await;
                 } else {
                     tracing::warn!("the add-on refused this host: {reason}; retrying in {backoff:?}");
+                    desktop.refused(&reason).await;
                 }
             }
             Err(e) => {
@@ -225,6 +255,7 @@ async fn session(
     pair_code: &str,
     handle: &Handle,
     events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    desktop: &Desktop,
 ) -> anyhow::Result<Outcome> {
     let url = format!("ws://{addr}/api/agent/ws");
     tracing::info!("connecting to {url}");
@@ -276,7 +307,7 @@ async fn session(
                             tracing::debug!("ignoring unrecognised daemon message: {text}");
                             continue;
                         };
-                        if let Some(outcome) = handle_daemon_msg(msg, config, handle, &mut keepalive, &mut ws).await? {
+                        if let Some(outcome) = handle_daemon_msg(msg, config, handle, &mut keepalive, &mut ws, desktop).await? {
                             return Ok(outcome);
                         }
                     }
@@ -289,7 +320,11 @@ async fn session(
             event = events.recv() => {
                 let Some(event) = event else { return Err(anyhow!("PipeWire thread is gone")) };
                 let msg = match event {
-                    Event::Master(master) => AgentMsg::State(host_state(&master)),
+                    Event::Master(master) => {
+                        let state = host_state(&master);
+                        desktop.set_host(state.clone()).await;
+                        AgentMsg::State(state)
+                    }
                     Event::ForeignSession(session) => AgentMsg::ForeignSession { session },
                 };
                 ws.send(Message::Text(serde_json::to_string(&msg)?.into())).await?;
@@ -307,17 +342,24 @@ async fn handle_daemon_msg(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    desktop: &Desktop,
 ) -> anyhow::Result<Option<Outcome>> {
     match msg {
         DaemonMsg::PairPending { code } => {
             // Logged so the person clicking "Approve" can confirm the code matches
             // this host — an approval prompt alone can't tell two requests apart.
             tracing::warn!("waiting for approval in the add-on UI — pairing code: {code}");
+            // Notified for the same reason, on the desktops that can: the person who
+            // just installed this is at *this* machine, not tailing its journal. Sent
+            // with the daemon's code, which is ours unless it had to mint one. Repeat
+            // pendings from reconnects do not re-raise the banner.
+            desktop.pair_pending(&code).await;
             Ok(None)
         }
         DaemonMsg::Paired { token } => {
             config.token = Some(token);
             config::save(config).context("saving the pairing token")?;
+            desktop.paired().await;
             Ok(Some(Outcome::Paired))
         }
         DaemonMsg::Denied { reason } => Ok(Some(Outcome::Denied(reason))),

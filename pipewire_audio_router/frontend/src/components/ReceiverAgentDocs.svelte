@@ -115,11 +115,19 @@
     <h3>2. Install</h3>
     <pre><code
         >chmod +x pwrouter-agent-* &amp;&amp; install -Dm755 pwrouter-agent-* ~/.local/bin/pwrouter-agent
-mkdir -p ~/.config/systemd/user
-curl -sSL -o ~/.config/systemd/user/pwrouter-agent.service https://raw.githubusercontent.com/davidgraeff/homeassistant-audio-routing/refs/heads/main/pipewire_audio_router/pwrouter-agent/pwrouter-agent.service
-systemctl --user daemon-reload
-systemctl --user enable --now pwrouter-agent</code
+~/.local/bin/pwrouter-agent autostart enable
+systemctl --user start pwrouter-agent</code
       ></pre>
+    <p class="card-sub hint">
+      Two commands, no download of a service file: the systemd unit is built into the binary.
+      <code>autostart enable</code> writes it to
+      <code>~/.config/systemd/user/pwrouter-agent.service</code>, pointed at the binary you ran it from,
+      and turns it on for your next login; <code>autostart disable</code> removes it again, and
+      <code>autostart</code> alone reports which it is. The tray menu has the same switch under
+      <strong>Autostart</strong>. Starting and stopping stay separate commands on purpose — an agent
+      installing its own unit is usually already running, and two in one session would fight over your
+      volume.
+    </p>
     <p class="card-sub hint">
       A <em>user</em> service, not a system one: the helper controls the audio of one logged-in session,
       so it runs as you and uses your PipeWire. Two people sharing a machine each install their own and
@@ -133,6 +141,15 @@ systemctl --user enable --now pwrouter-agent</code
     </p>
     <pre><code>journalctl --user -u pwrouter-agent -f
 … not paired yet — pairing code for this host: 4F2A9C</code></pre>
+    <p class="card-sub">
+      On a desktop it also shows you the code directly: a notification when it starts asking, and a
+      status icon in the tray whose menu keeps the code readable afterwards, next to the add-on it
+      found and what it is currently playing. That needs the desktop to support it — KDE, Xfce,
+      Cinnamon, MATE and most window-manager bars do, GNOME needs its AppIndicator extension — so the
+      log line above is always there as the fallback.
+      <code>pwrouter-agent spike-desktop</code> shows both for a made-up code, without asking this
+      add-on for anything, if you want to know what a machine supports.
+    </p>
     <p class="card-sub">
       The machine then appears under <strong>Discovered devices</strong> on this page, like any other
       speaker, with the same code on its card. Compare them before pressing <strong>Pair</strong>: that
@@ -160,7 +177,8 @@ systemctl --user enable --now pwrouter-agent</code
     </p>
     <p class="card-sub hint">
       To be rid of it for good, stop it on the machine itself:
-      <code>systemctl --user disable --now pwrouter-agent</code>, then delete the binary, the unit and
+      <code>pwrouter-agent autostart disable</code> (removes the unit) and
+      <code>systemctl --user stop pwrouter-agent</code>, then delete the binary and
       <code>~/.config/pwrouter-agent</code>. Nothing you do in this add-on can stop a helper from
       asking — that is deliberate, so a lost add-on configuration never means logging in to every
       machine to get your outputs back.

@@ -9,11 +9,17 @@
 //!
 //! * `run` — the service (see the shipped systemd user unit). Pairs on first
 //!   start, then reconnects on its own.
+//! * `autostart` — install or remove the systemd user unit, which is embedded in
+//!   this binary (plan §8.1). The tray menu's Autostart switch is the same code.
 //! * `spike-receiver` / `spike-volume` — the standalone spikes from plan §11,
 //!   kept because they are the fastest way to diagnose a host by hand.
+//! * `spike-desktop` — does this session show a tray icon and a notification?
+//!   Answers that without involving the add-on at all.
 
+mod autostart;
 mod client;
 mod config;
+mod desktop;
 mod proto;
 mod pw_thread;
 mod receiver;
@@ -28,11 +34,18 @@ pwrouter-agent — receiver-side helper for the PipeWire audio router add-on
 
 USAGE:
   pwrouter-agent run             [--daemon <host:port>]
+  pwrouter-agent autostart       [enable | disable]
   pwrouter-agent spike-receiver  [--ifname <iface>] [--node-name <name>]
   pwrouter-agent spike-volume    [--node-name <name>] [--session <rtp.session>] [--set <0.0-1.0>]
+  pwrouter-agent spike-desktop   [--code <XXXXXX>]
 
 `run` discovers the add-on over mDNS unless --daemon is given, and pairs on first
-start (approve the request in the add-on UI; it prints a code to match).
+start (approve the request in the add-on UI; it prints a code to match — to the log,
+and to a desktop notification and tray icon where the session has them).
+
+`autostart` writes (or removes) the systemd user unit that starts this binary at
+login; with no argument it reports the current state. The unit is built in, so
+nothing has to be downloaded. Same switch as the tray menu's Autostart entry.
 ";
 
 fn main() -> anyhow::Result<()> {
@@ -50,10 +63,12 @@ fn main() -> anyhow::Result<()> {
 
     match cmd {
         "run" => run(opt("--daemon")),
+        "autostart" => autostart_cmd(args.get(1).map(String::as_str)),
         "spike-receiver" => spike_receiver(
             opt("--ifname"),
             opt("--node-name").unwrap_or_else(|| receiver::RECEIVE_NODE_NAME.into()),
         ),
+        "spike-desktop" => spike_desktop(opt("--code").unwrap_or_else(|| "4F2A9C".into())),
         "spike-volume" => {
             let set = match opt("--set") {
                 Some(v) => Some(v.parse::<f32>().context("--set expects a float 0.0-1.0")?),
@@ -114,6 +129,74 @@ fn run(daemon: Option<String>) -> anyhow::Result<()> {
         }
         // Either arm drops the `Handle`, whose Drop restores ducked streams and
         // unloads the receiver module on the PipeWire thread (plan §9.1).
+    })
+}
+
+/// `autostart [enable|disable]` — the command-line half of the tray's Autostart
+/// switch. No PipeWire and no add-on involved: it writes a file and talks to
+/// systemd.
+fn autostart_cmd(action: Option<&str>) -> anyhow::Result<()> {
+    init_tracing();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let path = autostart::unit_path()?;
+        match action {
+            None | Some("status") => {
+                println!("autostart: {}", autostart::state().await.label());
+                println!("unit:      {}", path.display());
+                println!("\nchange it with: pwrouter-agent autostart enable|disable");
+            }
+            Some("enable") => {
+                let path = autostart::enable().await?;
+                println!("wrote {}", path.display());
+                for line in autostart::unit_text().lines() {
+                    if let Some(exec) = line.strip_prefix("ExecStart=") {
+                        println!("it starts: {exec}");
+                    }
+                }
+                println!(
+                    "enabled; it will start at your next login.\n\
+                     to start it now as well: systemctl --user start {}",
+                    autostart::UNIT_NAME
+                );
+            }
+            Some("disable") => {
+                autostart::disable().await?;
+                println!("disabled and removed {}", path.display());
+                println!(
+                    "an agent already running keeps running; stop it with: \
+                     systemctl --user stop {}",
+                    autostart::UNIT_NAME
+                );
+            }
+            Some(other) => {
+                print!("{USAGE}");
+                bail!("unknown autostart action: {other}")
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Does this desktop show the tray icon and the pairing notification? Answers that
+/// without touching the add-on: no pairing request is made, so nothing appears in
+/// anyone's UI and no token can change. Ctrl-C to stop.
+fn spike_desktop(code: String) -> anyhow::Result<()> {
+    init_tracing();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        println!("posting a pairing notification and a tray icon for the fake code {code}");
+        println!("(nothing is sent to the add-on; run with RUST_LOG=debug to see why either is missing)\n");
+        let desktop = desktop::Desktop::start(config::label(), Some(code.clone()), false).await;
+        desktop.set_daemon(Some("192.0.2.1:8099".into())).await;
+        desktop.pair_pending(&code).await;
+        println!("shown; Ctrl-C to stop");
+        tokio::signal::ctrl_c().await?;
+        Ok(())
     })
 }
 

@@ -326,6 +326,55 @@ Worth an upstream report either way.
    that is still on the network: it reappears under Discovered, and **Ignore** is
    how you put it away.
 
+### 8.1 Showing the code on the desktop, not only in the journal
+
+`journalctl --user -u pwrouter-agent` is the right answer for a server and a poor
+one for a desktop: the person who just installed the helper is sitting at the
+machine that could simply show them the code. `src/desktop.rs` therefore mirrors
+what step 2 above logs into two desktop surfaces:
+
+* a **notification** when the daemon reports the request pending, carrying the code
+  and the host label to approve. Sent with `replaces_id` and suppressed for a code
+  already announced, because an unpaired agent re-hellos on every backoff tick and
+  gets `pair_pending` back each time — without both, the user's screen would flash
+  the same banner every few seconds and stack a bubble per reconnect;
+* a **status tray icon** (StatusNotifierItem, via `ksni` — pure Rust on zbus, so the
+  two-arch cross-build and its GLIBC floor are untouched) whose menu keeps the code
+  readable afterwards, alongside the daemon address, the target sink, level and duck
+  state it already reports upstream.
+
+and carries the one **setting** that is genuinely local to that machine rather than
+the add-on's business: **Autostart**, a two-option radio (start at login / don't)
+that installs or removes the systemd user unit through `autostart.rs` (§10) and
+reports back what systemd actually says afterwards, rather than what was clicked.
+The command line has the same switch (`pwrouter-agent autostart [enable|disable]`)
+for headless hosts and for the case the tray cannot help with: a *sandboxed* agent
+whose unit predates `ReadWritePaths=-%h/.config/systemd/user` cannot write the file,
+so the toggle fails with a notification pointing at the terminal, where it works.
+
+Three deliberate limits:
+
+1. **Both are optional and neither is authoritative.** No session bus, no
+   notification server, or no tray host each degrade to what existed before — the
+   log line — and none of them can fail the agent. Which is also why the code still
+   goes to the journal at `warn`.
+2. **The menu is a display, plus one setting.** Every status row is disabled; the
+   only rows that do anything are Autostart and "show the notification again". No
+   unpair and no quit: those would be a second, divergent way to manage a
+   `Restart=always` unit, and a control surface competing with the add-on, which is
+   the thing that is supposed to drive this host. Autostart is the exception because
+   *nothing else can do it* — the add-on cannot reach into a session to decide
+   whether it starts at login.
+3. **Legacy icon names** (`audio-speakers`, `dialog-password`): those resolve in
+   both Breeze and Adwaita (via its `Inherits=AdwaitaLegacy`), whereas the two
+   `-symbolic` spellings wanted here are not both present in both themes.
+
+Tray support is not universal — KDE, Xfce, Cinnamon, MATE and most WM bars
+implement the spec, GNOME needs its AppIndicator extension — so `spike-desktop`
+exists to answer "does this session have either?" without involving the add-on, and
+`assume_sni_available` is set so a user unit that starts before the shell waits for
+the watcher instead of giving up.
+
 ## 9. Safety rails
 
 The failure mode to design against is *"the user's desktop is silently stuck at
@@ -372,7 +421,18 @@ desktop, a different feature; folding it into the agent is a separate decision.
 * Copied to `/app/www/agent/` and **served by the add-on itself**, so the download
   in the help dialog needs no third-party fetch and always matches the daemon.
 * **systemd user unit** (`~/.config/systemd/user/pwrouter-agent.service`), since
-  it needs the user's session PipeWire. `systemctl --user enable --now`.
+  it needs the user's session PipeWire. The unit is `include_str!`-ed into the
+  binary and installed by `pwrouter-agent autostart enable` (or the tray's Autostart
+  switch), which is what removed the `curl` of a raw.githubusercontent URL from the
+  install instructions — two steps, one of them a download from a *third party*, for
+  a file the binary already contains. `ExecStart` is rewritten to the installing
+  binary's own path (`%h/…` when it is under the user's home), so the unit can never
+  start a different copy than the one that wrote it, and enabling deliberately does
+  not start: the installer is usually the running agent, and a second one in the same
+  session would fight it over the volume. That the agent writes its own unit is also
+  the one thing `ProtectHome=read-only` had to be relaxed for
+  (`ReadWritePaths=-%h/.config/systemd/user`, `-` because the directory need not
+  exist).
 
 ## 11. Phases
 
@@ -399,6 +459,8 @@ applications' streams on that sink, never `pwsink-in`.
 | `pwrouter-agent/src/receiver.rs` | the `rtp-session` args replacing the drop-in (§7), with tests |
 | `pwrouter-agent/src/pw_thread.rs` | the service path: graph tracking, master lever, duck ramps |
 | `pwrouter-agent/src/volume.rs` | the diagnostic path (`spike-*`): snapshot, stream→sink walk, lever |
+| `pwrouter-agent/src/desktop.rs` | tray icon + pairing notification (§8.1); status is display-only, Autostart is the one setting |
+| `pwrouter-agent/src/autostart.rs` | the embedded systemd unit and the enable/disable pair behind both the tray switch and `pwrouter-agent autostart` (§10) |
 | `pw-control/` (own workspace root) | shared with the daemon: volume/route pods, the cubic scale, and the `pw_context_load_module` FFI neither `pipewire-rs` wraps nor either side should duplicate |
 | `frontend/src/components/OutputsTab.svelte` | the pairing UI, such as it is: a host waiting to pair is a discovered output card carrying the code, and Add/Unpair are its decisions. (`AgentsPanel.svelte` used to own a section of its own; deleted — see §8.3) |
 | `pw-control/` (new crate, P1) | `channelVolumes` get/set + cubic scale, shared with the daemon |
