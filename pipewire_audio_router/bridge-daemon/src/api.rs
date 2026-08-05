@@ -73,12 +73,10 @@ pub struct AppState {
     /// Live mDNS-discovered AirPlay-2 receivers (ap2_discovery.rs), surfaced as
     /// virtual routing outputs (`ap2-dev-*`). The RAOP-output replacement.
     pub ap2_devices: SharedAp2Devices,
-    /// Live mDNS-discovered pw-sink targets (pw_target_discovery.rs) — remote
-    /// PipeWire hosts running `module-rtp-session`, surfaced as virtual routing
-    /// outputs (`pwsink-dev-*`) and driven by per-target AppleMIDI senders.
-    pub pw_targets: crate::pw_target_discovery::SharedPwTargets,
     /// Paired receiver agents (pwsink_agent.rs) — the source of truth for pw-sink
-    /// outputs, their volume/mute control channel, and the pairing queue.
+    /// outputs (there is no mDNS registry behind them: `pw_target_discovery` is a
+    /// diagnostic that nothing here reads), their volume/mute control channel, and
+    /// the pairing queue.
     pub agents: crate::pwsink_agent::SharedAgents,
     /// Live mDNS-discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs).
     /// Unlike the other discoveries these are *senders*, not outputs: they build
@@ -148,7 +146,6 @@ pub fn router(
     xruns: crate::profiler::SharedXruns,
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
-    pw_targets: crate::pw_target_discovery::SharedPwTargets,
     agents: crate::pwsink_agent::SharedAgents,
     bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
     ap2_ptp: SharedAp2Ptp,
@@ -178,7 +175,6 @@ pub fn router(
         profiler_watchers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         sendspin_devices,
         ap2_devices,
-        pw_targets,
         agents,
         bt_bridges,
         ap2_ptp,
@@ -2451,7 +2447,7 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
             ap2_ptp: &state.ap2_ptp,
             ap2_control: &state.ap2_control,
             sync_settings: &state.sync_settings,
-            pw_targets: &state.pw_targets,
+            agents: &state.agents,
         };
         let mut groups = state.groups.lock().await;
         for target in &targets {

@@ -34,7 +34,11 @@
 use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SYNC_GRP_PREFIX};
 use crate::locks::LockRecover;
 use crate::overlay_mixer::OverlayMixer;
-use crate::pw_target_discovery::{PwTarget, SharedPwTargets};
+/// Connected receiver hosts, `node_name → label`, as
+/// `pwsink_agent::Agents::connected_targets` reports them. A pw-sink target exists
+/// because an agent is on the socket (plan §3) — mDNS is not consulted, and cannot
+/// be: its node names lack the `_<user>` half that routing intent carries.
+type PwsinkHosts = std::collections::BTreeMap<String, String>;
 use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
@@ -335,7 +339,9 @@ pub struct AnnounceDeps<'a> {
     pub ap2_ptp: &'a crate::ap2_ptp::SharedAp2Ptp,
     pub ap2_control: &'a crate::ap2_volume::SharedAp2Control,
     pub sync_settings: &'a crate::sync_settings::SharedSyncSettings,
-    pub pw_targets: &'a SharedPwTargets,
+    /// Receiver-host registry, for the pw-sink on-demand path: an announcement can
+    /// only be opened to a host whose agent is connected to take the session.
+    pub agents: &'a crate::pwsink_agent::SharedAgents,
 }
 
 /// Why an output with no live per-device sender can't carry an announcement, for
@@ -715,12 +721,11 @@ impl GroupReconciler {
     /// at one can be heard by the others (the deferred session-scoping decision, see
     /// docs/pipewire-sink-roadmap.md §4).
     async fn open_pwsink_announce_session(&mut self, output: &str, deps: &AnnounceDeps<'_>) -> AnnounceTransport {
-        let target = deps.pw_targets.lock_recover().get(output).cloned();
-        let Some(target) = target else {
-            return AnnounceTransport::Unavailable("unknown PipeWire target".into());
-        };
-        if !target.present {
-            return AnnounceTransport::Unavailable("target is not on the network (no mDNS advert)".into());
+        // The receiver dials *us*, so what has to be true is that its agent is on the
+        // socket to be told about the session — not that anything answered an mDNS
+        // browse.
+        if !deps.agents.lock().await.is_connected(output) {
+            return AnnounceTransport::Unavailable("no receiver agent is connected for this host".into());
         }
         let Some(control_port) = self.alloc_pwsink_ports(1).first().copied() else {
             return AnnounceTransport::Unavailable("no free control port for a pw-sink session".into());
@@ -921,7 +926,7 @@ fn compute_desired(
     devices: &BTreeMap<String, SendspinDevice>,
     ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
     ap2_latencies: &BTreeMap<String, u16>,
-    pw_targets: &BTreeMap<String, PwTarget>,
+    pwsink_hosts: &PwsinkHosts,
 ) -> BTreeMap<String, DesiredGroup> {
     let mut groups: BTreeMap<String, DesiredGroup> = BTreeMap::new();
 
@@ -952,12 +957,11 @@ fn compute_desired(
         g.ap2_members.push((dev_node.clone(), addr.ip(), ap2_latencies.get(dev_node).copied()));
     }
 
-    // Present pw-sink targets (remote PipeWire hosts) → members of their group.
+    // Connected receiver hosts (remote PipeWire machines) → members of their group.
     // The audio path (per-target AppleMIDI sender) is built in reconcile step (e).
-    for (node, tgt) in pw_targets {
-        if !tgt.present {
-            continue;
-        }
+    // Membership is the agent being connected: it is the thing that will be told to
+    // receive the session, and its node name is the one routing intent carries.
+    for node in pwsink_hosts.keys() {
         let sources = routing::source_set_of(intent, node);
         if sources.is_empty() {
             continue;
@@ -1031,7 +1035,7 @@ impl GroupReconciler {
         ap2_ptp: &crate::ap2_ptp::SharedAp2Ptp,
         sync_settings: &crate::sync_settings::SharedSyncSettings,
         ap2_control: &crate::ap2_volume::SharedAp2Control,
-        pw_targets: &SharedPwTargets,
+        pwsink_hosts: &PwsinkHosts,
     ) {
         // Re-earned every pass: whatever failed last time either succeeds now or
         // sets this again.
@@ -1047,8 +1051,7 @@ impl GroupReconciler {
         let devices_map = devices.lock_recover().clone();
         let ap2_map = ap2_devices.lock_recover().clone();
         let ap2_latencies = sync_settings.lock_recover().ap2_latencies();
-        let pw_targets_map = pw_targets.lock_recover().clone();
-        let mut desired = compute_desired(&intent, &devices_map, &ap2_map, &ap2_latencies, &pw_targets_map);
+        let mut desired = compute_desired(&intent, &devices_map, &ap2_map, &ap2_latencies, pwsink_hosts);
 
         // Resolve each group's AP2 capture/wire rate from the per-output rate mode
         // + learned capability cache (48000 iff every member's effective rate is
@@ -1175,7 +1178,7 @@ impl GroupReconciler {
                 let still_there = if o.starts_with(AP2_DEV_PREFIX) {
                     ap2_map.get(o).is_some_and(|d| d.present && d.addr.is_some())
                 } else {
-                    pw_targets_map.get(o).is_some_and(|t| t.present)
+                    pwsink_hosts.contains_key(o)
                 };
                 if grouped.contains(o.as_str()) {
                     Some((o.clone(), "endpoint is now routed — its group sender takes over"))
@@ -1951,6 +1954,50 @@ mod tests {
             let msg = no_transport_reason(output);
             assert!(msg.contains(needle), "{output}: {msg:?} lacks {needle:?}");
         }
+    }
+
+    /// A receiver host joins the group of whatever feeds it — keyed by the name its
+    /// **pairing** carries, obtained from the registry exactly as `reconcile` gets it.
+    ///
+    /// This is the invariant whose absence made every pw-sink output silent: members
+    /// used to be built from `pw_target_discovery`, which keys hosts
+    /// `pwsink-dev-<host>`, while pairing, adoption, routing intent and the HA entity
+    /// all carry `pwsink-dev-<host>_<user>`. `source_set_of` was therefore asked about
+    /// a name no link could hold, no member was ever added, no session was ever
+    /// advertised, and the agent waited forever for one. Nothing covered
+    /// `compute_desired`, so nothing noticed.
+    #[test]
+    fn a_connected_receiver_host_joins_the_group_of_whatever_feeds_it() {
+        use crate::pwsink_agent::{Agents, HelloClaim, PROTOCOL_VERSION};
+
+        let path = std::env::temp_dir().join(format!("sync-group-agents-{}.json", std::process::id()));
+        let mut agents = Agents::new(path.clone(), tokio::sync::broadcast::channel(1).0);
+        let claim = || HelloClaim {
+            protocol: PROTOCOL_VERSION,
+            machine_id: "m1",
+            hostname: "david-local",
+            user: "david",
+            token: None,
+            pair_code: None,
+        };
+        // Pair, then reconnect with the token — only a welcomed connection is a target.
+        agents.hello(claim(), tokio::sync::mpsc::unbounded_channel().0);
+        let paired = agents.approve("m1:david").expect("approve");
+        agents.hello(HelloClaim { token: Some(&paired.token), ..claim() }, tokio::sync::mpsc::unbounded_channel().0);
+
+        let hosts = agents.connected_targets();
+        assert_eq!(hosts.keys().collect::<Vec<_>>(), vec![&paired.node_name], "the registry's key is the pairing's node name");
+
+        // Unrouted: a connected host on its own forms no group and gets no session.
+        assert!(compute_desired(&[], &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), &hosts).is_empty());
+
+        // Routed: it becomes a member, which is what starts the pw-sink sender.
+        let intent = vec![RoutingLink { source: "bt-bridge-rtp".into(), output: paired.node_name.clone() }];
+        let desired = compute_desired(&intent, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(), &hosts);
+        assert_eq!(desired.len(), 1, "a routed host must form a group");
+        assert_eq!(desired.values().next().unwrap().pwsink_members, vec![paired.node_name]);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

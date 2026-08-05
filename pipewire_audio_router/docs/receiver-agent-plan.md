@@ -88,8 +88,24 @@ Consequences, accepted:
   migration path and none is wanted (same "start clean" stance as the output
   adoption gate).
 * `pw_target_discovery.rs` loses its role as the source of truth for targets; it
-  survives at most as a diagnostic ("host advertises a session but has no
-  agent → tell the user to install it").
+  survives as a **diagnostic only** — its browse still logs "discovered pw-sink
+  target", and nothing reads its registry (it is not even in `AppState` any more).
+
+  **This half was missed the first time round, and it made every pw-sink output
+  silent** (found live 2026-08-05: paired, adopted, routed, and the agent still
+  reporting `receiving: false`). `sync_group::compute_desired` and
+  `routing::build_matrix` still built their pw-sink half from that registry, which
+  keys a host `pwsink-dev-<host>` — while a pairing, and therefore every routing
+  link, adoption verdict and HA entity, carries `pwsink-dev-<host>_<user>`. So
+  `source_set_of` was asked about a name no link could hold: no member, no
+  `pwsink_server`, no advertised session, and an agent waiting forever for one. The
+  matrix showed the same host as `present: false` while `/api/outputs` showed it
+  connected — the visible tell of two sources of truth.
+
+  Both now read `Agents::connected_targets()`. The trap to remember: an agent host
+  *also* advertises `_pipewire-audio._udp` (its own receive session, under its bare
+  hostname), so the registry looks plausibly populated while being useless as a key.
+  `compute_desired` has a test now — it had none, which is why nothing caught this.
 * The static drop-in is **removed** from every host, including the author's own
   Fedora machines (§9.3).
 
@@ -443,7 +459,7 @@ desktop, a different feature; folding it into the agent is a separate decision.
 | **S2** (spike) | link-walk to the target sink + volume get/set | ✅ walk + read verified; ❗ write must use the device `Route` param, not node `Props` (§6.1) |
 | **S2b** (spike) | `SPA_PARAM_Route` set on the Device (volume + mute), read-back observed by `wpctl` | `wpctl get-volume` reflects an agent-set value; local changes read back |
 | **P1** | agent (config, pairing, reconnect, restore rails); `pwsink_agent.rs`; master volume/mute through to the HA `media_player` | ✅ built; control plane verified live (§14.2). `pw-control` extraction deferred (§13) |
-| **P2** | receiver config owned by the agent; targets sourced from paired agents (§3); drop-in deleted; systemd unit | ✅ built; adoption gate verified live. Serving the binary from the add-on frontend deferred (needs a cross-arch build stage) |
+| **P2** | receiver config owned by the agent; targets sourced from paired agents (§3); drop-in deleted; systemd unit | ✅ built; adoption gate verified live. "Targets sourced from paired agents" was only half done until 2026-08-05 — the *listing* was, the audio path and the matrix were not, so no pw-sink output could carry audio (§3). Serving the binary from the add-on frontend deferred (needs a cross-arch build stage) |
 | **P3** | per-stream duck of *foreign* streams with local ramp, wired to the announce path alongside `overlay_mixer` | ✅ built (`duck_output`/`unduck_output` from `announce.rs`); not yet heard on real audio |
 | **P4** | host-scoped extras: report sinks (target a *named* sink), report xruns into the profiler badges | deferred |
 
@@ -467,7 +483,7 @@ applications' streams on that sink, never `pwsink-in`.
 | `bridge-daemon/src/pwsink_agent.rs` (new) | daemon side: WS endpoint, token store, per-host command channel, keepalive |
 | `bridge-daemon/src/volume.rs` | source of the shared volume code (moves to `pw-control`) |
 | `bridge-daemon/src/pw_module.rs` | the client-context module-load FFI the agent reuses |
-| `bridge-daemon/src/pw_target_discovery.rs` | demoted to diagnostic (§3) |
+| `bridge-daemon/src/pw_target_discovery.rs` | diagnostic only, read by nothing (§3) — the audio path and the matrix take pw-sink hosts from `Agents::connected_targets()` |
 | `bridge-daemon/src/pwsink_server.rs` | unchanged audio path; gains session-scoping once S1b lands |
 | `custom_components/pipewire_audio_router/media_player.py` | `VOLUME_SET`/`VOLUME_MUTE` for pw-sink outputs with a connected agent |
 

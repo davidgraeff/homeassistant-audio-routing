@@ -582,6 +582,26 @@ impl Agents {
         rows
     }
 
+    /// Connected paired hosts, `node_name → label`. **This is the gate for the audio
+    /// path** (§3: no agent, no target): `sync_group::compute_desired` builds a
+    /// group's pw-sink members from it and `routing::build_matrix` reads presence
+    /// from it, so both agree with `/api/outputs` about which hosts exist and what
+    /// they are called.
+    ///
+    /// It used to be `pw_target_discovery`'s mDNS registry, which keys hosts as
+    /// `pwsink-dev-<host>` while a pairing is `pwsink-dev-<host>_<user>` — so the
+    /// reconciler asked about a name no routing link could ever carry, and *no
+    /// pw-sink output was ever routable*. The registry is diagnostic now.
+    pub fn connected_targets(&self) -> std::collections::BTreeMap<String, String> {
+        self.paired
+            .iter()
+            .filter_map(|a| {
+                let live = self.live.get(&a.node_name)?;
+                Some((a.node_name.clone(), live.label.clone()))
+            })
+            .collect()
+    }
+
     /// Paired agents plus pending requests, for `/api/agents` (diagnostics; the
     /// Outputs page reads the output listings instead).
     pub fn snapshot(&self) -> Vec<AgentInfo> {

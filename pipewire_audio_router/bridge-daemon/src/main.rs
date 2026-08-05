@@ -240,9 +240,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let ap2_devices: ap2_discovery::SharedAp2Devices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let ap2_ptp = ap2_ptp::Ap2PtpService::new();
-    // Discovered pw-sink targets (pw_target_discovery.rs): remote PipeWire hosts
-    // running module-rtp-session, surfaced as virtual routing outputs
-    // (`pwsink-dev-*`) and driven by per-target AppleMIDI senders (pwsink_server.rs).
+    // Hosts advertising an RTP session over mDNS (pw_target_discovery.rs).
+    // **Diagnostic only**: pw-sink outputs come from paired agents (plan §3), and
+    // these adverts cannot serve that role — they are keyed by hostname alone, while
+    // a pairing (and therefore every routing link and HA entity) carries the user
+    // too. Kept because "that host advertises a session" is worth a log line; read
+    // by nothing but its own liveness bookkeeping.
     let pw_targets: pw_target_discovery::SharedPwTargets =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // Discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs): Pis advertising
@@ -373,7 +376,11 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             let ap2_control = ap2_control.clone();
             let settings = sync_settings.clone();
             let groups = groups.clone();
-            let pw_targets = pw_targets.clone();
+            // Receiver hosts, for the pw-sink half of the reconcile. Snapshotted per
+            // pass here rather than reached for inside `reconcile`, which is where the
+            // rest of its inputs come from too — and the registry is an async mutex,
+            // so it cannot be read from the sync section that builds the groups.
+            let agents_for_groups = agents.clone();
             let mut rx = changes.subscribe();
             tokio::spawn(async move {
                 // routing::reconcile first (direct links for any real-node output),
@@ -399,9 +406,10 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                 loop {
                     let lead = sync_settings::group_lead_us(&settings);
                     routing::reconcile(&pw, &cmd, &routing).await;
+                    let pwsink_hosts = agents_for_groups.lock().await.connected_targets();
                     let retry = {
                         let mut g = groups.lock().await;
-                        g.reconcile(&pw, &cmd, &routing, &adopted, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pw_targets)
+                        g.reconcile(&pw, &cmd, &routing, &adopted, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pwsink_hosts)
                             .await;
                         g.retry_wanted()
                     };
@@ -481,7 +489,6 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             xruns,
             sendspin_devices,
             ap2_devices,
-            pw_targets,
             agents,
             bt_bridges,
             ap2_ptp.clone(),

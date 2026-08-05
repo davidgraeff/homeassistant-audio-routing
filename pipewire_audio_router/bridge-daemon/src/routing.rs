@@ -188,7 +188,12 @@ fn build_matrix(
     reg: &RegistryState,
     devices: &BTreeMap<String, SendspinDevice>,
     ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
-    pw_targets: &BTreeMap<String, crate::pw_target_discovery::PwTarget>,
+    // Connected receiver hosts (`node_name → label`, pwsink_agent.rs). The same
+    // source `sync_group` builds its pw-sink members from, so this page and the audio
+    // path cannot disagree about whether a host is there — they used to, because this
+    // read mDNS discovery (`pwsink-dev-<host>`) while everything else used the pairing
+    // (`pwsink-dev-<host>_<user>`), which showed a connected host as `present: false`.
+    pwsink_hosts: &BTreeMap<String, String>,
     adopted: &std::collections::BTreeSet<String>,
     source_labels: &std::collections::HashMap<String, String>,
     // User-chosen output names (outputs_store.rs), keyed by node name. Wins over
@@ -237,7 +242,7 @@ fn build_matrix(
     let mut output_names: BTreeSet<String> = present_outputs.keys().cloned().collect();
     output_names.extend(devices.keys().cloned());
     output_names.extend(ap2_devices.keys().cloned());
-    output_names.extend(pw_targets.keys().cloned());
+    output_names.extend(pwsink_hosts.keys().cloned());
     output_names.extend(intent.iter().map(|l| l.output.clone()));
     output_names.extend(adopted.iter().cloned());
     output_names.retain(|n| adopted.contains(n));
@@ -254,13 +259,13 @@ fn build_matrix(
             let node_id = present_outputs.get(&name).copied();
             let device = devices.get(&name);
             let ap2 = ap2_devices.get(&name);
-            let pwt = pw_targets.get(&name);
+            let pwsink_label = pwsink_hosts.get(&name);
             let display_name = output_labels
                 .get(&name)
                 .cloned()
                 .or_else(|| device.map(|d| d.display_name.clone()))
                 .or_else(|| ap2.map(|d| d.display_name.clone()))
-                .or_else(|| pwt.map(|t| t.display_name.clone()))
+                .or_else(|| pwsink_label.cloned())
                 .unwrap_or_else(|| output_display_name(&name));
             RoutingNode {
                 // Present if live in the graph, or a discovered sendspin/AP2/pw-sink
@@ -270,7 +275,7 @@ fn build_matrix(
                 present: node_id.is_some()
                     || device.is_some_and(|d| d.present)
                     || ap2.is_some_and(|d| d.present)
-                    || pwt.is_some_and(|t| t.present),
+                    || pwsink_label.is_some(),
                 // Reachable is not the same as connected for the dialed backends —
                 // report the session state separately so the UI can tell the two
                 // apart instead of implying delivery from mere presence.
@@ -374,7 +379,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let output_labels = crate::outputs_store::names_snapshot(&state.outputs);
     let devices = state.sendspin_devices.lock_recover().clone();
     let ap2_devices = state.ap2_devices.lock_recover().clone();
-    let pw_targets = state.pw_targets.lock_recover().clone();
+    let pwsink_hosts = state.agents.lock().await.connected_targets();
     let (lat, source_labels) = {
         use crate::sources_store::SourceConfig;
         let sources = state.sources.lock_recover();
@@ -407,7 +412,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         &reg,
         &devices,
         &ap2_devices,
-        &pw_targets,
+        &pwsink_hosts,
         &adopted,
         &source_labels,
         &output_labels,
