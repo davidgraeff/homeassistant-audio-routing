@@ -35,7 +35,7 @@ pwrouter-agent — receiver-side helper for the PipeWire audio router add-on
 USAGE:
   pwrouter-agent run             [--daemon <host:port>]
   pwrouter-agent autostart       [enable | disable]
-  pwrouter-agent spike-receiver  [--ifname <iface>] [--node-name <name>]
+  pwrouter-agent spike-receiver  [--ifname <iface>] [--node-name <name>] [--target <sink>]
   pwrouter-agent spike-volume    [--node-name <name>] [--session <rtp.session>] [--set <0.0-1.0>]
   pwrouter-agent spike-desktop   [--code <XXXXXX>]
 
@@ -67,6 +67,7 @@ fn main() -> anyhow::Result<()> {
         "spike-receiver" => spike_receiver(
             opt("--ifname"),
             opt("--node-name").unwrap_or_else(|| receiver::RECEIVE_NODE_NAME.into()),
+            opt("--target"),
         ),
         "spike-desktop" => spike_desktop(opt("--code").unwrap_or_else(|| "4F2A9C".into())),
         "spike-volume" => {
@@ -191,17 +192,49 @@ fn spike_desktop(code: String) -> anyhow::Result<()> {
     runtime.block_on(async move {
         println!("posting a pairing notification and a tray icon for the fake code {code}");
         println!("(nothing is sent to the add-on; run with RUST_LOG=debug to see why either is missing)\n");
-        let desktop = desktop::Desktop::start(config::label(), Some(code.clone()), false).await;
+        let (req_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let desktop = desktop::Desktop::start(
+            config::label(),
+            Some(code.clone()),
+            false,
+            None,
+            Some(req_tx),
+        )
+        .await;
         desktop.set_daemon(Some("192.0.2.1:8099".into())).await;
+        // Stand-ins, so the "Play to" picker can be opened and clicked here too —
+        // this spike runs no PipeWire thread, so there are no real sinks to offer.
+        desktop
+            .set_sinks(vec![
+                pw_thread::SinkInfo {
+                    node_name: "alsa_output.example-analog-stereo".into(),
+                    description: "Built-in Audio (example)".into(),
+                },
+                pw_thread::SinkInfo {
+                    node_name: "alsa_output.usb-example".into(),
+                    description: "USB Headset (example)".into(),
+                },
+            ])
+            .await;
         desktop.pair_pending(&code).await;
         println!("shown; Ctrl-C to stop");
+        // Prints what a menu choice would have done, instead of silently dropping it.
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                println!("menu asked for: {request:?}");
+            }
+        });
         tokio::signal::ctrl_c().await?;
         Ok(())
     })
 }
 
 /// S1: become the receiver with no config file.
-fn spike_receiver(ifname: Option<String>, node_name: String) -> anyhow::Result<()> {
+fn spike_receiver(
+    ifname: Option<String>,
+    node_name: String,
+    target: Option<String>,
+) -> anyhow::Result<()> {
     pw::init();
     let mainloop =
         pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow::anyhow!("mainloop: {e}"))?;
@@ -249,6 +282,7 @@ fn spike_receiver(ifname: Option<String>, node_name: String) -> anyhow::Result<(
         &node_name,
         receiver::RECEIVE_NODE_DESCRIPTION,
         None,
+        target.as_deref(),
     );
     println!(
         "loading {} with args:\n  {args}\n",

@@ -102,6 +102,29 @@ networking), point the agent at it directly — the address is remembered:
 pwrouter-agent run --daemon 192.168.1.20:8099
 ```
 
+## Choosing which output it plays to
+
+By default the audio lands in whatever this host's **default sink** is, following it
+around as the default changes. The tray menu's **Play to** picks a specific one
+instead — the built-in analogue jack, the USB interface wired to the good speakers —
+and remembers it in `~/.config/pwrouter-agent/config.json` (`target_sink`, the sink's
+PipeWire `node.name`).
+
+A chosen output is a **pin, with no fallback**: while it is not there — unplugged,
+card powered down, profile switched — nothing is played, and nothing moves to another
+sink behind your back. That is the point. Audio appearing in the wrong room is worse
+than audio not appearing, and the tray says which it is ("Chosen output … is not
+available — nothing is played"). Plug it back in and playback resumes on its own.
+
+The add-on has no say in this and never overrides it: it decides *what* is routed to
+this host, while which speakers that means is answered here. To test a pin by hand,
+without the add-on:
+
+```sh
+pwrouter-agent spike-receiver --target alsa_output.usb-Focusrite
+wpctl status          # names of the sinks to choose from
+```
+
 ## Two users on one machine
 
 Pairing identity is *machine id + user*, and the config lives in each user's

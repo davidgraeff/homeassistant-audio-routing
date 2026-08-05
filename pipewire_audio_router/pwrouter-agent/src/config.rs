@@ -17,6 +17,16 @@ pub struct Config {
     pub daemon: Option<String>,
     /// Bearer token minted when the pairing was approved.
     pub token: Option<String>,
+    /// The sink the received audio must play into, by PipeWire `node.name`
+    /// (`alsa_output.pci-0000_00_1f.3.analog-stereo`, …). Chosen from the tray menu.
+    ///
+    /// `None` — the default — means "follow the system default sink", which is what
+    /// the drop-in this agent replaced always did. A name here is a **pin**: it is
+    /// never silently changed, and while that sink is absent nothing is played. Its
+    /// whole point is that the machine in the workshop keeps sending to the workshop
+    /// speakers instead of following whatever the desktop's default became.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_sink: Option<String>,
 }
 
 /// `~/.config`, honouring `XDG_CONFIG_HOME`. Also where the systemd user unit goes
@@ -151,9 +161,23 @@ mod tests {
         let cfg = Config {
             daemon: Some("192.168.178.22:8099".into()),
             token: Some("t0ken".into()),
+            target_sink: Some("alsa_output.usb-Focusrite".into()),
         };
         let json = serde_json::to_vec(&cfg).unwrap();
         assert_eq!(serde_json::from_slice::<Config>(&json).unwrap(), cfg);
+    }
+
+    #[test]
+    fn a_config_written_before_the_output_picker_still_loads() {
+        // `target_sink` is `#[serde(default)]`, so an agent that is upgraded keeps its
+        // pairing and simply follows the default sink as it did before.
+        let cfg: Config =
+            serde_json::from_str(r#"{"daemon":"host:8099","token":"t0ken"}"#).unwrap();
+        assert_eq!(cfg.target_sink, None);
+        assert_eq!(cfg.token.as_deref(), Some("t0ken"));
+        // And it is left out of the file entirely while unset, rather than written
+        // as an explicit null that reads like a decision.
+        assert!(!serde_json::to_string(&cfg).unwrap().contains("target_sink"));
     }
 
     #[test]

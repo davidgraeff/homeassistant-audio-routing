@@ -45,6 +45,16 @@ pub enum Cmd {
     },
     /// Unload the receiver (and undo any duck).
     UnloadReceiver,
+    /// Pin playback to one sink by `node.name`, or `None` to follow the host's
+    /// default again. Takes effect at once (the receiver is reloaded when one is
+    /// running), and is remembered by `config.rs` on the control side.
+    SetTargetSink(Option<String>),
+    /// Rebuild the receiver with the current pin. Sent by this thread *to itself*
+    /// when the pinned sink reappears: the trigger is a registry event, and loading
+    /// a module from inside that dispatch — while the state is mutably borrowed —
+    /// would risk re-entering it. Going through the queue costs one loop iteration
+    /// and makes the reload plainly ordinary.
+    ReloadReceiver,
     SetMasterVolume(f32),
     SetMasterMute(bool),
     /// Attenuate every *foreign* playback stream on our target sink to
@@ -88,11 +98,25 @@ pub struct MasterState {
     pub ducked: bool,
 }
 
+/// One playback sink on this host, for the tray's output picker.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SinkInfo {
+    /// `node.name` — what a pin stores, because it survives reboots and
+    /// re-plugging where a node id does not.
+    pub node_name: String,
+    /// `node.description` when the sink has one ("Built-in Audio Analogue Stereo"),
+    /// else the node name. What a human should be shown.
+    pub description: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Pushed on *every* change, including ones the user made locally — the agent
     /// controls the value but never owns it (plan §9.4).
     Master(MasterState),
+    /// The host's sinks changed (plugged, unplugged, renamed). Sent so the tray can
+    /// offer them, which is the only reason the agent enumerates them at all.
+    Sinks(Vec<SinkInfo>),
     /// A session other than ours was discovered on this host: cross-talk that the
     /// agent deliberately does not touch yet (plan §7.1).
     ForeignSession(String),
@@ -149,6 +173,8 @@ impl Drop for Handle {
 /// arriving for as long as the node exists.
 struct NodeState {
     name: String,
+    /// `node.description`, for the sink picker. `None` on nodes that have none.
+    description: Option<String>,
     media_class: Option<String>,
     /// `rtp.session` — only set on `rtp-session` streams (plan §7.1).
     session: Option<String>,
@@ -175,9 +201,29 @@ struct Ramp {
     steps: u32,
 }
 
+/// What the receive-side module was loaded with, kept so it can be rebuilt for a
+/// new target sink without waiting for the daemon to say `welcome` again.
+#[derive(Clone)]
+struct ReceiverParams {
+    session: String,
+    ifname: Option<String>,
+    jitter_ms: Option<u32>,
+}
+
 struct State {
-    /// Session name we are the receiver for; `None` until `LoadReceiver`.
-    our_session: Option<String>,
+    /// The session we are the receiver for; `None` until `LoadReceiver`.
+    receiver: Option<ReceiverParams>,
+    /// The sink the user pinned (`node.name`), or `None` to follow the default.
+    target_sink: Option<String>,
+    /// Whether the pinned sink was in the graph last time we looked. Only the
+    /// *transition* acts: reloading whenever a pinned-and-present sink isn't
+    /// attached would spin on any graph change if the attach keeps failing.
+    pin_present: bool,
+    /// The context, so a retarget can reload the module from here rather than only
+    /// from the command handler. Same thread either way (`pw_module`'s contract).
+    context: pw::context::ContextRc,
+    /// This thread's own command queue, for [`Cmd::ReloadReceiver`].
+    self_cmd: pw::channel::Sender<Cmd>,
     nodes: HashMap<u32, NodeState>,
     /// link id → (output node, input node)
     links: HashMap<u32, (u32, u32)>,
@@ -188,17 +234,117 @@ struct State {
     duck_baseline: HashMap<u32, Vec<f32>>,
     ramp: Option<Ramp>,
     last_published: Option<MasterState>,
+    last_sinks: Option<Vec<SinkInfo>>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     /// Foreign sessions already reported, so the log/event isn't repeated.
     reported_foreign: Vec<String>,
 }
 
 impl State {
+    fn our_session(&self) -> Option<&str> {
+        self.receiver.as_ref().map(|r| r.session.as_str())
+    }
+
+    /// Every playback sink on the host, for the picker. Sorted by what the user
+    /// reads, so the menu order is stable across re-enumeration.
+    fn sinks(&self) -> Vec<SinkInfo> {
+        let mut sinks: Vec<SinkInfo> = self
+            .nodes
+            .values()
+            .filter(|n| n.media_class.as_deref() == Some("Audio/Sink") && !n.name.is_empty())
+            .map(|n| SinkInfo {
+                node_name: n.name.clone(),
+                description: n.description.clone().unwrap_or_else(|| n.name.clone()),
+            })
+            .collect();
+        sinks.sort();
+        sinks.dedup();
+        sinks
+    }
+
+    /// Is the pinned sink in the graph? Vacuously true when nothing is pinned.
+    fn pin_is_present(&self) -> bool {
+        match &self.target_sink {
+            None => true,
+            Some(target) => self
+                .nodes
+                .values()
+                .any(|n| n.media_class.as_deref() == Some("Audio/Sink") && &n.name == target),
+        }
+    }
+
+    /// Loads (or reloads) the receive-side module for the session we hold, with the
+    /// current pin. No-op when there is no session — the daemon hasn't asked us to
+    /// receive anything, so there is nothing to point anywhere.
+    fn load_module(&mut self) -> Result<(), String> {
+        let Some(params) = self.receiver.clone() else {
+            return Ok(());
+        };
+        let args = receiver::rtp_session_module_args(
+            params.ifname.as_deref(),
+            receiver::RECEIVE_NODE_NAME,
+            receiver::RECEIVE_NODE_DESCRIPTION,
+            params.jitter_ms,
+            self.target_sink.as_deref(),
+        );
+        if self.module.is_some() {
+            // Reload rather than stack a second receiver: the daemon may re-send
+            // `welcome` after a reconnect (plan §13.4), and a retarget lands here too.
+            self.restore_now();
+            self.module = None;
+        }
+        tracing::info!("loading receiver for session '{}': {args}", params.session);
+        // SAFETY: we are on the thread that owns `context`, which is pw_module's
+        // contract; the module is dropped on this thread too.
+        let loaded = unsafe {
+            LoadedModule::load(
+                self.context.as_raw_ptr(),
+                receiver::RTP_SESSION_MODULE_NAME,
+                &args,
+            )
+        };
+        match loaded {
+            Ok(module) => {
+                self.module = Some(module);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Acts on the pinned sink appearing or disappearing.
+    ///
+    /// Coming back is the case that needs work: `node.dont-reconnect` means the
+    /// stream was torn down rather than moved, so nothing would bring it back on its
+    /// own — the pin would silently become permanent silence. Going away needs no
+    /// action beyond saying so, which is the whole promise of a pin: no fallback, no
+    /// audio in the wrong room.
+    fn resync_pin(&mut self) {
+        let present = self.pin_is_present();
+        if present == self.pin_present {
+            return;
+        }
+        self.pin_present = present;
+        let Some(target) = self.target_sink.clone() else {
+            return;
+        };
+        if !present {
+            tracing::warn!(
+                "chosen output '{target}' is gone; nothing will be played until it returns"
+            );
+            return;
+        }
+        if self.receiver.is_some() {
+            tracing::info!("chosen output '{target}' is back; reattaching the receiver to it");
+            let _ = self.self_cmd.send(Cmd::ReloadReceiver);
+        }
+    }
+
     /// Our receive stream: the node carrying our `rtp.session` that has an
     /// outgoing link. `module-rtp-session` publishes a same-named send twin with
     /// no useful link (plan §7.2), so the link is what disambiguates.
     fn receive_stream(&self) -> Option<u32> {
-        let session = self.our_session.as_deref()?;
+        let session = self.our_session()?;
         self.nodes
             .iter()
             .filter(|(_, n)| n.session.as_deref() == Some(session))
@@ -305,7 +451,7 @@ impl State {
         let Some(sink_id) = self.target_sink() else {
             return Vec::new();
         };
-        let our_session = self.our_session.as_deref();
+        let our_session = self.our_session();
         self.links
             .values()
             .filter(|(_, inp)| *inp == sink_id)
@@ -353,10 +499,18 @@ impl State {
     }
 
     fn publish(&mut self) {
+        // A pinned sink appearing or vanishing is a graph change like any other, so
+        // this is where it is noticed — before the state that depends on it is sent.
+        self.resync_pin();
         let state = self.master();
         if self.last_published.as_ref() != Some(&state) {
             self.last_published = Some(state.clone());
             let _ = self.events.send(Event::Master(state));
+        }
+        let sinks = self.sinks();
+        if self.last_sinks.as_ref() != Some(&sinks) {
+            self.last_sinks = Some(sinks.clone());
+            let _ = self.events.send(Event::Sinks(sinks));
         }
     }
 
@@ -379,12 +533,14 @@ impl State {
 /// the thread (restoring ducked volumes and unloading the module) when dropped.
 pub fn spawn(events: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Result<Handle> {
     let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
+    // The thread's own handle on the queue, for the deferred reload above.
+    let cmd_tx_self = cmd_tx.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let join = std::thread::Builder::new()
         .name("pw-agent".into())
         .spawn(move || {
-            let result = run(cmd_rx, events, &ready_tx);
+            let result = run(cmd_rx, cmd_tx_self, events, &ready_tx);
             if let Err(e) = result {
                 tracing::error!("PipeWire thread stopped: {e}");
                 let _ = ready_tx.send(Err(e.to_string()));
@@ -403,6 +559,7 @@ pub fn spawn(events: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Resul
 
 fn run(
     cmd_rx: pw::channel::Receiver<Cmd>,
+    cmd_tx: pw::channel::Sender<Cmd>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> anyhow::Result<()> {
@@ -418,7 +575,13 @@ fn run(
         .map_err(|e| anyhow!("get registry: {e}"))?;
 
     let state = Rc::new(RefCell::new(State {
-        our_session: None,
+        receiver: None,
+        target_sink: None,
+        // Nothing is pinned yet, so "the pin is there" is vacuously true; the first
+        // `SetTargetSink` re-evaluates it against the graph.
+        pin_present: true,
+        context: context.clone(),
+        self_cmd: cmd_tx,
         nodes: HashMap::new(),
         links: HashMap::new(),
         devices: HashMap::new(),
@@ -426,6 +589,7 @@ fn run(
         duck_baseline: HashMap::new(),
         ramp: None,
         last_published: None,
+        last_sinks: None,
         events,
         reported_foreign: Vec::new(),
     }));
@@ -453,10 +617,11 @@ fn run(
         })
         .register();
 
+    // No context clone here: `State` holds one, because a retarget has to be able to
+    // reload the module from the registry side too, not only from a command.
     let _cmd_receiver = cmd_rx.attach(mainloop.loop_(), {
         let state = state.clone();
         let mainloop = mainloop.clone();
-        let context = context.clone();
         move |cmd| match cmd {
             Cmd::LoadReceiver {
                 session,
@@ -464,44 +629,57 @@ fn run(
                 jitter_ms,
                 reply,
             } => {
-                let args = receiver::rtp_session_module_args(
-                    ifname.as_deref(),
-                    receiver::RECEIVE_NODE_NAME,
-                    receiver::RECEIVE_NODE_DESCRIPTION,
-                    jitter_ms,
-                );
                 let mut st = state.borrow_mut();
-                st.our_session = Some(session.clone());
-                if st.module.is_some() {
-                    // Reload rather than stack a second receiver: the daemon may
-                    // re-send `welcome` after a reconnect (plan §13.4).
-                    st.restore_now();
-                    st.module = None;
-                }
-                tracing::info!("loading receiver for session '{session}': {args}");
-                // SAFETY: we are on the thread that owns `context`, which is
-                // pw_module's contract; the module is dropped on this thread too.
-                let loaded = unsafe {
-                    LoadedModule::load(
-                        context.as_raw_ptr(),
-                        receiver::RTP_SESSION_MODULE_NAME,
-                        &args,
-                    )
-                };
-                let result = match loaded {
-                    Ok(module) => {
-                        st.module = Some(module);
-                        Ok(())
+                st.receiver = Some(ReceiverParams {
+                    session,
+                    ifname,
+                    jitter_ms,
+                });
+                // Re-read the pin against the current graph: a pinned sink that isn't
+                // here must be seen as absent *now*, so its return reattaches us.
+                st.pin_present = st.pin_is_present();
+                if !st.pin_present {
+                    if let Some(target) = st.target_sink.clone() {
+                        tracing::warn!(
+                            "the chosen output '{target}' is not on this host right now — \
+                             nothing will be played until it returns"
+                        );
                     }
-                    Err(e) => Err(e),
-                };
+                }
+                let result = st.load_module();
                 let _ = reply.send(result);
             }
             Cmd::UnloadReceiver => {
                 let mut st = state.borrow_mut();
                 st.restore_now();
                 st.module = None;
-                st.our_session = None;
+                st.receiver = None;
+                st.publish();
+            }
+            Cmd::ReloadReceiver => {
+                let mut st = state.borrow_mut();
+                if let Err(e) = st.load_module() {
+                    tracing::warn!("could not reload the receiver: {e}");
+                }
+            }
+            Cmd::SetTargetSink(target) => {
+                let mut st = state.borrow_mut();
+                if st.target_sink == target {
+                    return;
+                }
+                match &target {
+                    Some(sink) => {
+                        tracing::info!("playing to '{sink}' from now on (no automatic switching)")
+                    }
+                    None => tracing::info!("following the host's default sink again"),
+                }
+                st.target_sink = target;
+                st.pin_present = st.pin_is_present();
+                // Only meaningful while receiving; otherwise the next `welcome`
+                // picks it up. `load_module` is a no-op with no session.
+                if let Err(e) = st.load_module() {
+                    tracing::warn!("could not point the receiver at the chosen output: {e}");
+                }
                 st.publish();
             }
             Cmd::SetMasterVolume(v) => {
@@ -586,10 +764,13 @@ fn on_global(
                             if let Some(v) = props.get("node.name") {
                                 entry.name = v.to_string();
                             }
+                            if let Some(v) = props.get("node.description") {
+                                entry.description = Some(v.to_string());
+                            }
                         }
                         let foreign = {
                             let st = st;
-                            let ours = st.our_session.clone();
+                            let ours = st.our_session().map(str::to_string);
                             st.nodes
                                 .get(&id)
                                 .and_then(|n| n.session.clone())
@@ -625,6 +806,7 @@ fn on_global(
                 id,
                 NodeState {
                     name: props.get("node.name").unwrap_or_default().to_string(),
+                    description: props.get("node.description").map(str::to_string),
                     media_class,
                     session: None,
                     device_id: None,

@@ -239,12 +239,14 @@ libpipewire-module-rtp-session
   }
 ```
 
-Three improvements over the static version:
+Four improvements over the static version:
 
 * **`local.ifname` auto-detected** (the iface holding the route to the daemon)
   rather than hardcoded per host.
 * **Session scoping** — see §7.1; the mechanism is agent-side, because the module
   offers none.
+* **A chosen output** (§7.3) — the drop-in could only land in whatever the host's
+  default sink happened to be.
 * **Lifetime.** Unload on disconnect/exit → no stale receiver, and the module
   reloads with fresh args when the daemon's session parameters change (no user
   edit, no PipeWire restart). Verified in S1: killing the agent removed every node
@@ -296,6 +298,40 @@ Options for the agent (decide in P2): tear down the bogus send-side link and
 ignore the node; or drop the `media.class` override and have the agent create the
 link to the target sink itself, which removes the need for `node.autoconnect` and
 gives explicit control over *which* sink receives us (§11 P4 wants that anyway).
+
+### 7.3 Which output plays it — chosen on the machine, and pinned
+
+Landing in the host's default sink is a poor default for the case this feature
+exists for: a machine wired to the speakers in one room, whose desktop default
+follows a headset, a dock or an HDMI monitor. So the tray offers a **Play to**
+picker over the host's sinks, stored as `config.target_sink` (`node.name`, because
+it survives reboots and re-plugging where a node id does not).
+
+Three decisions worth keeping:
+
+* **It lives on the machine, not in the add-on.** The add-on decides *what* is
+  routed to a host; only the person at that keyboard knows which of its own outputs
+  they mean. It is a sibling of the Autostart switch in that respect, and the same
+  channel carries it: the tray reports a `Request`, `client::run` (which owns the
+  config file and the PipeWire thread) stores it, applies it and publishes back what
+  was stored — so the menu cannot show a setting that was never written.
+* **A pin never falls back.** `target.object` alone is only a *preference*: the
+  session manager moves the stream to the default sink when the chosen one is
+  missing, which is exactly the automatic switch a pin exists to prevent. So it is
+  always accompanied by `node.dont-reconnect = true`, and an absent target means
+  **silence** — audio in the wrong room is worse than no audio. The tray says so
+  ("Chosen output … is not available — nothing is played") rather than letting the
+  user read it as the add-on being broken.
+* **Coming back is not automatic either, and has to be handled.** `dont-reconnect`
+  means the stream was destroyed rather than moved, so nothing would reattach on its
+  own — the pin would decay into permanent silence the first time a USB interface was
+  unplugged. `pw_thread::resync_pin` watches for the chosen sink appearing and
+  reloads the module then. It acts on the *transition* only: reloading whenever a
+  present-but-unattached pin is seen would spin on every graph change if the attach
+  keeps failing.
+
+`None` (follow the system default) stays on offer and remains the default, because
+it is what every host did before the picker and is still right for a laptop.
 Worth an upstream report either way.
 
 ## 8. Pairing and discovery
@@ -359,8 +395,10 @@ what step 2 above logs into two desktop surfaces:
   readable afterwards, alongside the daemon address, the target sink, level and duck
   state it already reports upstream.
 
-and carries the one **setting** that is genuinely local to that machine rather than
-the add-on's business: **Autostart**, a two-option radio (start at login / don't)
+and carries the **settings** that are genuinely local to that machine rather than
+the add-on's business. **Play to** (§7.3) picks which of the host's own sinks the
+audio comes out of, pinned with no fallback. And **Autostart**, a two-option radio
+(start at login / don't)
 that installs or removes the systemd user unit through `autostart.rs` (§10) and
 reports back what systemd actually says afterwards, rather than what was clicked.
 The command line has the same switch (`pwrouter-agent autostart [enable|disable]`)
@@ -374,13 +412,14 @@ Three deliberate limits:
    notification server, or no tray host each degrade to what existed before — the
    log line — and none of them can fail the agent. Which is also why the code still
    goes to the journal at `warn`.
-2. **The menu is a display, plus one setting.** Every status row is disabled; the
-   only rows that do anything are Autostart and "show the notification again". No
-   unpair and no quit: those would be a second, divergent way to manage a
-   `Restart=always` unit, and a control surface competing with the add-on, which is
-   the thing that is supposed to drive this host. Autostart is the exception because
-   *nothing else can do it* — the add-on cannot reach into a session to decide
-   whether it starts at login.
+2. **The menu is a display, plus the settings only this machine can answer.** Every
+   status row is disabled; the only rows that do anything are Play to, Autostart and
+   "show the notification again". No unpair and no quit: those would be a second,
+   divergent way to manage a `Restart=always` unit, and a control surface competing
+   with the add-on, which is the thing that is supposed to drive this host. The two
+   settings are the exception because *nothing else can answer them* — the add-on
+   cannot know which speakers a host's owner means, nor reach into a session to
+   decide whether it starts at login.
 3. **Legacy icon names** (`audio-speakers`, `dialog-password`): those resolve in
    both Breeze and Adwaita (via its `Inherits=AdwaitaLegacy`), whereas the two
    `-symbolic` spellings wanted here are not both present in both themes.
@@ -475,7 +514,7 @@ applications' streams on that sink, never `pwsink-in`.
 | `pwrouter-agent/src/receiver.rs` | the `rtp-session` args replacing the drop-in (§7), with tests |
 | `pwrouter-agent/src/pw_thread.rs` | the service path: graph tracking, master lever, duck ramps |
 | `pwrouter-agent/src/volume.rs` | the diagnostic path (`spike-*`): snapshot, stream→sink walk, lever |
-| `pwrouter-agent/src/desktop.rs` | tray icon + pairing notification (§8.1); status is display-only, Autostart is the one setting |
+| `pwrouter-agent/src/desktop.rs` | tray icon + pairing notification (§8.1); status is display-only, the settings are Play to (§7.3) and Autostart |
 | `pwrouter-agent/src/autostart.rs` | the embedded systemd unit and the enable/disable pair behind both the tray switch and `pwrouter-agent autostart` (§10) |
 | `pw-control/` (own workspace root) | shared with the daemon: volume/route pods, the cubic scale, and the `pw_context_load_module` FFI neither `pipewire-rs` wraps nor either side should duplicate |
 | `frontend/src/components/OutputsTab.svelte` | the pairing UI, such as it is: a host waiting to pair is a discovered output card carrying the code, and Add/Unpair are its decisions. (`AgentsPanel.svelte` used to own a section of its own; deleted — see §8.3) |

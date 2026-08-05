@@ -158,6 +158,20 @@ systemctl --user start pwrouter-agent</code
       (<code>~/.config/pwrouter-agent/config.json</code>, readable only by that user) and adds it as an
       output — routable, and a Home Assistant <code>media_player</code> if that setting is on.
     </p>
+    <h3>Which speakers it comes out of</h3>
+    <p class="card-sub">
+      That is decided <em>on that machine</em>, not here: its tray menu has a <strong>Play to</strong>
+      list of its own outputs. Left alone it follows the machine's default output, which is usually right
+      for a laptop and wrong for a PC wired to the speakers in one room — pick that output once and it
+      stays picked, whatever the desktop's default later becomes.
+    </p>
+    <p class="card-sub hint">
+      A chosen output is never silently swapped: while it is unavailable (unplugged, powered down)
+      nothing is played there, rather than the audio appearing somewhere unexpected. This page shows that
+      as a host that is online but not playing; the machine's own tray says which output it is waiting
+      for. Plug it back in and it resumes by itself.
+    </p>
+
     <p class="card-sub hint">
       If the machine cannot find the add-on — a routed VLAN, or mDNS blocked — point it straight at the
       add-on's host and port instead: <code>pwrouter-agent run --daemon &lt;host&gt;:8099</code>.

@@ -21,7 +21,7 @@
 //! desktop behaves exactly as before.
 
 use crate::config::{self, Config};
-use crate::desktop::Desktop;
+use crate::desktop::{Desktop, Request};
 use crate::proto::{AgentMsg, DaemonMsg, HostState, PROTOCOL_VERSION};
 use crate::pw_thread::{ramp_schedule, Cmd, Event, Handle, MasterState};
 use anyhow::{anyhow, Context as _};
@@ -145,12 +145,21 @@ pub async fn run(
 
     // Never fails: a host with no tray and no notification server gets a `Desktop`
     // whose every method is a no-op.
+    let (req_tx, mut requests) = tokio::sync::mpsc::unbounded_channel::<Request>();
     let desktop = Desktop::start(
         config::label(),
         (!pair_code.is_empty()).then(|| pair_code.clone()),
         config.token.is_some(),
+        config.target_sink.clone(),
+        Some(req_tx),
     )
     .await;
+    // The stored pin has to reach the PipeWire thread before any `welcome` does,
+    // or the first session would play out of the default sink.
+    if let Some(sink) = &config.target_sink {
+        tracing::info!("playing to '{sink}' (chosen on this machine; no automatic switching)");
+        handle.send(Cmd::SetTargetSink(Some(sink.clone())));
+    }
 
     loop {
         let addr = match daemon_address(&mut config, override_addr.as_deref()).await {
@@ -172,6 +181,7 @@ pub async fn run(
             &handle,
             &mut events,
             &desktop,
+            &mut requests,
         )
         .await
         {
@@ -199,7 +209,9 @@ pub async fn run(
                     // is paired and starts showing what to approve.
                     desktop.unpaired().await;
                 } else {
-                    tracing::warn!("the add-on refused this host: {reason}; retrying in {backoff:?}");
+                    tracing::warn!(
+                        "the add-on refused this host: {reason}; retrying in {backoff:?}"
+                    );
                     desktop.refused(&reason).await;
                 }
             }
@@ -218,8 +230,46 @@ pub async fn run(
             ramp_ms: RESTORE_RAMP_MS,
         });
         drive_ramp(handle.sender(), RESTORE_RAMP_MS);
-        tokio::time::sleep(backoff).await;
+        // Keep serving the tray while waiting to reconnect: picking an output is a
+        // local setting and has nothing to do with the add-on being reachable, so it
+        // must not be swallowed for up to a minute (or lost with the process).
+        let until = tokio::time::Instant::now() + backoff;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(until) => break,
+                request = requests.recv() => match request {
+                    Some(request) => apply_request(request, &mut config, &handle, &desktop).await,
+                    // The tray is gone (it never existed, or its task ended); just wait.
+                    None => { tokio::time::sleep_until(until).await; break }
+                },
+            }
+        }
         backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+/// Applies one tray choice: store it, act on it, then publish what was stored.
+///
+/// The order matters. Persisting first means a choice survives even if the reload
+/// below fails; publishing last means the menu shows the truth rather than the
+/// optimistic value the callback already painted.
+async fn apply_request(request: Request, config: &mut Config, handle: &Handle, desktop: &Desktop) {
+    match request {
+        Request::SetTarget(target) => {
+            if config.target_sink == target {
+                return;
+            }
+            config.target_sink = target.clone();
+            if let Err(e) = config::save(config) {
+                tracing::warn!("could not remember the chosen output: {e:#}");
+            }
+            match &target {
+                Some(sink) => tracing::info!("chosen output is now '{sink}'"),
+                None => tracing::info!("chosen output is now the system default"),
+            }
+            handle.send(Cmd::SetTargetSink(target.clone()));
+            desktop.set_target(target).await;
+        }
     }
 }
 
@@ -243,7 +293,9 @@ fn new_pair_code() -> String {
     {
         Ok(()) => buf.iter().map(|b| format!("{b:02X}")).collect(),
         Err(e) => {
-            tracing::warn!("cannot read /dev/urandom ({e}); letting the add-on pick the pairing code");
+            tracing::warn!(
+                "cannot read /dev/urandom ({e}); letting the add-on pick the pairing code"
+            );
             String::new()
         }
     }
@@ -256,6 +308,7 @@ async fn session(
     handle: &Handle,
     events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     desktop: &Desktop,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<Request>,
 ) -> anyhow::Result<Outcome> {
     let url = format!("ws://{addr}/api/agent/ws");
     tracing::info!("connecting to {url}");
@@ -325,9 +378,24 @@ async fn session(
                         desktop.set_host(state.clone()).await;
                         AgentMsg::State(state)
                     }
+                    // The host's own outputs are nobody's business but this machine's:
+                    // the picker is local, so this goes to the tray and not the wire.
+                    Event::Sinks(sinks) => {
+                        desktop.set_sinks(sinks).await;
+                        continue;
+                    }
                     Event::ForeignSession(session) => AgentMsg::ForeignSession { session },
                 };
                 ws.send(Message::Text(serde_json::to_string(&msg)?.into())).await?;
+            }
+
+            request = requests.recv() => {
+                match request {
+                    Some(request) => apply_request(request, config, handle, desktop).await,
+                    // Tray gone: stop selecting on a closed channel, which would
+                    // otherwise return immediately forever and spin this loop.
+                    None => std::future::pending::<()>().await,
+                }
             }
         }
     }

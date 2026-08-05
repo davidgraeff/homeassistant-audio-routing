@@ -14,11 +14,14 @@
 //!   before: the log line. Nothing here can fail the agent, and nothing here is
 //!   the *only* way to reach any information — the journal keeps printing
 //!   everything, and the add-on UI shows the same code on the host's card.
-//! * **The menu is a display, not a control panel.** Every row is disabled: the
-//!   agent's whole point is that the *add-on* drives volume and routing, and a
-//!   tray menu that could unpair or quit would be a second, divergent way to
-//!   manage a systemd unit that `Restart=always` would undo anyway. The one
-//!   clickable row re-shows the notification, which is information too.
+//! * **The menu shows state; it decides only what belongs to this machine.** The
+//!   add-on drives volume and what is routed here — a tray that could unpair or quit
+//!   would be a second, divergent way to manage a systemd unit that `Restart=always`
+//!   would undo anyway, so the status rows stay disabled. What *is* local to this
+//!   machine is which of its own outputs the audio should come out of, and whether
+//!   the session starts the agent by itself; those two are settings, and they live
+//!   here rather than in the add-on because the person at this keyboard is the one
+//!   who knows which speakers they mean.
 //!
 //! Tray support on Linux is [StatusNotifierItem] over D-Bus: KDE, Xfce, Cinnamon,
 //! MATE and most WM bars implement it natively; GNOME needs the AppIndicator
@@ -30,6 +33,7 @@
 
 use crate::autostart::{self, State as Autostart};
 use crate::proto::HostState;
+use crate::pw_thread::SinkInfo;
 use ksni::{Handle, TrayMethods as _};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -51,6 +55,18 @@ type TrayHandle = Arc<OnceLock<Handle<AgentTray>>>;
 const ICON: &str = "audio-speakers";
 /// Shown instead of [`ICON`] while the item is in `NeedsAttention`.
 const ATTENTION_ICON: &str = "dialog-password";
+
+/// What a menu row asks the agent to do.
+///
+/// The tray applies nothing itself: it reports the choice and `client::run` — which
+/// owns the config file and the PipeWire thread — persists it and acts on it, then
+/// publishes the result back. One writer for the config, and the menu can never end
+/// up showing a setting that was never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    /// Pin playback to this sink (`node.name`), or `None` to follow the default.
+    SetTarget(Option<String>),
+}
 
 /// Where the pairing stands, as far as this process knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,10 +94,16 @@ struct AgentTray {
     offered_code: Option<String>,
     daemon: Option<String>,
     host: HostState,
+    /// This host's playback sinks, as its PipeWire graph currently has them.
+    sinks: Vec<SinkInfo>,
+    /// The pinned sink (`node.name`), or `None` while following the default.
+    target: Option<String>,
     /// Whether this session starts the agent by itself, as systemd reports it.
     autostart: Autostart,
     notifier: Option<Notifier>,
     handle: TrayHandle,
+    /// Where a menu choice goes. `None` in tests and in the spike.
+    requests: Option<tokio::sync::mpsc::UnboundedSender<Request>>,
 }
 
 impl AgentTray {
@@ -96,6 +118,50 @@ impl AgentTray {
 
     fn needs_attention(&self) -> bool {
         !matches!(self.pairing, Pairing::Paired)
+    }
+
+    /// The pinned sink, if the graph currently has it.
+    fn pinned_sink(&self) -> Option<&SinkInfo> {
+        let target = self.target.as_deref()?;
+        self.sinks.iter().find(|s| s.node_name == target)
+    }
+
+    /// How to name the chosen output in a sentence: its description while it is
+    /// here, else the bare node name — which is all we know about a device that is
+    /// unplugged, and still enough to recognise it.
+    fn target_label(&self) -> Option<String> {
+        let target = self.target.as_deref()?;
+        Some(match self.pinned_sink() {
+            Some(sink) => sink.description.clone(),
+            None => target.to_string(),
+        })
+    }
+
+    /// The picker's rows: `(what it selects, what it says)`, first one first.
+    ///
+    /// Split out and tested because two of its cases are easy to get wrong. A pin
+    /// whose device is currently absent still gets a row — otherwise the radio would
+    /// have nothing to sit on and the menu would show the user following the default
+    /// when they are not. And "follow the default" stays on offer, because it is the
+    /// behaviour every host had before there was a picker, and the right one for a
+    /// laptop whose speakers change with its dock.
+    fn target_choices(&self) -> Vec<(Option<String>, String)> {
+        let mut choices: Vec<(Option<String>, String)> =
+            vec![(None, "Follow the system default output".to_string())];
+        choices.extend(
+            self.sinks
+                .iter()
+                .map(|sink| (Some(sink.node_name.clone()), sink.description.clone())),
+        );
+        if let Some(target) = self.target.as_deref() {
+            if self.pinned_sink().is_none() {
+                choices.push((
+                    Some(target.to_string()),
+                    format!("{target} (not available)"),
+                ));
+            }
+        }
+        choices
     }
 
     /// The menu's text, in order. Split out from [`Self::menu`] because this is
@@ -116,10 +182,27 @@ impl AgentTray {
             None => "Add-on: looking for it on the network".to_string(),
         });
         if self.pairing == Pairing::Paired {
+            // What is actually happening, which is not always what was chosen — and
+            // when the two differ, why. A pin whose device is unplugged is silent on
+            // purpose (no fallback), and that is the one state a user would otherwise
+            // read as a bug.
             lines.push(match (self.host.receiving, &self.host.sink_name) {
-                (true, Some(sink)) => format!("Playing to: {sink}"),
+                (true, Some(sink)) => {
+                    let shown = self
+                        .sinks
+                        .iter()
+                        .find(|s| &s.node_name == sink)
+                        .map(|s| s.description.clone())
+                        .unwrap_or_else(|| sink.clone());
+                    format!("Playing to: {shown}")
+                }
                 (true, None) => "Playing".to_string(),
-                (false, _) => "Idle — nothing routed here".to_string(),
+                (false, _) => match (self.target_label(), self.pinned_sink().is_some()) {
+                    (Some(label), false) => {
+                        format!("Chosen output '{label}' is not available — nothing is played")
+                    }
+                    _ => "Idle — nothing routed here".to_string(),
+                },
             });
             if let Some(volume) = self.host.volume {
                 let muted = if self.host.muted == Some(true) {
@@ -208,6 +291,50 @@ impl ksni::Tray for AgentTray {
 
         // Everything below the separator: the only rows that do anything.
         let mut actions: Vec<MenuItem<Self>> = Vec::new();
+
+        // Which of this machine's outputs the audio comes out of. Hidden only when
+        // the graph has told us nothing yet — an empty picker would read as "this
+        // host has no speakers", which is never what an empty list means here.
+        if !self.sinks.is_empty() {
+            let choices = self.target_choices();
+            let selected = choices
+                .iter()
+                .position(|(target, _)| target == &self.target)
+                .unwrap_or(0);
+            let requests = self.requests.clone();
+            let options: Vec<RadioItem> = choices
+                .iter()
+                .map(|(_, label)| RadioItem {
+                    label: label.clone(),
+                    ..Default::default()
+                })
+                .collect();
+            actions.push(
+                SubMenu {
+                    label: "Play to".into(),
+                    submenu: vec![RadioGroup {
+                        selected,
+                        select: Box::new(move |this: &mut Self, index| {
+                            let Some((target, _)) = this.target_choices().get(index).cloned()
+                            else {
+                                return;
+                            };
+                            // Shown at once so the radio doesn't sit on the old choice
+                            // while the config is written; `set_target` publishes what
+                            // was actually stored right after.
+                            this.target = target.clone();
+                            if let Some(requests) = &requests {
+                                let _ = requests.send(Request::SetTarget(target));
+                            }
+                        }),
+                        options,
+                    }
+                    .into()],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
 
         // The one setting, and the only row that changes anything about this
         // machine: whether the session starts the agent by itself. Hidden entirely
@@ -460,8 +587,16 @@ pub struct Desktop {
 
 impl Desktop {
     /// Never fails. `offered_code` is the code this process minted, `paired`
-    /// whether a token was already on disk when we started.
-    pub async fn start(label: String, offered_code: Option<String>, paired: bool) -> Self {
+    /// whether a token was already on disk when we started, `target` the pinned sink
+    /// from the config, and `requests` where menu choices are sent (`None` disables
+    /// the rows that would need it).
+    pub async fn start(
+        label: String,
+        offered_code: Option<String>,
+        paired: bool,
+        target: Option<String>,
+        requests: Option<tokio::sync::mpsc::UnboundedSender<Request>>,
+    ) -> Self {
         let notifier = Notifier::connect().await;
         let slot: TrayHandle = Arc::new(OnceLock::new());
         let tray = AgentTray {
@@ -474,9 +609,12 @@ impl Desktop {
             offered_code,
             daemon: None,
             host: HostState::default(),
+            sinks: Vec::new(),
+            target,
             autostart: autostart::state().await,
             notifier: notifier.clone(),
             handle: slot.clone(),
+            requests,
         };
         let tray = match tray
             // A user unit can start before the desktop shell: treat "no watcher"
@@ -543,6 +681,17 @@ impl Desktop {
     pub async fn set_host(&self, host: HostState) {
         self.update(|tray| tray.host = host).await;
     }
+
+    /// The host's sinks changed: re-offer them.
+    pub async fn set_sinks(&self, sinks: Vec<SinkInfo>) {
+        self.update(|tray| tray.sinks = sinks).await;
+    }
+
+    /// The pin as it now *is* — called after the choice has been stored, so the menu
+    /// never claims a setting that wasn't written.
+    pub async fn set_target(&self, target: Option<String>) {
+        self.update(|tray| tray.target = target).await;
+    }
 }
 
 #[cfg(test)]
@@ -556,10 +705,27 @@ mod tests {
             offered_code: Some("4F2A9C".into()),
             daemon: Some("192.168.1.20:8099".into()),
             host: HostState::default(),
+            sinks: Vec::new(),
+            target: None,
             autostart: Autostart::Unsupported,
             notifier: None,
             handle: Arc::new(OnceLock::new()),
+            requests: None,
         }
+    }
+
+    /// Two sinks, as a host with built-in audio and a headset would report them.
+    fn two_sinks() -> Vec<SinkInfo> {
+        vec![
+            SinkInfo {
+                node_name: "alsa_output.pci-0000_00_1f.3.analog-stereo".into(),
+                description: "Built-in Audio Analogue Stereo".into(),
+            },
+            SinkInfo {
+                node_name: "alsa_output.usb-Focusrite".into(),
+                description: "Scarlett Solo".into(),
+            },
+        ]
     }
 
     #[test]
@@ -625,6 +791,86 @@ mod tests {
         assert!(tray(Pairing::Pending { code: "A".into() }).needs_attention());
         assert!(tray(Pairing::Refused { reason: "x".into() }).needs_attention());
         assert!(!tray(Pairing::Paired).needs_attention());
+    }
+
+    #[test]
+    fn the_picker_offers_the_default_first_then_every_sink() {
+        let mut t = tray(Pairing::Paired);
+        t.sinks = two_sinks();
+        let choices = t.target_choices();
+        assert_eq!(choices[0].0, None, "following the default stays on offer");
+        assert!(choices[0].1.contains("default"));
+        assert_eq!(
+            choices
+                .iter()
+                .skip(1)
+                .map(|(target, _)| target.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string()),
+                Some("alsa_output.usb-Focusrite".to_string()),
+            ]
+        );
+        // Descriptions, not node names: the node name is the key, not the label.
+        assert_eq!(choices[2].1, "Scarlett Solo");
+    }
+
+    #[test]
+    fn a_chosen_sink_that_is_unplugged_keeps_its_row_and_the_selection() {
+        // Otherwise the radio would fall back to the first row and the menu would
+        // claim the user is following the default — the one thing a pin must never
+        // appear to do.
+        let mut t = tray(Pairing::Paired);
+        t.sinks = two_sinks();
+        t.target = Some("alsa_output.usb-Focusrite".into());
+        let selected = |t: &AgentTray| {
+            t.target_choices()
+                .iter()
+                .position(|(target, _)| target == &t.target)
+                .unwrap()
+        };
+        assert_eq!(selected(&t), 2);
+
+        t.sinks.remove(1); // unplugged
+        let choices = t.target_choices();
+        assert_eq!(selected(&t), choices.len() - 1);
+        assert!(choices.last().unwrap().1.contains("not available"));
+    }
+
+    #[test]
+    fn an_unavailable_pin_is_reported_as_silence_not_as_idle() {
+        // "Idle — nothing routed here" would send the user looking in the add-on for
+        // a problem that is on this machine.
+        let mut t = tray(Pairing::Paired);
+        t.sinks = two_sinks();
+        t.target = Some("alsa_output.usb-Focusrite".into());
+        t.sinks.remove(1);
+        let lines = t.status_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("not available") && l.contains("nothing is played")),
+            "{lines:?}"
+        );
+
+        // Chosen, present, but the add-on is sending nothing here: that *is* idle.
+        t.sinks = two_sinks();
+        assert!(t.status_lines().iter().any(|l| l.contains("Idle")));
+    }
+
+    #[test]
+    fn what_is_playing_is_named_the_way_the_picker_names_it() {
+        let mut t = tray(Pairing::Paired);
+        t.sinks = two_sinks();
+        t.target = Some("alsa_output.usb-Focusrite".into());
+        t.host = HostState {
+            sink_name: Some("alsa_output.usb-Focusrite".into()),
+            receiving: true,
+            ..Default::default()
+        };
+        assert!(t
+            .status_lines()
+            .contains(&"Playing to: Scarlett Solo".to_string()));
     }
 
     #[test]

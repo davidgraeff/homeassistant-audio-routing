@@ -40,6 +40,16 @@ const AUDIO_CHANNELS: u32 = 2;
 ///   negotiated `rtp.ptime` (observed: `100` vs `6.458`), and the right value
 ///   depends on the sender's packet time, so it is opt-in rather than guessed.
 ///
+/// * `target_sink` — pin the stream to one sink by `node.name` instead of following
+///   the host's default. `Some` adds **both** `target.object` (which sink) and
+///   `node.dont-reconnect = true` (and no other), because the pin has to hold in the
+///   awkward cases too: without `dont-reconnect` the session manager treats the
+///   target as a preference and moves the stream to the default sink when the chosen
+///   one is missing or goes away — which is precisely the automatic switch a pin
+///   exists to prevent. With it, an absent target means silence, and the user's
+///   choice is still their choice when the device comes back
+///   (`pw_thread` reloads the module then).
+///
 /// Note `sess.discover-local` is deliberately left at its default (false): it is
 /// only for sender and receiver on the *same* box, and setting it would make the
 /// agent connect to sessions advertised by its own host.
@@ -52,6 +62,7 @@ pub fn rtp_session_module_args(
     node_name: &str,
     description: &str,
     jitter_ms: Option<u32>,
+    target_sink: Option<&str>,
 ) -> String {
     let mut a = String::new();
     a.push_str("{ ");
@@ -66,13 +77,29 @@ pub fn rtp_session_module_args(
     write!(a, "audio.rate = {AUDIO_RATE} ").unwrap();
     write!(a, "audio.channels = {AUDIO_CHANNELS} ").unwrap();
     a.push_str("audio.position = [ FL FR ] ");
-    write!(
-        a,
-        "stream.props = {{ media.class = \"Stream/Output/Audio\" node.name = \"{node_name}\" node.description = \"{description}\" node.autoconnect = true }} "
-    )
-    .unwrap();
+    // `node.autoconnect` stays on even when pinned: it is what asks the session
+    // manager to link us at all. `target.object` narrows *what* it links to.
+    let mut props = format!(
+        "media.class = \"Stream/Output/Audio\" node.name = \"{node_name}\" node.description = \"{description}\" node.autoconnect = true"
+    );
+    if let Some(sink) = target_sink {
+        write!(
+            props,
+            " target.object = \"{}\" node.dont-reconnect = true",
+            escape(sink)
+        )
+        .unwrap();
+    }
+    write!(a, "stream.props = {{ {props} }} ").unwrap();
     a.push('}');
     a
+}
+
+/// Quotes a value for the SPA-JSON above. Sink names come from the local graph, not
+/// from the network, so this is about not producing a broken argument string for an
+/// exotic device name — never about trust.
+fn escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -81,7 +108,8 @@ mod tests {
 
     #[test]
     fn args_match_the_drop_in_they_replace() {
-        let args = rtp_session_module_args(Some("enp5s0"), "pwsink-in", "pw-router sink", None);
+        let args =
+            rtp_session_module_args(Some("enp5s0"), "pwsink-in", "pw-router sink", None, None);
         assert!(args.starts_with("{ ") && args.ends_with('}'));
         assert!(args.contains("local.ifname = \"enp5s0\""));
         assert!(args.contains("sess.media = \"audio\""));
@@ -99,13 +127,49 @@ mod tests {
 
     #[test]
     fn ifname_is_omitted_when_unknown() {
-        let args = rtp_session_module_args(None, "pwsink-in", "d", None);
+        let args = rtp_session_module_args(None, "pwsink-in", "d", None, None);
         assert!(!args.contains("local.ifname"));
     }
 
     #[test]
     fn jitter_buffer_is_included_when_given() {
-        let args = rtp_session_module_args(None, "pwsink-in", "d", Some(60));
+        let args = rtp_session_module_args(None, "pwsink-in", "d", Some(60), None);
         assert!(args.contains("sess.latency.msec = 60"));
+    }
+
+    #[test]
+    fn no_target_means_follow_the_default_sink() {
+        let args = rtp_session_module_args(None, "pwsink-in", "d", None, None);
+        assert!(args.contains("node.autoconnect = true"));
+        assert!(!args.contains("target.object"));
+        // Without a pin the stream *should* follow the default sink, so the
+        // session manager must stay free to move it.
+        assert!(!args.contains("node.dont-reconnect"));
+    }
+
+    #[test]
+    fn a_pinned_target_also_refuses_to_be_moved() {
+        // Both properties or neither: `target.object` alone is a preference the
+        // session manager may override with the default sink, which is the automatic
+        // switch a pin exists to prevent.
+        let args = rtp_session_module_args(
+            None,
+            "pwsink-in",
+            "d",
+            None,
+            Some("alsa_output.usb-Focusrite"),
+        );
+        assert!(args.contains("target.object = \"alsa_output.usb-Focusrite\""));
+        assert!(args.contains("node.dont-reconnect = true"));
+        assert!(
+            args.contains("node.autoconnect = true"),
+            "still needs linking, just not anywhere"
+        );
+    }
+
+    #[test]
+    fn a_sink_name_with_a_quote_cannot_break_the_argument_string() {
+        let args = rtp_session_module_args(None, "pwsink-in", "d", None, Some("odd\"name\\x"));
+        assert!(args.contains(r#"target.object = "odd\"name\\x""#), "{args}");
     }
 }
