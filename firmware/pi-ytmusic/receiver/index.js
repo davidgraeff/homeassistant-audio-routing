@@ -1,0 +1,294 @@
+/**
+ * YouTube Music cast receiver for the Pi bridge (WP2).
+ *
+ * Ties together:
+ *   - `yt-cast-receiver` — DIAL discovery + the Lounge API, i.e. how the phone
+ *     finds us and drives us. No Google Cast, no device certificates (see
+ *     ../../../docs/pi-ytmusic-receiver-plan.md §1 for why that matters).
+ *   - `MpvPlayer` (player.js) over `MpvClient` (mpv.js) — the actual playback,
+ *     into the `ytm-out` PipeWire sink that WP1 set up, which transmits to the
+ *     audio-router add-on over RTP.
+ *
+ * Everything is configured by environment variable so the systemd unit is the
+ * single place that describes this install. Defaults suit the Pi.
+ */
+
+import os from 'os';
+import { existsSync } from 'fs';
+import YouTubeCastReceiver, { Constants } from 'yt-cast-receiver';
+import MetadataReporter from './metadata.js';
+import MpvClient from './mpv.js';
+import MpvPlayer from './player.js';
+import Resolver from './resolver.js';
+import { AlreadyRunningError } from './singleton.js';
+
+/** Interfaces that must never be advertised over DIAL. */
+const IGNORED_IFACE = /^(lo|docker|veth|br-|virbr|tailscale|zt|wg)/;
+
+/**
+ * Pick the LAN address to bind the DIAL server to.
+ *
+ * This is not cosmetic. An SSDP responder left to its own devices on a
+ * multi-homed host answers on *every* interface with the same USN, and a sender
+ * that keeps the wrong answer cannot fetch our device description and silently
+ * drops us — which is exactly what cost an evening during WP0 on a box with a
+ * `docker0`. Bind explicitly, and log what was chosen.
+ */
+function pickBindAddress(logger) {
+  if (process.env.YTCR_BIND_ADDRESS) {
+    return process.env.YTCR_BIND_ADDRESS;
+  }
+  const candidates = [];
+  for (const [ name, addrs ] of Object.entries(os.networkInterfaces())) {
+    if (IGNORED_IFACE.test(name)) {
+      continue;
+    }
+    for (const a of addrs ?? []) {
+      if (a.family === 'IPv4' && !a.internal) {
+        candidates.push({ name, address: a.address });
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    logger.warn('[ytcr] no usable LAN interface found — letting the DIAL server bind everything');
+    return undefined;
+  }
+  if (candidates.length > 1) {
+    logger.warn(
+      `[ytcr] multiple LAN interfaces (${candidates.map((c) => `${c.name}=${c.address}`).join(', ')}); ` +
+      `using ${candidates[0].address}. Set YTCR_BIND_ADDRESS to override.`);
+  }
+  return candidates[0].address;
+}
+
+function buildMpvArgs() {
+  const audioDevice = process.env.YTCR_AUDIO_DEVICE || 'pipewire/ytm-out';
+  const args = [
+    '--idle=yes',
+    '--no-video',
+    // NOT `--no-terminal`: that disables mpv's messages entirely, so yt-dlp /
+    // ytdl_hook failures vanish and mpv.js's stderr forwarding receives nothing —
+    // a resolution failure then looks identical to a hang. Keep messages, drop only
+    // terminal *input* handling (there is no tty under systemd anyway).
+    '--input-terminal=no',
+    '--msg-level=all=warn',
+    // Pin the output to WP1's RTP sink. Without this WirePlumber picks a device,
+    // and on this box the wrong pick means the audio never leaves the Pi.
+    `--audio-device=${audioDevice}`,
+    // Keep the device open across playlist items so the RTP sink is not torn
+    // down between songs. Deliberately NOT an option that streams silence
+    // forever: `ytm-out` transmits whenever it has a client, so that would put
+    // ~1.5 Mbit/s of silence on the radio around the clock (see WP1).
+    '--gapless-audio=yes',
+    // Prefer the native 48 kHz Opus stream: `ytm-out` is 48 kHz and so is the
+    // router graph, so this keeps the whole path resample-free.
+    '--ytdl-format=bestaudio/best',
+    '--volume=100',
+    // Output-buffer slack, up from mpv's 0.2 s default. This is the knob that
+    // absorbs a *scheduling* hiccup: on this box a resolve spike (or anything else
+    // that briefly preempts mpv) has under 200 ms to be serviced before the sink
+    // runs dry, and a dry sink is an audible gap. One second costs one second of
+    // added latency, which this design already accepts — the phone's progress bar
+    // leading the sound is documented as expected.
+    '--audio-buffer=1',
+    // Say it rather than rely on `auto` classifying a bare googlevideo URL as a
+    // network stream — with `resolver.js` prefetching, that is what mpv is handed.
+    '--cache=yes',
+    // Bound the demuxer cache. NOT a readahead limit: `--cache-secs` defaults to
+    // 3600000 and overrides `--demuxer-readahead-secs` whenever the cache is on, so
+    // mpv reads as far ahead as the network allows either way — this only caps how
+    // much RAM that may occupy. mpv's own default is 150 MiB, which on a 512 MB box
+    // that is already swapping (measured: 708k pages out) would let one long track
+    // push the player into swap. 32 MiB is ~30 min of Opus, so it never binds in
+    // practice.
+    '--demuxer-max-bytes=32MiB',
+  ];
+  if (process.env.YTCR_YTDL_PATH) {
+    args.push(`--script-opts=ytdl_hook-ytdl_path=${process.env.YTCR_YTDL_PATH}`);
+  }
+
+  // Options forwarded to yt-dlp itself. Each goes through
+  // `--ytdl-raw-options-append` rather than `--ytdl-raw-options=`, because the
+  // latter REPLACES the whole key/value list — a second occurrence would silently
+  // drop the first.
+  const rawOptions = [];
+
+  // WP3: YouTube makes *authenticated* requests solve an `n` signature challenge,
+  // which yt-dlp can only do with an external JavaScript runtime. Without one it
+  // finds NO formats at all and every track fails — while anonymous playback keeps
+  // working, which makes this easy to misdiagnose.
+  //
+  // yt-dlp enables only `deno` by default, and on this Pi (armv7l) none of the
+  // obvious choices work: deno and bun have no 32-bit ARM builds, and Raspbian's
+  // node 20 is reported `(unsupported)` by yt-dlp's provider. Debian's `quickjs`
+  // does — verified with cookies on the hardware. The unit sets YTCR_JS_RUNTIME;
+  // this default matches it.
+  // The unit passes `node:<path>` for the private Node 22 (JIT: ~22 s vs ~90 s per
+  // authenticated resolve); `quickjs` is the fallback when that is not installed.
+  rawOptions.push(`js-runtimes=${process.env.YTCR_JS_RUNTIME || 'quickjs'}`);
+
+  // NOTE: the remote cipher server (YTCR_CIPHER_URL) is deliberately NOT passed to
+  // mpv. yt-dlp picks one JS-challenge provider by preference and the plugin
+  // registers none, so any builtin runtime — which mpv needs as its last-resort
+  // path — outranks it and the option would be inert. Remote solving happens in
+  // resolver.js, which offers the providers one at a time; this path stays local
+  // on purpose (see resolver.js #attempts).
+
+  // Cookies (WP3): needed for Premium/ad-free and, increasingly, to get a stream
+  // at all. Read *per track*, so a freshly provisioned jar takes effect on the
+  // next song with no restart. Only added when the file exists, so a missing jar
+  // degrades to anonymous resolution instead of failing everything.
+  const cookies = process.env.YTCR_COOKIES;
+  if (cookies) {
+    if (existsSync(cookies)) {
+      rawOptions.push(`cookies=${cookies}`);
+    }
+    else {
+      // Deliberately loud: this is the difference between "plays" and "every
+      // track fails", and it is invisible otherwise.
+      console.warn(`[ytcr] YTCR_COOKIES=${cookies} does not exist — resolving anonymously. `
+        + 'Provision it with firmware/pi-ytmusic/push_cookies.py');
+    }
+  }
+  for (const opt of rawOptions) {
+    args.push(`--ytdl-raw-options-append=${opt}`);
+  }
+  if (process.env.YTCR_MPV_EXTRA_ARGS) {
+    args.push(...process.env.YTCR_MPV_EXTRA_ARGS.split(' ').filter(Boolean));
+  }
+  return args;
+}
+
+/**
+ * The MpvClient, visible to the top-level error handler. An mpv spawned before a
+ * later startup step failed has to be killed on the way out, or it stays attached
+ * to `ytm-out` — mixing into the RTP stream with nothing left to control it, and
+ * `Restart=always` then stacks another one on top of it every few seconds.
+ */
+let mpvClient = null;
+
+async function main() {
+  const socketPath = process.env.YTCR_MPV_SOCKET
+    || `${process.env.XDG_RUNTIME_DIR || '/tmp'}/ytmusic-mpv.sock`;
+
+  // Two DISTINCT names on purpose: per the library, `name` is what a sender shows
+  // when it found us over DIAL and `screenName` when it found us through manual
+  // pairing ("Link with TV code"). Keeping them different means the picker itself
+  // tells you which path worked — a free diagnostic (WP0).
+  const deviceName = process.env.YTCR_DEVICE_NAME || `Musik (${os.hostname()})`;
+  const screenName = process.env.YTCR_SCREEN_NAME || `${deviceName} [code]`;
+
+  const dialPort = Number(process.env.YTCR_DIAL_PORT || 8099);
+  const audioDevice = process.env.YTCR_AUDIO_DEVICE || 'pipewire/ytm-out';
+  const bindAddress = pickBindAddress(console);
+
+  const mpv = new MpvClient({
+    binary: process.env.YTCR_MPV_BINARY || 'mpv',
+    args: buildMpvArgs(),
+    socketPath,
+    logger: console, // upgraded to the receiver's logger before start()
+  });
+  mpvClient = mpv;
+
+  // Now-playing reporting to the add-on (metadata.js, WP4 of
+  // docs/source-metadata-plan.md). Off unless the add-on host is configured: this
+  // role is otherwise a pure RTP sender that talks to nobody, and it must stay
+  // able to run that way.
+  const addonHost = process.env.YTCR_ADDON_HOST;
+  const metadata = addonHost
+    ? new MetadataReporter({
+      host: addonHost,
+      apiPort: Number(process.env.YTCR_ADDON_API_PORT || 8099),
+      rtpPort: Number(process.env.YTCR_RTP_PORT || 46001),
+      logger: console,
+    })
+    : null;
+  // Pre-resolve upcoming tracks (resolver.js). Uses the same yt-dlp, runtime and
+  // cookies as mpv's ytdl_hook, so a prefetched URL is exactly what mpv would have
+  // resolved — it just happens while the previous track is still playing.
+  const resolver = new Resolver({
+    ytdlp: process.env.YTCR_YTDL_PATH,
+    cookies: process.env.YTCR_COOKIES && existsSync(process.env.YTCR_COOKIES)
+      ? process.env.YTCR_COOKIES : null,
+    jsRuntime: process.env.YTCR_JS_RUNTIME || 'quickjs',
+    format: process.env.YTCR_FORMAT || 'bestaudio/best',
+    cipherUrl: process.env.YTCR_CIPHER_URL || null,
+    cipherTimeout: Number(process.env.YTCR_CIPHER_TIMEOUT || 8),
+  });
+  const player = new MpvPlayer(mpv, metadata, resolver);
+
+  const receiver = new YouTubeCastReceiver(player, {
+    dial: {
+      port: dialPort,
+      ...(bindAddress ? { bindToAddresses: [ bindAddress ] } : {}),
+    },
+    device: { name: deviceName, screenName },
+    logLevel: process.env.YTCR_LOG_LEVEL || 'info',
+  });
+  mpv.setLogger(receiver.logger);
+  resolver.setLogger?.(receiver.logger);
+  metadata?.attach(mpv);
+
+  receiver.on('senderConnect', (sender) => {
+    const isYtMusic = sender.client?.key === Constants.CLIENTS.YTMUSIC.key;
+    receiver.logger.info(
+      `[ytcr] sender connected: ${sender.name}` +
+      `${sender.client?.name ? ` (${sender.client.name})` : ''}` +
+      `${isYtMusic ? ' — YouTube Music' : ''}`);
+  });
+  receiver.on('senderDisconnect', (sender) => {
+    receiver.logger.info(`[ytcr] sender disconnected: ${sender.name}`);
+  });
+  receiver.on('error', (error) => {
+    receiver.logger.error('[ytcr] receiver error:', error);
+  });
+
+  await mpv.start();
+  await receiver.start();
+  receiver.logger.info(
+    `[ytcr] ready — DIAL name "${deviceName}" on ${bindAddress ?? 'all interfaces'}:${dialPort}, ` +
+    `audio -> ${audioDevice}` +
+    (metadata ? `, metadata -> ${addonHost}` : ', metadata reporting off'));
+
+  let stopping = false;
+  const shutdown = async (signal) => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    receiver.logger.info(`[ytcr] ${signal} — shutting down`);
+    try {
+      await receiver.stop();
+    }
+    catch (e) {
+      receiver.logger.warn(`[ytcr] receiver stop failed: ${e.message}`);
+    }
+    // Leave the add-on with a cleared entry rather than a track that stopped
+    // playing when this service did.
+    metadata?.stopped();
+    metadata?.close();
+    await mpv.stop();
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+}
+
+main().catch(async (e) => {
+  if (e instanceof AlreadyRunningError) {
+    // An operator mistake (a second service, or a dev harness against the live
+    // one), not a crash — so no stack trace. `Restart=always` will keep retrying
+    // every RestartSec, which is both cheap (the lock fails before mpv is
+    // spawned) and the behaviour you want: the service recovers by itself as
+    // soon as whatever held the lock exits.
+    console.error(`[ytcr] not starting: ${e.message}`);
+  }
+  else {
+    console.error('[ytcr] fatal:', e);
+  }
+  try {
+    await mpvClient?.stop();
+  }
+  catch { /* best effort on the way out */ }
+  process.exit(1);
+});
