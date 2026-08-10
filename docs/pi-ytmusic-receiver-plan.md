@@ -61,6 +61,40 @@ WP1.
 
 ---
 
+## Two deployments of one receiver
+
+The same application (`firmware/pi-ytmusic/receiver/`) runs in two places, on
+purpose — they coexist rather than one replacing the other:
+
+| | Raspberry Pi (Zero 2 W) | HA add-on (`ytmusic_receiver/`) |
+|---|---|---|
+| install | `scp -r firmware/pi-ytmusic` + `setup_pi_ytmusic.py` | `./scripts/deploy-dev.sh ytmusic` |
+| RTP port | 46001 | **46002** (separate router source) |
+| DIAL port | 8099 | **8098** (8099 is the router's) |
+| JS runtime | private node 22 tarball (Raspbian ships 20) | distro nodejs 22 |
+| cookie jar | `~/.local/state/pi-ytmusic-receiver/cookies.txt` | the add-on's `/data/cookies.txt` |
+| provision cookies | `push_cookies.py` | `push_cookies.py --addon` |
+| authenticated resolve | ~7-9 s (remote cipher) | faster: the Pi 4 is ~3.3x per core |
+
+The app directory stays canonical on the Pi side because that role is installed by
+copying it wholesale; `deploy-dev.sh` stages a copy into the add-on before building
+(Docker cannot `COPY` from outside its build context).
+
+**Why the add-on is worth having even though the Pi works:** it halves the cold
+start (the challenge is CPU-bound JS), frees the Zero's CPU, and moves the RTP onto
+loopback instead of the 2.4 GHz radio the Zero shares with Bluetooth. **Why the Pi
+is worth keeping:** it is independent of Home Assistant restarts and updates.
+
+The add-on runs `apt`/`npm`/`pip` in its image, so it is **built on the workstation
+and pulled**, not built on the device — assembling it under emulation on a Pi 4 is
+the slow part even with nothing to compile. Note that a freshly created GHCR package
+is **private**, and Supervisor then fails the pull with `401`; the
+`LABEL org.opencontainers.image.source` in the Dockerfile links the package to this
+repo so it inherits the repo's visibility (and so the prune workflow can use
+`GITHUB_TOKEN`).
+
+---
+
 ## 1. Why this shape, and why it isn't Chromecast
 
 Google Cast receive is **closed**: a sender authenticates the receiver over CASTV2 and

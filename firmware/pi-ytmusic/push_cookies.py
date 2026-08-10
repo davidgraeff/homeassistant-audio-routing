@@ -10,6 +10,8 @@ receiver's jar and proves it actually resolves a video there.
     ./push_cookies.py --file ~/cookies.txt                  # push an existing jar
     ./push_cookies.py --file ~/cookies.txt --inspect        # look, don't push
     ./push_cookies.py --check                               # liveness only, on the Pi
+    ./push_cookies.py --from-browser firefox --addon        # target the HA add-on
+    ./push_cookies.py --addon --check                       # liveness only, in the add-on
 
 WHY THIS IS "PROVISION", NOT "SYNC"
 -----------------------------------
@@ -67,6 +69,8 @@ REMOTE_JAR = ".local/state/pi-ytmusic-receiver/cookies.txt"
 #: instead — the socket IS available there. Add-on containers are named
 #: `app_<slug>` on this Supervisor version (checked with `docker ps`).
 DEFAULT_HA_HOST = "root@homeassistant.local"
+#: SSH target for the HA host; set from --ha-host in main().
+HA_HOST = DEFAULT_HA_HOST
 ADDON_CONTAINER = "app_local_ytmusic_receiver"
 ADDON_JAR = "/data/cookies.txt"
 ADDON_YTDLP = "/opt/ytdlp/bin/yt-dlp"
@@ -497,6 +501,13 @@ def main() -> None:
                           "Use a DEDICATED session — see the header.")
     src.add_argument("--file", metavar="PATH", help="Use an existing Netscape cookies.txt.")
     ap.add_argument("--target", default=DEFAULT_TARGET, help=f"Pi ssh target (default {DEFAULT_TARGET}).")
+    ap.add_argument("--addon", action="store_true",
+                    help="Target the Home Assistant ADD-ON instead of the Pi. The jar goes into "
+                         "the add-on's persistent /data via `docker exec` on the HA host — that "
+                         "directory is not reachable over the HA SSH add-on, which mounts only "
+                         "/addons, /config, /share, /ssl and /backup.")
+    ap.add_argument("--ha-host", default=DEFAULT_HA_HOST,
+                    help=f"SSH target for the HA host, used with --addon (default {DEFAULT_HA_HOST}).")
     ap.add_argument("--inspect", action="store_true", help="Report what is in the jar and exit.")
     ap.add_argument("--check", action="store_true", help="Only run the liveness check on the Pi.")
     ap.add_argument("--ytdlp", default="yt-dlp",
@@ -514,13 +525,14 @@ def main() -> None:
                     help="Replace an existing jar on the Pi even though it may be newer.")
     args = ap.parse_args()
 
-    global PROBE_URL, YTDLP, REMOTE_COMPONENTS
+    global PROBE_URL, YTDLP, REMOTE_COMPONENTS, HA_HOST
     PROBE_URL = args.probe_url
     YTDLP = args.ytdlp
+    HA_HOST = args.ha_host
     REMOTE_COMPONENTS = None if args.remote_components in ("none", "") else args.remote_components
 
     if args.check and not (args.from_browser or args.file):
-        sys.exit(0 if check_remote(args.target) else 1)
+        sys.exit(0 if (addon_check() if args.addon else check_remote(args.target)) else 1)
 
     if not (args.from_browser or args.file):
         ap.error("pass --from-browser or --file (or --check on its own)")
@@ -542,8 +554,12 @@ def main() -> None:
     if args.inspect:
         return
 
-    push(args.target, write_jar(rows), force=args.force)
-    ok = check_remote(args.target)
+    if args.addon:
+        addon_push(write_jar(rows), force=args.force)
+        ok = addon_check()
+    else:
+        push(args.target, write_jar(rows), force=args.force)
+        ok = check_remote(args.target)
     print(
         "\nNothing needs restarting: mpv passes --cookies to yt-dlp per track, so the new\n"
         "jar is picked up by the next song." if ok else

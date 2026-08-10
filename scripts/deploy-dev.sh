@@ -366,6 +366,10 @@ case "${1:-}" in
     ADDON_NAME="ytmusic_receiver"
     stage_ytmusic_receiver
     deploy_addon
+    # `ha apps update` leaves this add-on stopped (observed), and deploy_addon ends
+    # by tailing logs, so without this a deploy silently results in a receiver that
+    # is installed, current, and not running.
+    ssh "root@$HA_HOST" "ha apps start $ADDON_SLUG" 2>/dev/null || true
     ;;
   integration) deploy_integration ;;
   *) usage ;;
