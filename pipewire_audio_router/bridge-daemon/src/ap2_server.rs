@@ -427,6 +427,9 @@ pub fn start(
             match connect_one(name, *ip, clock_id, render_delay_ms, rate, &senders).await {
                 Ok((mut c, mut volume_rx)) => {
                     tracing::info!("AP2: streaming to '{}' ({}) @ {}Hz render_delay={}ms", name, ip, rate, render_delay_ms);
+                    // It works — drop any stale "why isn't this playing" note the UI
+                    // is still showing from an earlier failure.
+                    crate::ap2_health::Ap2Health::global().clear(name);
                     // Publish this output's capture rate so announcement overlays are
                     // rate-matched to it (overlay_mixer resamples the 48 kHz clip).
                     crate::overlay_mixer::OverlayMixer::global().set_output_rate(name, rate);
@@ -459,6 +462,11 @@ pub fn start(
                 }
                 Err(fail) => {
                     tracing::warn!("AP2: could not start '{}' ({}) @ {}Hz: {}", name, ip, rate, fail.msg);
+                    // Surface it: this used to be a log line and nothing else — the
+                    // output stayed green in the matrix and simply never played. The
+                    // liveness probe overwrites/clears this on its next tick, which is
+                    // what turns a one-off failure into a standing diagnosis.
+                    crate::ap2_health::Ap2Health::global().set(name, format!("Could not start the stream at {rate} Hz: {}", fail.msg));
                     // Auto-negotiation fallback: a 48 kHz SETUP rejection ⇒ this
                     // receiver is 44.1k-only. Cache it (persisted) so we don't re-probe,
                     // and flag a reconcile — the group's rate recomputes to 44.1 kHz and

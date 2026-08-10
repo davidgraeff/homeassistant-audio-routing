@@ -27,6 +27,32 @@ use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
 use tokio::io::AsyncReadExt;
 
+/// Send one handshake request, naming the step in the log and folding it into any
+/// error.
+///
+/// Every step of `connect_with_pin` / `connect_with_pair_verify` is an `rtsp.send`,
+/// and each one fails with the *same* bare `Operation timed out` against a receiver
+/// that accepts the TCP connection but never answers (a wedged AirTunes — see
+/// `bridge-daemon`'s `ap2_probe`). Without the label a caller's log can't say
+/// whether `/info`, M2 or M4 was the one that hung, which is the first thing you
+/// want to know: `/info` means the service never spoke at all, an M-step means
+/// pairing itself is being refused. A handful of requests per connect, so labelling
+/// them costs nothing.
+async fn send_step(
+    rtsp: &mut RtspConnection,
+    req: RtspRequest,
+    step: &str,
+) -> Result<airplay_rtsp::RtspResponse> {
+    debug!("handshake step: {}", step);
+    match rtsp.send(req).await {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            warn!("handshake step '{}' failed: {}", step, e);
+            Err(RtspError::SetupFailed(format!("{} — {}", step, e)).into())
+        }
+    }
+}
+
 /// Generate a random MAC-like device ID for the client.
 fn generate_device_id() -> String {
     use rand::Rng;
@@ -287,7 +313,7 @@ impl Connection {
 
         // 3. GET /info (required before pairing)
         let info_req = RtspRequest::get_info();
-        let _info_resp = rtsp.send(info_req).await?;
+        let _info_resp = send_step(&mut rtsp, info_req, "GET /info").await?;
 
         // 4. Transient pairing (SRP M1-M4 flow with HKP=4)
         let auth_method = AuthMethod::HomeKitTransient;
@@ -295,14 +321,14 @@ impl Connection {
 
         let m1 = pairing.start_transient_pairing_with_pin(pin)?;
         let pair_setup_req = RtspRequest::pair_setup(m1, &client_device_id, 4);
-        let m2_resp = rtsp.send(pair_setup_req).await?;
+        let m2_resp = send_step(&mut rtsp, pair_setup_req, "pair-setup M1→M2 (transient)").await?;
 
         let m2_body = m2_resp.body.as_deref().unwrap_or(&[]);
         let m3 = pairing.continue_transient_pairing(m2_body)?;
 
         if let Some(m3_data) = m3 {
             let pair_setup_req = RtspRequest::pair_setup(m3_data, &client_device_id, 4);
-            let m4_resp = rtsp.send(pair_setup_req).await?;
+            let m4_resp = send_step(&mut rtsp, pair_setup_req, "pair-setup M3→M4 (transient)").await?;
             let m4_body = m4_resp.body.as_deref().unwrap_or(&[]);
             pairing.continue_transient_pairing(m4_body)?;
         }
@@ -441,7 +467,7 @@ impl Connection {
 
         // 3. GET /info (required before pairing)
         let info_req = RtspRequest::get_info();
-        let _info_resp = rtsp.send(info_req).await?;
+        let _info_resp = send_step(&mut rtsp, info_req, "GET /info").await?;
 
         // 4. Pair-verify (M1-M4 flow with HKP=3)
         let mut pair_verify = PairVerify::new_with_controller(&controller);
@@ -458,7 +484,7 @@ impl Connection {
         debug!("Pair-verify M1: {} bytes", m1.len());
 
         let pair_verify_req = RtspRequest::pair_verify(m1, 3);
-        let m2_resp = rtsp.send(pair_verify_req).await?;
+        let m2_resp = send_step(&mut rtsp, pair_verify_req, "pair-verify M1→M2").await?;
 
         let m2_body = m2_resp.body.as_deref().unwrap_or(&[]);
         debug!("Pair-verify M2: {} bytes", m2_body.len());
@@ -475,7 +501,7 @@ impl Connection {
         debug!("Pair-verify M3: {} bytes", m3.len());
 
         let pair_verify_req = RtspRequest::pair_verify(m3, 3);
-        let m4_resp = rtsp.send(pair_verify_req).await?;
+        let m4_resp = send_step(&mut rtsp, pair_verify_req, "pair-verify M3→M4").await?;
 
         let m4_body = m4_resp.body.as_deref().unwrap_or(&[]);
         debug!("Pair-verify M4: {} bytes", m4_body.len());

@@ -682,6 +682,13 @@
               {@const duck = duckBadge(o)!}
               <span class="badge duck" title={duck.title}>{duck.text}</span>
             {/if}
+            <!-- A fault the daemon has diagnosed (see `last_error`). The badge is
+                 only the marker — the sentence itself is printed below the header,
+                 because a collapsed card would otherwise hide the one thing the
+                 user needs to read. -->
+            {#if o.last_error}
+              <span class="badge warn" title={o.last_error}>fault</span>
+            {/if}
             {#if ptpBadge(o)}
               {@const ptp = ptpBadge(o)!}
               <span class={ptp.cls} title={ptp.title}>{ptp.text}</span>
@@ -703,6 +710,13 @@
             {/if}
           </div>
         </header>
+
+        <!-- Outside the collapse guard on purpose: "this output cannot play, and
+             here is why" is the reason you came to this page, and an offline card
+             is exactly the one you find collapsed. -->
+        {#if o.last_error}
+          <p class="out-fault" role="status">{o.last_error}</p>
+        {/if}
 
         {#if !isCollapsed(o)}
           {@render connMeta(o)}
@@ -1144,6 +1158,19 @@
   .badge.duck {
     color: var(--info-color, #4285f4);
     border-color: currentColor;
+  }
+  /* The diagnosed reason an output can't play. Tinted rather than boxed in alarm
+     colours: it is an explanation to read, not an alert to dismiss, and it sits
+     under the header of a card that is already marked offline/fault. */
+  .out-fault {
+    margin: 0 0 8px;
+    padding: 8px 10px;
+    border-left: 3px solid var(--error-color, #db4437);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--error-color, #db4437) 8%, transparent);
+    color: var(--primary-text-color);
+    font-size: 0.85rem;
+    line-height: 1.4;
   }
   .out-badges {
     display: flex;

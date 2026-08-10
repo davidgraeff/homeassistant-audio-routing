@@ -621,6 +621,14 @@ pub(crate) struct OutputInfo {
     /// pw-sink only: whether foreign streams on that host are currently ducked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pwsink_ducked: Option<bool>,
+    /// Why this output currently can't play — a human-readable sentence, or `None`
+    /// when nothing is known to be wrong. AirPlay-2 only so far
+    /// ([`crate::ap2_health`], written by the liveness probe and by a failed
+    /// connect). Exists because "routed, present, and silent" used to be
+    /// indistinguishable from "playing" in the UI: the reason lived only in the
+    /// daemon log. Kind-agnostic on purpose — sendspin/pw-sink can fill it later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 /// One entry in a sendspin output's codec picker.
@@ -769,6 +777,9 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             pwsink_muted: None,
             pwsink_sink_name: None,
             pwsink_ducked: None,
+            // No health source for sendspin yet (its own liveness task would be the
+            // place); reported honestly as "nothing known" rather than "fine".
+            last_error: None,
             node_name,
         });
     }
@@ -870,6 +881,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             pwsink_muted: None,
             pwsink_sink_name: None,
             pwsink_ducked: None,
+            last_error: crate::ap2_health::Ap2Health::global().get(&node_name),
             node_name,
         });
     }
@@ -935,6 +947,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             pwsink_muted: host_state.as_ref().and_then(|s| s.muted),
             pwsink_sink_name: host_state.as_ref().and_then(|s| s.sink_name.clone()),
             pwsink_ducked: host_state.as_ref().map(|s| s.ducked),
+            last_error: None,
             node_name,
         });
     }

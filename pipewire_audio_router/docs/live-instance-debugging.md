@@ -93,6 +93,65 @@ a true lock-liveness signal.
 ssh root@homeassistant.local 'timeout 6 tcpdump -ni any "udp and (port 319 or port 320)"'
 ```
 
+### A receiver that accepts TCP but answers nothing ("wedged AirTunes")
+
+Symptom: one AP2 output never plays while others on the same source do. The log
+shows only
+
+```
+AP2: connect attempt 1/2 to 'ap2-dev-<name>' (<ip>) failed: connect/pair failed: Operation timed out
+```
+
+repeated, with **no `airplay_client` line between "Connecting to AirPlay2 at …"
+and the failure** — the very first RTSP request got no reply (that message is
+`airplay_core::Error::Timeout` from the 10 s response read in
+`airplay-rtsp/connection.rs`, *not* our 12 s `AP2_CONNECT_TIMEOUT`; the two are
+easy to confuse). Reproduce off the daemon entirely, from any host on the LAN:
+
+```
+# one plaintext RTSP round-trip; a healthy receiver answers in ~4 ms
+printf 'GET /info RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: AirPlay/745.83\r\n\r\n' \
+  | nc <receiver-ip> 7000 | head -c 200
+```
+
+**`nc -z` / any TCP-connect check is worthless here** — and this is the trap.
+`connect()` returns success because *our* kernel completed the handshake on
+receiving the SYN-ACK; the receiver, with a full accept queue, dropped our final
+ACK and never finished on its side. tcpdump is the tell:
+
+```
+ssh root@homeassistant.local 'timeout 12 tcpdump -ni any "host <ip> and tcp port 7000"'
+# wedged: SYN → SYN-ACK → our ACK → our data/FIN, then the receiver
+#   re-transmits the SAME SYN-ACK at 1.5/3.5/7.5 s and ACKs nothing.
+# healthy: the handshake completes once and data is ACKed.
+```
+
+Confirmed 2026-08-10 on the Pioneer VSX-934 (`192.168.178.35`): `:7000` "open"
+to every connect, **zero bytes** returned to `GET /info`, `OPTIONS`,
+`/server-info` or plain HTTP, while the same unit's web UI (`:8080`) and eISCP
+control (`:60128`) answered in milliseconds and its mDNS `_airplay._tcp` record
+was live and byte-identical to the working Yamaha's (same `srcvers=366.0`,
+`features=0x445F8A00,0x1C340`, `flags=0x4`, `acl=0`). So: not the network, not
+the features, not our code path — the receiver's AirTunes process had stopped
+calling `accept()`.
+
+Soft remedies did **not** work, and how they fail is itself diagnostic — the
+network module answers *queries* but refuses *state changes*:
+
+```
+# eISCP (Onkyo/Pioneer, TCP 60128). Frame: "ISCP" + hdr_size(16) + data_size + 01 00 00 00 + "!1<CMD>\r"
+PWRQSTN -> PWR01     (on)          SLIQSTN -> SLI2B (NET input)
+PWRSTBY -> PWRN/A    (refused!)    NLSI7   -> NLSN/A (refused!)
+```
+
+Only a **mains power cycle** clears it. Since `ap2_liveness` probed with a bare
+`TcpStream::connect`, such a receiver read `present: true`/green in the UI
+indefinitely — fixed by probing with a real `GET /info` round-trip
+(`ap2_probe.rs`) and publishing the verdict to `ap2_health.rs`, which surfaces as
+`last_error` on `/api/outputs` + the routing matrix. A `GET /info` probe is safe
+mid-session: a Yamaha WX-021 streaming from this daemon answered six of them in
+~4 ms each without a glitch.
+
 ### Real-time thread inventory
 
 ```
@@ -174,6 +233,10 @@ printf '{"clients":[]}' | ssh root@host 'docker run --rm -i --entrypoint sh \
   ~15-min cross-deploy.** Host gcc is C23 (so `bool`/`size_t` are builtin);
   the aarch64 cross-gcc is not — a missing `<stdbool.h>`/`<stddef.h>`
   compiles on the dev box and fails only in the cross-build.
+- **A TCP connect proves nothing about an AirPlay receiver.** It succeeds against
+  a receiver whose AirTunes has stopped accepting (see the wedged-AirTunes section
+  above), so `nc -z`, `ss`, and the old `ap2_liveness` probe all called a dead
+  receiver healthy. Only a request/response round-trip is evidence.
 - **A leaked `rt-sender` thread** persists to a receiver after a spike stop
   if teardown doesn't join the sender thread — shows as RTP still flowing
   (rms=0) with "no spike running." Confirm sender count with the chrt

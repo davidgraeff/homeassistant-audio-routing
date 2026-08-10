@@ -121,6 +121,14 @@ pub struct RoutingNode {
     /// [`Frame::Meters`], not here.
     #[serde(skip_serializing_if = "Option::is_none")]
     xruns: Option<u32>,
+    /// Outputs only: the diagnosed reason this output cannot carry audio right now
+    /// ([`crate::ap2_health`]); `None` when nothing is known to be wrong. Mirrors
+    /// `/api/outputs`' `last_error` so the graph can label a dead endpoint instead
+    /// of merely drawing it non-streaming — "routed but the receiver is refusing us"
+    /// was previously indistinguishable here from "no session up yet". AirPlay-2
+    /// only so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -331,6 +339,7 @@ fn build_matrix(
                 },
                 latency_ms: node_latency_ms(&name, lat),
                 xruns: xruns.get(&name).copied(),
+                last_error: crate::ap2_health::Ap2Health::global().get(&name),
                 node_name: name,
                 peak: 0.0, // outputs aren't metered
             }
@@ -361,6 +370,8 @@ fn build_matrix(
                 muted: None,
                 latency_ms,
                 xruns: node_xruns,
+                // Outputs-only: a source has no receiver to refuse us.
+                last_error: None,
             }
         })
         .collect();

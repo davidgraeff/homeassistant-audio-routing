@@ -56,6 +56,10 @@ export interface RoutingNode {
   /** Current mute state for outputs whose mute the daemon tracks out-of-band
    * (sendspin devices), pushed live over the routing WS. Absent otherwise. */
   muted?: boolean | null;
+  /** Outputs only: the diagnosed reason this output can't carry audio right now;
+   * absent when nothing is known to be wrong. Turns "not connected" from a state
+   * you have to guess about into one with a stated cause. AirPlay 2 only so far. */
+  last_error?: string | null;
   /** Estimated buffering (ms) this node adds to the path — the configured
    * jitter/playout buffer, not a measured value. Sources: ingest jitter buffer
    * (RTP / AirPlay). Outputs: playout lead (sendspin group send-ahead + static
@@ -196,6 +200,11 @@ export interface OutputInfo {
   /** pw-sink only: whether the agent is currently ducking the host's *other*
    * applications for an announcement. */
   pwsink_ducked?: boolean;
+  /** Why this output can't play right now, as a sentence to show the user; absent
+   * when nothing is known to be wrong. AirPlay 2 only so far (set by the daemon's
+   * liveness probe or a failed connect). Before this existed, a receiver that
+   * refused every connection looked identical to a working one in the UI. */
+  last_error?: string;
   /** sendspin only: stored wire-codec choice — 'auto' | 'pcm' | 'opus' | 'flac'. */
   sendspin_codec?: SendspinCodec;
   /** sendspin only: the codec the stream actually uses (the choice narrowed by what

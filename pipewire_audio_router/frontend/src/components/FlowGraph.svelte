@@ -739,6 +739,14 @@
                         {#if (xrunsOf($routing, m.node_name) ?? 0) > 0}
                           <span class="xrun" class:hot={xrunHot[m.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now.">⚠ {xrunsOf($routing, m.node_name)}</span>
                         {/if}
+                        <!-- A diagnosed fault outranks the generic states below: when
+                             the daemon knows *why* nothing is playing, showing
+                             "offline"/"not connected" alone is what sent people to the
+                             logs. Kept on the offline branch too — a receiver demoted
+                             for refusing us is offline *and* has a reason. -->
+                        {#if m.last_error}
+                          <span class="tag fault" title={m.last_error}>fault</span>
+                        {/if}
                         {#if !m.present}
                           <span class="tag off">offline</span>
                           <button class="x" title="Remove this output" onclick={() => removeOutput(m)}>✕</button>
@@ -747,7 +755,8 @@
                                and the reason an announcement here would be refused. -->
                           <span
                             class="tag wait"
-                            title="On the network, but no session is up — nothing routed here is being played. A PipeWire target has to connect to us (its module-rtp-session initiates the handshake); an AirPlay-2 receiver may still be connecting or have refused the session."
+                            title={m.last_error ??
+                              'On the network, but no session is up — nothing routed here is being played. A PipeWire target has to connect to us (its module-rtp-session initiates the handshake); an AirPlay-2 receiver may still be connecting or have refused the session.'}
                             >not connected</span
                           >
                         {/if}
@@ -1153,6 +1162,13 @@
     color: var(--warning-color, #b26a00);
     text-transform: none;
     white-space: nowrap;
+  }
+  /* A named, diagnosed fault — red rather than the amber of "not up yet", because
+     this one will not fix itself by waiting. Hover carries the sentence. */
+  .tag.fault {
+    background: color-mix(in srgb, var(--error-color, #db4437) 18%, transparent);
+    color: var(--error-color, #db4437);
+    cursor: help;
   }
   /* Estimated per-node buffering (~ms), rendered inline next to the name/meter. */
   .lat {
