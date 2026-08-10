@@ -48,15 +48,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      # Same build deps as the Dockerfile's build stage. libasound2-dev is for
-      # the embedded sendspin server's transitive cpal/alsa dependency (it has
-      # no feature flag to drop its audio-output module, even though we only use
-      # the server-role input path).
+      # Same build deps as the Dockerfile's build stage — keep this list and the
+      # Dockerfile's native branch in step, or a dependency only one of them has
+      # makes CI and the image disagree about whether the tree builds.
+      #   libasound2-dev  the embedded sendspin server's transitive cpal/alsa
+      #                   dependency (no feature flag drops its audio-output
+      #                   module, even though we only use the server-role path)
+      #   libevent-dev    vendor/libairptp includes <event2/event.h> (build.rs)
+      #   cmake make g++  cc-rs/cmake crates: bundled libopus, and fdk-aac-sys
+      #                   compiles C++ (needs cc1plus)
+      # The runner image happens to ship cmake/make/g++ already; they are listed
+      # anyway so this reads as the whole requirement rather than the remainder.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config clang libpipewire-0.3-dev libspa-0.2-dev libasound2-dev
+            pkg-config clang cmake make g++ libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libevent-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
