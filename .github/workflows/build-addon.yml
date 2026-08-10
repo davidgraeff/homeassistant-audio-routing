@@ -38,7 +38,11 @@ jobs:
           - arch: aarch64
             platform: linux/arm64
     steps:
+      # `submodules` because the Dockerfile builds submodules/sendspin as a path
+      # dependency and asserts the directory is non-empty before compiling.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

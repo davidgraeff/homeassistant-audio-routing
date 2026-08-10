@@ -23,7 +23,12 @@ jobs:
     name: Rust formatting (rustfmt)
     runs-on: ubuntu-latest
     steps:
+      # `submodules` because bridge-daemon's Cargo.toml has a path dependency on
+      # submodules/sendspin — without it every cargo command (even `cargo fmt`,
+      # which shells out to `cargo metadata`) dies on "failed to load manifest".
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -41,6 +46,8 @@ jobs:
         working-directory: pipewire_audio_router/bridge-daemon
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       # Same build deps as the Dockerfile's build stage. libasound2-dev is for
       # the embedded sendspin server's transitive cpal/alsa dependency (it has
       # no feature flag to drop its audio-output module, even though we only use
@@ -53,8 +60,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Depends on the public `sendspin` git dependency (davidgraeff/sendspin-rs)
-      # — fetched anonymously over https; no token needed while that repo is public.
+      # Depends on the public `sendspin` submodule (davidgraeff/sendspin-rs) —
+      # cloned anonymously over https; no token needed while that repo is public.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: pipewire_audio_router/bridge-daemon
@@ -116,7 +123,11 @@ jobs:
     needs: [rust, frontend]
     timeout-minutes: 30
     steps:
+      # The image build needs submodules/sendspin in the context (the Dockerfile
+      # asserts it is non-empty before compiling).
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Ensure ffmpeg (fixture generation + signal analysis)
         run: ffmpeg -version >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg; }
       - name: Generate the audio fixture
