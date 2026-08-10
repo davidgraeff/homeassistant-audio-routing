@@ -43,7 +43,17 @@ options:
   rtp_host: "127.0.0.1"
   rtp_port: 46002
   dial_port: 8098
-  cipher_url: "https://cipher.kikkia.dev"
+  # NO `cipher_url` default, on purpose — twice over.
+  #
+  # 1. A key listed here is a *default*, and Supervisor re-applies it whenever the key
+  #    is absent from the user's options. Clearing the field in the UI removes the key,
+  #    so the default came straight back and the option was effectively impossible to
+  #    turn off from the UI. (`bind_address` below has always worked this way: schema
+  #    only, no default.)
+  # 2. Remote solving is no longer worth defaulting to. The resident JS worker solves
+  #    challenges locally in 15-58 ms; the remote server needs four WAN round trips
+  #    (one per challenge), takes 3.4-4.6 s, and has been observed returning a wrong
+  #    `n` and an nginx 504. Set it only if the local path is unavailable.
   report_metadata: true
   log_level: info
 schema:
@@ -57,9 +67,18 @@ schema:
   rtp_port: int(1024,65535)
   # DIAL/SSDP HTTP port. Not 8099 — that is the audio router's own port.
   dial_port: int(1024,65535)
-  # yt-cipher server that solves YouTube's JS challenges off-box (~3x faster than
-  # solving locally). Leave empty to always solve locally.
+  # yt-cipher server that solves YouTube's JS challenges off-box. Leave empty (or set
+  # `none`) to solve locally, which is the default and the faster path now that a
+  # resident node holds the solver: 15-58 ms locally against four WAN round trips.
   cipher_url: str?
+  # A bgutil PO-token provider server (mode A), e.g. http://127.0.0.1:4416. Only
+  # needed if YouTube starts demanding GVS PO tokens for this account/videos — the
+  # symptom is a URL that resolves and then answers 403 no matter how fresh the
+  # session is. The plugin is baked in; the server is not (it needs a native `canvas`
+  # build and ~200 MB of node modules), so run it separately and point this at it.
+  # Empty switches PO-token fetching off entirely, which is what keeps the plugin from
+  # probing localhost and warning on every resolve.
+  pot_provider_url: str?
   # Pin the DIAL server to one local IP. Leave empty to auto-detect; only needed
   # on a multi-homed host, where answering SSDP on the wrong address makes senders
   # silently drop the device.

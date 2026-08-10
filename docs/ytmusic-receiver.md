@@ -155,7 +155,7 @@ Layout on the device:
 | Path | What |
 |---|---|
 | `~/.local/share/pi-ytmusic-receiver/` | the app (`WorkingDirectory` is *not* here — see below) |
-| `~/.local/state/pi-ytmusic-receiver/` | state dir: the cookie jar and node-persist's DIAL identity |
+| `~/.local/state/pi-ytmusic-receiver/` | state dir: the cookie jar, node-persist's DIAL identity, `yt-dlp-cache/` |
 | `~/.local/share/pi-ytmusic-venv/` | yt-dlp + `yt-dlp-ejs` + `yt-dlp-remote-cipher` |
 | `~/.local/opt/node22/` | private Node 22 (`v22.23.2`), used as the JS runtime |
 | `~/.config/systemd/user/ytmusic-receiver.service` | the receiver (user unit, `WantedBy=default.target`) |
@@ -329,6 +329,71 @@ Self-hosting yt-cipher (it ships a `docker-compose`, and its README recommends
 10 req/s limit and the third-party egress — which carries the challenge strings and this
 host's IP, never cookies.
 
+**The remote cipher is now the slow option, on both boxes.** Its entire value was avoiding a
+slow local solve, and the resident worker (below) takes a local solve to **4-48 ms** in steady
+state — against 4.4 s for a *successful* remote round trip. Meanwhile the public instance
+failed twice in one session on 2026-08-10: the known wrong `n` (`HTTP 403` caught at the
+verify step, 4.4 s wasted before the fallback even starts) and an nginx **`504 Gateway
+Time-out`**. Both escalated correctly and playback continued, but each costs a whole extra
+resolve.
+
+**One line per round trip, not per retry.** The `Solving JS challenges via remote cipher
+server` message is the plugin's `note=` on a single `/decrypt_signature` POST, and
+`_call_api(player_url, sig_value, n_value)` sends **one request per challenge**. A resolve
+of one video needs four — two `sig` specs (two signature lengths, visible in the cache as
+`<player>-107.json` and `-111.json`) plus `n` for the progressive URL and for the HLS
+manifest, hence the `Downloading m3u8 information` line. So four WAN round trips per track,
+where the builtin ejs provider and the resident worker both batch all four into one call:
+**15-58 ms against 3.4-4.6 s**.
+
+So set `cipher_url: ""` (add-on) / `--cipher-url none` (Pi). Confirmed live: the resident
+worker logs `[memory]` solves at 15-58 ms on the add-on, which is what the remote server
+was there to avoid. Turning it off buys three things beyond latency — one fewer internet
+dependency, no third-party egress, and **half the resolves per track change**, since the
+remote attempt is a complete resolve of its own. That last point stopped being cosmetic
+once transient 403 bursts turned out to be the failure mode above: fewer requests per track
+is now a correctness argument, not just a speed one.
+
+Two earlier revisions of this section recommended the same change for wrong reasons (first
+"a warm yt-dlp makes local solving fast" — it does not, the 15 s was JS parsing; then a
+mis-attributed 403). The recommendation only became sound once the *stage* was measured
+rather than the total.
+
+**Turning it off is a `config.yaml` change, not a UI one.** An add-on option listed under
+`options:` is a *default*, and Supervisor re-applies it whenever the key is missing from
+the user's saved options — so clearing the field in the UI removes the key and the default
+comes straight back, which looks exactly like the save being ignored. `cipher_url`
+therefore has **no default** any more (like `bind_address`, which was always schema-only),
+and `run.sh` additionally accepts `none`/`off`/`false` as an explicit disable, matching the
+Pi's `--cipher-url none`. A value saved before this change stays in the user's options, so
+overwrite it with `none` rather than clearing it.
+
+### PO tokens: the plugin is installed, the server is not
+
+YouTube is rolling out a **GVS PO token** requirement per client — the verbose log carries
+`Detected experiment to bind GVS PO Token to video ID for web_safari client` — and yt-dlp
+cannot mint one itself. The usual provider is
+[`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider),
+which comes in two halves, and only one of them belongs in this image:
+
+| half | where |
+|---|---|
+| the **plugin** (pip, pure Python, **116 kB**) | installed in `/opt/ytdlp` and in the Pi's venv, refreshed with yt-dlp |
+| the **server** (BotGuard in a JS VM) | **not installed.** `canvas ^3` (native, no armv7 prebuild), `jsdom ^27` and `youtubei.js ^16`: ~150-250 MB of node modules plus a source build, and it is not on npm — `git clone` + `npm ci` + `npx tsc`. Run it wherever suits (its own container is the easy answer) and point `pot_provider_url` / `--pot-url` at it |
+
+**Not needed today, and measured rather than assumed.** With no provider at all, every
+client that has audio formats returned a working URL for the video that had been failing —
+`default`, `tv`, `web_safari` and `mweb` all 206 — and every *fresh* process produced
+playable URLs. The 403s tracked session age, not token absence, so `PO Token Providers:
+none` is informational here, not a diagnosis. The switch exists so that turning it on later
+is one field rather than a rebuild.
+
+**When unconfigured, PO-token fetching is switched off explicitly** with
+`--extractor-args youtube:fetch_pot=never`. Without that the installed plugin defaults to
+probing `http://127.0.0.1:4416` and emits a `WARNING: … Error reaching GET
+http://127.0.0.1:4416/ping` on **every resolve**. Verified both ways on the add-on: without
+the switch, that warning plus `251`; with it, just `251`.
+
 ### Prefetch — why track changes are fast and the first track is not
 
 [`resolver.js`](../firmware/pi-ytmusic/receiver/resolver.js) resolves the *next* track to a
@@ -351,8 +416,10 @@ margin) rather than a guess; `peek()` does not consume the entry, so a retry is 
 and if a prefetched URL loads but fails to play, `doPlay` invalidates it and re-runs itself
 once through the slow path rather than reporting a dead track to the phone.
 
-The **first** track of a session still pays full price, because nothing can be prefetched
-before the phone says what to play. That is accepted.
+The **first** track of a session still pays a cold-ish price, because nothing can be
+prefetched before the phone says what to play. What it no longer pays is the *process* half
+of that: the resolver daemon's `--prewarm` resolves a throwaway video at startup, so the
+first real track meets a warm yt-dlp (see below).
 
 ### Why resolution itself cannot just be made fast
 
@@ -366,11 +433,13 @@ Measured, so it does not get re-litigated:
   string, which is per stream URL. The PO-token cache provider is literally named `memory`.
   And mpv's `ytdl_hook` spawns a fresh yt-dlp per track, so every track discards all of it —
   two consecutive resolves of the same video measured 22 s then 21 s.
-- **A long-lived resolver process was built, measured and rejected.** Four sequential
-  resolves in one process: 19.5 s, 17.5 s, 15.9 s, then 16.0 s for a *repeat of the first*.
-  Only ~3.5 s of a ~20 s cost is process warmth, and repeating the same video is not
-  cheaper — the challenge is keyed per stream URL and the GVS PO token is bound per video id.
-  A daemon to save 3.5 s was not worth a service.
+- **Process warmth is worth ~3.5 s of a ~20 s authenticated resolve, and no more.** Four
+  sequential resolves in one process: 19.5 s, 17.5 s, 15.9 s, then 16.0 s for a *repeat of
+  the first*. Repeating the same video is not cheaper — the challenge is keyed per stream
+  URL and the GVS PO token is bound per video id. That measurement first led to rejecting a
+  resolver daemon outright; it is now built anyway (see below), because ~3.5 s is a third of
+  the add-on's resolve and because being warm is what makes prewarming the *first* track
+  possible. It is **not** a route to a ~2 s authenticated resolve on its own.
 - **Configuration levers are flat.** `--extractor-args youtube:skip=hls,dash`,
   `player_client=tv` and `player_client=web_safari` all came in at 21-25 s, within noise of
   the 22 s baseline.
@@ -382,6 +451,282 @@ What would actually move it, neither small: resolve on a faster machine (which i
 add-on deployment and the remote cipher both do), or run the Pi on a 64-bit OS — the Zero
 2 W's Cortex-A53 is aarch64-capable, and Raspbian armhf's 32-bit userland is what rules out
 deno/bun and modern node in the first place.
+
+**Resolved 2026-08-10.** The premise above was wrong in one respect: the cost was never
+spread across the resolve, it was almost entirely **one thing** — re-parsing the player JS
+in a fresh `node` on every track. Measured on the add-on host with the JS stage isolated
+(`node --permission -` fed exactly what `jsc/_builtin/node.py` feeds it):
+
+| stage of one challenge solve | x86_64 workstation | HA host (aarch64, nice 19) |
+|---|---|---|
+| raw player + solve — **what happened per track** | 1.05 s | **15.15 s** |
+| preprocessed player + solve | 0.33 s | 3.38 s |
+| *three* solves in one process, preprocessed | 0.33 s | 2.78 s |
+| bare `node` startup floor | 0.10 s | 0.90 s |
+
+So ~11.8 s of the 15.15 s is `preprocessPlayer()` — meriyah parsing 2.8 MB of player JS and
+astring regenerating it — ~2.5 s is node parsing the 3.8 MB stdin payload, and the **solving
+itself is free**: three challenges cost the same as one. There is no hot loop for a JIT to
+warm up; each transform runs once. What remained was to stop re-parsing, which is what the
+resident worker below does.
+
+### The long-lived resolver (`ytdlp_daemon.py`)
+
+One yt-dlp process for the life of the service, asked per track over a unix socket, instead
+of one process per track. [`ytdlp.js`](../firmware/pi-ytmusic/receiver/ytdlp.js) spawns and
+supervises it in exactly the shape `mpv.js` uses for mpv — newline-delimited JSON correlated
+by id, the child's stderr forwarded into the receiver's log, respawn on death.
+
+Measured on the Pi Zero 2 W, **anonymous** (2026-08-10, four videos, cold disk cache, both
+paths through `nice -n 19 ionice -c 3`):
+
+| | per-track spawn | long-lived daemon |
+|---|---|---|
+| 1st resolve | 6.3 s | 4.1 s (cold) |
+| 2nd | 7.0 s | 3.8 s |
+| 3rd | 7.3 s | 3.6 s |
+| 4th | 5.6 s | **2.6 s** |
+
+What that removes is the fixed per-process cost — the Python start and `yt_dlp` import, the
+~2-3 MB player JS download, the InnerTube client-version probes, the PO token (its cache
+provider is `memory`, i.e. per process). What it does **not** touch is the JS challenge, which
+turned out to be the dominant term of an authenticated resolve (15 s on the add-on host, all
+of it parsing); that is what the resident worker below is for. The two compose: this daemon
+makes the *process* cheap, the worker makes the *challenge* cheap, and what remains is the
+`/player` round trips.
+
+Five things it has to get right, each with a failure it prevents:
+
+| | why |
+|---|---|
+| **Modes come from `resolver.js`** | `daemonModes` hands the daemon the *same argv* `#attempts()` would have spawned, so the warm path and the fallback path cannot drift. The daemon turns them into API options with yt-dlp's own `parse_options`, not a translation table. |
+| **A per-track spawn is still there** | A daemon that will not start (no importable `yt_dlp`), dies repeatedly, or wedges falls back to spawning — a slow resolver must never become a dead player. Only *transport* failures fall back; a resolve that genuinely failed escalates to the next attempt instead, which is the better move. |
+| **One shared cookie jar, reloaded by content** | `--cookies` used to be read per spawn, so a pushed jar took effect on the next song. All modes now share **one** jar object (`YoutubeDL.cookiejar` is a `cached_property`, so assigning it before the first request replaces it wholesale), and it is re-read in place when the file's **content hash** changes — never on mtime, and never as a rebuild. Rotated cookies are flushed back at most every 5 min and on `SIGTERM`. See below for the bug that shaped this. |
+| **Warm state is discarded after 2 consecutive failures** | yt-dlp caches *negative* results too. Observed while building this: after one failed solve, later resolves on the same instance stopped reporting `[jsc:node] Solving JS challenges using node` and warned "No supported JavaScript runtime could be found" instead — a provider marked unavailable for the life of the process. A fresh process per track papered over that by construction. |
+| **`--prewarm`** | One throwaway resolve at startup, while nothing is playing, so the first real track finds the caches populated. This is the one thing warmth does for the *first* track of a session, which prefetch cannot help by definition. |
+
+### The resident JS-challenge worker (`jsc_worker.js` + `jsc_resident.py`)
+
+One `node` kept alive for the life of the daemon, holding the `{n, sig}` solver **closures**
+per player version. Measured on the Pi Zero 2 W (armv7, node 22), which is the box where the
+old behaviour hurt most — 17.9 s per track:
+
+| what the solve had to do | cost |
+|---|---|
+| `[player]` first sight of a player version — full preprocess | **17.9 s** |
+| `[preprocessed]` fresh worker, player already on disk — a `Function()` compile | **3.7 s** |
+| `[memory]` steady state — a function call | **4-48 ms** |
+
+Every solve logs which of the three it was, because "is the worker actually being used?" is
+the only question a latency report about this needs answered:
+
+```
+[ytdlpd] jsc: solved 1 challenge(s) for 854a788e-main in 17908ms [player]
+[ytdlpd] jsc: solved 2 challenge(s) for 854a788e-main in 7ms [memory]
+```
+
+How it fits together:
+
+| | |
+|---|---|
+| **The worker** | `node --permission -e <source>` — the source is passed on the command line and never imported, so the process can keep yt-dlp's sandbox (no filesystem, no network) while evaluating untrusted player JS. It evaluates the ejs lib+core once, then caches `{n, sig}` per player id, bounded to 4 players. |
+| **The provider** | A real yt-dlp `JsChallengeProvider` (`ResidentNodeJCP`), registered **in-process** by the daemon rather than as a plugin package — the worker has to be owned by something long-lived, and that is the daemon. Providers are instantiated per `YoutubeDL`, so the worker is a module singleton and `close()` is deliberately a no-op; letting yt-dlp's close hook kill it would discard every cached player. |
+| **Opt-in by extractor-arg** | `youtubejsc-residentnode:enable=1`, injected by the daemon into every mode that is *not* the remote-cipher attempt. Not decoration: `resolver.js` offers exactly one challenge provider per attempt, and a provider registered unconditionally would outrank the remote cipher in the attempt meant to use it — the failure already documented in `#attempts`. |
+| **Failure is free** | yt-dlp's director tries providers in preference order and moves to the next one on *any* exception, so a dead worker degrades to the builtin `node` provider by construction. Verified by breaking the worker on purpose: `Error solving n challenge request using "resident node" provider: …` followed by `[jsc:node] Solving JS challenges using node`. |
+| **Two consumers, one cached file** | The preprocessed player is written to yt-dlp's own disk cache under exactly the key the builtin ejs provider reads, and `_ENABLE_PREPROCESSED_PLAYER_CACHE` — which upstream leaves off — is switched on. So the fallback path reads what the worker computed and vice versa, and a worker restart costs 3.7 s instead of 17.9 s. |
+| **Version-scoped cache** | The upstream key is the player URL alone. The section is suffixed with the solver version (`challenge-solver-0.8.0`), because `run.sh` upgrades `yt-dlp-ejs` at every boot and a new solver paired with a player preprocessed by the old one is the most plausible reason that flag is off upstream. A wrong answer would still be caught by `#verify`'s two-byte ranged request. |
+
+**A player rotation costs one track.** YouTube served `854a788e` and then `341562bc` within
+an hour of testing; a new player id has nothing cached anywhere, so the first resolve after a
+rotation pays the full preprocess once. `--prewarm` absorbs it at startup, not mid-session.
+
+Switches: `YTCR_JSC_RESIDENT=0` disables the worker (back to yt-dlp's own `node` provider),
+`YTCR_YTDLP_PREPROCESSED_CACHE=0` disables the disk cache. The worker only runs where
+`YTCR_JS_RUNTIME` is node-based — a box configured for `quickjs` keeps yt-dlp's path
+untouched, since the worker speaks node's flags.
+
+Two bugs this shook out, both found by running it rather than reading it: the worker's own
+`let jsc` collided with the `var jsc` the core script declares in global scope (node refuses
+the whole init with *"Identifier 'jsc' has already been declared"*, so the variable name is
+load-bearing — it is now `entry`); and `YoutubeDL.extract_info` returns **None** rather than
+raising when yt-dlp handled a failure non-fatally, which surfaced as
+`AttributeError: 'NoneType' object has no attribute 'get'` instead of a diagnosis.
+
+#### The 403 at the verify step: unexplained, mitigated (2026-08-10)
+
+**Symptom:** a resolve succeeds, and the resolved URL then answers `HTTP 403` to a two-byte
+ranged GET. `#verify` catches it, the attempt fails, and without recovery `doPlay` falls
+through to mpv re-resolving from scratch (~17 s).
+
+**It arrives in windows.** The same video, from the same code, on the same box: three
+consecutive resolves through one daemon all 403 while a fresh `yt-dlp` CLI interleaved
+between them gets 206 — and ten minutes later *every* configuration, daemon included, gets
+206. Any experiment that does not interleave its control is therefore worthless, which
+invalidated several rounds of this investigation.
+
+**What has been ruled out**, each by A/B on the hardware, most of it twice:
+
+| candidate | verdict |
+|---|---|
+| the resident worker | worker ON vs OFF, both 206 in a good window; and its `n` output is **bit-identical** to a fresh `jsc()` call across repeated solves, rebuilt closures and fresh `vm` contexts |
+| the preprocessed-player disk cache | ON vs OFF, both 206; and a fresh process inheriting the live cache dir is fine |
+| `youtube-sigfuncs` poisoning | cached specs match freshly computed ones byte for byte |
+| `fetch_pot=never` | the failing video resolved to a working URL under `never`, `auto`, `auto` with plugins disabled, and `always` |
+| IP binding | the URL's `ip=` matches this host's current IPv6 source address exactly, and still 403s |
+| the cookie jar | a copy works; and mpv's own resolution, using the *same* jar file, works |
+| session age / `YoutubeDL` age | a session seconds old still 403s; a 4-minute-old one sometimes does not |
+| process age, "only the first solve works" | a **brand-new** daemon 403'd on its very first resolve while a CLI seconds later succeeded |
+| `_pot_memory_cache` (module-level, per video) | cleared on every rebuild; the next resolve still 403'd |
+
+**What is left:** within a bad window, the daemon's `extract_info` loses where a CLI wins,
+and no configuration difference explains it. The leading suspect is server-side — YouTube
+deciding a given request needs an attestation this deployment cannot provide (`PO Token
+Providers: none`, plus `Detected experiment to bind GVS PO Token to video ID` in the verbose
+log, on videos that carry ads). Naming it needs the InnerTube request bodies from a daemon
+and a CLI captured *inside* a bad window and diffed; that is the next experiment, and it
+needs a window to happen while somebody is watching.
+
+**Ads are the leading mechanism, and the ladder follows from it.** Ad enforcement is
+reported **per client** (`Detected a 15s ad skippable after 5s for web_safari`), and the
+correlation with failures is suggestive: every URL ever rejected here belonged to an
+ad-carrying video, and neither zero-ad video has ever failed. Not conclusive — two
+ad-carrying videos have never failed either, on a couple of samples each — but it points
+somewhere cheap to act:
+
+| ads | history |
+|---|---|
+| 2-3 markers | `H7079Sq3dAg`, `dQw4w9WgXcQ`, `kJQP7kiw5Fk`, `LCt92oOexsg`, `ZCbMzDclnEM` — all 403-prone |
+| 0 markers | `jNQXAC9IVRw`, `aqz-KE-bpKQ` — never failed |
+| 2-3 markers | `QK2oBpEBMs0`, `UnAHtKGgkQ8` — never failed (few samples) |
+
+**Mitigation, which is what actually ships.** Cheapest first, and each rung gated by
+`#verify` so a URL that will not play never reaches mpv:
+
+1. **`#verify` retries once after 1.5 s** — a transient rejection costs 1.5 s, not a resolve.
+2. **A client ladder.** The primary attempt keeps the default clients (itag 251: opus,
+   audio-only, 48 kHz — the resample-free format). If its URL will not play, the same video
+   is resolved through `web_embedded`, then `web_safari`, then `mweb` (`YTCR_CLIENT_LADDER`,
+   `none` to disable). Ordered by format, measured **with cookies**: `web_embedded` serves the
+   same `251 | opus | 136 kbps` as the default, `web_safari` drops to HLS (96) and `mweb` to
+   muxed 360p (18, i.e. video bytes fetched and discarded). `android_vr` looked good in an
+   anonymous sweep and offers **no formats** once authenticated — which is why the ladder was
+   ranked from an authenticated measurement. Each rung's
+   `YoutubeDL` is built lazily, so unused rungs cost nothing, and **prewarm only warms the
+   primary**.
+3. **Then a restart**, once the *whole* ladder has produced unplayable URLs — never on the
+   first failure, which would kill the daemon mid-ladder and push the remaining rungs onto
+   the per-track spawn path. `resolver.js` waits for the replacement and retries the primary
+   attempt only.
+4. **mpv's own resolution** stays the last resort: a different code path in a fresh process.
+
+Measured with *every* verify forced to fail — the worst case, which the hypothesis says
+should be rare: **13.5 s** for ladder + restart + retry, against 27 s for a real session
+before any of this existed.
+
+**Confirmed live (2026-08-10):** two tracks in one session were rescued by the ladder —
+`local` produced a URL that answered 403, `client-web_safari` produced one that played
+(itag 96). Steady-state track changes in the same session ran at **1.1-1.3 s** to audio on
+prefetched URLs, and the per-solve closure rebuild cost **121-182 ms**.
+
+Two things that log exposed, both now fixed:
+
+- **Duplicate `--extractor-args youtube:…` silently replace each other.** Every ladder rung
+  had lost `fetch_pot=never` to its own `player_client=…`, and was warning about the
+  unreachable PO-token server on every resolve. All `youtube:` settings are now composed
+  into a single `youtube:a=1;b=2` value; other prefixes (`youtubejsc-*`, `youtubepot-*`) are
+  separate keys and stay separate options.
+- **A 403 no longer earns the verify retry.** It is a verdict, not a hiccup — the retry never
+  once turned into a 200 — and it was costing 1.7 s of every rescued track. Timeouts, resets
+  and 5xx still get one retry; 4xx goes straight to the next rung.
+
+**And a 403 now diagnoses itself.** When every attempt has failed, the daemon sweeps the
+video across ten `player_client` values in fresh `YoutubeDL` instances, fetches two bytes of
+each resulting URL, and writes a JSON report to `/data/403-diagnostics/` — itag, HTTP status,
+ad markers, and the server-side URL parameters (`expire`, `ip`, `ei`, `svpuc`, `cps`;
+deliberately never `n`, `sig`, `pot` or cookies). Throttled to one per 15 minutes, run in the
+background, ~16 s for ten clients anonymously.
+
+This exists because these rejections arrive in **windows** that cannot be reconstructed
+afterwards: the same video 403s three times through the daemon while an interleaved CLI gets
+206, and ten minutes later every configuration succeeds. Every hypothesis tested outside a
+window measured nothing, and several were. The report answers, unattended, the one question
+that matters during a window — *was there a client that could have played this?* — and the
+answer tunes the ladder.
+
+**One thing was changed on the strength of a since-falsified theory, and is kept anyway:**
+the worker now rebuilds the solver closures per solve instead of caching them, because that
+is what the ejs core does (`getFromPrepared` inside `main`) and the cost is a lazy
+`Function()` compile — 13 ms on x86_64, and logged per solve as `[rebuilt build Xms]`. It
+matches upstream semantics; it is not a fix for the 403.
+
+#### The cookie-jar reload that ate the warmth (fixed 2026-08-10, same day)
+
+**Symptom**, from a live add-on log at a song change:
+
+```
+[ytdlpd] mode remote: cookie jar changed on disk — reloading
+[ytdlpd] DrORE5_qTFg via remote in 4.4s (cold)
+[resolver] remote cipher failed: stream URL rejected with HTTP 403 — falling back to local node
+[ytdlpd] mode local: cookie jar changed on disk — reloading
+[ytdlpd] DrORE5_qTFg via local in 12.2s (cold)
+```
+
+Both modes cold, on a warm daemon, for a total of ~17 s — *worse* than the per-track spawn
+it replaced.
+
+**Cause.** The first version gave each mode its own `YoutubeDL` (hence its own jar) and
+treated any **mtime** change as "the operator pushed a new jar", discarding that mode's warm
+caches. But nearly every write to that file is *ours*: `--cookies FILE` makes yt-dlp dump the
+jar back on `close()`, the daemon saves it periodically, and mpv's `ytdl_hook` writes it on
+the fallback path — so with two modes sharing one file, each mode's cookie rotation looked
+like an external push to the other and the two took turns going cold. Compounding it, a
+rebuild of the *fallback* mode is exactly when you can least afford one: the 403 above is the
+public cipher instance's known 1-in-3 wrong `n`, so the 12.2 s cold resolve landed on top of
+a 4.4 s wasted one.
+
+**Fix**, both halves needed: track the jar's **content hash** against what we last read *or
+wrote*, so our own writes are invisible and only a real push registers; and share **one jar
+object** across modes, reloaded in place — cookies live in the jar, not in
+`_code_cache`/`_player_cache`, so a push has no business invalidating the expensive state.
+Verified: `touch` alone changes nothing, an appended cookie produces one
+`cookie jar was replaced on disk — reloaded N cookies, keeping warm resolver state` and every
+mode stays warm. Sharing the jar also removes a hazard that predates the daemon — two
+`YoutubeDL`s rotating the same Google session against each other is what `push_cookies.py`
+warns about at length.
+
+#### Every logged line is attributable
+
+A related trap, from the same session: an `nginx 504` error page — padding comments and all —
+appeared in the receiver's journal as a dozen **bare** lines, with nothing identifying who
+had written them. Two causes, both fixed:
+
+- the daemon's `log()` prefixed only the *first* line of a multi-line message, so
+  continuation lines arrived untagged;
+- `ytdlp.js` passed the daemon's stderr through verbatim, trusting it to tag itself — which
+  cannot hold for text written by a process yt-dlp spawned (the JS runtime for the `n`
+  challenge inherits that stderr) or by a Python traceback.
+
+So `log()` now prefixes every line, yt-dlp's own messages are flattened to one line and
+capped at 500 characters (they can carry a whole HTTP response), and any untagged stderr line
+is forwarded as `[ytdlpd:raw]`. If that blob recurs, the log now says where it came from.
+
+`YTCR_YTDLP_CACHE_DIR` pins yt-dlp's on-disk cache (extracted signature functions, the
+downloaded ejs solver scripts) somewhere persistent — `/data/yt-dlp-cache` in the add-on,
+the state dir on the Pi. It is the only part of a cold resolve that survives a restart, and
+yt-dlp's default (`~/.cache/yt-dlp`) is neither persistent nor reliably writable in the
+container.
+
+Environment: `YTCR_YTDLP_DAEMON=0` disables it (back to a spawn per track),
+`YTCR_YTDLP_PREWARM=0` skips the startup resolve, `YTCR_YTDLP_PYTHON` overrides the
+interpreter (default: `python3` next to `YTCR_YTDL_PATH`, i.e. the venv's own),
+`YTCR_YTDLP_SOCKET` overrides the socket path. The receiver's startup line says which path
+is in use — `resolver: long-lived yt-dlp` or `resolver: yt-dlp per track` — and every resolve
+logs whether it was served warm:
+
+```
+[resolver] resolved <id> in 2.6s via local node (daemon)
+[resolver] resolved <id> in 4.1s via local node (daemon, cold)
+```
 
 ---
 
@@ -493,6 +838,11 @@ step (`yt-cast-receiver` ships JS + typings, so plain Node runs it):
 | `player.js` | `MpvPlayer extends Player` — the nine abstract methods, plus `end-file` → advance queue |
 | `mpv.js` | JSON-IPC client: spawns one long-lived `mpv --idle`, request/reply by `request_id`, re-emits mpv events, forwards mpv's stderr into the log, respawns mpv if it dies |
 | `resolver.js` | Pre-resolves the next track to a direct URL; remote-cipher-first with a local fallback |
+| `ytdlp.js` | Client for the long-lived resolver: spawns it, JSON over a unix socket, respawns it, falls back to a per-track spawn |
+| `ytdlp_daemon.py` | The long-lived resolver itself — one `YoutubeDL` per mode, kept warm across tracks |
+| `jsc_resident.py` | A yt-dlp JS-challenge provider backed by a resident `node`, plus the preprocessed-player disk cache |
+| `jsc_worker.js` | That resident `node`: holds the ejs solver closures per player version (run via `node -e`, never imported) |
+| `priority.js` | The `nice`/`ionice` prefix shared by both resolve paths |
 | `metadata.js` | Now-playing reporting to the add-on's API |
 | `singleton.js` | Single-instance lock, so a second mpv can never join `ytm-out` |
 
@@ -808,6 +1158,19 @@ instead of 22-30 s.
 
 **Not yet confirmed:**
 
+- The **authenticated end-to-end** resolve time, on either box. Every *stage* is now measured
+  on real hardware — the daemon cuts an anonymous Pi Zero resolve from 6.3-7.3 s to
+  2.6-4.1 s, and the resident worker cuts the challenge from 17.9 s to 4-48 ms on the same
+  box — but the two have never run together against a cookie jar, which is the only test that
+  answers "is a track change ~2 s?". Needs `./scripts/deploy-dev.sh ytmusic` and a real cast;
+  watch for `[resolver] resolved <id> in Xs via <label> (daemon)` together with
+  `jsc: solved N challenge(s) … [memory]`.
+- Whether `cipher_url` should then be turned off (see *Remote cipher*): expected, but it is a
+  config change to make on evidence from that same log.
+- Whether `--prewarm` is a *net* win on the Zero 2 W specifically. It spends a full cold
+  resolve at boot (nice 19, ionice idle, ~88 MB for the JS runtime on a 424 MB box) to make
+  the first track of the first session fast. On the add-on this is free; on the Zero, if it
+  ever collides with something, `YTCR_YTDLP_PREWARM=0`.
 - A full album start-to-finish with **no gap** at every track change.
 - Fan-out to two or more outputs in sync, with **announce/duck** behaving exactly as it does
   for any other RTP source (nothing special should be needed — worth confirming rather than

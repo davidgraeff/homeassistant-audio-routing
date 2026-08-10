@@ -84,6 +84,19 @@ export default class MpvPlayer extends Player {
   }
 
   async doPlay(video, position) {
+    // Timed in three parts, because "20 s until I could hear music" is otherwise
+    // unattributable: the resolve is logged by resolver.js, but everything after it —
+    // mpv opening the URL, demuxing from a mid-stream position, filling `--audio-buffer`
+    // — was invisible. `playback-restart` is mpv's own "audio is flowing again" event and
+    // is the closest thing to when sound actually starts; the RTP hop and the router's
+    // buffering (~0.6 s) sit downstream of even that.
+    const startedAt = Date.now();
+    const since = (t) => ((Date.now() - t) / 1000).toFixed(1);
+    const onRestart = () => {
+      this.#mpv.off('playback-restart', onRestart);
+      this.logger.info(`[MpvPlayer] ${video.id} audio flowing after ${since(startedAt)}s`);
+    };
+    this.#mpv.on('playback-restart', onRestart);
     const watchUrl = `https://www.youtube.com/watch?v=${video.id}`;
     // Resolve through resolver.js rather than letting mpv's ytdl_hook do it.
     //
@@ -103,7 +116,20 @@ export default class MpvPlayer extends Player {
       this.logger.warn(`[MpvPlayer] falling back to mpv's own resolution for ${video.id}`);
     }
     const prefetched = !!direct;
-    const url = direct ?? watchUrl;
+    const resolvedAt = Date.now();
+    const url = direct?.url ?? watchUrl;
+    // Hand mpv the User-Agent yt-dlp used, because the URL is issued against it: some
+    // googlevideo URLs answer **403** to a request without a matching UA and 206 with
+    // one (measured on the add-on, same URL, three fetchers). `ytdl_hook` passes these
+    // headers when *it* resolves; a prefetched URL bypasses it, so they have to be
+    // supplied here or the bypass silently loses playback on those tracks.
+    //
+    // Set as a property rather than a per-file option: `loadfile`'s option list is
+    // comma-separated and the UA contains a comma ("(KHTML, like Gecko)"), which would
+    // need mpv's `%<len>%` escaping. One long-lived mpv plays one stream at a time, so
+    // a global is equivalent and unambiguous. Cleared on the fallback path so a stale
+    // UA cannot follow ytdl_hook's own resolution.
+    await this.#mpv.setProperty('user-agent', direct?.headers?.['User-Agent'] ?? '');
     // Tell the reporter which video this is *before* loading: the artwork URL is
     // derivable from the id alone, so it can be reported while yt-dlp is still
     // resolving the title (metadata.js).
@@ -160,6 +186,12 @@ export default class MpvPlayer extends Player {
     }
 
     const ok = await started;
+    this.logger.info(
+      `[MpvPlayer] ${video.id} ${ok ? 'loaded' : 'failed'} after ${since(startedAt)}s `
+      + `(resolve ${((resolvedAt - startedAt) / 1000).toFixed(1)}s, mpv ${since(resolvedAt)}s)`);
+    if (!ok) {
+      this.#mpv.off('playback-restart', onRestart);
+    }
     if (!ok && prefetched && this.#retriedFor !== video.id) {
       // The direct URL was accepted by `loadfile` but did not play — most likely
       // expired or rejected. Drop it and try once more via mpv's own resolution,

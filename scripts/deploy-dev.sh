@@ -66,7 +66,15 @@ stage_ytmusic_receiver() {
   mkdir -p "$dst"
   # Only the app files. node_modules is npm's job inside the image, and copying a
   # host build of it would mean armv7 binaries in an aarch64 image.
-  cp "$src"/*.js "$src"/package.json "$dst/"
+  #
+  # The .py files are the long-lived resolver daemon and its resident JS-challenge
+  # provider, both spawned/imported by ytdlp.js's daemon rather than by node. Without
+  # them the image still plays, just with a per-track yt-dlp and a 15 s challenge —
+  # which is why the copy fails loudly if either is missing.
+  cp "$src"/*.js "$src"/*.py "$src"/package.json "$dst/"
+  for required in ytdlp_daemon.py jsc_resident.py jsc_worker.js; do
+    [ -f "$dst/$required" ] || { echo "ERROR: $src/$required missing" >&2; exit 1; }
+  done
 }
 
 # Map the target's `uname -m` to Home Assistant's arch name and the buildx

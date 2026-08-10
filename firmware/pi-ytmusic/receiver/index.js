@@ -18,10 +18,12 @@
 import os from 'os';
 import { existsSync } from 'fs';
 import YouTubeCastReceiver, { Constants } from 'yt-cast-receiver';
+import path from 'path';
 import MetadataReporter from './metadata.js';
 import MpvClient from './mpv.js';
 import MpvPlayer from './player.js';
 import Resolver from './resolver.js';
+import YtdlpDaemon from './ytdlp.js';
 import { AlreadyRunningError } from './singleton.js';
 
 /** Interfaces that must never be advertised over DIAL. */
@@ -129,6 +131,14 @@ function buildMpvArgs() {
   // the fallback, and hence this default.
   rawOptions.push(`js-runtimes=${process.env.YTCR_JS_RUNTIME || 'quickjs'}`);
 
+  // Same persistent yt-dlp cache the resolver uses (resolver.js `#attempts`). mpv's
+  // ytdl_hook is only the fallback path now, but when it runs it should not have to
+  // re-fetch the challenge-solver scripts, and its default cache location in the
+  // add-on's container is not persistent.
+  if (process.env.YTCR_YTDLP_CACHE_DIR) {
+    rawOptions.push(`cache-dir=${process.env.YTCR_YTDLP_CACHE_DIR}`);
+  }
+
   // NOTE: the remote cipher server (YTCR_CIPHER_URL) is deliberately NOT passed to
   // mpv. yt-dlp picks one JS-challenge provider by preference and the plugin
   // registers none, so any builtin runtime — which mpv needs as its last-resort
@@ -162,12 +172,53 @@ function buildMpvArgs() {
 }
 
 /**
+ * Where the resolver daemon's Python lives.
+ *
+ * Derived from `YTCR_YTDL_PATH` rather than configured: both deployments install
+ * yt-dlp into a venv (`/opt/ytdlp` in the add-on, `~/.local/share/pi-ytmusic-venv`
+ * on the Pi), and the interpreter that can `import yt_dlp` is by definition the one
+ * next to that venv's `yt-dlp` — not whatever `python3` is first on PATH, which in
+ * the add-on's container is the system Python with no yt-dlp in it.
+ */
+function daemonPython() {
+  if (process.env.YTCR_YTDLP_PYTHON) {
+    return process.env.YTCR_YTDLP_PYTHON;
+  }
+  if (!process.env.YTCR_YTDL_PATH) {
+    return null;
+  }
+  return path.join(path.dirname(process.env.YTCR_YTDL_PATH), 'python3');
+}
+
+/**
+ * The `node` binary the resident JS-challenge worker should run on, or null.
+ *
+ * Taken from `YTCR_JS_RUNTIME`, which is what yt-dlp is told to solve challenges with:
+ * `node` in the add-on, `node:/home/…/node22/bin/node` on the Pi (Raspbian's node 20 is
+ * rejected by yt-dlp, hence the private tarball). The worker is node-specific — it
+ * speaks node's stdin/permission flags — so a box configured for `quickjs` gets no
+ * worker and keeps yt-dlp's own path.
+ */
+function jscResidentNode() {
+  if (process.env.YTCR_JSC_RESIDENT === '0') {
+    return null;
+  }
+  const runtime = process.env.YTCR_JS_RUNTIME || 'quickjs';
+  if (runtime !== 'node' && !runtime.startsWith('node:')) {
+    return null;
+  }
+  return runtime.startsWith('node:') ? runtime.slice('node:'.length) : 'node';
+}
+
+/**
  * The MpvClient, visible to the top-level error handler. An mpv spawned before a
  * later startup step failed has to be killed on the way out, or it stays attached
  * to `ytm-out` — mixing into the RTP stream with nothing left to control it, and
  * `Restart=always` then stacks another one on top of it every few seconds.
  */
 let mpvClient = null;
+/** Likewise the resolver daemon: a child that outlives a failed startup. */
+let ytdlpDaemon = null;
 
 async function main() {
   const socketPath = process.env.YTCR_MPV_SOCKET
@@ -215,7 +266,36 @@ async function main() {
     format: process.env.YTCR_FORMAT || 'bestaudio/best',
     cipherUrl: process.env.YTCR_CIPHER_URL || null,
     cipherTimeout: Number(process.env.YTCR_CIPHER_TIMEOUT || 8),
+    potUrl: process.env.YTCR_POT_URL || null,
+    // `YTCR_CLIENT_LADDER=none` disables the extra client attempts; a comma-separated
+    // list replaces them (valid names: web, web_safari, web_embedded, web_music,
+    // web_creator, android, android_vr, ios, mweb, tv, tv_downgraded, tv_simply).
+    ...(process.env.YTCR_CLIENT_LADDER
+      ? { clientLadder: process.env.YTCR_CLIENT_LADDER === 'none'
+        ? [] : process.env.YTCR_CLIENT_LADDER.split(',').map((c) => c.trim()).filter(Boolean) }
+      : {}),
+    cacheDir: process.env.YTCR_YTDLP_CACHE_DIR || null,
   });
+
+  // The long-lived yt-dlp (ytdlp.js). Optional in both directions: no yt-dlp path
+  // means no resolver at all, and a daemon that fails to start leaves the resolver
+  // spawning per track — the behaviour before it existed. Nothing here may abort
+  // startup, because a slow resolver is a worse outcome than an undiscoverable
+  // receiver.
+  const python = daemonPython();
+  if (resolver.enabled && python && process.env.YTCR_YTDLP_DAEMON !== '0') {
+    ytdlpDaemon = new YtdlpDaemon({
+      python,
+      socketPath: process.env.YTCR_YTDLP_SOCKET
+        || `${process.env.XDG_RUNTIME_DIR || '/tmp'}/ytmusic-ytdlp.sock`,
+      modes: resolver.daemonModes,
+      prewarm: process.env.YTCR_YTDLP_PREWARM !== '0',
+      jscResident: jscResidentNode(),
+      jscPreprocessedCache: process.env.YTCR_YTDLP_PREPROCESSED_CACHE !== '0',
+      logger: console, // upgraded to the receiver's logger below
+    });
+  }
+
   const player = new MpvPlayer(mpv, metadata, resolver);
 
   const receiver = new YouTubeCastReceiver(player, {
@@ -228,9 +308,14 @@ async function main() {
   });
   mpv.setLogger(receiver.logger);
   resolver.setLogger?.(receiver.logger);
+  ytdlpDaemon?.setLogger(receiver.logger);
   metadata?.attach(mpv);
 
   receiver.on('senderConnect', (sender) => {
+    // Fresh session state for the first track. It expires in minutes (see
+    // MAX_WARM_AGE_S), and the first play after a connect is the resolve least able to
+    // absorb a retry — the user is waiting on it with nothing prefetched.
+    ytdlpDaemon?.refresh('sender connected');
     const isYtMusic = sender.client?.key === Constants.CLIENTS.YTMUSIC.key;
     receiver.logger.info(
       `[ytcr] sender connected: ${sender.name}` +
@@ -245,11 +330,28 @@ async function main() {
   });
 
   await mpv.start();
+  if (ytdlpDaemon) {
+    // Started before the receiver so its prewarm resolve overlaps with becoming
+    // discoverable. If a cast arrives while the prewarm is still running, the first
+    // track waits behind it on the mode's lock rather than starting a second cold
+    // extraction beside it — measured: 2.0 s wall for a 1.1 s resolve that queued.
+    try {
+      await ytdlpDaemon.start();
+      resolver.setDaemon(ytdlpDaemon);
+    }
+    catch (e) {
+      receiver.logger.warn(
+        `[ytcr] resolver daemon did not start (${e.message}) — resolving with one `
+        + 'yt-dlp per track');
+      ytdlpDaemon = null;
+    }
+  }
   await receiver.start();
   receiver.logger.info(
     `[ytcr] ready — DIAL name "${deviceName}" on ${bindAddress ?? 'all interfaces'}:${dialPort}, ` +
     `audio -> ${audioDevice}` +
-    (metadata ? `, metadata -> ${addonHost}` : ', metadata reporting off'));
+    (metadata ? `, metadata -> ${addonHost}` : ', metadata reporting off') +
+    (ytdlpDaemon ? ', resolver: long-lived yt-dlp' : ', resolver: yt-dlp per track'));
 
   let stopping = false;
   const shutdown = async (signal) => {
@@ -269,6 +371,7 @@ async function main() {
     metadata?.stopped();
     metadata?.close();
     await mpv.stop();
+    await ytdlpDaemon?.stop();
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
@@ -289,6 +392,7 @@ main().catch(async (e) => {
   }
   try {
     await mpvClient?.stop();
+    await ytdlpDaemon?.stop();
   }
   catch { /* best effort on the way out */ }
   process.exit(1);

@@ -21,6 +21,11 @@
  * plays, resolve track N+1 and keep its direct URL. `doPlay` then hands mpv a
  * plain https URL, which skips `ytdl_hook` entirely and starts in about a second.
  *
+ * Resolution itself is *also* made faster now, by not paying that process-local cost
+ * per track: `ytdlp.js` keeps one long-lived yt-dlp process whose caches survive
+ * across tracks, and this class asks it rather than spawning. The per-track spawn
+ * survives as the fallback for when there is no usable daemon — see `#runOnce`.
+ *
  * WHY NOT mpv's OWN PLAYLIST PREFETCH
  * -----------------------------------
  * Appending upcoming tracks to mpv's playlist would let mpv advance on its own,
@@ -30,46 +35,8 @@
  */
 
 import { spawn } from 'child_process';
-import fs from 'fs';
 import os from 'os';
-
-/**
- * A resolve must never compete with playback.
- *
- * Measured on the Pi Zero 2 W (2026-08-10): one resolve is `yt-dlp` at ~26 % of a
- * core *plus* the JS runtime it spawns for the `n` challenge at **>100 % and ~88 MB
- * RSS**, for ~20 s — and because `prefetch()` is deliberately fired while track N is
- * playing, that lands mid-song on a 4-core 1 GHz box with ~80 MB free. mpv and this
- * both ran at nice 0, so the resolve could take CPU straight off the player.
- *
- * `nice` and `ionice` are set by exec'ing through the wrappers rather than after the
- * fact: the priority then applies from the first instruction, and — the part that
- * matters here — it is **inherited by the JS runtime yt-dlp spawns**, which is the
- * expensive process. `--js-runtimes` gives yt-dlp a plain binary path, so there is no
- * other way to reach that child.
- *
- * The unit's `CPUWeight` cannot express this: it throttles the whole service cgroup,
- * mpv included, i.e. the player is punished together with the offender.
- */
-const RESOLVE_NICE = 19;
-/** `ionice -c 3` (idle): SD-card reads for the Python/extractor import yield too. */
-const IONICE_CLASS = 3;
-
-/**
- * Build the argv prefix that lowers a resolve's priority, using whichever wrappers
- * this box actually has. Falls back to `os.setPriority` in `#run` when neither is
- * present, which covers CPU but not I/O.
- */
-function priorityPrefix() {
-  const prefix = [];
-  if (fs.existsSync('/usr/bin/nice')) {
-    prefix.push('/usr/bin/nice', '-n', String(RESOLVE_NICE));
-  }
-  if (fs.existsSync('/usr/bin/ionice')) {
-    prefix.push('/usr/bin/ionice', '-c', String(IONICE_CLASS));
-  }
-  return prefix;
-}
+import { RESOLVE_NICE, priorityPrefix } from './priority.js';
 
 /**
  * Treat a URL as stale this long before YouTube's own `expire=`. Generous because
@@ -81,8 +48,40 @@ const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 const RESOLVE_TIMEOUT_MS = 150000;
 /** Budget for the two-byte URL verification (see #verify). */
 const VERIFY_TIMEOUT_MS = 8000;
+/** Pause before verify's single retry. Long enough for a transient rejection to pass,
+ * short enough to stay inside a track change. */
+const VERIFY_RETRY_DELAY_MS = 1500;
 /** Cache bound. The queue only ever needs the next one or two. */
 const MAX_ENTRIES = 8;
+/**
+ * Extra attempts that differ only in which InnerTube client yt-dlp asks.
+ *
+ * Ad enforcement is reported **per client** — the verbose log carries lines like
+ * `Detected a 15s ad skippable after 5s for web_safari` — and every URL that has been
+ * rejected with 403 belonged to an ad-carrying video, while neither zero-ad video ever
+ * failed. So when one client's URL will not play, the cheapest thing to try is the same
+ * video through a different client: no extra credentials, no extra risk, and the attempt
+ * ladder in `#run` already gates each one with `#verify`.
+ *
+ * Ordered by **format**, then by whether it plays at all. Measured on the add-on *with the
+ * cookie jar*, which matters — an anonymous sweep ranked `android_vr` highly and it turns out
+ * to offer no formats at all once authenticated:
+ *
+ *     (default)      251 | opus | 136 kbps     <- audio-only, 48 kHz, resample-free
+ *     web_embedded   251 | opus | 136 kbps     <- same format, different client
+ *     web_safari      96 | mp4a | HLS
+ *     mweb            18 | mp4a | muxed 360p   <- video bytes fetched and discarded
+ *     web_music       18 | mp4a | muxed 360p
+ *     android_vr      no formats (authenticated)
+ *
+ * So the two opus rungs come first and the lossy-but-working ones behind them: a worse
+ * format that plays still beats a perfect one that 403s, but there is no reason to reach for
+ * it before trying the other client that serves opus.
+ *
+ * Only reached when the attempt before it failed, and each mode's `YoutubeDL` is built
+ * lazily, so an unused rung costs nothing.
+ */
+const DEFAULT_CLIENT_LADDER = [ 'web_embedded', 'web_safari', 'mweb' ];
 
 export default class Resolver {
   #ytdlp;
@@ -91,26 +90,54 @@ export default class Resolver {
   #format;
   #cipherUrl;
   #cipherTimeout;
+  #potUrl;
+  #clientLadder;
+  #cacheDir;
   #logger;
-  /** videoId -> { url, expiresAt } */
+  /** Long-lived yt-dlp (ytdlp.js), or null to spawn one per track. */
+  #daemon = null;
+  /** videoId -> { url, headers, expiresAt } — headers are part of the answer, see #verify */
   #cache = new Map();
   /** videoId -> Promise, so a play racing its own prefetch waits instead of duplicating. */
   #inflight = new Map();
 
   constructor({ ytdlp, cookies = null, jsRuntime = null, format = 'bestaudio/best',
-    cipherUrl = null, cipherTimeout = 8, logger = console }) {
+    cipherUrl = null, cipherTimeout = 8, potUrl = null, cacheDir = null,
+    clientLadder = DEFAULT_CLIENT_LADDER, logger = console }) {
     this.#ytdlp = ytdlp;
     this.#cookies = cookies;
     this.#jsRuntime = jsRuntime;
     this.#format = format;
     this.#cipherUrl = cipherUrl;
     this.#cipherTimeout = cipherTimeout;
+    this.#potUrl = potUrl;
+    this.#clientLadder = clientLadder;
+    this.#cacheDir = cacheDir;
     this.#logger = logger;
   }
 
   /** Swap in the receiver's logger once it exists (same pattern as mpv.js). */
   setLogger(logger) {
     this.#logger = logger;
+  }
+
+  /**
+   * Attach the long-lived resolver, after it has been started.
+   *
+   * Set rather than constructed here because the daemon needs `daemonModes` — this
+   * class stays the single source of truth for what a resolve's arguments are, so
+   * the daemon and the fallback spawn can never drift apart.
+   */
+  setDaemon(daemon) {
+    this.#daemon = daemon;
+  }
+
+  /**
+   * The resolve strategies as `{ mode: argv }`, for `YtdlpDaemon`'s `--mode` options.
+   * Same arguments the fallback spawn would use, minus the video URL.
+   */
+  get daemonModes() {
+    return Object.fromEntries(this.#attempts().map((a) => [ a.mode, a.args ]));
   }
 
   /** Whether prefetching is possible at all (a yt-dlp path is configured). */
@@ -134,7 +161,7 @@ export default class Resolver {
       this.#cache.delete(videoId);
       return null;
     }
-    return hit.url;
+    return { url: hit.url, headers: hit.headers };
   }
 
   /** Drop a cached URL that turned out not to work. */
@@ -205,21 +232,76 @@ export default class Resolver {
    * no local runtime, attempt 2 has no remote server.
    */
   #attempts() {
-    const base = [ '--no-warnings', '--no-playlist', '-f', this.#format, '-g' ];
+    // `--print` rather than `-g`: the fallback spawn has to report the stream's
+    // **headers** as well as its URL, because mpv is handed the URL directly and
+    // `ytdl_hook` — which would otherwise supply them — is bypassed.
+    const base = [ '--no-warnings', '--no-playlist', '-f', this.#format,
+      '--print', '%(url)s', '--print', '%(http_headers)j' ];
     if (this.#cookies) {
       base.push('--cookies', this.#cookies);
     }
+    if (this.#cacheDir) {
+      // yt-dlp's own on-disk cache, pinned somewhere persistent. It holds the extracted
+      // signature functions and the downloaded ejs challenge-solver scripts — the one part
+      // of a cold resolve that survives a restart — and its default (`~/.cache/yt-dlp`) is
+      // neither persistent nor reliably writable in the add-on's container.
+      base.push('--cache-dir', this.#cacheDir);
+    }
+    if (this.#potUrl) {
+      base.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${this.#potUrl}`);
+    }
+
+    // EVERY `youtube:`-prefixed setting has to go in ONE `--extractor-args`, because a
+    // second occurrence of the same prefix **replaces** the first rather than merging:
+    //
+    //   --extractor-args youtube:fetch_pot=never --extractor-args youtube:player_client=X
+    //     -> {'player_client': ['X']}          … fetch_pot silently gone
+    //   --extractor-args 'youtube:fetch_pot=never;player_client=X'
+    //     -> {'fetch_pot': ['never'], 'player_client': ['X']}
+    //
+    // Found in a live log: every client-ladder rung had lost `fetch_pot=never` and was
+    // warning about the unreachable PO-token server on each resolve. Other prefixes
+    // (`youtubejsc-*`, `youtubepot-*`) are separate keys and safe as separate options.
+    const youtubeArgs = [];
+    if (!this.#potUrl) {
+      // No provider configured, so switch PO-token fetching off explicitly. Left to its
+      // default, the installed plugin probes http://127.0.0.1:4416 and warns per resolve.
+      youtubeArgs.push('fetch_pot=never');
+    }
+    const withYoutubeArgs = (extra = []) => {
+      const merged = [ ...youtubeArgs, ...extra ];
+      return merged.length ? [ '--extractor-args', `youtube:${merged.join(';')}` ] : [];
+    };
+
     const remote = this.#cipherUrl
       ? [ {
+        mode: 'remote',
         label: 'remote cipher',
-        args: [ ...base, '--extractor-args',
-          `youtubejsc-remotecipher:base_url=${this.#cipherUrl};timeout=${this.#cipherTimeout}` ],
+        // `--no-js-runtimes` states what this attempt means. yt-dlp enables `deno` by
+        // default, so on a box that has one, a builtin runtime would outrank the plugin and
+        // solve locally while the log still claimed the server was in use.
+        args: [ ...base, '--no-js-runtimes', '--extractor-args',
+          `youtubejsc-remotecipher:base_url=${this.#cipherUrl};timeout=${this.#cipherTimeout}`,
+          ...withYoutubeArgs() ],
       } ]
       : [];
     const local = this.#jsRuntime
-      ? [ { label: `local ${this.#jsRuntime.split(':')[0]}`, args: [ ...base, '--js-runtimes', this.#jsRuntime ] } ]
+      ? [ {
+        mode: 'local',
+        label: `local ${this.#jsRuntime.split(':')[0]}`,
+        args: [ ...base, '--js-runtimes', this.#jsRuntime, ...withYoutubeArgs() ],
+      } ]
       : [];
-    return [ ...remote, ...local ];
+    // Same solver, same cookies — only the client differs.
+    const ladder = this.#jsRuntime
+      ? this.#clientLadder.map((client) => ({
+        mode: `client-${client}`,
+        label: `client ${client}`,
+        args: [ ...base, '--js-runtimes', this.#jsRuntime,
+          ...withYoutubeArgs([ `player_client=${client}` ]) ],
+      }))
+      : [];
+    return [ ...remote, ...local, ...ladder ];
   }
 
   /**
@@ -232,18 +314,50 @@ export default class Resolver {
    * long after the resolve that caused it. Costs ~200 ms, and turns a wrong answer
    * into "that attempt failed, try the next one".
    */
-  async #verify(url) {
+  async #verify(url, headers) {
+    // Retried once, because a 403 here is not reliably a verdict on the URL. Measured on
+    // the add-on: a burst of rejections hit every path at once — remote cipher, resident
+    // worker, a fresh process, mpv's own resolution — and minutes later the same video
+    // verified fine everywhere, from the same cache and the same jar. That is YouTube
+    // rejecting requests, not a bad answer, and treating it as a verdict turned one
+    // track change into seven resolves, which is the wrong direction to push.
+    try {
+      await this.#verifyOnce(url, headers);
+      return;
+    }
+    catch (e) {
+      // A 403 is a verdict, not a hiccup: retrying it cost 1.7 s of every rescued track
+      // (measured — the retry never once turned into a 200), and there is now somewhere
+      // better to spend that time, namely the next client on the ladder. Anything else —
+      // a timeout, a reset, a 5xx — is worth one retry.
+      if (e.status && e.status >= 400 && e.status < 500) {
+        throw e;
+      }
+      this.#logger.debug(`[resolver] verify failed (${e.message}) — one retry in ${VERIFY_RETRY_DELAY_MS}ms`);
+    }
+    await new Promise((r) => setTimeout(r, VERIFY_RETRY_DELAY_MS));
+    await this.#verifyOnce(url, headers);
+  }
+
+  async #verifyOnce(url, headers) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
     try {
       const res = await fetch(url, {
-        headers: { Range: 'bytes=0-1' },
+        // yt-dlp's own headers, or the check lies. A bare request is answered **403**
+        // by some googlevideo URLs while the identical request with the User-Agent
+        // yt-dlp used gets 206 — so without these, this method rejects perfectly good
+        // resolves, both attempts "fail", and playback falls through to mpv's slow
+        // path. That was the whole of a reported failure on 2026-08-10.
+        headers: { ...(headers ?? {}), Range: 'bytes=0-1' },
         signal: controller.signal,
       });
       // Drain so the socket can be reused/closed promptly.
       await res.arrayBuffer().catch(() => {});
       if (res.status !== 200 && res.status !== 206) {
-        throw new Error(`stream URL rejected with HTTP ${res.status}`);
+        const e = new Error(`stream URL rejected with HTTP ${res.status}`);
+        e.status = res.status;
+        throw e;
       }
     }
     finally {
@@ -252,27 +366,93 @@ export default class Resolver {
   }
 
   async #run(videoId) {
-    const attempts = this.#attempts();
     let lastError = new Error('no resolution method configured');
-    for (const [ i, attempt ] of attempts.entries()) {
-      try {
-        const url = await this.#runOnce(videoId, attempt);
-        await this.#verify(url);
-        this.#store(videoId, url);
-        return url;
+    let ladderExhausted = false;
+
+    for (let pass = 0; pass < 2; pass++) {
+      // Pass 0 walks the whole ladder — the primary client, then each alternate. Pass 1
+      // retries the primary ONLY: by then the alternates have been tried and what changed
+      // is the process, not the client.
+      const attempts = pass === 0 ? this.#attempts() : this.#attempts().slice(0, 1);
+      for (const [ i, attempt ] of attempts.entries()) {
+        let resolved;
+        try {
+          resolved = await this.#runOnce(videoId, attempt);
+        }
+        catch (e) {
+          lastError = e;
+          const more = i < attempts.length - 1;
+          this.#logger.warn(
+            `[resolver] ${attempt.label} failed for ${videoId}: ${e.message}`
+            + `${more ? ` — falling back to ${attempts[i + 1].label}` : ''}`);
+          continue;
+        }
+        try {
+          await this.#verify(resolved.url, resolved.headers);
+        }
+        catch (e) {
+          lastError = e;
+          ladderExhausted = true;
+          this.#logger.warn(
+            `[resolver] ${attempt.label} resolved ${videoId} but the URL did not work `
+            + `(${e.message})`);
+          continue;
+        }
+        this.#store(videoId, resolved);
+        return resolved;
       }
-      catch (e) {
-        lastError = e;
-        const more = i < attempts.length - 1;
-        this.#logger.warn(
-          `[resolver] ${attempt.label} failed for ${videoId}: ${e.message}`
-          + `${more ? ` — falling back to ${attempts[i + 1].label}` : ''}`);
+
+      // Restart only once the WHOLE ladder has produced unplayable URLs. Escalating on the
+      // first failure would kill the daemon mid-ladder and push the remaining rungs onto
+      // the per-track spawn path, which re-pays the entire JS challenge each time.
+      if (pass > 0 || !ladderExhausted || !this.#daemon?.running) {
+        break;
       }
+      this.#logger.warn(
+        `[resolver] every attempt for ${videoId} produced a URL that would not play — `
+        + 'restarting the resolver and trying once more');
+      this.#daemon.invalidate(null, lastError.message, videoId, { escalate: true });
+      await this.#daemon.waitUntilRunning();
     }
+
+    // Nothing worked. Record why *now*: these rejections come in windows that cannot be
+    // reconstructed afterwards, and every post-mortem without a snapshot taken during one
+    // has been guesswork.
+    this.#daemon?.diagnose(videoId, lastError?.message ?? 'unknown');
     throw lastError;
   }
 
-  #runOnce(videoId, attempt) {
+  /**
+   * One attempt, through the long-lived daemon when there is one and a fresh
+   * `yt-dlp` otherwise.
+   *
+   * A daemon *transport* failure falls through to the spawn: a dead or wedged
+   * resolver must not become a dead player, and `ytdlp.js` will respawn it
+   * meanwhile. A resolve that genuinely failed (no formats, stale cookies, a wrong
+   * `n`) is re-thrown instead — spawning would spend another ~20 s reaching the same
+   * answer, and `#run` already has a better move: the next attempt.
+   */
+  async #runOnce(videoId, attempt) {
+    if (this.#daemon?.running) {
+      try {
+        const reply = await this.#daemon.resolve(videoId, attempt.mode, RESOLVE_TIMEOUT_MS);
+        this.#logger.info(
+          `[resolver] resolved ${videoId} in ${(reply.elapsed_ms / 1000).toFixed(1)}s `
+          + `via ${attempt.label} (daemon${reply.cold ? ', cold' : ''})`);
+        return { url: reply.url, headers: reply.headers ?? {} };
+      }
+      catch (e) {
+        if (!e.transport) {
+          throw e;
+        }
+        this.#logger.warn(
+          `[resolver] daemon unusable (${e.message}) — spawning yt-dlp for ${videoId}`);
+      }
+    }
+    return this.#spawnOnce(videoId, attempt);
+  }
+
+  #spawnOnce(videoId, attempt) {
     // `--` last, so a video id can never be read as an option.
     const args = [ ...attempt.args, '--', `https://www.youtube.com/watch?v=${videoId}` ];
 
@@ -309,23 +489,37 @@ export default class Resolver {
       });
       proc.on('close', (code) => {
         clearTimeout(timer);
-        const url = out.split('\n').map((l) => l.trim()).find((l) => l.startsWith('http'));
+        // Two `--print` templates, in the order `#attempts` passes them: the URL, then
+        // the headers as JSON. Matched by shape rather than by line number, so extra
+        // chatter on stdout cannot shift the parse.
+        const lines = out.split('\n').map((l) => l.trim()).filter(Boolean);
+        const url = lines.find((l) => l.startsWith('http'));
         if (code !== 0 || !url) {
           reject(new Error(err.trim().split('\n').pop() || `yt-dlp exited ${code}`));
           return;
         }
+        let headers = {};
+        const json = lines.find((l) => l.startsWith('{'));
+        if (json) {
+          try {
+            headers = JSON.parse(json);
+          }
+          catch {
+            this.#logger.debug('[resolver] could not parse the stream headers from yt-dlp');
+          }
+        }
         const seconds = ((Date.now() - started) / 1000).toFixed(1);
         this.#logger.info(`[resolver] resolved ${videoId} in ${seconds}s via ${attempt.label}`);
-        resolve(url);
+        resolve({ url, headers });
       });
     });
   }
 
-  #store(videoId, url) {
+  #store(videoId, { url, headers }) {
     // YouTube stamps its own lifetime into the URL; honour it rather than guessing.
     const m = /[?&]expire=(\d+)/.exec(url);
     const expiresAt = m ? (Number(m[1]) * 1000) - EXPIRY_MARGIN_MS : null;
-    this.#cache.set(videoId, { url, expiresAt });
+    this.#cache.set(videoId, { url, headers, expiresAt });
     while (this.#cache.size > MAX_ENTRIES) {
       this.#cache.delete(this.#cache.keys().next().value);
     }

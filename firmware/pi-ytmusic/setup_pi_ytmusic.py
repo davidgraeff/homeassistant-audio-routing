@@ -352,6 +352,16 @@ def ytdlp_path(home: str) -> str:
     return os.path.join(home, VENV_DIR_REL, "bin", "yt-dlp")
 
 
+def venv_python(home: str) -> str:
+    """The interpreter the resolver daemon runs on.
+
+    `receiver/ytdlp_daemon.py` keeps ONE yt-dlp alive and imports it as a library, so
+    it needs the venv's own Python — not the system one, which has no yt-dlp in it.
+    `index.js` derives this the same way, from the directory of `YTCR_YTDL_PATH`.
+    """
+    return os.path.join(home, VENV_DIR_REL, "bin", "python3")
+
+
 def cipher_extractor_args(url: str | None) -> str | None:
     """yt-dlp `--extractor-args` value enabling the remote solver, or None."""
     if not url:
@@ -435,7 +445,8 @@ def ensure_ytdlp(home: str) -> bool:
     # a JS runtime) YouTube's `n` challenge cannot be solved and authenticated
     # requests return NO formats — the "connects but plays nothing" failure.
     r = run([os.path.join(venv, "bin", "pip"), "install", "--quiet", "--upgrade",
-             "yt-dlp", "yt-dlp-ejs", "yt-dlp-remote-cipher"], check=False)
+             "yt-dlp", "yt-dlp-ejs", "yt-dlp-remote-cipher",
+              "bgutil-ytdlp-pot-provider"], check=False)
     if r.returncode != 0:
         print("  pip install failed (no network / registry trouble?) — keeping whatever is there")
     exe = ytdlp_path(home)
@@ -463,7 +474,7 @@ Description=Update yt-dlp + solver plugins (YouTube extractor breakage is routin
 
 [Service]
 Type=oneshot
-ExecStart={venv}/bin/pip install --quiet --upgrade yt-dlp yt-dlp-ejs yt-dlp-remote-cipher
+ExecStart={venv}/bin/pip install --quiet --upgrade yt-dlp yt-dlp-ejs yt-dlp-remote-cipher bgutil-ytdlp-pot-provider
 """
     timer = f"""\
 {MANAGED_MARKER}
@@ -552,7 +563,8 @@ def deploy_receiver(home: str) -> bool:
 
 def receiver_unit(home: str, *, device_name: str | None, dial_port: int,
                   bind_address: str | None, addon_host: str | None,
-                  api_port: int, rtp_port: int, cipher_url: str | None) -> str:
+                  api_port: int, rtp_port: int, cipher_url: str | None,
+                  pot_url: str | None = None) -> str:
     app_dir = os.path.join(home, APP_DIR_REL)
     state_dir = os.path.join(home, STATE_DIR_REL)
     # Every value is QUOTED. systemd splits an unquoted `Environment=` line on
@@ -565,7 +577,18 @@ def receiver_unit(home: str, *, device_name: str | None, dial_port: int,
         f'Environment="YTCR_YTDL_PATH={ytdlp_path(home)}"',
         f'Environment="YTCR_COOKIES={os.path.join(home, COOKIES_REL)}"',
         f'Environment="YTCR_JS_RUNTIME={js_runtime_spec(home)}"',
+        # yt-dlp's on-disk cache, in the state dir rather than `~/.cache/yt-dlp`: it
+        # holds the extracted signature functions and the downloaded ejs
+        # challenge-solver scripts, i.e. the part of a cold resolve that survives a
+        # restart, so it belongs with the other mutable receiver state.
+        f'Environment="YTCR_YTDLP_CACHE_DIR={os.path.join(state_dir, "yt-dlp-cache")}"',
         *([f'Environment="YTCR_CIPHER_URL={cipher_url}"'] if cipher_url else []),
+        # A bgutil PO-token provider server, if one is reachable. The *plugin* is in the
+        # venv; its server needs a native `canvas` build and ~200 MB of node modules and
+        # has no armv7 prebuild, so it is never installed here — point this at one running
+        # elsewhere on the LAN. Unset means `fetch_pot=never` (resolver.js), which keeps
+        # the plugin from probing localhost and warning on every resolve.
+        *([f'Environment="YTCR_POT_URL={pot_url}"'] if pot_url else []),
         'Environment="YTCR_LOG_LEVEL=info"',
     ]
     # Now-playing reporting to the add-on. `YTCR_ADDON_HOST` is what switches it on
@@ -604,8 +627,9 @@ RestartSec=3
 # starving the audio path — but a cgroup weight applies to the whole service, and
 # **mpv is in this service**, so it throttled the player together with the offender
 # while doing nothing about their relative priority. The resolve is what must yield:
-# resolver.js exec's it through `nice`/`ionice` (which the JS runtime it spawns then
-# inherits), and PipeWire's own loops are realtime — see ensure_realtime_scheduling().
+# the resolver daemon (and the fallback per-track yt-dlp) is exec'd through
+# `nice`/`ionice` by priority.js, which the JS runtime it spawns then inherits, and
+# PipeWire's own loops are realtime — see ensure_realtime_scheduling().
 CPUWeight=100
 
 [Install]
@@ -615,13 +639,15 @@ WantedBy=default.target
 
 def install_receiver_service(home: str, *, device_name: str | None, dial_port: int,
                              bind_address: str | None, addon_host: str | None,
-                             api_port: int, rtp_port: int, cipher_url: str | None) -> None:
+                             api_port: int, rtp_port: int, cipher_url: str | None,
+                             pot_url: str | None = None) -> None:
     print("== Installing the receiver service ==")
     os.makedirs(os.path.join(home, STATE_DIR_REL), exist_ok=True)
     unit_path = os.path.join(home, ".config/systemd/user", RECEIVER_UNIT)
     user_write(unit_path, receiver_unit(home, device_name=device_name, dial_port=dial_port,
                                         bind_address=bind_address, addon_host=addon_host,
-                                        api_port=api_port, rtp_port=rtp_port, cipher_url=cipher_url))
+                                        api_port=api_port, rtp_port=rtp_port, cipher_url=cipher_url,
+                                        pot_url=pot_url))
     systemctl_user("daemon-reload", check=False)
     systemctl_user("enable", "--now", RECEIVER_UNIT, check=False)
     systemctl_user("restart", RECEIVER_UNIT, check=False)
@@ -886,6 +912,18 @@ def verify_resolver(home: str, cipher_url: str | None = None) -> None:
         v = subprocess.run([exe, "--version"], text=True, capture_output=True)
         print(f"  yt-dlp (venv):               {(v.stdout or '?').strip()}")
         print(f"  JS challenge runtime:        {js_runtime_spec(home)}")
+        # The resolver daemon imports yt-dlp instead of spawning it, so what matters
+        # for *latency* is whether the venv's interpreter can import it. A failure
+        # here is invisible in normal operation — the receiver logs one warning and
+        # goes back to one yt-dlp per track, i.e. ~7 s a resolve instead of ~2 s.
+        py = venv_python(home)
+        imp = subprocess.run([py, "-c", "import yt_dlp"], text=True, capture_output=True)
+        if imp.returncode == 0:
+            print("  long-lived resolver usable:  YES")
+        else:
+            reason = (imp.stderr or "").strip().splitlines()
+            print(f"  long-lived resolver usable:  NO — {reason[-1][:150] if reason else 'unknown'}")
+            print(f"    {py} cannot import yt_dlp; resolves will spawn one process each.")
         # An installed yt-dlp is NOT the same as a working one: YouTube makes
         # requests solve an `n` challenge, which needs a JS runtime plus the
         # yt-dlp-ejs scripts. Missing either yields "No video formats found" and
@@ -1099,6 +1137,11 @@ def main() -> None:
                     help="Pin the DIAL server to this local IP. Omit to auto-detect the LAN "
                          "interface at runtime; set it on a multi-homed host, where answering "
                          "SSDP on the wrong address makes senders silently drop the device.")
+    ap.add_argument("--pot-url", default=None,
+                    help="Base URL of a bgutil PO-token provider server (mode A), e.g. "
+                         "http://nas.local:4416. Only needed if YouTube starts demanding "
+                         "GVS PO tokens; the plugin is installed either way and stays "
+                         "silent without this.")
     ap.add_argument("--cipher-url", default=DEFAULT_CIPHER_URL,
                     help=f"Remote yt-cipher server used to solve YouTube's JS challenges "
                          f"(~3x faster than solving locally on this hardware; the local "
@@ -1147,7 +1190,8 @@ def main() -> None:
                                  bind_address=args.bind_address,
                                  addon_host=None if args.no_metadata else args.host,
                                  api_port=args.api_port, rtp_port=args.port,
-                                 cipher_url=cipher_url)
+                                 cipher_url=cipher_url,
+                                 pot_url=args.pot_url)
     verify(args.host, args.port, dial_port=args.dial_port, home=home, cipher_url=cipher_url)
     if args.test_tone:
         test_tone()

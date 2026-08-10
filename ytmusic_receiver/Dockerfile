@@ -52,9 +52,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 #   yt-dlp-ejs           the JS challenge-solver scripts
 #   yt-dlp-remote-cipher solves challenges on a yt-cipher server (~3x faster)
+#   bgutil-ytdlp-pot-provider  the PO-token *plugin* only — 116 kB of pure Python. Its
+#                        server half needs a native `canvas` build plus jsdom and
+#                        youtubei.js (~200 MB, no armv7 prebuild), so it is not here:
+#                        run it separately and set the `pot_provider_url` option. The
+#                        plugin stays silent until then (resolver.js passes
+#                        `youtube:fetch_pot=never`), because otherwise it probes
+#                        http://127.0.0.1:4416 and warns on every resolve.
 RUN python3 -m venv /opt/ytdlp \
     && /opt/ytdlp/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/ytdlp/bin/pip install --no-cache-dir yt-dlp yt-dlp-ejs yt-dlp-remote-cipher \
+        bgutil-ytdlp-pot-provider \
     && /opt/ytdlp/bin/yt-dlp --version
 
 # The receiver app + its single dependency (yt-cast-receiver). `npm ci` would need
@@ -64,6 +72,10 @@ COPY receiver/package.json ./
 RUN npm install --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 COPY receiver/*.js ./
+# The long-lived resolver (ytdlp.js spawns it with the venv's interpreter, so it
+# imports yt_dlp as a library instead of paying a process start per track) and its
+# resident JS-challenge provider (jsc_worker.js arrives with the *.js above).
+COPY receiver/*.py ./
 
 COPY rootfs/ /
 

@@ -36,6 +36,15 @@ RTP_HOST="$(opt rtp_host 127.0.0.1)"
 RTP_PORT="$(opt rtp_port 46002)"
 DIAL_PORT="$(opt dial_port 8098)"
 CIPHER_URL="$(opt cipher_url)"
+# `none`/`off`/`false` disable remote solving explicitly, matching the Pi's
+# `--cipher-url none`. Worth having even though the default is now empty: a value that
+# was saved once stays in the user's options, and typing a word is a reliable way to
+# override it — clearing the field only removes the key, which is how the old default
+# kept coming back.
+case "$(printf '%s' "$CIPHER_URL" | tr '[:upper:]' '[:lower:]')" in
+  none|off|false|disabled) CIPHER_URL="" ;;
+esac
+POT_URL="$(opt pot_provider_url)"
 BIND_ADDRESS="$(opt bind_address)"
 REPORT_METADATA="$(opt report_metadata true)"
 LOG_LEVEL="$(opt log_level info)"
@@ -98,7 +107,7 @@ fi
 # than only at image build. Backgrounded on purpose: it needs the network and
 # takes tens of seconds on a Pi, and the receiver must be discoverable immediately.
 (
-  if /opt/ytdlp/bin/pip install --quiet --upgrade yt-dlp yt-dlp-ejs yt-dlp-remote-cipher 2>/dev/null; then
+  if /opt/ytdlp/bin/pip install --quiet --upgrade yt-dlp yt-dlp-ejs yt-dlp-remote-cipher bgutil-ytdlp-pot-provider 2>/dev/null; then
     echo "[run] yt-dlp refreshed: $(/opt/ytdlp/bin/yt-dlp --version)"
   else
     echo "[run] yt-dlp refresh failed (offline?) — using the version baked into the image: $(/opt/ytdlp/bin/yt-dlp --version)"
@@ -118,8 +127,15 @@ export YTCR_JS_RUNTIME=node
 # cookies rotate, and node-persist keeps the DIAL identity next to it so the phone
 # recognises the same device across restarts.
 export YTCR_COOKIES=/data/cookies.txt
+# yt-dlp's own on-disk cache, in /data so it survives container restarts and image
+# updates. It holds the extracted signature functions and the downloaded ejs
+# challenge-solver scripts — the part of a cold resolve that a *restart* would
+# otherwise re-pay. The default (~/.cache/yt-dlp) is neither persistent here nor
+# reliably writable.
+export YTCR_YTDLP_CACHE_DIR=/data/yt-dlp-cache
 export YTCR_LOG_LEVEL="$LOG_LEVEL"
 [ -n "$CIPHER_URL" ] && export YTCR_CIPHER_URL="$CIPHER_URL"
+[ -n "$POT_URL" ] && export YTCR_POT_URL="$POT_URL"
 [ -n "$BIND_ADDRESS" ] && export YTCR_BIND_ADDRESS="$BIND_ADDRESS"
 if [ "$REPORT_METADATA" = "true" ]; then
   # The router add-on shares this host's network namespace, so its API is local.

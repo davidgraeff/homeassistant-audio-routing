@@ -104,6 +104,21 @@ authenticated resolve is ~22 s with node 22 against ~90 s with quickjs. Faster s
 solving locally at all: `--cipher-url` hands the challenge to a yt-cipher server (~7-10 s),
 with the local runtime as fallback.
 
+Whichever solver is used, yt-dlp itself is **kept alive** rather than spawned per track
+(`receiver/ytdlp_daemon.py`, on the venv's own `python3`): the Python start, the player JS and
+the PO token are all process-local, and paying for them once a session instead of once a track
+took an anonymous Zero 2 W resolve from 6.3-7.3 s to 2.6-4.1 s. The per-track spawn remains
+the fallback, so a venv whose Python cannot `import yt_dlp` still plays — just slowly, which
+is why `setup_pi_ytmusic.py` reports `long-lived resolver usable: YES/NO`.
+
+The `n` challenge itself is solved in a **resident node** (`receiver/jsc_resident.py` +
+`jsc_worker.js`, on the private node 22) that keeps the solver closures per player version.
+Measured on this box: **17.9 s** the first time a player version is seen, **3.7 s** on a fresh
+worker whose disk cache already has it, and **4-48 ms** thereafter — against 17.9 s *every
+track* before. Which of the three a solve paid is in the log: `jsc: solved 1 challenge(s) for
+854a788e-main in 7ms [memory]`. With that, `--cipher-url` (a ~7-10 s network round trip) has
+nothing left to buy: pass `--cipher-url none` once the log shows `[memory]` solves.
+
 Only **authenticated** requests hit that challenge, so an anonymous test proves nothing about
 it — the verification deliberately probes with the cookie jar when one is present and says so
 in its output. Missing any of that looks like
