@@ -146,10 +146,14 @@ ensure_builder() {
 # reuse the credential docker login already stored. Empty if none available.
 ghcr_token() {
   if [ -n "${GHCR_TOKEN:-}" ]; then echo "$GHCR_TOKEN"; return; fi
+  # The docker-config PAT is tried BEFORE `gh auth token`, deliberately: a normal
+  # `gh auth login` token carries no package scopes, so preferring it made
+  # prune_dev_tags print "list failed (403 Forbidden)" on every deploy while a
+  # working credential sat unused. What `docker login ghcr.io` stored is the PAT that
+  # can push here, so it can also list and delete. Same order as
+  # scripts/prune-ghcr-tags.sh.
   local t
-  t="$(gh auth token 2>/dev/null || true)"
-  if [ -n "$t" ]; then echo "$t"; return; fi
-  python3 - <<'PY' 2>/dev/null || true
+  t="$(python3 - <<'PY' 2>/dev/null || true
 import json, base64, os
 try:
     d = json.load(open(os.path.expanduser("~/.docker/config.json")))
@@ -159,6 +163,9 @@ try:
 except Exception:
     pass
 PY
+)"
+  if [ -n "$t" ]; then echo "$t"; return; fi
+  gh auth token 2>/dev/null || true
 }
 
 # Keep only the newest $DEV_TAGS_KEEP dev tags on GHCR. Dev and release tags now
