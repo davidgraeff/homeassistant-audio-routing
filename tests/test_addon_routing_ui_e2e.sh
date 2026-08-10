@@ -63,6 +63,11 @@ for NAME in kitchen bedroom; do
   docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c "
 pw-cli create-node adapter \"{ factory.name=support.null-audio-sink node.name=sendspin-out-$NAME media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }\" >/dev/null
 " || { echo "FAIL: could not create the virtual test sink ($NAME)"; docker logs "$CONTAINER_NAME"; exit 1; }
+  # Being in the graph is not enough: since the adoption gate (outputs_store.rs)
+  # the matrix lists only *adopted* outputs, so a discovered-but-unadded device
+  # is deliberately absent. Adding is what a user does on the Outputs page.
+  ADOPT=$(curl -s -X POST "http://localhost:$HOST_PORT/api/outputs/sendspin-out-$NAME/adopt")
+  echo "$ADOPT" | grep -q '"ok":true' || { echo "FAIL: could not add output sendspin-out-$NAME: $ADOPT"; exit 1; }
 done
 
 echo "--- waiting for both outputs ---"
@@ -139,9 +144,19 @@ python3 - << PYEOF
 import asyncio, json, urllib.request
 import websockets
 
+# The socket multiplexes several frame kinds (routing.rs Frame: matrix, outputs,
+# discovered, agents, now_playing, meters), internally tagged. Only the matrix
+# frame carries links — reading 'links' off an outputs/meters frame would
+# KeyError, so every read below skips what it isn't looking for.
+async def matrix(ws, timeout=10):
+    while True:
+        frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+        if frame.get('type', 'matrix') == 'matrix':
+            return frame
+
 async def main():
     async with websockets.connect('ws://localhost:$HOST_PORT/api/routing/ws') as ws:
-        initial = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        initial = await matrix(ws)
         assert initial['links'] == [], f'expected no links in initial snapshot, got {initial[\"links\"]}'
         req = urllib.request.Request(
             'http://localhost:$HOST_PORT/api/routing/link',
@@ -149,15 +164,14 @@ async def main():
             headers={'Content-Type': 'application/json'},
         )
         urllib.request.urlopen(req).read()
-        # The socket also pushes periodic snapshots for the live meters (~250ms
-        # tick), so the frame right after linking may be a stale meter tick that
-        # predates the change — read until the link shows up (bounded) rather
-        # than assuming the very next frame reflects it.
+        # Read matrix frames until the link shows up (bounded) rather than
+        # assuming the very next one reflects it: the change notifier can coalesce
+        # and the listing frames interleave.
         want = {'source': '$SOURCE_NAME', 'output': '$OUTPUT_NAME'}
         pushed = {'links': None}
         found = False
         for _ in range(40):
-            pushed = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            pushed = await matrix(ws)
             if want in pushed['links']:
                 found = True
                 break

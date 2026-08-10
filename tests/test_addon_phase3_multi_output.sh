@@ -1,15 +1,23 @@
 #!/bin/bash
-# Phase 3 check: one AirPlay source fanned out to TWO simultaneous outputs
-# (one RAOP, one sendspin) via the bridge daemon's real POST /api/links —
-# the "Brave -> Dusche + Pioneer" scenario from the original Fedora
-# pw-graph screenshot that kicked off this whole project. PLAN.md Phase 3's
-# "multiple simultaneous outputs from one source" goal.
+# Phase 3 check: one AirPlay source fanned out to TWO simultaneous outputs via
+# the bridge daemon's real routing API — the "Brave -> Dusche + Pioneer" scenario
+# from the original Fedora pw-graph screenshot that kicked off this whole
+# project. PLAN.md Phase 3's "multiple simultaneous outputs from one source" goal.
 #
 # No new mixing logic needed on our part: PipeWire's own graph natively
-# supports one output port linking to many input ports (fan-out) — this
-# test proves that's actually exercised correctly through the real add-on
-# code with two structurally different output types at once, not just
-# that the underlying PipeWire primitive exists.
+# supports one output port linking to many input ports (fan-out) — this test
+# proves that's actually exercised correctly through the real add-on code, with
+# real audio arriving at both sinks at once, not just that the underlying
+# PipeWire primitive exists.
+#
+# **Narrowed on purpose.** It used to fan out to two structurally *different*
+# output types (one RAOP, one sendspin). The RAOP output path was removed in
+# Phase 6 (raop_migration.rs, "drop-raop 2026-07"), and the two remaining dialed
+# backends (AirPlay-2, pw-sink) have no PipeWire node to capture from and need a
+# real receiver on the network, which CI has none of. So both stand-ins here are
+# `sendspin-out-` null sinks: the fan-out itself is still proven end to end, the
+# heterogeneous-backend half is not, and that gap needs hardware (see
+# docs/ for the per-device spikes that cover it there).
 set -euo pipefail
 
 ADDON_DIR="$(dirname "$0")/../pipewire_audio_router"
@@ -18,8 +26,13 @@ CONTAINER_NAME="pw-addon-phase3-test"
 NETWORK_NAME="pw-addon-phase3-net"
 DATA_DIR="$(mktemp -d)"
 HOST_PORT="${HOST_PORT:-18097}"
+BASE="http://localhost:$HOST_PORT"
 WAV_HOST_PATH="${WAV_HOST_PATH:-/usr/share/sounds/speech-dispatcher/pipe.wav}"
 CLIRAOP_PATH="${CLIRAOP_PATH:-$(dirname "$0")/../../music-assistant-server/music_assistant/providers/airplay/bin/cliraop-linux-x86_64}"
+
+SOURCE_NAME="airplay-in-test-airplay"
+OUT_A="sendspin-out-kitchen"
+OUT_B="sendspin-out-bedroom"
 
 if [ ! -x "$CLIRAOP_PATH" ]; then
   echo "SKIP: cliraop not found at $CLIRAOP_PATH — set CLIRAOP_PATH to run this test."
@@ -36,11 +49,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+fail() {
+  echo "FAIL: $1"
+  echo "--- container logs ---"
+  docker logs "$CONTAINER_NAME" 2>&1 | tail -40 || true
+  exit 1
+}
+
 echo "--- building add-on image ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-# No options.json seeding — the RAOP output, sendspin output, and AirPlay
-# source are created at runtime via the API once the daemon is up (below).
+# No options.json seeding — both outputs and the AirPlay source are created at
+# runtime via the API once the daemon is up (below).
 docker network create "$NETWORK_NAME" >/dev/null 2>&1 || true
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 # --cap-add SYS_NICE/IPC_LOCK mirror the add-on config.yaml privileges. Without
@@ -50,34 +70,60 @@ docker run -d --cap-add SYS_NICE --cap-add IPC_LOCK --name "$CONTAINER_NAME" --n
   -v "$DATA_DIR:/data" -p "$HOST_PORT:8099" "$IMAGE" >/dev/null
 
 echo "--- waiting for the bridge-daemon HTTP API ---"
-for _ in $(seq 1 30); do curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-echo "--- creating the RAOP output, sendspin output, and AirPlay source via the API ---"
-curl -s -X POST "http://localhost:$HOST_PORT/api/outputs" -H 'Content-Type: application/json' \
-  -d '{"name":"Test RAOP","ip":"192.0.2.1","port":7000,"encryption":"auth_setup"}' | grep -q '"ok":true' \
-  || { echo "FAIL: POST /api/outputs failed"; docker logs "$CONTAINER_NAME"; exit 1; }
-curl -s -X POST "http://localhost:$HOST_PORT/api/sendspin_outputs" -H 'Content-Type: application/json' \
-  -d '{"name":"Kitchen"}' | grep -q '"ok":true' \
-  || { echo "FAIL: POST /api/sendspin_outputs failed"; docker logs "$CONTAINER_NAME"; exit 1; }
-curl -s -X PUT "http://localhost:$HOST_PORT/api/source/airplay" -H 'Content-Type: application/json' \
-  -d '{"name":"PipeWire Router"}' | grep -q '"ok":true' \
-  || { echo "FAIL: PUT /api/source/airplay failed"; docker logs "$CONTAINER_NAME"; exit 1; }
-
-echo "--- waiting for bridge-daemon + both output nodes ---"
 READY=""
 for _ in $(seq 1 30); do
-  NODES=$(curl -sf "http://localhost:$HOST_PORT/api/nodes" 2>/dev/null || true)
-  if echo "$NODES" | grep -q "raop-out-test_raop" && echo "$NODES" | grep -q "sendspin-out-kitchen"; then
+  if curl -sf "$BASE/health" >/dev/null 2>&1; then READY=1; break; fi
+  sleep 1
+done
+[ -n "$READY" ] || fail "bridge-daemon never became healthy"
+
+echo "--- standing in for two sendspin devices, then adding both ---"
+for NAME in "$OUT_A" "$OUT_B"; do
+  docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c "
+pw-cli create-node adapter \"{ factory.name=support.null-audio-sink node.name=$NAME media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }\" >/dev/null
+" || fail "could not create the virtual sink $NAME"
+  # Discovery is only an offer since the adoption gate (outputs_store.rs) — an
+  # unadded device is not routable, so linking below would be refused.
+  ADOPT=$(curl -s -X POST "$BASE/api/outputs/$NAME/adopt")
+  echo "$ADOPT" | grep -q '"ok":true' || fail "could not add output $NAME: $ADOPT"
+done
+
+echo "--- creating the AirPlay source via the API ---"
+CODE=$(curl -s -o /tmp/phase3_src.json -w '%{http_code}' -X POST "$BASE/api/sources" \
+  -H 'Content-Type: application/json' -d '{"label":"Test AirPlay","kind":"airplay"}')
+[ "$CODE" = "201" ] || fail "POST /api/sources returned $CODE: $(cat /tmp/phase3_src.json)"
+rm -f /tmp/phase3_src.json
+
+echo "--- waiting for the source and both outputs in the matrix ---"
+READY=""
+for _ in $(seq 1 30); do
+  MATRIX=$(curl -sf "$BASE/api/routing" 2>/dev/null || true)
+  if echo "$MATRIX" | grep -q "\"node_name\":\"$SOURCE_NAME\"" \
+    && echo "$MATRIX" | grep -q "\"node_name\":\"$OUT_A\"" \
+    && echo "$MATRIX" | grep -q "\"node_name\":\"$OUT_B\""; then
     READY=1
     break
   fi
   sleep 1
 done
-if [ -z "$READY" ]; then
-  echo "FAIL: both output nodes never appeared"
-  docker logs "$CONTAINER_NAME"
-  exit 1
-fi
-echo "OK: both outputs present"
+[ -n "$READY" ] || fail "source and both outputs never appeared in /api/routing: ${MATRIX:-}"
+echo "OK: all three endpoints present"
+
+echo "--- fan-out: one source linked to BOTH outputs ---"
+for OUT in "$OUT_A" "$OUT_B"; do
+  LINK=$(curl -s -X POST "$BASE/api/routing/link" -H 'Content-Type: application/json' \
+    -d "{\"source\":\"$SOURCE_NAME\",\"output\":\"$OUT\"}")
+  echo "$LINK" | grep -q '"ok":true' || fail "link to $OUT did not report ok:true: $LINK"
+done
+# The point of the test: the *same* source port feeding two sinks at once. Assert
+# it in the real graph, not just in the API's answer.
+REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
+echo "$REAL_LINKS" | grep -q "$OUT_A" || { echo "$REAL_LINKS"; fail "no real pw-link into $OUT_A"; }
+echo "$REAL_LINKS" | grep -q "$OUT_B" || { echo "$REAL_LINKS"; fail "no real pw-link into $OUT_B"; }
+MATRIX=$(curl -s "$BASE/api/routing")
+echo "$MATRIX" | grep -q "\"source\":\"$SOURCE_NAME\",\"output\":\"$OUT_A\"" || fail "matrix missing the link to $OUT_A: $MATRIX"
+echo "$MATRIX" | grep -q "\"source\":\"$SOURCE_NAME\",\"output\":\"$OUT_B\"" || fail "matrix missing the link to $OUT_B: $MATRIX"
+echo "OK: linked to both outputs"
 
 CONTAINER_IP=$(docker inspect "$CONTAINER_NAME" --format "{{(index .NetworkSettings.Networks \"$NETWORK_NAME\").IPAddress}}")
 
@@ -98,47 +144,33 @@ PLAYBACK_WAV="${TEMP_WAV:-$WAV_HOST_PATH}"
 
 echo "--- capturing from both sinks while sending one AirPlay stream ---"
 docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" \
-  bash -c 'timeout 6 pw-record --target raop-out-test_raop --rate 44100 --channels 2 --format s16 /tmp/cap_raop.raw' &
-RECORD_PID_RAOP=$!
+  bash -c "timeout 8 pw-record --target $OUT_A --rate 48000 --channels 2 --format s16 /tmp/cap_a.raw" &
+RECORD_PID_A=$!
 docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" \
-  bash -c 'timeout 6 pw-record --target sendspin-out-kitchen --rate 48000 --channels 2 --format s16 /tmp/cap_sendspin.raw' &
-RECORD_PID_SENDSPIN=$!
+  bash -c "timeout 8 pw-record --target $OUT_B --rate 48000 --channels 2 --format s16 /tmp/cap_b.raw" &
+RECORD_PID_B=$!
 sleep 0.3
 
 "$CLIRAOP_PATH" -et 0 "$CONTAINER_IP" "$PLAYBACK_WAV" > /tmp/phase3_cliraop.log 2>&1 &
 CLIRAOP_PID=$!
 
-echo "--- fan-out linking via POST /api/links: one source -> two outputs ---"
-LINKED_RAOP=""
-LINKED_SENDSPIN=""
-for _ in $(seq 1 100); do
-  R1=$(curl -s -X POST "http://localhost:$HOST_PORT/api/links" -H 'Content-Type: application/json' -d '{"from_port":"alsa_playback.shairport-sync:output_FL","to_port":"raop-out-test_raop:send_FL"}')
-  R2=$(curl -s -X POST "http://localhost:$HOST_PORT/api/links" -H 'Content-Type: application/json' -d '{"from_port":"alsa_playback.shairport-sync:output_FR","to_port":"raop-out-test_raop:send_FR"}')
-  R3=$(curl -s -X POST "http://localhost:$HOST_PORT/api/links" -H 'Content-Type: application/json' -d '{"from_port":"alsa_playback.shairport-sync:output_FL","to_port":"sendspin-out-kitchen:playback_FL"}')
-  R4=$(curl -s -X POST "http://localhost:$HOST_PORT/api/links" -H 'Content-Type: application/json' -d '{"from_port":"alsa_playback.shairport-sync:output_FR","to_port":"sendspin-out-kitchen:playback_FR"}')
-  echo "$R1" | grep -q '"ok":true' && echo "$R2" | grep -q '"ok":true' && LINKED_RAOP=1
-  echo "$R3" | grep -q '"ok":true' && echo "$R4" | grep -q '"ok":true' && LINKED_SENDSPIN=1
-  if [ -n "$LINKED_RAOP" ] && [ -n "$LINKED_SENDSPIN" ]; then
-    break
-  fi
-  sleep 0.03
-done
-if [ -z "$LINKED_RAOP" ] || [ -z "$LINKED_SENDSPIN" ]; then
-  echo "FAIL: fan-out linking incomplete (raop=$LINKED_RAOP sendspin=$LINKED_SENDSPIN)"
-  exit 1
-fi
-echo "OK: linked to both outputs"
-
 wait "$CLIRAOP_PID" || { echo "FAIL: cliraop exited with an error"; cat /tmp/phase3_cliraop.log; exit 1; }
-wait "$RECORD_PID_RAOP" || true
-wait "$RECORD_PID_SENDSPIN" || true
-docker cp "$CONTAINER_NAME:/tmp/cap_raop.raw" /tmp/phase3_cap_raop.raw
-docker cp "$CONTAINER_NAME:/tmp/cap_sendspin.raw" /tmp/phase3_cap_sendspin.raw
+wait "$RECORD_PID_A" || true
+wait "$RECORD_PID_B" || true
+docker cp "$CONTAINER_NAME:/tmp/cap_a.raw" /tmp/phase3_cap_a.raw
+docker cp "$CONTAINER_NAME:/tmp/cap_b.raw" /tmp/phase3_cap_b.raw
 
-echo "--- RAOP output signal ---"
-ffmpeg -f s16le -ar 44100 -ac 2 -i /tmp/phase3_cap_raop.raw -af astats -f null - 2>&1 | grep -E "Peak level dB|RMS level dB" | head -2
-echo "--- sendspin output signal ---"
-ffmpeg -f s16le -ar 48000 -ac 2 -i /tmp/phase3_cap_sendspin.raw -af astats -f null - 2>&1 | grep -E "Peak level dB|RMS level dB" | head -2
-rm -f /tmp/phase3_cap_raop.raw /tmp/phase3_cap_sendspin.raw /tmp/phase3_cliraop.log
+# Real audio on BOTH, or the fan-out only looked right in the graph. Silence
+# reads as -inf/-100 dB, so a finite peak above the noise floor is the check.
+for PAIR in "$OUT_A:/tmp/phase3_cap_a.raw" "$OUT_B:/tmp/phase3_cap_b.raw"; do
+  NAME="${PAIR%%:*}"; RAW="${PAIR##*:}"
+  echo "--- $NAME signal ---"
+  STATS=$(ffmpeg -f s16le -ar 48000 -ac 2 -i "$RAW" -af astats -f null - 2>&1)
+  echo "$STATS" | grep -E "Peak level dB|RMS level dB" | head -2
+  PEAK=$(echo "$STATS" | grep -m1 "Peak level dB" | grep -oE '\-?[0-9]+\.[0-9]+' | head -1)
+  [ -n "$PEAK" ] || { echo "$STATS" | tail -20; fail "could not read a peak level from the $NAME capture"; }
+  awk -v p="$PEAK" 'BEGIN { exit !(p > -60) }' || fail "$NAME captured silence (peak ${PEAK} dB) — the fan-out did not deliver"
+done
+rm -f /tmp/phase3_cap_a.raw /tmp/phase3_cap_b.raw /tmp/phase3_cliraop.log
 
-echo "PASS: one AirPlay source fanned out to a RAOP output AND a sendspin output simultaneously, real signal confirmed on both"
+echo "PASS: one AirPlay source fanned out to two outputs simultaneously, real signal confirmed on both"

@@ -1,22 +1,27 @@
 #!/bin/bash
 # Phase 1 end-to-end check for the real add-on (pipewire_audio_router/),
-# not a spike: builds the actual multi-stage Dockerfile, runs it with a
-# test RAOP output pointed at an unroutable placeholder IP (192.0.2.1,
-# RFC 5737 TEST-NET-1, same convention as spikes/02), and verifies the
-# full chain end to end:
+# not a spike: builds the actual multi-stage Dockerfile, runs it with nothing
+# configured, and verifies the two halves of the "config becomes reality" chain
+# that everything else in the add-on stands on:
 #
-#   options.json -> bridge-daemon seeds its outputs store and loads the
-#   raop-sink module into its own PipeWire context at startup ->
-#   bridge-daemon's registry listener discovers the node ->
-#   REST API reports it
+#   inputs:  POST /api/sources -> the daemon loads the source into its own
+#            PipeWire context (module-rtp-source / the native AirPlay receiver's
+#            producer) -> its registry listener discovers the node ->
+#            GET /api/nodes and GET /api/sources report it
 #
-# (Outputs are no longer written to a static pipewire.conf.d before
-# pipewire starts — the daemon owns raop-sink lifecycle now, see
-# docs/roadmap.md "RAOP output hot-reload".)
+#   outputs: POST /api/outputs/<name>/adopt -> the adoption store (outputs_store.rs)
+#            -> the output is in GET /api/outputs and in the routing matrix
 #
-# This does NOT prove real RAOP delivery to hardware (see
-# tests/test_spike02_raop_real_device.sh for that, same caveat applies:
-# no network path to real devices from this sandbox).
+# The output half used to be `POST /api/outputs` creating a RAOP sink at an
+# unroutable placeholder IP. That path was removed in Phase 6 (raop_migration.rs,
+# "drop-raop 2026-07"): receivers are reached as AirPlay-2 outputs, discovery only
+# offers them and *adopting* is what makes one real, so adoption is the chain to
+# prove. Nothing is behind `ap2-dev-test-placeholder`, which is deliberate — an
+# adopted output stays listed while absent, and that is exactly the placeholder's
+# old job.
+#
+# This does NOT prove audio delivery to a real device (see
+# tests/test_addon_phase2_e2e.sh for a real sender and signal analysis).
 set -euo pipefail
 
 ADDON_DIR="$(dirname "$0")/../pipewire_audio_router"
@@ -24,6 +29,7 @@ IMAGE="${IMAGE:-pipewire_audio_router:dev}"
 CONTAINER_NAME="pw-addon-e2e-test"
 DATA_DIR="$(mktemp -d)"
 HOST_PORT="${HOST_PORT:-18080}"
+BASE="http://localhost:$HOST_PORT"
 
 cleanup() {
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -31,12 +37,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+fail() {
+  echo "FAIL: $1"
+  echo "--- container logs ---"
+  docker logs "$CONTAINER_NAME" 2>&1 | tail -40 || true
+  exit 1
+}
+
 echo "--- building add-on image ---"
 docker build -t "$IMAGE" "$ADDON_DIR"
 
-# No options.json seeding anymore — the daemon starts empty and the output is
-# created at runtime via the API below. /data is still mounted for the daemon's
-# own persisted stores.
+# No options.json seeding — the daemon starts empty and everything below is
+# created at runtime through the API. /data is mounted for its own stores.
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 # --cap-add SYS_NICE/IPC_LOCK mirror the add-on config.yaml privileges. Without
 # IPC_LOCK, PipeWire's mem.mlock-all (50-mlock.conf) mlockall() fails and 1.6.2
@@ -46,41 +58,59 @@ docker run -d --cap-add SYS_NICE --cap-add IPC_LOCK --name "$CONTAINER_NAME" -v 
 echo "--- waiting for bridge-daemon HTTP API ---"
 READY=""
 for _ in $(seq 1 30); do
-  if curl -sf "http://localhost:$HOST_PORT/health" >/dev/null 2>&1; then
+  if curl -sf "$BASE/health" >/dev/null 2>&1; then
     READY=1
     break
   fi
   sleep 1
 done
-if [ -z "$READY" ]; then
-  echo "FAIL: bridge-daemon never became healthy"
-  docker logs "$CONTAINER_NAME"
-  exit 1
-fi
+[ -n "$READY" ] || fail "bridge-daemon never became healthy"
 echo "OK: health endpoint responding"
 
-echo "--- adding the RAOP output via the API ---"
-ADD=$(curl -s -X POST "http://localhost:$HOST_PORT/api/outputs" -H 'Content-Type: application/json' \
-  -d '{"name":"Test Placeholder","ip":"192.0.2.1","port":7000,"encryption":"auth_setup"}')
-echo "$ADD" | grep -q '"ok":true' || { echo "FAIL: POST /api/outputs did not report ok:true: $ADD"; docker logs "$CONTAINER_NAME"; exit 1; }
-
-echo "--- waiting for the RAOP node to be discovered ---"
-FOUND=""
-for _ in $(seq 1 15); do
-  if curl -sf "http://localhost:$HOST_PORT/api/nodes" 2>/dev/null | grep -q "raop-out-test_placeholder"; then
-    FOUND=1
-    break
-  fi
-  sleep 1
+echo "--- adding both source kinds via the API ---"
+# Both kinds, because they reach PipeWire by different mechanisms: RTP loads
+# libpipewire-module-rtp-source, AirPlay runs the native receiver and pushes
+# through its own producer stream. One passing tells you nothing about the other.
+for BODY in \
+  '{"label":"Test Bridge","kind":"rtp","rtp":{"port":46200}}' \
+  '{"label":"Test AirPlay","kind":"airplay"}'; do
+  CODE=$(curl -s -o /tmp/phase1_add.json -w '%{http_code}' -X POST "$BASE/api/sources" \
+    -H 'Content-Type: application/json' -d "$BODY")
+  [ "$CODE" = "201" ] || fail "POST /api/sources returned $CODE for $BODY: $(cat /tmp/phase1_add.json)"
 done
-if [ -z "$FOUND" ]; then
-  echo "FAIL: configured output never appeared in /api/nodes"
-  echo "--- container logs ---"
-  docker logs "$CONTAINER_NAME"
-  exit 1
-fi
+rm -f /tmp/phase1_add.json
+
+echo "--- waiting for both source nodes to be discovered ---"
+# Node names derive from the label's slug (sources_store.rs source_node_name).
+for NODE in rtp-in-test-bridge airplay-in-test-airplay; do
+  FOUND=""
+  for _ in $(seq 1 20); do
+    if curl -sf "$BASE/api/nodes" 2>/dev/null | grep -q "$NODE"; then FOUND=1; break; fi
+    sleep 1
+  done
+  [ -n "$FOUND" ] || fail "source node '$NODE' never appeared in /api/nodes"
+done
+SOURCES=$(curl -s "$BASE/api/sources")
+echo "$SOURCES" | grep -q '"present":false' && fail "a configured source is not running: $SOURCES"
+echo "OK: both sources loaded into the daemon's PipeWire context and reported present"
+
+echo "--- an unadopted output is offered, not routable ---"
+# Nothing has been added yet, so both listings that mean "the system's outputs"
+# must be empty. This is the gate itself: discovery alone must never make a
+# device routable or turn it into a Home Assistant entity.
+[ "$(curl -s "$BASE/api/outputs")" = "[]" ] || fail "expected no adopted outputs before adding one"
+curl -s "$BASE/api/routing" | grep -q '"outputs":\[\]' || fail "expected no outputs in the matrix before adding one"
+
+echo "--- adopting an output puts it in the listing and the matrix ---"
+ADOPT=$(curl -s -X POST "$BASE/api/outputs/ap2-dev-test-placeholder/adopt")
+echo "$ADOPT" | grep -q '"ok":true' || fail "adopt did not report ok:true: $ADOPT"
+OUTS=$(curl -s "$BASE/api/outputs")
+echo "$OUTS" | grep -q '"state":"adopted"' || fail "output not reported as adopted: $OUTS"
+MATRIX=$(curl -s "$BASE/api/routing")
+echo "$MATRIX" | grep -q 'ap2-dev-test-placeholder' || fail "adopted output missing from the matrix: $MATRIX"
+echo "OK: adopted output reaches both the outputs listing and the routing matrix"
 
 echo "--- /api/nodes response ---"
-curl -s "http://localhost:$HOST_PORT/api/nodes"
+curl -s "$BASE/api/nodes"
 echo
-echo "PASS: POST /api/outputs -> bridge-daemon loads raop-sink -> PipeWire RAOP node -> bridge-daemon registry -> REST API, full chain verified"
+echo "PASS: POST /api/sources -> daemon loads the source -> PipeWire node -> registry -> REST, and adopt -> outputs listing + routing matrix, full chain verified"
