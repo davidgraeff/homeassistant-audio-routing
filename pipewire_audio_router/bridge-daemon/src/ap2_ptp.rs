@@ -87,7 +87,9 @@ extern "C" {
 pub fn monotonic_ns() -> u64 {
     let mut ts = Timespec::default();
     // SAFETY: valid timespec pointer.
-    unsafe { clock_gettime(1 /* CLOCK_MONOTONIC */, &mut ts) };
+    unsafe {
+        clock_gettime(1 /* CLOCK_MONOTONIC */, &mut ts)
+    };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -185,14 +187,7 @@ pub struct Ap2PtpService {
 
 impl Ap2PtpService {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(Inner {
-                master: None,
-                peers: HashMap::new(),
-                clock_id: None,
-            }),
-            port_override: None,
-        })
+        Arc::new(Self { inner: Mutex::new(Inner { master: None, peers: HashMap::new(), clock_id: None }), port_override: None })
     }
 
     /// Lazily bind 319/320 and start the grandmaster. Idempotent — returns the
@@ -206,9 +201,7 @@ impl Ap2PtpService {
         // Arbitrary 48-bit seed; libairptp ORs 0xFFFF into the top octets.
         const SEED: u64 = 0x0000_A1B2_C3D4_E5F6;
         let master = AirptpMaster::start(SEED, self.port_override)?;
-        let cid = master
-            .clock_id()
-            .ok_or_else(|| "airptp started but reported no clock id".to_string())?;
+        let cid = master.clock_id().ok_or_else(|| "airptp started but reported no clock id".to_string())?;
         g.master = Some(master);
         g.clock_id = Some(cid);
         tracing::info!("AP2 PTP grandmaster started, clock_id={:#018x}", cid);
@@ -233,10 +226,7 @@ impl Ap2PtpService {
         if last_seen == 0 {
             return None;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
         Some(std::time::Duration::from_secs(now.saturating_sub(last_seen)))
     }
 
@@ -298,11 +288,7 @@ mod tests {
         // Use high, unprivileged ports so the test needs no capability and can't
         // collide with a real grandmaster on 319/320.
         let svc = Arc::new(Ap2PtpService {
-            inner: Mutex::new(Inner {
-                master: None,
-                peers: HashMap::new(),
-                clock_id: None,
-            }),
+            inner: Mutex::new(Inner { master: None, peers: HashMap::new(), clock_id: None }),
             port_override: Some((19319, 19320)),
         });
         let cid = svc.ensure_started().expect("grandmaster should start");

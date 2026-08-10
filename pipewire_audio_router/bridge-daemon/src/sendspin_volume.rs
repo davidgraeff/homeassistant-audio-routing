@@ -309,10 +309,7 @@ impl SendspinControl {
     /// so a disconnected device simply reports `false` rather than queuing a clear
     /// for a stream that will be freshly started anyway.
     pub fn clear_stream(&self, node_name: &str) -> PendingClear {
-        PendingClear {
-            node_name: node_name.to_string(),
-            sender: self.senders.get(node_name).cloned(),
-        }
+        PendingClear { node_name: node_name.to_string(), sender: self.senders.get(node_name).cloned() }
     }
 
     /// Bundle one command for a device with its live sender, if any.

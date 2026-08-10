@@ -100,15 +100,7 @@ impl OverlayMixer {
         let pcm = crate::resample::from_48k_stereo_to(&pcm, rate);
         self.slots.lock().unwrap().insert(
             output.to_string(),
-            Overlay {
-                id,
-                pcm,
-                cursor: 0,
-                duck: duck.clamp(0.0, 1.0),
-                grace,
-                watch_cursor: 0,
-                watch_since: Instant::now(),
-            },
+            Overlay { id, pcm, cursor: 0, duck: duck.clamp(0.0, 1.0), grace, watch_cursor: 0, watch_since: Instant::now() },
         );
     }
 
@@ -217,11 +209,7 @@ fn mix_s16le_into(music: &[u8], overlay: &[u8], duck: f32, out: &mut Vec<u8>) {
     out.reserve(n * 2);
     for i in 0..n {
         let m = i16::from_le_bytes([music[2 * i], music[2 * i + 1]]) as f32;
-        let o = if 2 * i + 1 < overlay.len() {
-            i16::from_le_bytes([overlay[2 * i], overlay[2 * i + 1]]) as f32
-        } else {
-            0.0
-        };
+        let o = if 2 * i + 1 < overlay.len() { i16::from_le_bytes([overlay[2 * i], overlay[2 * i + 1]]) as f32 } else { 0.0 };
         let mixed = (m * duck + o).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         out.extend_from_slice(&mixed.to_le_bytes());
     }

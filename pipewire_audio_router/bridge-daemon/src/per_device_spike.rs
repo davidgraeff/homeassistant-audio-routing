@@ -29,8 +29,8 @@ use crate::sendspin_volume::SharedSendspinControl;
 use serde::Serialize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 
 /// Distinctive sink-name prefix. Deliberately NOT `sendspin-dev-`/`raop-out-` so
 /// the routing/group reconciler never treats this scratch sink as an output.
@@ -114,11 +114,8 @@ pub async fn start(
 
     // 1. Free the device from production routing so only our single-member server
     //    dials it. Remembered for restore on teardown.
-    let freed_links: Vec<(String, String)> = routing_store::snapshot(routing)
-        .into_iter()
-        .filter(|l| l.output == device_node_name)
-        .map(|l| (l.source, l.output))
-        .collect();
+    let freed_links: Vec<(String, String)> =
+        routing_store::snapshot(routing).into_iter().filter(|l| l.output == device_node_name).map(|l| (l.source, l.output)).collect();
     if !freed_links.is_empty() {
         // Mutate the store in a *sync* helper so the (non-Send) std MutexGuard
         // never enters this async fn's state across the await below.
@@ -128,15 +125,10 @@ pub async fn start(
     }
 
     // 2. Create the per-device sink and wait for it in the graph.
-    let suffix = device_node_name
-        .strip_prefix(crate::config::SENDSPIN_DEV_PREFIX)
-        .unwrap_or(device_node_name);
+    let suffix = device_node_name.strip_prefix(crate::config::SENDSPIN_DEV_PREFIX).unwrap_or(device_node_name);
     let sink_node_name = format!("{PERDEV_PREFIX}{suffix}");
     let (tx, rx) = oneshot::channel();
-    if pw_cmd
-        .send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx })
-        .is_err()
-    {
+    if pw_cmd.send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx }).is_err() {
         restore_links(routing, changes, &freed_links);
         return Err("pipewire thread unavailable".to_string());
     }
@@ -198,13 +190,8 @@ pub async fn start(
             source.map(|s| format!(", fed from '{s}'")).unwrap_or_default()
         ),
     };
-    *guard = Some(PerDeviceSpike {
-        device_node_name: device_node_name.to_string(),
-        sink_node_name,
-        sink_node_id,
-        freed_links,
-        _server: server,
-    });
+    *guard =
+        Some(PerDeviceSpike { device_node_name: device_node_name.to_string(), sink_node_name, sink_node_id, freed_links, _server: server });
     Ok(info)
 }
 
@@ -263,10 +250,7 @@ pub async fn start_multi(
     // One anchor sink for the whole group.
     let sink_node_name = "perdev-multi".to_string();
     let (tx, rx) = oneshot::channel();
-    if pw_cmd
-        .send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx })
-        .is_err()
-    {
+    if pw_cmd.send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx }).is_err() {
         restore_links(routing, changes, &freed_links);
         return Err("pipewire thread unavailable".to_string());
     }
@@ -325,13 +309,8 @@ pub async fn start_multi(
             source.map(|s| format!(", fed from '{s}'")).unwrap_or_default()
         ),
     };
-    *guard = Some(PerDeviceSpike {
-        device_node_name: device_node_names.join(","),
-        sink_node_name,
-        sink_node_id,
-        freed_links,
-        _server: server,
-    });
+    *guard =
+        Some(PerDeviceSpike { device_node_name: device_node_names.join(","), sink_node_name, sink_node_id, freed_links, _server: server });
     Ok(info)
 }
 
@@ -383,7 +362,6 @@ fn restore_links(routing: &SharedRouting, changes: &ChangeNotifier, freed: &[(St
     }
     let _ = changes.send(());
 }
-
 
 /// The `(fullname, url)` pairs a spike server should supervise, from the discovery
 /// registry — the same source the group reconciler uses (see sendspin_server: the

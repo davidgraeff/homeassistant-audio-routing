@@ -1,6 +1,5 @@
 mod airplay_clients;
 mod airplay_source;
-mod applemidi_sender;
 mod announce;
 mod announce_arbiter;
 mod ap2_discovery;
@@ -10,6 +9,7 @@ mod ap2_server;
 mod ap2_spike;
 mod ap2_volume;
 mod api;
+mod applemidi_sender;
 mod bt_bridge_discovery;
 mod calibrate;
 mod config;
@@ -33,6 +33,7 @@ mod pw_target_liveness;
 mod pw_thread;
 mod pwsink_agent;
 mod pwsink_server;
+mod raop_migration;
 mod resample;
 mod routing;
 mod routing_store;
@@ -43,7 +44,6 @@ mod sendspin_discovery;
 mod sendspin_liveness;
 mod sendspin_server;
 mod sendspin_volume;
-mod raop_migration;
 mod settings_store;
 mod sources_store;
 mod sync_group;
@@ -96,13 +96,13 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| // `sendspin=info` matters more than it looks: the vendored server role logs its
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+            |_| // `sendspin=info` matters more than it looks: the vendored server role logs its
             // dial loop (attempt, failure, retry backoff, goodbye reason) through the `log`
             // crate, and without its target enabled every one of those lines is dropped —
             // which left "why is this speaker not connected?" unanswerable from the log.
-            "bridge_daemon=info,sendspin=info,shairplay=info,airplay_client=info,airplay_audio=info,libairptp=info".into()),
-        )
+            "bridge_daemon=info,sendspin=info,shairplay=info,airplay_client=info,airplay_audio=info,libairptp=info".into(),
+        ))
         .init();
 
     let cli = Cli::parse();
@@ -238,8 +238,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // Discovered AirPlay-2 receivers (ap2_discovery.rs) + the host-global PTP
     // grandmaster (ap2_ptp.rs) they register with. The RAOP-output replacement.
-    let ap2_devices: ap2_discovery::SharedAp2Devices =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let ap2_devices: ap2_discovery::SharedAp2Devices = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let ap2_ptp = ap2_ptp::Ap2PtpService::new();
     // Hosts advertising an RTP session over mDNS (pw_target_discovery.rs).
     // **Diagnostic only**: pw-sink outputs come from paired agents (plan §3), and
@@ -247,14 +246,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // a pairing (and therefore every routing link and HA entity) carries the user
     // too. Kept because "that host advertises a session" is worth a log line; read
     // by nothing but its own liveness bookkeeping.
-    let pw_targets: pw_target_discovery::SharedPwTargets =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let pw_targets: pw_target_discovery::SharedPwTargets = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // Discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs): Pis advertising
     // `_pwrouter-btbridge._tcp`. These are input *senders*, so unlike the four
     // registries above they drive no audio path — they let the Sources tab offer
     // one-click adoption and a link to a bridge's diagnostics page.
-    let bt_bridges: bt_bridge_discovery::SharedBtBridges =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let bt_bridges: bt_bridge_discovery::SharedBtBridges = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     let (pw_state, changes, pw_cmd, xruns) = pw_thread::spawn()?;
 
@@ -305,10 +302,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // (previously 4) throttled static-file serving — under a hard-reload storm the
     // UI failed to load. The pool is on-demand and idles out, so leaving it at the
     // default is not a persistent-thread cost.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     rt.block_on(async {
         // Start every stored source/adapter process (AirPlay source via
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
@@ -416,8 +410,21 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                     let pwsink_hosts = agents_for_groups.lock().await.connected_targets();
                     let retry = {
                         let mut g = groups.lock().await;
-                        g.reconcile(&pw, &cmd, &routing, &adopted, &devices, &control, lead, &ap2_devices, &ap2_ptp, &settings, &ap2_control, &pwsink_hosts)
-                            .await;
+                        g.reconcile(
+                            &pw,
+                            &cmd,
+                            &routing,
+                            &adopted,
+                            &devices,
+                            &control,
+                            lead,
+                            &ap2_devices,
+                            &ap2_ptp,
+                            &settings,
+                            &ap2_control,
+                            &pwsink_hosts,
+                        )
+                        .await;
                         g.retry_wanted()
                     };
                     // Wait for the next change — or for the retry delay, whichever

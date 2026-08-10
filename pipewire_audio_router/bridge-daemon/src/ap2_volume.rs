@@ -34,12 +34,18 @@ pub type SharedAp2Control = Arc<Mutex<Ap2Control>>;
 /// [`Ap2Control`] before it reaches the task.
 #[derive(Debug, Clone)]
 pub enum Ap2Command {
-    SetVolume { node_name: String, volume: f32 },
+    SetVolume {
+        node_name: String,
+        volume: f32,
+    },
     /// Change the render delay (PT=87 anchor offset) on the LIVE stream, without a
     /// reconnect — the streamer reads it per packet, so a UI change takes effect
     /// mid-stream. Avoids the session churn a group restart caused (which could leave
     /// a receiver silent).
-    SetRenderDelay { node_name: String, ms: u16 },
+    SetRenderDelay {
+        node_name: String,
+        ms: u16,
+    },
 }
 
 #[derive(Default)]

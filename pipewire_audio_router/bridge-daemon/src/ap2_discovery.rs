@@ -73,12 +73,7 @@ fn display_name_from_service(info: &ResolvedService) -> String {
 /// host-global grandmaster. The browser runs until `daemon` is shut down (which
 /// disconnects the receiver and ends the loop). Mirrors
 /// `sendspin_discovery::spawn`.
-pub fn spawn(
-    daemon: &ServiceDaemon,
-    devices: SharedAp2Devices,
-    changes: ChangeNotifier,
-    ptp: SharedAp2Ptp,
-) -> anyhow::Result<()> {
+pub fn spawn(daemon: &ServiceDaemon, devices: SharedAp2Devices, changes: ChangeNotifier, ptp: SharedAp2Ptp) -> anyhow::Result<()> {
     let receiver = daemon.browse(AIRPLAY_SERVICE_TYPE)?;
     std::thread::Builder::new().name("ap2-discovery".into()).spawn(move || {
         while let Ok(event) = receiver.recv() {
@@ -117,14 +112,7 @@ pub fn spawn(
                         None => {
                             devs.insert(
                                 node_name.clone(),
-                                Ap2Device {
-                                    fullname,
-                                    display_name: display_name.clone(),
-                                    model,
-                                    features,
-                                    addr,
-                                    present: true,
-                                },
+                                Ap2Device { fullname, display_name: display_name.clone(), model, features, addr, present: true },
                             );
                             tracing::info!("discovered AirPlay-2 receiver '{display_name}' ({node_name})");
                             true
@@ -190,10 +178,7 @@ mod tests {
         let devs = devices.lock().unwrap();
         println!("\n=== AP2 discovery: {} receiver(s) on the LAN ===", devs.len());
         for (node, d) in devs.iter() {
-            println!(
-                "  {node} -> '{}'  addr={:?}  model={:?}  present={}",
-                d.display_name, d.addr, d.model, d.present
-            );
+            println!("  {node} -> '{}'  addr={:?}  model={:?}  present={}", d.display_name, d.addr, d.model, d.present);
         }
         println!("PTP grandmaster clock_id: {:?}", ptp.clock_id());
         println!("PTP peers registered: {:?}", ptp.peers());

@@ -3,7 +3,6 @@
 
 use crate::airplay_clients::AirplayClientStore;
 use crate::ap2_discovery::SharedAp2Devices;
-use airplay_core::features::Features;
 use crate::ap2_ptp::SharedAp2Ptp;
 use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use crate::locks::LockRecover;
@@ -11,12 +10,11 @@ use crate::outputs_store::{OutputState, SharedOutputs};
 use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
 use crate::routing_store::SharedRouting;
-use crate::rtp_source::{
-    DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR,
-};
+use crate::rtp_source::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::settings_store::SharedSettings;
 use crate::sources_store::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore};
+use airplay_core::features::Features;
 use axum::{
     body::{Body, Bytes},
     extract::{Extension, FromRef, Path, Query, State},
@@ -364,11 +362,7 @@ fn content_type_for(path: &str) -> &'static str {
 fn static_response(f: &StaticFile, key: &str) -> Response {
     // Content-hashed assets are immutable (cache a year); the entrypoint HTML must
     // never be cached, or a stale index pins old asset URLs after a redeploy.
-    let cache = if key.starts_with("assets/") {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-cache"
-    };
+    let cache = if key.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     Response::builder()
         .header(header::CONTENT_TYPE, f.content_type)
         .header(header::CACHE_CONTROL, cache)
@@ -754,7 +748,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             port: addr.map(|a| a.port()),
             encryption: Some("None".to_string()),
             latency_ms: None,
-            ptp_locked: None,   // sendspin has no PTP
+            ptp_locked: None, // sendspin has no PTP
             ptp_lock_age_s: None,
             ptp_supported: None,
             ptp_relevant: None,
@@ -814,11 +808,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         // "still locked" window. If a present, routed receiver isn't locked, its stream
         // renders silence — surface that as degraded in the UI.
         let ptp_age = addr.and_then(|a| state.ap2_ptp.peer_lock_age(&a.ip().to_string()));
-        let ptp_locked = if present {
-            Some(ptp_age.is_some_and(|age| age <= std::time::Duration::from_secs(5)))
-        } else {
-            None
-        };
+        let ptp_locked = if present { Some(ptp_age.is_some_and(|age| age <= std::time::Duration::from_secs(5))) } else { None };
         // Decoded capabilities (features TXT bit 41 = PTP, 40 = buffered, 48 = transient).
         let features = dev.and_then(|d| d.features).map(Features::from_raw);
         let ptp_supported = features.map(|f| f.supports_ptp());
@@ -833,12 +823,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         // receiver risk audible multi-room drift.
         let ptp_relevant = if present {
             let my = crate::routing::source_set_of(&ap2_intent, &node_name);
-            Some(
-                !my.is_empty()
-                    && ap2_present_nodes
-                        .iter()
-                        .any(|o| o != &node_name && crate::routing::source_set_of(&ap2_intent, o) == my),
-            )
+            Some(!my.is_empty() && ap2_present_nodes.iter().any(|o| o != &node_name && crate::routing::source_set_of(&ap2_intent, o) == my))
         } else {
             None
         };
@@ -913,10 +898,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         let name = host
             .map(|h| h.label.clone())
             .unwrap_or_else(|| node_name.strip_prefix(PWSINK_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
-        let host_state = agent_rows
-            .iter()
-            .find(|row| row.node_name == node_name)
-            .and_then(|row| row.state.clone());
+        let host_state = agent_rows.iter().find(|row| row.node_name == node_name).and_then(|row| row.state.clone());
         let streaming = crate::pw_sink_liveness::PwSinkLiveness::global().get(&node_name).map(|s| s.established);
         outputs.push(OutputInfo {
             kind: "pwsink",
@@ -977,12 +959,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
 /// consulted — this is for toasts, where the store lookup is cheap and reaching
 /// into three discovery maps isn't.
 fn output_label(state: &AppState, node_name: &str) -> String {
-    state
-        .outputs
-        .lock_recover()
-        .name(node_name)
-        .map(str::to_string)
-        .unwrap_or_else(|| routing::output_display_name(node_name))
+    state.outputs.lock_recover().name(node_name).map(str::to_string).unwrap_or_else(|| routing::output_display_name(node_name))
 }
 
 /// Both listings from one pass: `(adopted, offered)`.
@@ -1063,9 +1040,7 @@ async fn adopt_output(State(state): State<AppState>, Path(node_name): Path<Strin
                 if !agents.is_paired(&identity) {
                     match agents.approve(&identity) {
                         Ok(agent) => paired_note = format!(" (paired '{}')", agent.label),
-                        Err(e) => {
-                            return Json(OutputOpResponse { ok: false, message: format!("failed to pair '{node_name}': {e}") })
-                        }
+                        Err(e) => return Json(OutputOpResponse { ok: false, message: format!("failed to pair '{node_name}': {e}") }),
                     }
                 }
             }
@@ -1246,20 +1221,14 @@ fn set_priority_for(state: &AppState, id: &str, key: &str, priority: i32) -> (St
 async fn disconnect_client_for(state: &AppState, id: &str, key: &str) -> (StatusCode, Json<OutputOpResponse>) {
     // Resolve the key to the live peer IP the RAOP server keys connections on.
     let Some(addr) = state.airplay_clients.registry(id).connected_addr(key) else {
-        return (
-            StatusCode::CONFLICT,
-            Json(OutputOpResponse { ok: false, message: format!("'{key}' is not currently connected") }),
-        );
+        return (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: format!("'{key}' is not currently connected") }));
     };
     match state.airplay.lock().await.get(id) {
         Some(handle) => {
             handle.disconnect_client(&addr);
             (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("disconnecting AirPlay client '{key}'") }))
         }
-        None => (
-            StatusCode::CONFLICT,
-            Json(OutputOpResponse { ok: false, message: format!("AirPlay source '{id}' is not running") }),
-        ),
+        None => (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: format!("AirPlay source '{id}' is not running") })),
     }
 }
 
@@ -1458,17 +1427,10 @@ async fn report_now_playing(
 ) -> Result<Json<OutputOpResponse>, SourceError> {
     let node_name = {
         let sources = state.sources.lock_recover();
-        sources
-            .list()
-            .iter()
-            .find(|e| matches!(&e.config, SourceConfig::Rtp(r) if r.port == req.rtp_port))
-            .map(|e| e.node_name())
+        sources.list().iter().find(|e| matches!(&e.config, SourceConfig::Rtp(r) if r.port == req.rtp_port)).map(|e| e.node_name())
     };
     let Some(node_name) = node_name else {
-        return Err(source_err(
-            StatusCode::NOT_FOUND,
-            format!("no RTP source is configured on port {}", req.rtp_port),
-        ));
+        return Err(source_err(StatusCode::NOT_FOUND, format!("no RTP source is configured on port {}", req.rtp_port)));
     };
     let reporter = state.now_playing.reporter(node_name.clone());
     // An empty body is how a reporter says "nothing is playing any more" without
@@ -1593,10 +1555,8 @@ fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::bt_bridge_d
         SourceConfig::Airplay(a) => (Some(a.clone()), None),
         SourceConfig::Rtp(r) => (None, Some(r.clone())),
     };
-    let bridge = rtp
-        .as_ref()
-        .and_then(|r| crate::bt_bridge_discovery::match_bridge(bridges.iter(), r.port, &r.source_addr))
-        .map(BridgeView::of);
+    let bridge =
+        rtp.as_ref().and_then(|r| crate::bt_bridge_discovery::match_bridge(bridges.iter(), r.port, &r.source_addr)).map(BridgeView::of);
     SourceView {
         id: entry.id.clone(),
         label: entry.label.clone(),
@@ -1689,8 +1649,7 @@ async fn list_sources(State(state): State<AppState>) -> Json<SourcesListResponse
     let entries = state.sources.lock_recover().list();
     let present = present_node_names(&state.pw);
     let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
-    let sources: Vec<SourceView> =
-        entries.iter().map(|e| source_view(e, present.contains(&e.node_name()), &bridges)).collect();
+    let sources: Vec<SourceView> = entries.iter().map(|e| source_view(e, present.contains(&e.node_name()), &bridges)).collect();
     let discovered_bridges = unmatched_bridges(&bridges, &sources);
     Json(SourcesListResponse { sources, discovered_bridges })
 }
@@ -1701,8 +1660,7 @@ async fn list_sources(State(state): State<AppState>) -> Json<SourcesListResponse
 /// unit-tested: a bridge visible in both lists would invite the user to add a
 /// duplicate source on a port that is already taken.
 fn unmatched_bridges(bridges: &[crate::bt_bridge_discovery::BtBridge], sources: &[SourceView]) -> Vec<BridgeView> {
-    let claimed: std::collections::HashSet<&str> =
-        sources.iter().filter_map(|s| s.bridge.as_ref()).map(|b| b.fullname.as_str()).collect();
+    let claimed: std::collections::HashSet<&str> = sources.iter().filter_map(|s| s.bridge.as_ref()).map(|b| b.fullname.as_str()).collect();
     bridges.iter().filter(|b| !claimed.contains(b.fullname.as_str())).map(BridgeView::of).collect()
 }
 
@@ -1728,11 +1686,8 @@ async fn create_source(
 }
 
 async fn get_source(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<SourceView>, SourceError> {
-    let entry = state
-        .sources
-        .lock_recover()
-        .get(&id)
-        .ok_or_else(|| source_err(StatusCode::NOT_FOUND, format!("no source with id '{id}'")))?;
+    let entry =
+        state.sources.lock_recover().get(&id).ok_or_else(|| source_err(StatusCode::NOT_FOUND, format!("no source with id '{id}'")))?;
     let present = node_present(&state.pw, &entry.node_name());
     let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
     Ok(Json(source_view(&entry, present, &bridges)))
@@ -1829,10 +1784,7 @@ struct SetSendspinMuteRequest {
     muted: bool,
 }
 
-async fn set_sendspin_mute(
-    State(state): State<AppState>,
-    Json(req): Json<SetSendspinMuteRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn set_sendspin_mute(State(state): State<AppState>, Json(req): Json<SetSendspinMuteRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     let pending = state.sendspin_control.lock().await.set_muted(&req.node_name, req.muted);
     let reached = pending.apply().await;
     let verb = if req.muted { "muted" } else { "unmuted" };
@@ -1902,10 +1854,7 @@ struct SetAp2VolumeRequest {
     volume: f32,
 }
 
-async fn set_ap2_volume(
-    State(state): State<AppState>,
-    Json(req): Json<SetAp2VolumeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn set_ap2_volume(State(state): State<AppState>, Json(req): Json<SetAp2VolumeRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     let reached = state.ap2_control.lock().await.set_volume(&req.node_name, req.volume).await;
     let pct = (req.volume.clamp(0.0, 1.0) * 100.0).round() as u8;
     let message = if reached {
@@ -1922,17 +1871,11 @@ struct SetAp2MuteRequest {
     muted: bool,
 }
 
-async fn set_ap2_mute(
-    State(state): State<AppState>,
-    Json(req): Json<SetAp2MuteRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn set_ap2_mute(State(state): State<AppState>, Json(req): Json<SetAp2MuteRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     let reached = state.ap2_control.lock().await.set_muted(&req.node_name, req.muted).await;
     let verb = if req.muted { "muted" } else { "unmuted" };
-    let message = if reached {
-        format!("{verb} '{}'", req.node_name)
-    } else {
-        format!("saved {verb} for '{}' (not streaming)", req.node_name)
-    };
+    let message =
+        if reached { format!("{verb} '{}'", req.node_name) } else { format!("saved {verb} for '{}' (not streaming)", req.node_name) };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
 
@@ -1958,16 +1901,10 @@ struct SetPwsinkVolumeRequest {
     volume: f32,
 }
 
-async fn set_pwsink_volume(
-    State(state): State<AppState>,
-    Json(req): Json<SetPwsinkVolumeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn set_pwsink_volume(State(state): State<AppState>, Json(req): Json<SetPwsinkVolumeRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     let delivered = state.agents.lock().await.set_volume(&req.node_name, req.volume);
     if delivered {
-        (
-            StatusCode::OK,
-            Json(OutputOpResponse { ok: true, message: format!("set '{}' to {:.0}%", req.node_name, req.volume * 100.0) }),
-        )
+        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{}' to {:.0}%", req.node_name, req.volume * 100.0) }))
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1982,10 +1919,7 @@ struct SetPwsinkMuteRequest {
     muted: bool,
 }
 
-async fn set_pwsink_mute(
-    State(state): State<AppState>,
-    Json(req): Json<SetPwsinkMuteRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn set_pwsink_mute(State(state): State<AppState>, Json(req): Json<SetPwsinkMuteRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     let delivered = state.agents.lock().await.set_mute(&req.node_name, req.muted);
     let verb = if req.muted { "muted" } else { "unmuted" };
     if delivered {
@@ -2058,8 +1992,7 @@ fn lead_floor(state: &AppState) -> (u32, Vec<LeadFloorSource>) {
         .filter(|(_, d)| d.present)
         .map(|(node_name, d)| {
             let static_delay_ms = delays.get(node_name).copied().unwrap_or(0);
-            let codec =
-                crate::sendspin_server::resolve_codec(ss.sendspin_codec(node_name), std::iter::once(&d.supported_codecs));
+            let codec = crate::sendspin_server::resolve_codec(ss.sendspin_codec(node_name), std::iter::once(&d.supported_codecs));
             // Same rule the audio path uses: what the device asked for, else our floor
             // for its codec — and the device's static delay on top either way.
             let codec_minimum_ms = (crate::sendspin_codec::min_send_ahead_us(codec) / 1000) as u32;
@@ -2101,10 +2034,7 @@ async fn get_sync_settings(State(state): State<AppState>) -> Json<SyncSettingsIn
     })
 }
 
-async fn set_sync_settings(
-    State(state): State<AppState>,
-    Json(req): Json<SetSyncSettingsRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn set_sync_settings(State(state): State<AppState>, Json(req): Json<SetSyncSettingsRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     if let Err(e) = state.sync_settings.lock_recover().set_group_lead_ms(req.group_lead_ms) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
     }
@@ -2171,22 +2101,34 @@ async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettings
         let mut s = state.settings.lock_recover();
         if let Some(d) = req.default_duck {
             if let Err(e) = s.set_default_duck(d) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+                );
             }
         }
         if let Some(enabled) = req.discovery_enabled {
             if let Err(e) = s.set_discovery_enabled(enabled) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+                );
             }
         }
         if let Some(live) = req.sendspin_delay_live {
             if let Err(e) = s.set_sendspin_delay_live(live) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+                );
             }
         }
         if let Some(expose) = req.expose_outputs_as_media_players {
             if let Err(e) = s.set_expose_outputs_as_media_players(expose) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+                );
             }
         }
     }
@@ -2194,7 +2136,10 @@ async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettings
     // is reported but the flag stays persisted — it'll retry on next boot.
     if let Some(enabled) = req.discovery_enabled {
         if let Err(e) = state.discovery.set_enabled(enabled) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to apply discovery: {e}") }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OutputOpResponse { ok: false, message: format!("failed to apply discovery: {e}") }),
+            );
         }
     }
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "settings saved".to_string() }))
@@ -2284,16 +2229,10 @@ struct Ap2SpikeRequest {
     clip: Option<String>,
 }
 
-async fn spike_ap2_start(
-    State(state): State<AppState>,
-    Json(req): Json<Ap2SpikeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn spike_ap2_start(State(state): State<AppState>, Json(req): Json<Ap2SpikeRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     // Resolve targets: explicit IPs, else every present discovered AP2 receiver.
     let targets: Vec<(String, std::net::IpAddr)> = if !req.ips.is_empty() {
-        req.ips
-            .iter()
-            .filter_map(|s| s.parse::<std::net::IpAddr>().ok().map(|ip| (s.clone(), ip)))
-            .collect()
+        req.ips.iter().filter_map(|s| s.parse::<std::net::IpAddr>().ok().map(|ip| (s.clone(), ip))).collect()
     } else {
         state
             .ap2_devices
@@ -2321,17 +2260,18 @@ async fn spike_ap2_start(
     let (live, file_wav) = if voice {
         match crate::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3").await {
             Ok(wav) => (false, Some(wav)),
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("decode test clip: {e}") })),
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("decode test clip: {e}") }))
+            }
         }
     } else {
         (req.mode.as_deref() == Some("live"), None)
     };
 
     match crate::ap2_spike::start(targets, &state.ap2_ptp, freq, secs, delay, live, rate, file_wav).await {
-        Ok(info) => (
-            StatusCode::OK,
-            Json(OutputOpResponse { ok: true, message: format!("{} — {}", info.message, info.targets.join(", ")) }),
-        ),
+        Ok(info) => {
+            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{} — {}", info.message, info.targets.join(", ")) }))
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
     }
 }
@@ -2358,15 +2298,9 @@ struct PwSinkSpikeRequest {
     ifname: Option<String>,
 }
 
-async fn spike_pwsink_start(
-    State(state): State<AppState>,
-    Json(req): Json<PwSinkSpikeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+async fn spike_pwsink_start(State(state): State<AppState>, Json(req): Json<PwSinkSpikeRequest>) -> (StatusCode, Json<OutputOpResponse>) {
     if req.target_ip.parse::<std::net::IpAddr>().is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse { ok: false, message: format!("invalid target_ip '{}'", req.target_ip) }),
-        );
+        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("invalid target_ip '{}'", req.target_ip) }));
     }
     let freq = req.freq.unwrap_or(440.0);
     let ifname = req.ifname.as_deref().or(Some("end0"));
@@ -2454,7 +2388,13 @@ async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, St
     match q.get("device") {
         Some(device) => {
             let stopped = crate::overlay_mixer::OverlayMixer::global().stop(device).is_some();
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("overlay on '{device}': {}", if stopped { "stopped" } else { "none active" }) }))
+            (
+                StatusCode::OK,
+                Json(OutputOpResponse {
+                    ok: true,
+                    message: format!("overlay on '{device}': {}", if stopped { "stopped" } else { "none active" }),
+                }),
+            )
         }
         None => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: "missing ?device=".to_string() })),
     }
@@ -2550,7 +2490,12 @@ async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String
 }
 
 async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRequest>) -> (StatusCode, Json<AgAnnounceResponse>) {
-    let reject = |msg: String| (StatusCode::BAD_REQUEST, Json(AgAnnounceResponse { ok: false, admission: "rejected".into(), position: None, reason: Some(msg.clone()), message: msg }));
+    let reject = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(AgAnnounceResponse { ok: false, admission: "rejected".into(), position: None, reason: Some(msg.clone()), message: msg }),
+        )
+    };
 
     // Resolve effective targets/priority/duck — optionally from a named
     // announcement group (explicit `targets`/`duck` in the request still win).
@@ -2617,11 +2562,8 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
             _ => None,
         })
         .collect();
-    let starting: Vec<String> = transports
-        .iter()
-        .filter(|(_, s)| matches!(s, AnnounceTransport::Starting))
-        .map(|(t, _)| output_label(&state, t))
-        .collect();
+    let starting: Vec<String> =
+        transports.iter().filter(|(_, s)| matches!(s, AnnounceTransport::Starting)).map(|(t, _)| output_label(&state, t)).collect();
     // A clip may sit unconsumed while an on-demand session pairs up; give the
     // mixer's stall watchdog a matching grace so it isn't reaped mid-connect.
     let grace = if transports.iter().any(|(_, s)| s.is_on_demand()) {
@@ -2629,11 +2571,8 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     } else {
         crate::overlay_mixer::OVERLAY_STALL_GRACE
     };
-    let targets: Vec<String> = transports
-        .into_iter()
-        .filter(|(_, s)| !matches!(s, AnnounceTransport::Unavailable(_)))
-        .map(|(t, _)| t)
-        .collect();
+    let targets: Vec<String> =
+        transports.into_iter().filter(|(_, s)| !matches!(s, AnnounceTransport::Unavailable(_))).map(|(t, _)| t).collect();
     if targets.is_empty() {
         return reject(format!("no target can play an announcement right now: {}", skipped.join("; ")));
     }
@@ -2675,10 +2614,7 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     if !starting.is_empty() {
         // Honest about the wait: the endpoint has to connect first (AP2: pair +
         // SETUP + its render buffer; pw-sink: discover our advert and handshake).
-        message.push_str(&format!(
-            " — opening an on-demand session for {} (audio starts in a few seconds)",
-            starting.join(", ")
-        ));
+        message.push_str(&format!(" — opening an on-demand session for {} (audio starts in a few seconds)", starting.join(", ")));
     }
     if !skipped.is_empty() {
         message.push_str(&format!("; skipped {}", skipped.join("; ")));
@@ -2727,14 +2663,21 @@ async fn list_music_groups(State(state): State<AppState>) -> Json<Vec<crate::gro
     Json(state.groups_config.lock_recover().music().to_vec())
 }
 
-async fn create_music_group(State(state): State<AppState>, Json(req): Json<CreateMusicGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn create_music_group(
+    State(state): State<AppState>,
+    Json(req): Json<CreateMusicGroupRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
     match state.groups_config.lock_recover().create_music(&req.name, req.members) {
         Ok(mg) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": mg }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
     }
 }
 
-async fn update_music_group(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<UpdateMusicGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn update_music_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateMusicGroupRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
     match state.groups_config.lock_recover().update_music(&id, req.name, req.members) {
         Ok(mg) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": mg }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
@@ -2757,7 +2700,11 @@ struct RouteGroupRequest {
 /// `source` (replacing any prior source per member), so they play it in sync. The
 /// group is the routable unit; individual member re-routing is left to the raw
 /// matrix. Reuses the per-output routing store + reconciler (no special-casing).
-async fn route_music_group(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<RouteGroupRequest>) -> (StatusCode, Json<OutputOpResponse>) {
+async fn route_music_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RouteGroupRequest>,
+) -> (StatusCode, Json<OutputOpResponse>) {
     tracing::info!("USER ACTION: route music group '{}' (routing graph)", id);
     let members = {
         let g = state.groups_config.lock_recover();
@@ -2777,12 +2724,18 @@ async fn route_music_group(State(state): State<AppState>, Path(id): Path<String>
                 let _ = store.remove(&l.source, member);
             }
             if let Err(e) = store.add(&req.source, member) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+                );
             }
         }
     }
     let _ = state.changes.send(());
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("routed '{id}' ({} member(s)) from '{}'", members.len(), req.source) }))
+    (
+        StatusCode::OK,
+        Json(OutputOpResponse { ok: true, message: format!("routed '{id}' ({} member(s)) from '{}'", members.len(), req.source) }),
+    )
 }
 
 /// Un-route a whole music group: remove all links feeding its members.
@@ -2810,7 +2763,10 @@ async fn list_announcement_groups(State(state): State<AppState>) -> Json<Vec<cra
     Json(state.groups_config.lock_recover().announcement().to_vec())
 }
 
-async fn create_announcement_group(State(state): State<AppState>, Json(req): Json<CreateAnnouncementGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn create_announcement_group(
+    State(state): State<AppState>,
+    Json(req): Json<CreateAnnouncementGroupRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let duck = req.duck.unwrap_or_else(|| state.settings.lock_recover().default_duck());
     match state.groups_config.lock_recover().create_announcement(&req.name, req.targets, req.priority, duck) {
         Ok(ag) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": ag }))),
@@ -2818,7 +2774,11 @@ async fn create_announcement_group(State(state): State<AppState>, Json(req): Jso
     }
 }
 
-async fn update_announcement_group(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<UpdateAnnouncementGroupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn update_announcement_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateAnnouncementGroupRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
     match state.groups_config.lock_recover().update_announcement(&id, req.name, req.targets, req.priority, req.duck) {
         Ok(ag) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": ag }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
@@ -2889,12 +2849,7 @@ async fn align_start(
     State(state): State<AppState>,
     Json(req): Json<AlignStartRequest>,
 ) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
-    state
-        .align
-        .start(req.sources)
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+    state.align.start(req.sources).await.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
 }
 
 #[derive(Deserialize)]
@@ -3073,10 +3028,7 @@ async fn set_output_latency(
         Some(ms) => format!("{ms} ms"),
         None => "default".to_string(),
     };
-    (
-        StatusCode::OK,
-        Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' render delay to {latency_label} (live)") }),
-    )
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' render delay to {latency_label} (live)") }))
 }
 
 #[derive(serde::Deserialize)]
@@ -3106,10 +3058,7 @@ async fn set_sendspin_codec(
     Json(req): Json<SetSendspinCodecRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
     if !node_name.starts_with(SENDSPIN_DEV_PREFIX) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not a sendspin output") }),
-        );
+        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not a sendspin output") }));
     }
     let Some(codec) = crate::sync_settings::SendspinCodec::parse(&req.codec) else {
         return (
@@ -3129,18 +3078,12 @@ async fn set_sendspin_codec(
         }
     }
     if let Err(e) = state.sync_settings.lock_recover().set_sendspin_codec(&node_name, codec) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to persist codec: {e}") }),
-        );
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist codec: {e}") }));
     }
     // Codec is part of the sendspin server's restart identity → the group restarts
     // and sends a fresh stream/start with the new format.
     let _ = state.changes.send(());
-    (
-        StatusCode::OK,
-        Json(OutputOpResponse { ok: true, message: format!("codec for '{node_name}' set to {}", codec.as_str()) }),
-    )
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("codec for '{node_name}' set to {}", codec.as_str()) }))
 }
 
 async fn set_ap2_rate_mode(
@@ -3176,10 +3119,7 @@ async fn set_ap2_rate_mode(
         crate::sync_settings::Ap2RateMode::Auto => "auto (negotiate 48 kHz)",
         crate::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
     };
-    (
-        StatusCode::OK,
-        Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' sample rate to {label} (applies shortly)") }),
-    )
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' sample rate to {label} (applies shortly)") }))
 }
 
 /// One output the custom HA integration turns into a
@@ -3502,10 +3442,9 @@ mod tests {
     /// fields *flattened*, not nested. The Pi's reporter is written against this.
     #[test]
     fn a_report_body_is_the_port_plus_flattened_metadata() {
-        let req: NowPlayingReportRequest = serde_json::from_str(
-            r#"{"rtp_port":46000,"title":"Song","artist":"Artist","state":"playing","position_ms":1234}"#,
-        )
-        .expect("parses");
+        let req: NowPlayingReportRequest =
+            serde_json::from_str(r#"{"rtp_port":46000,"title":"Song","artist":"Artist","state":"playing","position_ms":1234}"#)
+                .expect("parses");
         assert_eq!(req.rtp_port, 46000);
         assert_eq!(req.metadata.title.as_deref(), Some("Song"));
         assert_eq!(req.metadata.artist.as_deref(), Some("Artist"));
@@ -3649,8 +3588,11 @@ mod tests {
         // rtp_entry() listens on 47000, so it claims "Bathroom".
         let sources = vec![source_view(&rtp_entry(), true, &bridges)];
         let offered = unmatched_bridges(&bridges, &sources);
-        assert_eq!(offered.iter().map(|b| b.display_name.as_str()).collect::<Vec<_>>(), ["Garage"],
-                   "an already-configured bridge must not be offered again on a taken port");
+        assert_eq!(
+            offered.iter().map(|b| b.display_name.as_str()).collect::<Vec<_>>(),
+            ["Garage"],
+            "an already-configured bridge must not be offered again on a taken port"
+        );
     }
 
     #[test]

@@ -79,8 +79,7 @@ pub const AP2_RENDER_DELAY_MAX_MS: u16 = 2000;
 /// 352 frames/packet), sent as the SETUP phase-2 ASC so the receiver can decode.
 /// Deterministic for that format — this is exactly the blob the standalone spike
 /// sent and both receivers accepted.
-pub(crate) const ALAC_MAGIC_COOKIE: [u8; 24] =
-    [0, 0, 1, 96, 0, 16, 40, 10, 14, 2, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 172, 68];
+pub(crate) const ALAC_MAGIC_COOKIE: [u8; 24] = [0, 0, 1, 96, 0, 16, 40, 10, 14, 2, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 172, 68];
 
 /// ALAC magic cookie for a given sample `rate`: the base cookie with its trailing
 /// 4 bytes (the sample rate, big-endian) rewritten. `ALAC_MAGIC_COOKIE` is the
@@ -252,7 +251,12 @@ async fn connect_one(
         match try_connect_once(node_name, ip, clock_id, render_delay_ms, rate, senders).await {
             Ok(ok) => return Ok(ok),
             Err(fail) => {
-                tracing::warn!("AP2: connect attempt {}/{} to '{node_name}' ({ip}) failed: {}", attempt + 1, AP2_CONNECT_ATTEMPTS, fail.msg);
+                tracing::warn!(
+                    "AP2: connect attempt {}/{} to '{node_name}' ({ip}) failed: {}",
+                    attempt + 1,
+                    AP2_CONNECT_ATTEMPTS,
+                    fail.msg
+                );
                 last = Some(fail);
             }
         }
@@ -301,11 +305,7 @@ async fn try_connect_once(
     // Live PCM feed at the group's capture rate (PipeWire resampled the anchor to
     // `rate` in-graph). Register it BEFORE starting so the capture-forward loop fills
     // the decoder during start_live's prefill (else it starts starved).
-    let (sender, decoder) = LiveAudioDecoder::create_pair(
-        rate,
-        crate::sendspin_capture::CHANNELS as u8,
-        AP2_FEED_FRAMES,
-    );
+    let (sender, decoder) = LiveAudioDecoder::create_pair(rate, crate::sendspin_capture::CHANNELS as u8, AP2_FEED_FRAMES);
     senders.lock().unwrap().push((node_name.to_string(), sender));
     // start_streaming_live spawns the RT sender + producer threads. On failure: stop
     // the connection (join those threads, bounded) AND drop the feed we just
@@ -398,11 +398,7 @@ pub fn start(
                     let mut buf = s.take_buffer();
                     let src: &[u8] = if mixer.mix_into(name, &pcm, &mut mix_buf) { &mix_buf } else { &pcm };
                     buf.extend(src.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
-                    let _ = s.try_send(LivePcmFrame {
-                        samples: buf,
-                        channels: crate::sendspin_capture::CHANNELS as u8,
-                        sample_rate: rate,
-                    });
+                    let _ = s.try_send(LivePcmFrame { samples: buf, channels: crate::sendspin_capture::CHANNELS as u8, sample_rate: rate });
                 }
             }
             tracing::debug!("ap2 relay thread exiting");
@@ -445,7 +441,9 @@ pub fn start(
                             tracing::info!("AP2: '{name}' reported volume {:.0}%", v * 100.0);
                             control_task.lock().await.note_reported_volume(name, v);
                         }
-                        None => tracing::debug!("AP2: '{name}' did not report a volume (GET_PARAMETER unsupported); UI shows it as unknown"),
+                        None => {
+                            tracing::debug!("AP2: '{name}' did not report a volume (GET_PARAMETER unsupported); UI shows it as unknown")
+                        }
                     }
                     // Forward this receiver's reported volume into the control so
                     // the UI reflects a change made on the device itself.

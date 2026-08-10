@@ -61,9 +61,7 @@ fn restrict_to_lan(daemon: &ServiceDaemon, label: &str) {
         }
         None => {
             let _ = daemon.disable_interface(IfKind::IPv6);
-            tracing::warn!(
-                "could not determine primary LAN IPv4; {label} left on all IPv4 interfaces (IPv6 disabled)"
-            );
+            tracing::warn!("could not determine primary LAN IPv4; {label} left on all IPv4 interfaces (IPv6 disabled)");
         }
     }
 }

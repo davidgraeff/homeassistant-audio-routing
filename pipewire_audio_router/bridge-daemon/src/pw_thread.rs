@@ -26,10 +26,10 @@
 //! to execute where the proxies live.
 
 use crate::locks::LockRecover;
-use pw_control::module::LoadedModule;
 use pipewire as pw;
 use pipewire::link::Link;
 use pipewire::properties::PropertiesBox;
+use pw_control::module::LoadedModule;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -171,7 +171,12 @@ pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender, 
     Ok((state, changes, cmd_tx, xruns))
 }
 
-fn run(state: SharedState, changes: ChangeNotifier, cmd_rx: pw::channel::Receiver<PwCommand>, xruns: crate::profiler::SharedXruns) -> anyhow::Result<()> {
+fn run(
+    state: SharedState,
+    changes: ChangeNotifier,
+    cmd_rx: pw::channel::Receiver<PwCommand>,
+    xruns: crate::profiler::SharedXruns,
+) -> anyhow::Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;

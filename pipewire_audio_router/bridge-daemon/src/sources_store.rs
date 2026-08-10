@@ -310,7 +310,11 @@ impl SourcesStore {
             });
         }
         if let Some(rtp) = legacy.rtp_source {
-            sources.push(SourceEntry { id: LEGACY_RTP_ID.to_string(), label: "Bluetooth Bridge".to_string(), config: SourceConfig::Rtp(rtp) });
+            sources.push(SourceEntry {
+                id: LEGACY_RTP_ID.to_string(),
+                label: "Bluetooth Bridge".to_string(),
+                config: SourceConfig::Rtp(rtp),
+            });
         }
 
         let mut store = Self { path: path.to_path_buf(), config: SourcesConfig { sources } };
@@ -357,12 +361,7 @@ impl SourcesStore {
     /// Update a source's `label` and/or `config`. The `id` and `kind` are
     /// immutable: changing kind (a config of a different kind) is an error.
     pub fn update(&mut self, id: &str, label: Option<String>, config: Option<SourceConfig>) -> anyhow::Result<SourceEntry> {
-        let idx = self
-            .config
-            .sources
-            .iter()
-            .position(|e| e.id == id)
-            .ok_or_else(|| anyhow::anyhow!("no source with id '{id}'"))?;
+        let idx = self.config.sources.iter().position(|e| e.id == id).ok_or_else(|| anyhow::anyhow!("no source with id '{id}'"))?;
 
         if let Some(new_cfg) = &config {
             let cur_kind = self.config.sources[idx].kind();
@@ -440,10 +439,10 @@ impl SourcesStore {
     }
 
     fn airplay_port_in_use(&self, port: u16, exclude_id: Option<&str>) -> bool {
-        self.config.sources.iter().any(|e| {
-            Some(e.id.as_str()) != exclude_id
-                && matches!(&e.config, SourceConfig::Airplay(a) if a.port != 0 && a.port == port)
-        })
+        self.config
+            .sources
+            .iter()
+            .any(|e| Some(e.id.as_str()) != exclude_id && matches!(&e.config, SourceConfig::Airplay(a) if a.port != 0 && a.port == port))
     }
 
     /// The id of an RTP source (other than `exclude_id`) already listening on
@@ -461,11 +460,7 @@ impl SourcesStore {
     fn allocate_airplay_ports(&mut self) -> bool {
         let mut changed = false;
         loop {
-            let idx = self
-                .config
-                .sources
-                .iter()
-                .position(|e| matches!(&e.config, SourceConfig::Airplay(a) if a.port == 0));
+            let idx = self.config.sources.iter().position(|e| matches!(&e.config, SourceConfig::Airplay(a) if a.port == 0));
             let Some(idx) = idx else { break };
             let port = self.first_free_airplay_port(None);
             if let SourceConfig::Airplay(a) = &mut self.config.sources[idx].config {
@@ -484,7 +479,6 @@ impl SourcesStore {
         std::fs::write(&self.path, json).map_err(|e| anyhow::anyhow!("writing sources store {}: {e}", self.path.display()))?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -545,7 +539,13 @@ mod tests {
         assert_eq!(rtp.node_name(), "bt-bridge-rtp");
         assert_eq!(
             rtp.config,
-            SourceConfig::Rtp(RtpSourceConfig { port: 46000, latency_msec: 250, source_addr: "239.255.42.42".to_string(), ignore_ssrc: false, rate: 44100 })
+            SourceConfig::Rtp(RtpSourceConfig {
+                port: 46000,
+                latency_msec: 250,
+                source_addr: "239.255.42.42".to_string(),
+                ignore_ssrc: false,
+                rate: 44100
+            })
         );
 
         // The file was rewritten in the NEW shape and reloads idempotently.
@@ -599,9 +599,7 @@ mod tests {
         assert_eq!(labels, vec!["Garage Bridge".to_string(), "Kitchen AirPlay".to_string()]);
 
         // update label + config (same kind)
-        let updated = store
-            .update("garage-bridge", Some("Garage RTP".to_string()), Some(SourceConfig::Rtp(sample_rtp(47001))))
-            .unwrap();
+        let updated = store.update("garage-bridge", Some("Garage RTP".to_string()), Some(SourceConfig::Rtp(sample_rtp(47001)))).unwrap();
         assert_eq!(updated.label, "Garage RTP");
         if let SourceConfig::Rtp(r) = &updated.config {
             assert_eq!(r.port, 47001);
@@ -693,5 +691,4 @@ mod tests {
         assert_eq!(source_node_name(SourceKind::Airplay, "kitchen"), "airplay-in-kitchen");
         assert_eq!(source_node_name(SourceKind::Rtp, "garage"), "rtp-in-garage");
     }
-
 }

@@ -80,23 +80,17 @@ fn decode_stream_to_wav(mss: MediaSourceStream, hint: Hint) -> anyhow::Result<Ve
 /// Decode the first audio track to interleaved S16LE PCM, returning it with its
 /// native sample rate and channel count.
 fn decode_stream_to_pcm(mss: MediaSourceStream, hint: Hint) -> anyhow::Result<(Vec<u8>, u32, u16)> {
-    let mut format =
-        symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())?;
+    let mut format = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())?;
 
-    let track = format
-        .first_track_known_codec(TrackType::Audio)
-        .ok_or_else(|| anyhow::anyhow!("no decodable audio track found"))?;
+    let track = format.first_track_known_codec(TrackType::Audio).ok_or_else(|| anyhow::anyhow!("no decodable audio track found"))?;
     let track_id = track.id;
     let audio_params = match &track.codec_params {
         Some(CodecParameters::Audio(params)) => params,
         _ => anyhow::bail!("no decodable audio track found"),
     };
     let sample_rate = audio_params.sample_rate.ok_or_else(|| anyhow::anyhow!("announce audio has no known sample rate"))?;
-    let channels = audio_params
-        .channels
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("announce audio has no known channel layout"))?
-        .count() as u16;
+    let channels =
+        audio_params.channels.as_ref().ok_or_else(|| anyhow::anyhow!("announce audio has no known channel layout"))?.count() as u16;
 
     let mut decoder = symphonia::default::get_codecs().make_audio_decoder(audio_params, &AudioDecoderOptions::default())?;
 

@@ -188,17 +188,14 @@ impl AppleMidiSender {
     /// buffers and repacketizes into ~2 ms RTP packets.
     pub fn start(config: SessionConfig, pcm: Receiver<PcmChunk>) -> anyhow::Result<Self> {
         let SessionConfig { session_name, control_port, ifname: _ifname, format, advertise_daemon } = config;
-        let data_port = control_port
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("control_port {control_port} leaves no room for the data port"))?;
+        let data_port =
+            control_port.checked_add(1).ok_or_else(|| anyhow::anyhow!("control_port {control_port} leaves no room for the data port"))?;
 
         // 2. Bind the control + data UDP ports on IPv4 (the receiver initiates
         //    to these advertised ports; bind v4 so single-host ipv4 sessions
         //    work — see the spike gotchas).
-        let ctrl_sock = UdpSocket::bind(("0.0.0.0", control_port))
-            .map_err(|e| anyhow::anyhow!("bind control port {control_port}: {e}"))?;
-        let data_sock = UdpSocket::bind(("0.0.0.0", data_port))
-            .map_err(|e| anyhow::anyhow!("bind data port {data_port}: {e}"))?;
+        let ctrl_sock = UdpSocket::bind(("0.0.0.0", control_port)).map_err(|e| anyhow::anyhow!("bind control port {control_port}: {e}"))?;
+        let data_sock = UdpSocket::bind(("0.0.0.0", data_port)).map_err(|e| anyhow::anyhow!("bind data port {data_port}: {e}"))?;
         // Short read timeouts so the reader threads can observe `shutdown`.
         ctrl_sock.set_read_timeout(Some(Duration::from_millis(200)))?;
         data_sock.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -242,15 +239,7 @@ impl AppleMidiSender {
             move || rtp_sender_loop(pcm, peers, shutdown, format)
         }));
 
-        Ok(Self {
-            status,
-            shutdown,
-            peers,
-            ctrl_sock: ctrl_keep,
-            data_sock: data_keep,
-            threads,
-            mdns,
-        })
+        Ok(Self { status, shutdown, peers, ctrl_sock: ctrl_keep, data_sock: data_keep, threads, mdns })
     }
 
     /// Snapshot of the current liveness/status.

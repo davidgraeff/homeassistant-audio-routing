@@ -294,9 +294,7 @@ impl ClientsDb {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let out = ClientsFileOut {
-            sources: self.by_source.iter().map(|(id, clients)| (id, SourceClientsOut { clients })).collect(),
-        };
+        let out = ClientsFileOut { sources: self.by_source.iter().map(|(id, clients)| (id, SourceClientsOut { clients })).collect() };
         match serde_json::to_string_pretty(&out) {
             Ok(json) => {
                 // Atomic write: write a temp file then rename over the target. rename()
@@ -568,7 +566,7 @@ mod tests {
         assert!(list[0].banned);
         assert_eq!(list[0].priority, 5);
         assert!(!list[0].connected); // #[serde(skip)] → false after load
-        // Rewrite it (any mutation) and confirm the new shape reloads.
+                                     // Rewrite it (any mutation) and confirm the new shape reloads.
         r.set_priority("Old Phone", 7);
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"sources\""));

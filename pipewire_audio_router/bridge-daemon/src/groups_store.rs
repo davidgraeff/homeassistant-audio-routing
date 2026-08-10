@@ -97,7 +97,11 @@ impl GroupsStore {
     fn unique_id(&self, name: &str) -> String {
         let base = {
             let s = slugify(name);
-            if s.is_empty() { "group".to_string() } else { s }
+            if s.is_empty() {
+                "group".to_string()
+            } else {
+                s
+            }
         };
         let taken = |id: &str| self.config.music.iter().any(|g| g.id == id) || self.config.announcement.iter().any(|g| g.id == id);
         if !taken(&base) {

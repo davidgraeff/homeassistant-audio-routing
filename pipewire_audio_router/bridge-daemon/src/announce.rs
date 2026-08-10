@@ -114,8 +114,7 @@ impl AnnounceCoordinator {
         let id = inner.next_id;
         inner.next_id += 1;
         inner.clips.insert(id, Clip { pcm: Arc::new(pcm), duck, grace });
-        let (admission, effects) =
-            inner.sched.begin(Request { id, priority, targets, on_busy, barge_in, ttl_ms }, now);
+        let (admission, effects) = inner.sched.begin(Request { id, priority, targets, on_busy, barge_in, ttl_ms }, now);
         inner.apply(effects);
         if matches!(admission, Admission::Rejected(_)) {
             inner.clips.remove(&id);

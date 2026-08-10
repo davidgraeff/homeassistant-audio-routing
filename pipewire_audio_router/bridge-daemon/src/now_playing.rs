@@ -102,12 +102,7 @@ pub struct UnixMillis(pub u64);
 
 impl UnixMillis {
     pub fn now() -> Self {
-        Self(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-        )
+        Self(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0))
     }
 }
 
@@ -515,11 +510,7 @@ mod tests {
     #[test]
     fn blank_strings_are_treated_as_absent() {
         let s = store();
-        s.reporter("rtp-in-bt").update(MetadataUpdate {
-            title: Some("  Song  ".into()),
-            artist: Some("   ".into()),
-            ..Default::default()
-        });
+        s.reporter("rtp-in-bt").update(MetadataUpdate { title: Some("  Song  ".into()), artist: Some("   ".into()), ..Default::default() });
         let np = s.get("rtp-in-bt").unwrap();
         assert_eq!(np.title.as_deref(), Some("Song"), "surrounding whitespace is trimmed");
         assert_eq!(np.artist, None, "a blank field is nothing, not an empty display");

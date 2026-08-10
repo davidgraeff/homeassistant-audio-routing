@@ -124,7 +124,6 @@ impl SettingsStore {
         self.persist()
     }
 
-
     fn persist(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -137,7 +136,6 @@ impl SettingsStore {
 
 /// Shared handle used across the API and (for the discovery flag) startup.
 pub type SharedSettings = std::sync::Arc<std::sync::Mutex<SettingsStore>>;
-
 
 #[cfg(test)]
 mod tests {

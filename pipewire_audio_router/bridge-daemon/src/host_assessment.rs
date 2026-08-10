@@ -228,15 +228,7 @@ pub fn assess() -> HostAssessment {
     let rt_available = detect_rt_available();
     let (verdict, note) = compute_verdict(cores, &arch, rt_available);
 
-    HostAssessment {
-        cpu_model,
-        cores,
-        arch,
-        mem_total_mb,
-        rt_available,
-        verdict,
-        note,
-    }
+    HostAssessment { cpu_model, cores, arch, mem_total_mb, rt_available, verdict, note }
 }
 
 #[cfg(test)]
@@ -248,11 +240,7 @@ mod tests {
         let a = assess();
         assert!(a.cores >= 1, "cores should be at least 1, got {}", a.cores);
         assert!(!a.verdict.is_empty(), "verdict should be non-empty");
-        assert!(
-            matches!(a.verdict.as_str(), "adequate" | "marginal" | "underpowered"),
-            "unexpected verdict: {}",
-            a.verdict
-        );
+        assert!(matches!(a.verdict.as_str(), "adequate" | "marginal" | "underpowered"), "unexpected verdict: {}", a.verdict);
         assert!(!a.note.is_empty(), "note should be non-empty");
         assert!(!a.arch.is_empty(), "arch should be non-empty");
         assert!(!a.cpu_model.is_empty(), "cpu_model should be non-empty");

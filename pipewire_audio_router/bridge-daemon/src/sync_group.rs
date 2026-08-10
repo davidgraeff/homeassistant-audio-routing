@@ -1096,9 +1096,9 @@ impl GroupReconciler {
                     d.sendspin_send_ahead_us = sendspin_server::required_send_ahead_us(
                         send_ahead_us,
                         d.sendspin_codec,
-                        d.sendspin_node_names.iter().map(|n| {
-                            (devices_map.get(n).and_then(|dev| dev.min_buffer_ms), delays.get(n).copied().unwrap_or(0))
-                        }),
+                        d.sendspin_node_names
+                            .iter()
+                            .map(|n| (devices_map.get(n).and_then(|dev| dev.min_buffer_ms), delays.get(n).copied().unwrap_or(0))),
                     );
                 }
             }
@@ -1242,18 +1242,7 @@ impl GroupReconciler {
 
             // Snapshot what we need so no borrow of `self.running` is held across
             // an await (the async link/server calls below).
-            let (
-                anchor_name,
-                anchor_id,
-                port,
-                prev_members,
-                prev_codec,
-                prev_lead,
-                have_server,
-                prev_ap2,
-                prev_ap2_rate,
-                prev_pwsink,
-            ) = {
+            let (anchor_name, anchor_id, port, prev_members, prev_codec, prev_lead, have_server, prev_ap2, prev_ap2_rate, prev_pwsink) = {
                 let rg = self.running.get(key).expect("just inserted");
                 (
                     rg.anchor_node_name.clone(),
@@ -1500,8 +1489,7 @@ impl GroupReconciler {
             // downgrade) restarts the senders. Render delay is intentionally NOT in
             // the identity: it's retuned live (ap2_control → SetRenderDelay), so a
             // delay edit never reconnects (that churn could silence a flaky receiver).
-            let ap2_identity: Vec<String> =
-                d.ap2_members.iter().map(|(n, _, _)| n.clone()).collect();
+            let ap2_identity: Vec<String> = d.ap2_members.iter().map(|(n, _, _)| n.clone()).collect();
             if ap2_identity != prev_ap2 || d.ap2_rate != prev_ap2_rate {
                 if let Some(rg) = self.running.get_mut(key) {
                     rg.ap2_sender = None; // drop → TEARDOWN old receiver sessions
@@ -1511,11 +1499,19 @@ impl GroupReconciler {
                     // Receivers are already PTP peers of the host-global grandmaster
                     // (registered at discovery); ensure it's up and get its clock id.
                     match ap2_ptp.ensure_started() {
-                        Ok(clock_id) => match crate::ap2_server::start(d.ap2_members.clone(), anchor_id, clock_id, ap2_control.clone(), d.ap2_rate, sync_settings.clone()) {
+                        Ok(clock_id) => match crate::ap2_server::start(
+                            d.ap2_members.clone(),
+                            anchor_id,
+                            clock_id,
+                            ap2_control.clone(),
+                            d.ap2_rate,
+                            sync_settings.clone(),
+                        ) {
                             Ok(handle) => {
                                 tracing::info!(
                                     "sync group '{anchor_name}': AP2 senders streaming to {} receiver(s) @ {} Hz",
-                                    d.ap2_members.len(), d.ap2_rate
+                                    d.ap2_members.len(),
+                                    d.ap2_rate
                                 );
                                 if let Some(rg) = self.running.get_mut(key) {
                                     rg.ap2_sender = Some(handle);
@@ -1555,10 +1551,7 @@ impl GroupReconciler {
                         .pwsink_members
                         .iter()
                         .zip(ports.iter())
-                        .map(|(node_name, port)| crate::pwsink_server::PwSinkMember {
-                            node_name: node_name.clone(),
-                            control_port: *port,
-                        })
+                        .map(|(node_name, port)| crate::pwsink_server::PwSinkMember { node_name: node_name.clone(), control_port: *port })
                         .collect();
                     match crate::pwsink_server::start(members, anchor_id) {
                         Ok(handle) => {
@@ -1798,8 +1791,7 @@ mod tests {
     /// *other* member a full reconnect and a re-anchored stream.
     #[test]
     fn membership_alone_does_not_restart_the_sendspin_server() {
-        let running =
-            |config_changed| sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed });
+        let running = |config_changed| sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed });
         // A join or a departure changes neither the codec nor the send-ahead, so the
         // stream config is unchanged — and the server keeps running.
         assert_eq!(running(false), ServerAction::KeepRunning);
@@ -1907,9 +1899,7 @@ mod tests {
 
     #[test]
     fn announce_sink_names_are_distinct_from_outputs_and_anchors() {
-        for (output, expected) in
-            [("ap2-dev-dusche", "idle-dev-ap2-dusche"), ("pwsink-dev-office", "idle-dev-pwsink-office")]
-        {
+        for (output, expected) in [("ap2-dev-dusche", "idle-dev-ap2-dusche"), ("pwsink-dev-office", "idle-dev-pwsink-office")] {
             let name = announce_sink_name(output);
             assert_eq!(name, expected);
             // Routing must never mistake it for an output or a sync anchor.
@@ -1923,10 +1913,8 @@ mod tests {
     #[test]
     fn has_live_sender_uses_membership_for_sendspin_and_real_state_for_dialed_backends() {
         let mut r = GroupReconciler::new();
-        r.running.insert(
-            "src".into(),
-            running_group(&["sendspin-dev-kitchen"], &["ap2-dev-dusche", "ap2-dev-pioneer"], &["pwsink-dev-office"]),
-        );
+        r.running
+            .insert("src".into(), running_group(&["sendspin-dev-kitchen"], &["ap2-dev-dusche", "ap2-dev-pioneer"], &["pwsink-dev-office"]));
         let connected: HashSet<String> = ["ap2-dev-dusche".to_string()].into_iter().collect();
         assert!(r.has_live_sender("sendspin-dev-kitchen", &connected));
         assert!(r.has_live_sender("ap2-dev-dusche", &connected));
@@ -2008,10 +1996,7 @@ mod tests {
         assert_eq!(next_free_pwsink_ports([PWSINK_BASE_PORT], 1), vec![PWSINK_BASE_PORT + 2]);
         // An on-demand announce session's port is fed in the same way, so a group
         // starting afterwards can't be handed the port it's already bound to.
-        assert_eq!(
-            next_free_pwsink_ports([PWSINK_BASE_PORT, PWSINK_BASE_PORT + 2], 2),
-            vec![PWSINK_BASE_PORT + 4, PWSINK_BASE_PORT + 6]
-        );
+        assert_eq!(next_free_pwsink_ports([PWSINK_BASE_PORT, PWSINK_BASE_PORT + 2], 2), vec![PWSINK_BASE_PORT + 4, PWSINK_BASE_PORT + 6]);
     }
 
     #[test]

@@ -258,15 +258,8 @@ impl AlignManager {
 
         let reference = Some(members[0].node_name.clone());
         let target = Some(members[1].node_name.clone());
-        let session = Session {
-            sources: group.sources,
-            members,
-            reference,
-            target,
-            volume: DEFAULT_CAL_VOLUME,
-            stop: stop.clone(),
-            saved_sendspin,
-        };
+        let session =
+            Session { sources: group.sources, members, reference, target, volume: DEFAULT_CAL_VOLUME, stop: stop.clone(), saved_sendspin };
         self.apply_audibility(&session.members, session.reference.as_deref(), session.target.as_deref(), session.volume).await;
         let state = session.state();
         *guard = Some(session);

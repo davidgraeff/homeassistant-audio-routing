@@ -120,11 +120,7 @@ pub fn spawn(label: &'static str, target_node_id: u32) -> Result<(CaptureHandle,
 /// (on its own RT thread) between the monitor's native rate and `rate`, so a
 /// consumer that needs a specific rate (e.g. the AP2 sender's 44100) can avoid
 /// resampling on its own hot path. Chunks are S16LE / `CHANNELS` at `rate`.
-pub fn spawn_with_rate(
-    label: &'static str,
-    target_node_id: u32,
-    rate: u32,
-) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
+pub fn spawn_with_rate(label: &'static str, target_node_id: u32, rate: u32) -> Result<(CaptureHandle, Receiver<PooledBuf>), String> {
     let (pcm_tx, pcm_rx) = mpsc::channel(CAPTURE_CHANNEL_CAP);
     let (cmd_tx, cmd_rx) = pw::channel::channel::<CaptureCmd>();
 

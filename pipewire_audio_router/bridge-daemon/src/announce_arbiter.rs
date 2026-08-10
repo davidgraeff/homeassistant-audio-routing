@@ -196,12 +196,8 @@ impl AnnounceScheduler {
         } else if req.barge_in {
             // Preempt every announcement overlapping our targets; re-queue each
             // whole (if still within TTL) so it replays from the start later.
-            let victims: Vec<AnnouncementId> = self
-                .active
-                .iter()
-                .filter(|e| e.req.targets.iter().any(|o| req.targets.contains(o)))
-                .map(|e| e.req.id)
-                .collect();
+            let victims: Vec<AnnouncementId> =
+                self.active.iter().filter(|e| e.req.targets.iter().any(|o| req.targets.contains(o))).map(|e| e.req.id).collect();
             for vid in victims {
                 if let Some(entry) = self.remove_active(vid) {
                     if entry.deadline.is_some_and(|d| now_ms >= d) {
@@ -217,9 +213,7 @@ impl AnnounceScheduler {
             match req.on_busy {
                 OnBusy::Reject => Path::Rejected(RejectReason::Busy),
                 OnBusy::Queue if req.ttl_ms == Some(0) => Path::Rejected(RejectReason::Stale),
-                OnBusy::Queue if self.queue.len() >= self.max_queue => {
-                    Path::Rejected(RejectReason::QueueFull)
-                }
+                OnBusy::Queue if self.queue.len() >= self.max_queue => Path::Rejected(RejectReason::QueueFull),
                 OnBusy::Queue => {
                     let deadline = Self::deadline_for(&req, now_ms);
                     let seq = self.take_seq();
@@ -338,10 +332,7 @@ impl AnnounceScheduler {
         // as we start clips, so a single ordered sweep with rechecks suffices.
         loop {
             let occ = self.occupancy();
-            let pick = self
-                .queue
-                .iter()
-                .position(|e| e.req.targets.iter().all(|o| !occ.contains_key(o)));
+            let pick = self.queue.iter().position(|e| e.req.targets.iter().all(|o| !occ.contains_key(o)));
             match pick {
                 Some(i) => {
                     let entry = self.queue.remove(i);
@@ -351,16 +342,12 @@ impl AnnounceScheduler {
             }
         }
     }
-
 }
 
 /// Compute the ordered action list from an occupancy transition. For each output
 /// (in stable, sorted order): a hand-over emits stop(old)+start(new); a newly
 /// occupied output emits duck+start; a freed output emits stop+unduck.
-fn diff_actions(
-    before: &HashMap<Output, AnnouncementId>,
-    after: &HashMap<Output, AnnouncementId>,
-) -> Vec<Action> {
+fn diff_actions(before: &HashMap<Output, AnnouncementId>, after: &HashMap<Output, AnnouncementId>) -> Vec<Action> {
     let mut outputs: BTreeSet<&Output> = BTreeSet::new();
     outputs.extend(before.keys());
     outputs.extend(after.keys());
@@ -459,7 +446,7 @@ mod tests {
         s.begin(req(1, 0, &["k"]), 0); // playing
         s.begin(req(2, 0, &["k"]), 1); // queued (low)
         s.begin(req(3, 10, &["k"]), 2); // queued (high) → should play first
-        // #1 done → highest-priority queued (#3) plays next.
+                                        // #1 done → highest-priority queued (#3) plays next.
         let eff = s.complete(1, 100);
         assert_eq!(eff.actions, vec![StopAnnouncement(o("k"), 1), StartAnnouncement(o("k"), 3)]);
         // #3 done → then the lower one (#2).
@@ -510,7 +497,7 @@ mod tests {
     fn multi_output_waits_for_all_targets_free() {
         let mut s = AnnounceScheduler::new();
         s.begin(req(1, 0, &["k"]), 0); // occupies kitchen
-        // #2 targets kitchen+bedroom; kitchen busy → must wait (not start on bedroom).
+                                       // #2 targets kitchen+bedroom; kitchen busy → must wait (not start on bedroom).
         assert_eq!(s.begin(req(2, 0, &["k", "bed"]), 5).0, Admission::Queued { position: 0 });
         assert!(!s.is_active(2), "must not start on the free output alone");
         // kitchen frees → #2 now plays on BOTH outputs together. Actions are in
@@ -519,12 +506,7 @@ mod tests {
         let eff = s.complete(1, 100);
         assert_eq!(
             eff.actions,
-            vec![
-                DuckMusic(o("bed")),
-                StartAnnouncement(o("bed"), 2),
-                StopAnnouncement(o("k"), 1),
-                StartAnnouncement(o("k"), 2),
-            ]
+            vec![DuckMusic(o("bed")), StartAnnouncement(o("bed"), 2), StopAnnouncement(o("k"), 1), StartAnnouncement(o("k"), 2),]
         );
         assert!(s.is_active(2));
     }

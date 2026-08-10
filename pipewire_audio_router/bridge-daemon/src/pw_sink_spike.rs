@@ -212,13 +212,8 @@ pub async fn start(
         }
     });
 
-    *slot().lock().await = Some(PwSinkSpike {
-        stop: stop_flag,
-        player: Some(player),
-        anchor_node_id: anchor_id,
-        mdns,
-        pw_cmd: pw_cmd.clone(),
-    });
+    *slot().lock().await =
+        Some(PwSinkSpike { stop: stop_flag, player: Some(player), anchor_node_id: anchor_id, mdns, pw_cmd: pw_cmd.clone() });
     tracing::info!("pw-sink spike: {freq_hz:.0} Hz -> {target_ip}:{port} (anchor {anchor_id} -> rtp-sink), advertised over mDNS");
     Ok(PwSinkSpikeInfo {
         message: format!(

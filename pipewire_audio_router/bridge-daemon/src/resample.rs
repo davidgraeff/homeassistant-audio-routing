@@ -25,11 +25,7 @@ pub fn to_48k_stereo_s16le(pcm: &[u8], src_rate: u32, src_channels: u16) -> Vec<
     let left: Vec<i16> = (0..frames).map(|f| at(f, 0)).collect();
     let right: Vec<i16> = (0..frames).map(|f| at(f, right_ch)).collect();
 
-    let out_frames = if src_rate == TARGET_RATE {
-        frames
-    } else {
-        ((frames as u64) * TARGET_RATE as u64 / src_rate as u64) as usize
-    };
+    let out_frames = if src_rate == TARGET_RATE { frames } else { ((frames as u64) * TARGET_RATE as u64 / src_rate as u64) as usize };
     let ratio = src_rate as f64 / TARGET_RATE as f64;
 
     let interp = |chan: &[i16], of: usize| -> i16 {

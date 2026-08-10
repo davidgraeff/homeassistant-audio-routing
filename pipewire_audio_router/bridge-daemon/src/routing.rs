@@ -292,10 +292,7 @@ fn build_matrix(
                 // endpoint the liveness task still deems online. An offline endpoint
                 // stays listed (grayed) until liveness removes it — an mDNS blip no
                 // longer makes it vanish.
-                present: node_id.is_some()
-                    || device.is_some_and(|d| d.present)
-                    || ap2.is_some_and(|d| d.present)
-                    || pwsink_label.is_some(),
+                present: node_id.is_some() || device.is_some_and(|d| d.present) || ap2.is_some_and(|d| d.present) || pwsink_label.is_some(),
                 // Reachable is not the same as connected for the dialed backends —
                 // report the session state separately so the UI can tell the two
                 // apart instead of implying delivery from mere presence.
@@ -836,11 +833,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 enum Frame<'a> {
     Matrix(&'a RoutingMatrix),
     /// `/api/outputs` — the adopted devices.
-    Outputs { outputs: &'a [crate::api::OutputInfo] },
+    Outputs {
+        outputs: &'a [crate::api::OutputInfo],
+    },
     /// `/api/outputs/discovered` — offered but not added (plus ignored).
-    Discovered { outputs: &'a [crate::api::OutputInfo] },
+    Discovered {
+        outputs: &'a [crate::api::OutputInfo],
+    },
     /// `/api/agents` — paired receiver hosts and pending pair requests.
-    Agents { agents: &'a [crate::pwsink_agent::AgentInfo] },
+    Agents {
+        agents: &'a [crate::pwsink_agent::AgentInfo],
+    },
     /// Per-source now-playing metadata (now_playing.rs), keyed by source node
     /// name. Its own frame rather than a field on [`Frame::Matrix`] **on purpose**:
     /// the matrix is a large, mostly-static payload keyed by a different shape, and
@@ -848,7 +851,9 @@ enum Frame<'a> {
     /// would make every consumer re-read the whole graph to learn a new song
     /// (the same cost [`Frame::Meters`] exists to avoid). Sent through the same
     /// `push_if_changed` dedupe as the listings, so a quiet house costs nothing.
-    NowPlaying { sources: &'a BTreeMap<String, crate::now_playing::NowPlaying> },
+    NowPlaying {
+        sources: &'a BTreeMap<String, crate::now_playing::NowPlaying>,
+    },
     /// The fast lane: the only two figures that move without a graph change —
     /// keyed by node name, so the client merges them onto the matrix it already
     /// has.
@@ -862,7 +867,9 @@ enum Frame<'a> {
     /// web UI recomputing the graph layout, the HA integration re-rendering every
     /// entity — to learn nothing. So the matrix moved to the `changes` channel
     /// (deduped), and this frame carries what actually ticks.
-    Meters { nodes: &'a BTreeMap<String, MeterSample> },
+    Meters {
+        nodes: &'a BTreeMap<String, MeterSample>,
+    },
 }
 
 /// One node's live figures on the fast lane. Both fields are omitted when there
@@ -925,11 +932,7 @@ fn build_meter_samples(
 /// is now change-driven, and the same dedupe as the listings applies — because the
 /// `changes` notifier fires for *any* daemon change, most of which the matrix does
 /// not reflect.
-async fn push_matrix(
-    socket: &mut WebSocket,
-    sent: &mut SentListings,
-    matrix: &RoutingMatrix,
-) -> Result<(), axum::Error> {
+async fn push_matrix(socket: &mut WebSocket, sent: &mut SentListings, matrix: &RoutingMatrix) -> Result<(), axum::Error> {
     push_if_changed(socket, &mut sent.matrix, Frame::Matrix(matrix)).await
 }
 
@@ -953,11 +956,7 @@ struct SentListings {
 /// Sends a frame only if its payload differs from the last one sent on this socket.
 /// `slot` holds that last payload. Every frame on this socket goes out through
 /// here — there is no unconditional send left.
-async fn push_if_changed(
-    socket: &mut WebSocket,
-    slot: &mut Option<String>,
-    frame: Frame<'_>,
-) -> Result<(), axum::Error> {
+async fn push_if_changed(socket: &mut WebSocket, slot: &mut Option<String>, frame: Frame<'_>) -> Result<(), axum::Error> {
     let json = match serde_json::to_string(&frame) {
         Ok(json) => json,
         // Unreachable in practice; dropping one frame beats killing the socket.
@@ -982,11 +981,7 @@ async fn push_if_changed(
 /// times. Coalescing onto the tick that already runs costs at most 250 ms of
 /// latency on a *background* change; anything the user just clicked is re-read by
 /// the page itself, so it never waits for this path.
-async fn push_listings(
-    socket: &mut WebSocket,
-    state: &AppState,
-    sent: &mut SentListings,
-) -> Result<(), axum::Error> {
+async fn push_listings(socket: &mut WebSocket, state: &AppState, sent: &mut SentListings) -> Result<(), axum::Error> {
     let (adopted, offered) = crate::api::outputs_listings(state).await;
     let agents = state.agents.lock().await.snapshot();
     let now_playing = state.now_playing.snapshot();

@@ -189,14 +189,8 @@ impl OpusEncoder {
         let mut err = 0i32;
         // SAFETY: valid rate/channel/application arguments; `err` is written by the
         // callee. A null return with `err != OPUS_OK` is handled below.
-        let st = unsafe {
-            opusic_sys::opus_encoder_create(
-                SAMPLE_RATE as i32,
-                CHANNELS as i32,
-                opusic_sys::OPUS_APPLICATION_AUDIO,
-                &mut err,
-            )
-        };
+        let st =
+            unsafe { opusic_sys::opus_encoder_create(SAMPLE_RATE as i32, CHANNELS as i32, opusic_sys::OPUS_APPLICATION_AUDIO, &mut err) };
         if st.is_null() || err != opusic_sys::OPUS_OK {
             tracing::warn!("opus: encoder_create failed (err {err})");
             return None;
@@ -215,14 +209,11 @@ impl OpusEncoder {
         let lookahead_us = i64::from(lookahead) * 1_000_000 / i64::from(SAMPLE_RATE);
         tracing::info!(
             "opus: encoder ready ({} Hz, {} ch, {} bps, complexity {OPUS_COMPLEXITY}, lookahead {lookahead} samples = {lookahead_us} µs)",
-            SAMPLE_RATE, CHANNELS, OPUS_BITRATE
+            SAMPLE_RATE,
+            CHANNELS,
+            OPUS_BITRATE
         );
-        Some(Self {
-            st,
-            lookahead_us,
-            pcm: Vec::with_capacity(OPUS_FRAME_FRAMES * CHANNELS as usize),
-            out: vec![0u8; OPUS_MAX_PACKET],
-        })
+        Some(Self { st, lookahead_us, pcm: Vec::with_capacity(OPUS_FRAME_FRAMES * CHANNELS as usize), out: vec![0u8; OPUS_MAX_PACKET] })
     }
 
     fn encode(&mut self, block: &[u8]) -> Option<&[u8]> {
@@ -239,13 +230,7 @@ impl OpusEncoder {
         // `out` has `OPUS_MAX_PACKET` bytes of capacity, both of which we pass as
         // the matching lengths.
         let n = unsafe {
-            opusic_sys::opus_encode(
-                self.st,
-                self.pcm.as_ptr(),
-                OPUS_FRAME_FRAMES as i32,
-                self.out.as_mut_ptr(),
-                self.out.len() as i32,
-            )
+            opusic_sys::opus_encode(self.st, self.pcm.as_ptr(), OPUS_FRAME_FRAMES as i32, self.out.as_mut_ptr(), self.out.len() as i32)
         };
         if n < 0 {
             tracing::warn!("opus: encode failed (error {n})");
@@ -402,9 +387,9 @@ fn flac_stream_header() -> Vec<u8> {
     let bs = FLAC_BLOCK_FRAMES as u16;
     si[0..2].copy_from_slice(&bs.to_be_bytes()); // min block size
     si[2..4].copy_from_slice(&bs.to_be_bytes()); // max block size
-    // si[4..7] min frame size, si[7..10] max frame size — 0 = unknown.
-    // Then a packed field: 20 bits sample rate, 3 bits channels-1, 5 bits depth-1,
-    // 36 bits total samples (0 = unknown).
+                                                 // si[4..7] min frame size, si[7..10] max frame size — 0 = unknown.
+                                                 // Then a packed field: 20 bits sample rate, 3 bits channels-1, 5 bits depth-1,
+                                                 // 36 bits total samples (0 = unknown).
     let rate = SAMPLE_RATE;
     let channels = u32::from(CHANNELS) - 1;
     let depth = 16u32 - 1;
@@ -445,9 +430,7 @@ mod tests {
 
     fn pcm_frames(n: usize) -> Vec<u8> {
         // A quiet ramp — real-ish input, so the encoders actually do work.
-        (0..n * CHANNELS as usize)
-            .flat_map(|i| ((i as i16).wrapping_mul(64)).to_le_bytes())
-            .collect()
+        (0..n * CHANNELS as usize).flat_map(|i| ((i as i16).wrapping_mul(64)).to_le_bytes()).collect()
     }
 
     #[test]
@@ -496,7 +479,12 @@ mod tests {
         let block = pcm_frames(OPUS_FRAME_FRAMES);
         let packet = e.encode(&block).expect("a correctly-sized block encodes");
         assert!(!packet.is_empty());
-        assert!(packet.len() < block.len() / 4, "160 kbps opus is ≈10× smaller than 1.5 Mbit/s PCM, got {} vs {}", packet.len(), block.len());
+        assert!(
+            packet.len() < block.len() / 4,
+            "160 kbps opus is ≈10× smaller than 1.5 Mbit/s PCM, got {} vs {}",
+            packet.len(),
+            block.len()
+        );
         // Steady state: no reallocation across many blocks.
         let (pcm_cap, out_cap) = (e.pcm.capacity(), e.out.len());
         for _ in 0..100 {

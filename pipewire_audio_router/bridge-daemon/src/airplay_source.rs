@@ -214,7 +214,8 @@ pub async fn start(
     let producer_stop = spawn_producer(node_name.clone(), consumer, peak.clone(), target, flush.clone())
         .map_err(|e| anyhow::anyhow!("failed to start AirPlay PipeWire producer: {e}"))?;
 
-    let handler = Arc::new(Handler { ring_prod, flush, peak: peak.clone(), clients, prevent_takeover: prevent_takeover.clone(), now_playing });
+    let handler =
+        Arc::new(Handler { ring_prod, flush, peak: peak.clone(), clients, prevent_takeover: prevent_takeover.clone(), now_playing });
     let mut builder = RaopServer::builder().name(service_name.clone()).hwaddr(derive_hwaddr(&service_name)).port(port);
     // Advertise on the process-wide shared, LAN-restricted mDNS daemon so the
     // receiver's `_raop._tcp`/`_airplay._tcp` records share one interface-pinned
@@ -233,12 +234,7 @@ pub async fn start(
     let mut server = builder.build(handler).map_err(|e| anyhow::anyhow!("failed to build AirPlay server: {e}"))?;
     server.start().await.map_err(|e| anyhow::anyhow!("failed to start AirPlay server on port {port}: {e}"))?;
 
-    let cfg = AirplaySourceConfig {
-        latency_msec,
-        auth_setup,
-        prevent_takeover: prevent_takeover.load(Ordering::Relaxed),
-        port,
-    };
+    let cfg = AirplaySourceConfig { latency_msec, auth_setup, prevent_takeover: prevent_takeover.load(Ordering::Relaxed), port };
     Ok(AirplayHandle { server: Some(server), producer_stop: Some(producer_stop), peak, service_name, cfg, prevent_takeover })
 }
 
@@ -308,8 +304,7 @@ pub async fn reconcile(
         let registry = clients.registry(id);
         let prevent_takeover: SharedPreventTakeover = Arc::new(AtomicBool::new(cfg.prevent_takeover));
         let reporter = now_playing.reporter(node_name.clone());
-        match start(node_name, entry.label.clone(), cfg.port, cfg.latency_msec, cfg.auth_setup, registry, prevent_takeover, reporter)
-            .await
+        match start(node_name, entry.label.clone(), cfg.port, cfg.latency_msec, cfg.auth_setup, registry, prevent_takeover, reporter).await
         {
             Ok(handle) => {
                 guard.insert(id.clone(), handle);
@@ -365,7 +360,15 @@ impl AudioHandler for Handler {
         } else {
             tracing::info!("AirPlay stream started ({in_rate}Hz/{in_channels}ch)");
         }
-        Box::new(Session { ring_prod: self.ring_prod.clone(), flush: self.flush.clone(), peak: self.peak.clone(), in_channels, resampler, frames: Vec::new(), scratch: Vec::new() })
+        Box::new(Session {
+            ring_prod: self.ring_prod.clone(),
+            flush: self.flush.clone(),
+            peak: self.peak.clone(),
+            in_channels,
+            resampler,
+            frames: Vec::new(),
+            scratch: Vec::new(),
+        })
     }
 
     fn authorize_session(&self, addr: &str, name: Option<&str>, current: Option<&SessionInfo>) -> SessionDecision {
@@ -387,10 +390,7 @@ impl AudioHandler for Handler {
             tracing::info!("AirPlay: {addr} (priority {mine}) takes over from {} (priority {theirs})", cur.addr);
             SessionDecision::Takeover
         } else if self.prevent_takeover.load(Ordering::Relaxed) {
-            tracing::info!(
-                "AirPlay: refusing {addr} — {} is streaming (prevent-takeover; priority {mine} <= {theirs})",
-                cur.addr
-            );
+            tracing::info!("AirPlay: refusing {addr} — {} is streaming (prevent-takeover; priority {mine} <= {theirs})", cur.addr);
             SessionDecision::Reject
         } else {
             SessionDecision::Takeover
@@ -423,12 +423,7 @@ impl AudioHandler for Handler {
     // volunteers all three.
 
     fn on_metadata(&self, metadata: &shairplay::TrackMetadata) {
-        tracing::debug!(
-            "AirPlay metadata: title={:?} artist={:?} album={:?}",
-            metadata.title,
-            metadata.artist,
-            metadata.album
-        );
+        tracing::debug!("AirPlay metadata: title={:?} artist={:?} album={:?}", metadata.title, metadata.artist, metadata.album);
         self.now_playing.update(MetadataUpdate {
             state: Some(PlaybackState::Playing),
             title: metadata.title.clone(),
@@ -627,7 +622,13 @@ impl Resampler {
 /// Spawn the PipeWire producer on a dedicated thread (mirrors
 /// sendspin_capture's thread+channel+mainloop shape). Returns a stop sender.
 /// `target` is the jitter-buffer prebuffer, in interleaved-f32 samples.
-fn spawn_producer(node_name: String, consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, flush: Arc<AtomicBool>) -> Result<pw::channel::Sender<ProducerCmd>, String> {
+fn spawn_producer(
+    node_name: String,
+    consumer: rtrb::Consumer<f32>,
+    peak: Arc<AtomicU32>,
+    target: usize,
+    flush: Arc<AtomicBool>,
+) -> Result<pw::channel::Sender<ProducerCmd>, String> {
     let (cmd_tx, cmd_rx) = pw::channel::channel::<ProducerCmd>();
     std::thread::Builder::new()
         .name("airplay-producer".into())
@@ -667,7 +668,14 @@ fn set_producer_realtime_priority() {
 #[cfg(not(target_os = "linux"))]
 fn set_producer_realtime_priority() {}
 
-fn run_producer(node_name: String, consumer: rtrb::Consumer<f32>, peak: Arc<AtomicU32>, target: usize, cmd_rx: pw::channel::Receiver<ProducerCmd>, flush: Arc<AtomicBool>) -> Result<(), String> {
+fn run_producer(
+    node_name: String,
+    consumer: rtrb::Consumer<f32>,
+    peak: Arc<AtomicU32>,
+    target: usize,
+    cmd_rx: pw::channel::Receiver<ProducerCmd>,
+    flush: Arc<AtomicBool>,
+) -> Result<(), String> {
     set_producer_realtime_priority();
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("mainloop: {e}"))?;
@@ -724,9 +732,9 @@ fn run_producer(node_name: String, consumer: rtrb::Consumer<f32>, peak: Arc<Atom
                 let filled = if let Some(slice) = data.data() {
                     let cap_frames = slice.len() / stride;
                     let want = cap_frames * CHANNELS; // f32 samples wanted
-                    // Leave prebuffer once we've accumulated the current arm
-                    // threshold (full `target` cold, small `rearm_target` after
-                    // a prior underrun).
+                                                      // Leave prebuffer once we've accumulated the current arm
+                                                      // threshold (full `target` cold, small `rearm_target` after
+                                                      // a prior underrun).
                     if !draining && consumer.slots() >= arm_target {
                         draining = true;
                     }

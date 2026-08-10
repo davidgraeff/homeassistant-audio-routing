@@ -58,10 +58,8 @@ fn migrate_routing(routing_path: &Path) {
         }
     };
     // Snapshot the links that need rewriting (source, old_output, new_output).
-    let rewrites: Vec<(String, String, String)> = store
-        .links()
-        .filter_map(|l| rewrite(&l.output).map(|new| (l.source.clone(), l.output.clone(), new)))
-        .collect();
+    let rewrites: Vec<(String, String, String)> =
+        store.links().filter_map(|l| rewrite(&l.output).map(|new| (l.source.clone(), l.output.clone(), new))).collect();
     if rewrites.is_empty() {
         return;
     }

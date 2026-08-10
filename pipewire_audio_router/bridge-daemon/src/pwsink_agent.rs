@@ -67,7 +67,9 @@ pub enum AgentMsg {
         pair_code: Option<String>,
     },
     State(HostState),
-    ForeignSession { session: String },
+    ForeignSession {
+        session: String,
+    },
     Pong,
 }
 

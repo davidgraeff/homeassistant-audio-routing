@@ -296,10 +296,7 @@ pub async fn refresh_probes(bridges: &SharedBtBridges) {
     let now = Instant::now();
     let stale: Vec<(String, String)> = {
         let map = bridges.lock_recover();
-        map.values()
-            .filter(|b| b.probe_stale(now))
-            .filter_map(|b| b.diag_url().map(|url| (b.fullname.clone(), url)))
-            .collect()
+        map.values().filter(|b| b.probe_stale(now)).filter_map(|b| b.diag_url().map(|url| (b.fullname.clone(), url))).collect()
     };
     if stale.is_empty() {
         return;
@@ -422,9 +419,9 @@ fn looks_like_diag_app(body: &str) -> bool {
 /// wrong diagnostics link is worse than no link.
 pub fn match_bridge<'a>(bridges: impl IntoIterator<Item = &'a BtBridge>, port: u16, source_addr: &str) -> Option<&'a BtBridge> {
     let want_group = is_multicast_addr(source_addr);
-    let mut hits = bridges.into_iter().filter(|b| {
-        b.stream.rtp_port == port && (!want_group || b.stream.rtp_dest.eq_ignore_ascii_case(source_addr.trim()))
-    });
+    let mut hits = bridges
+        .into_iter()
+        .filter(|b| b.stream.rtp_port == port && (!want_group || b.stream.rtp_dest.eq_ignore_ascii_case(source_addr.trim())));
     let first = hits.next()?;
     match hits.next() {
         Some(_) => None, // ambiguous — don't guess
@@ -461,13 +458,7 @@ mod tests {
             addr: Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 178, 78))),
             diag_port: 8080,
             diag_path: "/".into(),
-            stream: BridgeStream {
-                rtp_port: port,
-                rtp_dest: dest.into(),
-                rate: 48_000,
-                channels: 2,
-                format: "S16LE".into(),
-            },
+            stream: BridgeStream { rtp_port: port, rtp_dest: dest.into(), rate: 48_000, channels: 2, format: "S16LE".into() },
             probe: None,
         }
     }

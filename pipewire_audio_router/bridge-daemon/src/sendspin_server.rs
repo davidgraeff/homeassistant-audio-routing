@@ -572,8 +572,8 @@ pub async fn start_server_per_device(
 ) -> anyhow::Result<SendspinServerHandle> {
     let node_name = server_name.to_string();
 
-    let (capture_handle, mut pcm_rx) =
-        crate::sendspin_capture::spawn("sendspin", sink_node_id).map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
+    let (capture_handle, mut pcm_rx) = crate::sendspin_capture::spawn("sendspin", sink_node_id)
+        .map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
 
     // One clock shared by the timeline and the dial manager, so the timestamps
     // stamped here are in the same domain as the `server/time` replies members
@@ -652,10 +652,7 @@ pub async fn start_server_per_device(
     for (fullname, url) in &members {
         client_manager.supervise(fullname, url);
     }
-    tracing::info!(
-        "sendspin server '{node_name}': supervising {} device(s) from the discovery registry",
-        members.len()
-    );
+    tracing::info!("sendspin server '{node_name}': supervising {} device(s) from the discovery registry", members.len());
 
     let event_task = {
         let groups = Arc::clone(&groups);
@@ -688,9 +685,7 @@ pub async fn start_server_per_device(
                         pending.apply().await;
                         ready_conn.lock_recover().remove(&client_id);
                         groups_conn.lock_recover().remove(&client_id);
-                        pending_conn
-                            .lock_recover()
-                            .insert(client_id, (dev_node_name, sender, std::time::Instant::now()));
+                        pending_conn.lock_recover().insert(client_id, (dev_node_name, sender, std::time::Instant::now()));
                     }
                     ClientEvent::Message { client_id, message } => {
                         // Device→UI volume/mute sync: a device reporting its own
@@ -865,13 +860,8 @@ pub async fn start_server_per_device(
 
     // Arm/disarm idle devices around announcements (WhenAnnounced only).
     // Decides which connected devices are in a group (→ stream/start + audio).
-    let arm_task = Some(spawn_membership_task(
-        policy,
-        Arc::clone(&pending),
-        Arc::clone(&ready),
-        Arc::clone(&groups),
-        Arc::clone(&timeline),
-    ));
+    let arm_task =
+        Some(spawn_membership_task(policy, Arc::clone(&pending), Arc::clone(&ready), Arc::clone(&groups), Arc::clone(&timeline)));
 
     Ok(SendspinServerHandle {
         _advertisement: advertisement,
@@ -1109,11 +1099,7 @@ fn spawn_membership_task(
             if policy == StreamPolicy::WhenAnnounced {
                 let armed: Vec<(String, String)> = {
                     let pending = pending.lock_recover();
-                    groups
-                        .lock_recover()
-                        .keys()
-                        .filter_map(|id| pending.get(id).map(|(node, _, _)| (id.clone(), node.clone())))
-                        .collect()
+                    groups.lock_recover().keys().filter_map(|id| pending.get(id).map(|(node, _, _)| (id.clone(), node.clone()))).collect()
                 };
                 for (client_id, node) in armed {
                     if wanted(&node) {
@@ -1178,10 +1164,7 @@ fn spawn_accept_loop_per_device(
                     // device's initial `client/state`.
                     ready_members.lock_recover().remove(&client_id);
                     groups.lock_recover().remove(&client_id);
-                    pending_members.lock_recover().insert(
-                        client_id.clone(),
-                        (node_name.clone(), sender, std::time::Instant::now()),
-                    );
+                    pending_members.lock_recover().insert(client_id.clone(), (node_name.clone(), sender, std::time::Instant::now()));
                     tokio::spawn(drain_messages_per_device(
                         conn,
                         client_id,

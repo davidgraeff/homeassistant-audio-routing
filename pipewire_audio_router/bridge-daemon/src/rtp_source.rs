@@ -200,7 +200,14 @@ mod tests {
 
     #[test]
     fn module_args_carry_the_firmware_wire_format() {
-        let args = rtp_source_module_args(RTP_SOURCE_NODE_NAME, 46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_RATE);
+        let args = rtp_source_module_args(
+            RTP_SOURCE_NODE_NAME,
+            46000,
+            DEFAULT_RTP_LATENCY_MSEC,
+            DEFAULT_RTP_SOURCE_ADDR,
+            DEFAULT_RTP_IGNORE_SSRC,
+            DEFAULT_RTP_RATE,
+        );
         // Braces so the module's pw_properties_new_string parses it as an object.
         assert!(args.starts_with("{ ") && args.ends_with('}'));
         assert!(args.contains("source.ip = \"0.0.0.0\""));
@@ -221,19 +228,34 @@ mod tests {
 
     #[test]
     fn module_args_honor_a_custom_port() {
-        let args = rtp_source_module_args(RTP_SOURCE_NODE_NAME, 47100, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_RATE);
+        let args = rtp_source_module_args(
+            RTP_SOURCE_NODE_NAME,
+            47100,
+            DEFAULT_RTP_LATENCY_MSEC,
+            DEFAULT_RTP_SOURCE_ADDR,
+            DEFAULT_RTP_IGNORE_SSRC,
+            DEFAULT_RTP_RATE,
+        );
         assert!(args.contains("source.port = 47100"));
     }
 
     #[test]
     fn module_args_honor_a_custom_latency() {
-        let args = rtp_source_module_args(RTP_SOURCE_NODE_NAME, 46000, 350, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_RATE);
+        let args =
+            rtp_source_module_args(RTP_SOURCE_NODE_NAME, 46000, 350, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_RATE);
         assert!(args.contains("sess.latency.msec = 350"));
     }
 
     #[test]
     fn module_args_honor_a_multicast_source_address() {
-        let args = rtp_source_module_args(RTP_SOURCE_NODE_NAME, 46000, DEFAULT_RTP_LATENCY_MSEC, "239.255.42.42", DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_RATE);
+        let args = rtp_source_module_args(
+            RTP_SOURCE_NODE_NAME,
+            46000,
+            DEFAULT_RTP_LATENCY_MSEC,
+            "239.255.42.42",
+            DEFAULT_RTP_IGNORE_SSRC,
+            DEFAULT_RTP_RATE,
+        );
         assert!(args.contains("source.ip = \"239.255.42.42\""));
     }
 
@@ -241,7 +263,8 @@ mod tests {
     fn module_args_honor_ignore_ssrc_false() {
         // "Only one client": the receiver latches onto the first SSRC and drops
         // foreign senders. Requires a firmware with a stable (MAC-derived) SSRC.
-        let args = rtp_source_module_args(RTP_SOURCE_NODE_NAME, 46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, false, DEFAULT_RTP_RATE);
+        let args =
+            rtp_source_module_args(RTP_SOURCE_NODE_NAME, 46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, false, DEFAULT_RTP_RATE);
         assert!(args.contains("sess.ignore-ssrc = false"));
     }
 
@@ -249,14 +272,28 @@ mod tests {
     fn module_args_honor_a_custom_rate() {
         // A sender still transmitting 44.1 kHz (e.g. an ESP32 whose SBC decoder
         // settled there) — the receiver rate must match the wire.
-        let args = rtp_source_module_args(RTP_SOURCE_NODE_NAME, 46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC, 44100);
+        let args = rtp_source_module_args(
+            RTP_SOURCE_NODE_NAME,
+            46000,
+            DEFAULT_RTP_LATENCY_MSEC,
+            DEFAULT_RTP_SOURCE_ADDR,
+            DEFAULT_RTP_IGNORE_SSRC,
+            44100,
+        );
         assert!(args.contains("audio.rate = 44100"));
     }
 
     #[test]
     fn module_args_honor_a_custom_node_name() {
         // A non-legacy RTP source presents under its `rtp-in-<id>` node name.
-        let args = rtp_source_module_args("rtp-in-garage", 46000, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_SOURCE_ADDR, DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_RATE);
+        let args = rtp_source_module_args(
+            "rtp-in-garage",
+            46000,
+            DEFAULT_RTP_LATENCY_MSEC,
+            DEFAULT_RTP_SOURCE_ADDR,
+            DEFAULT_RTP_IGNORE_SSRC,
+            DEFAULT_RTP_RATE,
+        );
         assert!(args.contains("node.name = \"rtp-in-garage\""));
     }
 

@@ -209,8 +209,7 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
     // `Weak` to each sender so it never keeps a session alive — once the handle
     // drops (senders' strong count → 0) every upgrade fails and the task exits
     // after clearing liveness. Cheap: a mutex read per sender each second.
-    let weak_senders: Vec<(String, Weak<AppleMidiSender>)> =
-        senders.iter().map(|(n, s)| (n.clone(), Arc::downgrade(s))).collect();
+    let weak_senders: Vec<(String, Weak<AppleMidiSender>)> = senders.iter().map(|(n, s)| (n.clone(), Arc::downgrade(s))).collect();
     let status_task = tokio::spawn(async move {
         let liveness = PwSinkLiveness::global();
         loop {
@@ -232,10 +231,5 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
         }
     });
 
-    Ok(PwSinkServerHandle {
-        senders,
-        _capture: capture,
-        _relay: relay,
-        _status_task: status_task,
-    })
+    Ok(PwSinkServerHandle { senders, _capture: capture, _relay: relay, _status_task: status_task })
 }

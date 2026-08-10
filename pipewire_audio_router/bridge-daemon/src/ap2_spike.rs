@@ -125,18 +125,10 @@ pub struct Ap2SpikeInfo {
 }
 
 /// Connect one receiver via the file path and start streaming the tone WAV.
-async fn connect_tone(
-    ip: IpAddr,
-    clock_id: u64,
-    render_delay_ms: u32,
-    wav: &[u8],
-    rate: u32,
-) -> Result<Connection, String> {
+async fn connect_tone(ip: IpAddr, clock_id: u64, render_delay_ms: u32, wav: &[u8], rate: u32) -> Result<Connection, String> {
     let device = build_device(ip);
     let config = spike_config(rate);
-    let mut conn = Connection::connect_auto(device, config, "3939")
-        .await
-        .map_err(|e| format!("connect/pair: {e}"))?;
+    let mut conn = Connection::connect_auto(device, config, "3939").await.map_err(|e| format!("connect/pair: {e}"))?;
     conn.set_ptp_clock_id(clock_id);
     conn.set_render_delay_ms(render_delay_ms);
     conn.setup().await.map_err(|e| format!("SETUP: {e}"))?;
@@ -163,9 +155,7 @@ async fn connect_tone_live(
 ) -> Result<(Connection, std::thread::JoinHandle<()>), String> {
     let device = build_device(ip);
     let config = spike_config(rate);
-    let mut conn = Connection::connect_auto(device, config, "3939")
-        .await
-        .map_err(|e| format!("connect/pair: {e}"))?;
+    let mut conn = Connection::connect_auto(device, config, "3939").await.map_err(|e| format!("connect/pair: {e}"))?;
     conn.set_ptp_clock_id(clock_id);
     conn.set_render_delay_ms(render_delay_ms);
     conn.setup().await.map_err(|e| format!("SETUP: {e}"))?;
@@ -211,9 +201,7 @@ async fn connect_tone_live(
         })
         .map_err(|e| format!("spawn tone feeder: {e}"))?;
 
-    conn.start_streaming_live(decoder)
-        .await
-        .map_err(|e| format!("start_streaming_live: {e}"))?;
+    conn.start_streaming_live(decoder).await.map_err(|e| format!("start_streaming_live: {e}"))?;
     Ok((conn, feeder))
 }
 
@@ -260,12 +248,10 @@ pub async fn start(
         let mut conns: Vec<Connection> = Vec::new();
         for (name, ip) in &targets_task {
             let r = if live {
-                connect_tone_live(*ip, clock_id, render_delay_ms, freq_hz, rate, stop_flag_task.clone())
-                    .await
-                    .map(|(c, feeder)| {
-                        feeders_task.lock().unwrap().push(feeder);
-                        c
-                    })
+                connect_tone_live(*ip, clock_id, render_delay_ms, freq_hz, rate, stop_flag_task.clone()).await.map(|(c, feeder)| {
+                    feeders_task.lock().unwrap().push(feeder);
+                    c
+                })
             } else {
                 connect_tone(*ip, clock_id, render_delay_ms, &wav, rate).await
             };
@@ -290,12 +276,7 @@ pub async fn start(
         tracing::info!("AP2 spike: stopped");
     });
 
-    *slot().lock().unwrap() = Some(Ap2ToneSpike {
-        shutdown: Some(shutdown_tx),
-        stop_flag,
-        feeders,
-        task: Some(task),
-    });
+    *slot().lock().unwrap() = Some(Ap2ToneSpike { shutdown: Some(shutdown_tx), stop_flag, feeders, task: Some(task) });
     let mode = if live { "live (start_streaming_live)".to_string() } else { format!("file ({secs:.0}s)") };
     Ok(Ap2SpikeInfo {
         message: format!(

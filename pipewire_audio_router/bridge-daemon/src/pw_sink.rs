@@ -108,5 +108,4 @@ mod tests {
         let args = rtp_sink_module_args("pwsink-spike", "s", "192.168.178.21", 5004, Some("end0"));
         assert!(args.contains("local.ifname = \"end0\""));
     }
-
 }
