@@ -20,6 +20,45 @@ drives the whole design below.
 This plan also removes the legacy node-volume duck/announce API, which this work
 makes definitively dead — see §7.
 
+---
+
+## 0. Status: code complete, live validation outstanding
+
+**VD1–VD5 and L1–L5 are all in.** They were built 2026-08-03/04 on
+`chore/drop-legacy-node-volume-api`, which then sat unmerged while the mainline
+moved on ~21 commits; **replayed onto `chore/sendspin-submodule` on 2026-08-10**,
+the eleven commits below this one. L6 stays deferred by design (§7).
+
+The divergence was wide — 35 files on the branch, 123 on the mainline, 18
+overlapping — but shallow: three of the eleven commits needed help.
+
+| Commit | Conflict | Resolution |
+|---|---|---|
+| L1+L2 | `api.py` gained a `base_url` property exactly where L1 removes `async_get_media_players` | Both: keep `base_url`, take `async_health` |
+| L1+L2 | `api.ts` / `types.ts` gained `agents:`/`AgentInfo` beside the `mediaPlayers`/`setVolume`/`VolumeResponse` being removed | Keep the agent additions, drop the removed ones |
+| L3+L4 | `volume.rs` is deleted here, but the mainline had refactored it onto the shared `pw-control` crate (`857222f`) | Deleted. That refactor was maintenance on code L4 proves unreachable; nothing references `crate::volume` |
+| VD5 | The badge was written against the pre-`857222f` header; the mainline has since moved badges out of `.out-title` into a right-aligned column with a deliberate order | Mainline's structure, duck badge slotted in **leftmost** — it is the most transient badge (one voice turn), so it must not displace the PTP badge |
+
+Two things the replay itself invalidated, both folded into the L1+L2 commit so it
+does not leave a broken tree behind: `test_now_playing.py` still patched
+`async_get_media_players` (it postdates the branch, so `2e80f68`'s test sweep never
+saw it), and `routing.rs`'s module doc still cited `/api/media_players` as the
+source of truth for what an output is — that rule is now `is_output_node`,
+vestigial and deferred to L6.
+
+Verified at **every one of the eleven commits**, not just the tip: daemon tests,
+integration tests and `cargo fmt --check` are green throughout, and the tip has
+**219 daemon tests**, **72 integration tests**, `svelte-check` 140 files / 0 errors
+and zero build warnings. The two config-flow teardown errors the branch had
+recorded as pre-existing are gone — `e09bd06` fixed them on the mainline.
+`cargo clippy` reports 7 warnings, **all pre-existing on the mainline** and none
+from this work: 2 `derivable_impls` (CI allows them explicitly) and 5
+`chunks_exact`-with-a-constant-size, a lint newer than the `@stable` toolchain CI
+resolves, which is why `21e749e` passed the gate.
+
+**What is left is §6: nothing here has been observed on the live instance.** The
+mechanism has unit and integration coverage only.
+
 ## 1. Why this belongs in the add-on
 
 Everything the blueprint does poorly is poor *because* it can only act through
@@ -264,6 +303,12 @@ the deletions in §7 (net negative).
   and worth a test.
 
 ## 6. Acceptance (live instance)
+
+> **Not run — this is the outstanding work** (§0). Everything shipped with unit and
+> integration coverage; nothing below has been observed on the instance. Add case 8:
+> an announcement and a voice turn overlapping on an agent-backed pw-sink host —
+> the host's own music stays ducked until the voice turn ends (the backend §3.1 did
+> not foresee, see §4).
 
 1. Music on the room's speaker, say the wake word → music quiet within a fraction
    of a second, response intelligible, music back at full level after `idle`,
