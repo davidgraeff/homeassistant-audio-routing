@@ -1022,6 +1022,8 @@ impl GroupReconciler {
 
     /// `send_ahead_us` is the group presentation lead from the sync settings
     /// (sync_settings.rs), applied to every group's sendspin server.
+    // Reconciliation reads from every subsystem it has to line up.
+    #[allow(clippy::too_many_arguments)]
     pub async fn reconcile(
         &mut self,
         pw: &SharedState,

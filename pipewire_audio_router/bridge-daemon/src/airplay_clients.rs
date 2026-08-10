@@ -156,7 +156,7 @@ impl ClientsDb {
     /// A snapshot of one source's clients, most-recently-connected first.
     fn list(&self, sid: &str) -> Vec<AirplayClient> {
         let mut out = self.by_source.get(sid).cloned().unwrap_or_default();
-        out.sort_by(|a, b| b.last_connected.cmp(&a.last_connected));
+        out.sort_by_key(|c| std::cmp::Reverse(c.last_connected));
         out
     }
 

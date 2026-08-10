@@ -246,7 +246,7 @@ fn run(
                             if matches!(e, mpsc::error::TrySendError::Full(_)) {
                                 let n = CAPTURE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
                                 // ~every 0.5 s of dropped audio at a ~21 ms quantum.
-                                if n % 24 == 0 {
+                                if n.is_multiple_of(24) {
                                     tracing::debug!("sendspin capture (node {target_node_id}): consumer behind, dropped {n} chunks total");
                                 }
                             }

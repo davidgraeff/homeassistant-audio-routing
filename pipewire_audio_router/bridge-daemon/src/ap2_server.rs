@@ -95,8 +95,9 @@ pub(crate) fn alac_cookie(rate: u32) -> [u8; 24] {
 /// drives the SETUP `audioFormat` bit (`airplay_format_value`), which must agree
 /// with the cookie's rate.
 pub(crate) fn ap2_stream_config(rate: u32) -> StreamConfig {
-    let mut audio_format = AudioFormat::default(); // ALAC/16/2, 352 frames/packet
-    audio_format.sample_rate = if rate >= 48_000 { SampleRate::Hz48000 } else { SampleRate::Hz44100 };
+    // ALAC/16/2, 352 frames/packet from Default; only the rate is ours to pick.
+    let audio_format =
+        AudioFormat { sample_rate: if rate >= 48_000 { SampleRate::Hz48000 } else { SampleRate::Hz44100 }, ..Default::default() };
     StreamConfig {
         timing_protocol: TimingProtocol::Ptp,
         ptp_mode: PtpMode::Master, // sender is the (external) grandmaster reference

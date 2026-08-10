@@ -1187,6 +1187,8 @@ fn spawn_accept_loop_per_device(
     })
 }
 
+// Per-connection task: takes the connection plus the handles it reports into.
+#[allow(clippy::too_many_arguments)]
 async fn drain_messages_per_device(
     mut conn: ServerConnection,
     client_id: String,

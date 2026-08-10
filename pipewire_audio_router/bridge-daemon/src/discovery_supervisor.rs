@@ -75,8 +75,8 @@ fn lan_restricted_daemon() -> anyhow::Result<ServiceDaemon> {
 }
 
 /// One process-wide mDNS daemon shared by everything outside the toggleable
-/// browse daemon, restricted to the LAN interface. It backs the sendspin server
-/// + AirPlay-receiver (shairplay) **advertisements** ([`crate::sendspin_server`],
+/// browse daemon, restricted to the LAN interface. It backs the sendspin server +
+/// AirPlay-receiver (shairplay) **advertisements** ([`crate::sendspin_server`],
 /// [`crate::airplay_source`]) *and* the sendspin server's dial-in
 /// **`ClientManager` browse** — all via the vendored crates' `with_daemon`
 /// constructors. Distinct from the toggleable browse daemon above: these must

@@ -529,8 +529,8 @@ mod tests {
         assert_eq!(airplay.node_name(), "airplay-in");
         if let SourceConfig::Airplay(a) = &airplay.config {
             assert_eq!(a.latency_msec, 150);
-            assert_eq!(a.auth_setup, true);
-            assert_eq!(a.prevent_takeover, false);
+            assert!(a.auth_setup);
+            assert!(!a.prevent_takeover);
             assert_eq!(a.port, 5000); // allocated from the base
         } else {
             panic!("expected airplay config");
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(airplay.label, "Den");
         if let SourceConfig::Airplay(a) = &airplay.config {
             assert_eq!(a.latency_msec, DEFAULT_AIRPLAY_LATENCY_MSEC);
-            assert_eq!(a.prevent_takeover, true); // default_true preserved
+            assert!(a.prevent_takeover); // default_true preserved
         } else {
             panic!("expected airplay config");
         }
