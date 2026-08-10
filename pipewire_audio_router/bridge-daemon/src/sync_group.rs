@@ -736,7 +736,10 @@ impl GroupReconciler {
             Err(e) => return AnnounceTransport::Unavailable(e),
         };
 
-        let member = crate::pwsink_server::PwSinkMember { node_name: output.to_string(), control_port };
+        // The sender sizes its catch-up burst against the buffer the receiver was
+        // told to keep, so it is told the same figure the agent got.
+        let playout_ms = deps.sync_settings.lock_recover().pwsink_jitter_effective(output);
+        let member = crate::pwsink_server::PwSinkMember { node_name: output.to_string(), control_port, playout_ms };
         let server = match crate::pwsink_server::start(vec![member], sink_node_id) {
             Ok(handle) => handle,
             Err(e) => {
@@ -1098,6 +1101,7 @@ impl GroupReconciler {
                     d.sendspin_send_ahead_us = sendspin_server::required_send_ahead_us(
                         send_ahead_us,
                         d.sendspin_codec,
+                        ss.opus_floor_ms(),
                         d.sendspin_node_names
                             .iter()
                             .map(|n| (devices_map.get(n).and_then(|dev| dev.min_buffer_ms), delays.get(n).copied().unwrap_or(0))),
@@ -1553,7 +1557,11 @@ impl GroupReconciler {
                         .pwsink_members
                         .iter()
                         .zip(ports.iter())
-                        .map(|(node_name, port)| crate::pwsink_server::PwSinkMember { node_name: node_name.clone(), control_port: *port })
+                        .map(|(node_name, port)| crate::pwsink_server::PwSinkMember {
+                            playout_ms: sync_settings.lock_recover().pwsink_jitter_effective(node_name),
+                            node_name: node_name.clone(),
+                            control_port: *port,
+                        })
                         .collect();
                     match crate::pwsink_server::start(members, anchor_id) {
                         Ok(handle) => {
@@ -1596,6 +1604,7 @@ impl GroupReconciler {
                 let lead = sendspin_server::required_send_ahead_us(
                     send_ahead_us,
                     codec,
+                    ss.opus_floor_ms(),
                     std::iter::once((
                         devices_map.get(dev).and_then(|d| d.min_buffer_ms),
                         ss.sendspin_delays().get(dev).copied().unwrap_or(0),
@@ -1825,6 +1834,8 @@ mod tests {
         sendspin_server::required_send_ahead_us(
             100_000, // the user's configured group lead
             "opus",
+            crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS,
+            // Both report, so the Opus floor above is bypassed either way.
             [(Some(100), kitchen_delay_ms), (Some(300), bath_delay_ms)],
         )
     }
@@ -1971,9 +1982,9 @@ mod tests {
             pair_code: None,
         };
         // Pair, then reconnect with the token — only a welcomed connection is a target.
-        agents.hello(claim(), tokio::sync::mpsc::unbounded_channel().0);
+        agents.hello(claim(), tokio::sync::mpsc::channel(1).0);
         let paired = agents.approve("m1:david").expect("approve");
-        agents.hello(HelloClaim { token: Some(&paired.token), ..claim() }, tokio::sync::mpsc::unbounded_channel().0);
+        agents.hello(HelloClaim { token: Some(&paired.token), ..claim() }, tokio::sync::mpsc::channel(1).0);
 
         let hosts = agents.connected_targets();
         assert_eq!(hosts.keys().collect::<Vec<_>>(), vec![&paired.node_name], "the registry's key is the pairing's node name");

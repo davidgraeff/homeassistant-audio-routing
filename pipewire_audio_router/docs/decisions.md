@@ -706,3 +706,123 @@ AirPlay-receive for that little).
 > pulled only by the daemon's own mDNS + PipeWire's needs, not shairport. The
 > image-size *conclusions* still hold; only the "what already pulls X in"
 > attribution changed. Not re-measured here.
+
+---
+
+## Playout delay: one knob per backend, and every default adds nothing
+
+Each output path has exactly one per-output "shift this speaker in time" dial,
+and the shipped default of each adds no latency of its own:
+
+| Backend | Dial | Default | Applied |
+|---|---|---|---|
+| AirPlay 2 | render delay (PT=87 anchor shift) | **0 ms** | live on the running stream |
+| Sendspin | static delay, over the group lead | 0 (lead **0**) | in-band on (re)connect |
+| pw-sink | the receiver's jitter buffer (`sess.latency.msec`) | 100 ms (the module's own) | agent reloads `module-rtp-session` |
+
+The sendspin group lead is a *floor*, not the value used: `required_send_ahead_us`
+raises every group's send-ahead to the largest member requirement (a reported
+`min_buffer_ms` + that member's static delay, or the wire codec's decode floor),
+so 0 means "what the members ask for, nothing more".
+
+Reading a receiver that is out of step:
+
+- **AirPlay 2 goes silent rather than early** when its delay is too low. Packets
+  arriving past their play deadline are dropped by the receiver, not played late,
+  and the negotiated `latency_min` is 22050 frames (≈500 ms at 44.1 kHz) — so a
+  receiver that refuses at 0 needs `ap2_stream_config`'s minimum lowered as well
+  as the delay raised.
+- **A pw-sink target crackles** when its buffer is too small for the network hop
+  and the remote host's scheduling.
+
+pw-sink's dial is the *only* lever on that path's delay, which is why it exists at
+all: `welcome` carries the value, and changing it re-sends `welcome` rather than
+adding a message type, because the agent reloads its receiver on every one by
+design (receiver-agent-plan §13.4). That works against already-deployed agents.
+
+## No unbounded queues
+
+A queue that can grow is latency that can grow, and in an audio daemon that
+usually surfaces as delay rather than as memory. Every channel in the add-on is
+bounded; what differs is the behaviour when one is full:
+
+- **Audio/PCM lanes drop.** Latency *is* queue depth here, so the realtime-correct
+  answer is to discard and log rather than block or grow: `sendspin_capture`
+  (32 chunks), the pw-sink relay→sender feed (`PCM_FEED_DEPTH`), sendspin's
+  per-connection audio lane (`MAX_QUEUED_AUDIO_FRAMES`, an admission counter so
+  the caller can be told *which* member is not draining).
+- **Control lanes are capped generously and complain.** Dropping an unduck or a
+  release is worse than briefly queueing one, so these get far more room than any
+  real burst (`AGENT_MSG_DEPTH`, `REMOTE_DUCK_DEPTH`, `AP2_CMD_DEPTH`) — but a
+  ceiling all the same, because a peer that stops reading its socket must not be
+  able to grow a queue until the daemon dies. Hitting it means that connection is
+  wedged, which is logged and reported as failure.
+- **Senders `try_send`; they never `await` a send.** A fan-out must not let one
+  slow member stall the others, and callers holding the registry lock must not
+  wait on a socket at all.
+
+### Throughput must not depend on the wakeup rate
+
+Bounding a queue only helps if the consumer can keep up, and for the pw-sink
+sender two things decide that:
+
+1. **The send thread runs at `SCHED_FIFO` 50**, matching the AP2 path's
+   `rt-sender`. It wakes every `PACKET_MS` to put packets on the wire, so it
+   belongs on the same ladder as the capture (45), the relay (40) and PipeWire's
+   data loop (83).
+2. **Each wakeup emits every packet whose deadline has passed**, not one. One
+   packet per wakeup would cap throughput at `wakeups/s × PACKET_MS` of audio per
+   second whatever the thread was fed; the shortfall would then surface as growing
+   delay or as continuous dropping, depending only on the queue policy. Sending
+   all due packets makes a late wakeup cost a burst the receiver's jitter buffer
+   absorbs instead of costing audio.
+
+`BacklogLimits::for_playout` derives both limits from the receiver's configured
+buffer, because that buffer is the physical constraint on both: a burst has to fit
+it, and a backlog worth holding has to be absorbable by it. A burst gets two
+thirds of the buffer, and the drop ceiling is three bursts, so a gap too large for
+one wakeup is still caught up over the next few. The ceiling is always above one
+full burst — a lower one would discard audio the loop is about to deliver. That
+derivation is also why `PWSINK_JITTER_MIN_MS` is three packet times: at two, the
+minimum burst would be the entire buffer.
+
+The queue bound and the rate-matching trim (±0.5 % on the packet interval, which
+the receiver's adaptive resampler absorbs) cover the two remaining cases: clock
+difference between PipeWire's graph and this thread's monotonic clock, and gaps
+too large to catch up. Tests assert the ceiling-above-burst and
+burst-inside-buffer invariants across the whole range the API accepts.
+
+**Still unbounded, and knowingly**: the sendspin submodule's *control* and
+inbound-message lanes (`submodules/sendspin`, upstream PR pending). Its audio lane
+is capped as above, and the inbound one carries a note that hardening it is a DoS
+question rather than a latency one.
+
+## The Opus send-ahead floor is a setting
+
+A sendspin group's send-ahead is `max(configured lead, per-member requirement)`,
+and a member that reports no `min_buffer_ms` — which is every Voice PE and
+satellite1 here — falls back to a per-codec floor. PCM and FLAC impose none. Opus
+imposes `DEFAULT_OPUS_FLOOR_MS`, **40 ms**, two 20 ms blocks: measured to play
+cleanly on this hardware over 2.4 GHz WiFi.
+
+That floor sets the latency of every output aligned to the group, so it is
+`opus_floor_ms` in sync_settings, editable beside the group lead. It is
+configurable because the network half of the budget belongs to the site: a
+congested band spends more of it on retransmissions.
+
+**Its lower bound is arithmetic.** `opus_floor_lower_bound_ms` returns the Opus
+block size — 20 ms at 48 kHz, the frame length sendspin-cpp's decoder is built
+around. The encoder emits nothing before a whole block exists, so audio captured
+at `C` leaves no earlier than `C + 20 ms`; a 20 ms send-ahead has it arriving
+exactly when it is due to play, leaving no window for the network hop, the MCU's
+decode or its scheduling. The API clamps there.
+
+Which side the floor protects is worth stating, because it is easy to assume it is
+our own encoder: **it is not**. Encoding happens here, ahead of sending, and
+libopus's algorithmic lookahead is compensated separately (`codec_delay_us`). The
+floor buys time for the *receiver* — the network hop, the ESP32's decode and its
+scheduling.
+
+A device that reports its own `min_buffer_ms` bypasses the floor in **both**
+directions: a firmware announcing 80 ms puts its group at 80 ms. That is the
+protocol's way to set this per device rather than guessing on the device's behalf.

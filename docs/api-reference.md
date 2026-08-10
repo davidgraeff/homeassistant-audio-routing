@@ -20,7 +20,7 @@ handler name, which is the authoritative place to check the exact body shape.
 | `GET` | `/api/nodes` | raw PipeWire node/port snapshot |
 | `GET` | `/api/status` | daemon status summary (`get_status`) |
 | `GET`/`PUT` | `/api/settings` | daemon settings (`get_settings` / `set_settings`) |
-| `GET`/`PUT` | `/api/sync/settings` | group lead + per-device delays (`get_sync_settings` / `set_sync_settings`) |
+| `GET`/`PUT` | `/api/sync/settings` | group lead + Opus send-ahead floor (`get_sync_settings` / `set_sync_settings`) |
 | `GET` | `/api/outputs` | your outputs (adopted) + live state |
 | `GET` | `/api/outputs/discovered` | devices discovery is offering |
 | `POST` | `/api/outputs/{node_name}/adopt` | add a discovered device (for `pwsink`, this pairs it) |
@@ -218,7 +218,22 @@ Assistant). Independent of the adoption verdict — removing or un-ignoring a de
 keeps the name you gave it. Nothing restarts.
 
 ### `PUT /api/outputs/{node_name}/latency`
-Per-output latency in ms. Persisted, applied to the running sender.
+Per-output playout delay in ms (`{"latency_ms": 40}`; `null` clears the override and
+returns the output to the add-on default). Persisted per node name and applied to the
+running sender. Two kinds have this knob:
+
+- **AirPlay 2** — the render delay (default 0, up to 2000 ms). Applied live to the
+  running stream, no reconnect.
+- **pw-sink** — the receiving host's jitter buffer (`sess.latency.msec`, default 100 ms
+  = the PipeWire module's own). Clamped to a multiple of the 5 ms packet time, 15–2000 ms,
+  and pushed to that host's
+  agent, which reloads its receiver — a sub-second gap in that one target's audio. A
+  disconnected host is not an error: the value applies when it reconnects.
+
+Sendspin has no entry here; its equivalent is the static delay
+(`PUT /api/sendspin/delay`) over the group lead (`PUT /api/sync/settings`).
+`latency_ms` in a listing is the stored override (`null` = none) and
+`latency_effective_ms` is what the output is actually running.
 
 ### `PUT /api/outputs/{node_name}/ap2-rate`
 AirPlay-2 rate mode for one receiver — `auto` or a fixed rate (e.g. `fixed_44100`),
@@ -560,7 +575,28 @@ is nothing to clear, and its next stream starts fresh anyway. Exposed in the web
 Per-device playback delay in ms, used to time-align speakers within a group (a device
 with no entry has no extra delay). `GET` returns the sparse map keyed by device node
 name; `PUT` sets one entry. A delay edit is applied without restarting the group's
-server — see [`/api/sync/settings`](#endpoint-index) for the group-wide lead.
+server — see [`/api/sync/settings`](#getput-apisyncsettings) for the group-wide lead.
+
+### `GET`/`PUT` `/api/sync/settings`
+The two group-wide sendspin timing knobs.
+
+```json
+{ "group_lead_ms": 0, "opus_floor_ms": 40 }
+```
+
+* **`group_lead_ms`** — extra head start for every group, over what its members need.
+* **`opus_floor_ms`** — the head start an **Opus** stream gets whether or not a device
+  asked for one: time for the network hop, the speaker's decode and its scheduling.
+  Default 40 ms (two Opus blocks). PCM and FLAC impose nothing, and a device that
+  reports its own `min_buffer_ms` overrides it. Optional in the `PUT`, which leaves it
+  unchanged. Clamped at the Opus block size (20 ms at 48 kHz) — nothing is sent before a
+  whole block exists.
+
+A group's send-ahead is `max(group_lead_ms, largest member requirement)`, where a
+member's requirement is its reported `min_buffer_ms` (else its codec's floor) plus its
+own static delay. `GET` therefore also reports what that resolves to, read-only:
+`group_lead_floor_ms`, `group_lead_effective_ms`, `group_lead_floor_sources` (which
+devices set the floor and why), and `opus_floor_min_ms`.
 
 ## AirPlay-2 receiver volume
 

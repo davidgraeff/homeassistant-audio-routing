@@ -43,6 +43,13 @@ use crate::pw_sink_liveness::{PwSinkLiveness, PwSinkStatus};
 pub struct PwSinkMember {
     pub node_name: String,
     pub control_port: u16,
+    /// This target's configured playout delay in ms — the `sess.latency.msec` its
+    /// agent was told to run (`sync_settings::pwsink_jitter_effective`). Passed down
+    /// because the sender sizes its catch-up burst and backlog ceiling against the
+    /// far end's buffer; see [`crate::applemidi_sender::BacklogLimits`]. It is read
+    /// when the session starts, so a change to the knob reaches this on the next
+    /// session (re)start — which is also when the receiver reloads.
+    pub playout_ms: u16,
 }
 
 /// A running group's pw-sink senders. Dropping it stops every target's session
@@ -101,6 +108,17 @@ pub fn session_name_for(node_name: &str) -> String {
     format!("{PWSINK_SESSION_PREFIX}{slug}")
 }
 
+/// Depth of one target's relay→sender PCM feed, in captured chunks.
+///
+/// **Bounded on purpose** (the rule the capture channel already follows —
+/// `sendspin_capture::CAPTURE_CHANNEL_CAP`): an unbounded feed is unbounded
+/// latency, since every chunk queued in it is audio the receiver will hear late.
+/// At a ~21 ms quantum, 8 chunks is ~170 ms of absolute worst case, reached only
+/// while a sender thread is not running at all; steady-state occupancy is 0-1.
+/// Past it the relay drops the chunk and says so, rather than growing a queue
+/// nobody can hear the end of.
+const PCM_FEED_DEPTH: usize = 8;
+
 /// Best-effort real-time scheduling for the capture→feed relay thread. Same
 /// rationale + priority (40) as ap2_server's relay: the hop from capture to each
 /// sender's PCM channel must never queue behind the daemon's general-purpose
@@ -141,15 +159,16 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
     let format = SessionFormat::default(); // 48 kHz / 2ch
     let mut senders: Vec<(String, Arc<AppleMidiSender>)> = Vec::with_capacity(members.len());
     // (node_name, PCM sender) list moved into the relay thread for fan-out.
-    let mut feeds: Vec<(String, std::sync::mpsc::Sender<PcmChunk>)> = Vec::with_capacity(members.len());
+    let mut feeds: Vec<(String, std::sync::mpsc::SyncSender<PcmChunk>)> = Vec::with_capacity(members.len());
 
     for m in &members {
-        let (pcm_tx, pcm_rx_sender) = std::sync::mpsc::channel::<PcmChunk>();
+        let (pcm_tx, pcm_rx_sender) = std::sync::mpsc::sync_channel::<PcmChunk>(PCM_FEED_DEPTH);
         let config = SessionConfig {
             session_name: session_name_for(&m.node_name),
             control_port: m.control_port,
             ifname: None,
             format,
+            playout_ms: m.playout_ms,
             advertise_daemon: advertise_daemon.clone(),
         };
         match AppleMidiSender::start(config, pcm_rx_sender) {
@@ -187,17 +206,44 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
             set_relay_realtime_priority();
             let mixer = crate::overlay_mixer::OverlayMixer::global();
             let mut mix_buf: Vec<u8> = Vec::new();
+            // Per-target dropped-chunk counters + one shared report cadence: a
+            // blocked sender drops many chunks in a row, and one line per burst is
+            // the diagnostic (mirrors the sendspin relay's backlog-full report).
+            let mut dropped: Vec<u32> = vec![0; feeds.len()];
+            let mut last_drop_log = std::time::Instant::now();
             while let Some(pcm) = pcm_rx.blocking_recv() {
-                for (name, tx) in feeds.iter() {
+                for (index, (name, tx)) in feeds.iter().enumerate() {
                     // Per-device overlay: `mix_into` returns false on the plain
                     // music path (no work); when a device is being announced to it
                     // returns duck(music)+overlay in `mix_buf`. Both are S16LE at
                     // 48 kHz here, so the mix is a plain sample add.
                     let src: &[u8] = if mixer.mix_into(name, &pcm, &mut mix_buf) { &mix_buf } else { &pcm };
                     // S16LE bytes → native i16 (applemidi_sender byte-swaps to L16
-                    // big-endian on the wire). Drop the chunk if the sender is gone.
+                    // big-endian on the wire).
                     let samples: PcmChunk = src.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
-                    let _ = tx.send(samples);
+                    // `try_send`, never `send`: this is an RT thread feeding N
+                    // targets, so blocking on one full queue would stall the audio
+                    // of every *other* target too. A full queue means that sender
+                    // is not draining, and the realtime-correct answer is to drop.
+                    if tx.try_send(samples).is_err() {
+                        dropped[index] += 1;
+                    }
+                }
+                if dropped.iter().any(|&n| n > 0) && last_drop_log.elapsed() >= std::time::Duration::from_secs(5) {
+                    let detail: Vec<String> = feeds
+                        .iter()
+                        .zip(dropped.iter())
+                        .filter(|(_, &n)| n > 0)
+                        .map(|((name, _), n)| format!("{name}: {n}"))
+                        .collect();
+                    tracing::warn!(
+                        "pw-sink relay: audio DISCARDED because a target's feed was full — {}. \
+                         That sender thread is not draining (host CPU starvation, or its session is wedged), \
+                         so it is missing this audio while the other targets are unaffected.",
+                        detail.join(", ")
+                    );
+                    dropped.iter_mut().for_each(|n| *n = 0);
+                    last_drop_log = std::time::Instant::now();
                 }
             }
             tracing::debug!("pwsink relay thread exiting");

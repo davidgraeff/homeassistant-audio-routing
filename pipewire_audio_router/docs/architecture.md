@@ -185,10 +185,14 @@ group:
   `stream_start`/audio to each device over the Sendspin WebSocket via an
   embedded native server (`sendspin_server.rs`, vendored+patched
   `sendspin` crate).
-- **ESPHome / Voice PE receiver**: a **250 ms send-ahead lead** is the
-  *only* jitter buffer end-to-end — it converts the presentation timestamp
-  to its local clock and plays. Every hiccup above that 250 ms budget is
-  audible.
+- **ESPHome / Voice PE receiver**: the **send-ahead lead** is the *only*
+  jitter buffer end-to-end — it converts the presentation timestamp to its
+  local clock and plays, so every hiccup above that budget is audible. The
+  lead is what the group's speakers ask for (`required_send_ahead_us`: each
+  member's reported `min_buffer_ms` + its static delay, or the codec's decode
+  floor), raised by the configured `group_lead_ms` if you want more headroom
+  than that. That configured value defaults to **0** — see
+  [decisions.md](decisions.md#playout-delay-one-knob-per-backend-and-every-default-adds-nothing).
 
 Per-device **volume** is sent in-band over the protocol
 (`sendspin_volume.rs`); **liveness** is connection-driven (mDNS is
@@ -216,8 +220,8 @@ discovered over `_airplay._tcp` (`ap2_discovery.rs`) and surfaced as
 - **`rt-sender`** [SCHED_FIFO 50]: emits **RTP** + **PT=87 anchor**
   packets, paced by `clock_nanosleep(TIMER_ABSTIME)`.
 - **AP2 receiver**: renders against the shared PTP clock. A **render
-  delay** (default 1500 ms, tunable 200–2000 ms via
-  `AP2_RENDER_DELAY_MIN_MS..=MAX_MS`) is the receiver-side buffer. It is
+  delay** (default **0**, tunable 0–2000 ms up to
+  `AP2_RENDER_DELAY_MAX_MS`) is the receiver-side buffer. It is
   retuned **live** — `ap2_control` sends `SetRenderDelay` to the running
   streamer, which shifts the next PT=87 anchor — so a UI change takes
   effect mid-stream with **no reconnect**; it is deliberately *not* part of
@@ -601,9 +605,9 @@ flow in text.
    │ WebSocket / TCP → WiFi                │        │        ▼                                      │
    │        ▼                              │        │ rt-sender [FIFO 50]  RTP + PT=87 anchor        │
    │ ESPHome / Voice PE receiver           │        │  clock_nanosleep(TIMER_ABSTIME)               │
-   │  250 ms send-ahead lead (only JB)     │        │        ▼                                      │
+   │  send-ahead lead = what it asks for   │        │        ▼                                      │
    └─────────────────────────────────────┘        │ AirPlay-2 receiver (Yamaha / Pioneer)         │
-                                                    │  render delay 200–2000 ms (dflt 1500)         │
+                                                    │  render delay 0–2000 ms (dflt 0)              │
                                                     └────────────────────────────────────────────┘
                                                                     ▲
                                           gPTP 319/320 (Sync 8×/s)  │
@@ -620,7 +624,7 @@ flow in text.
   diverge at the monitor. That shared origin is what keeps a Voice PE
   speaker and an AV receiver sample-coincident.
 - **Inter-device sync differs per branch:** Sendspin uses the
-  `SharedTimeline` stamp + the receiver's 250 ms lead (no PTP); AP2 uses
+  `SharedTimeline` stamp + the receiver's send-ahead lead (no PTP); AP2 uses
   the **PTP wall clock + PT=87 anchors** (its sample `ts` comes from a
   per-sender RTP counter, not the SharedTimeline — see the divergence note
   in §4/§6).

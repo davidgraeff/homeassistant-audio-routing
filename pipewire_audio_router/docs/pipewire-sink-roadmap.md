@@ -148,8 +148,17 @@ connection-driven" (§5.1).
 
 - **JB** = the module's `sess.latency.msec`, exposed as a **per-target setting**.
   Tune it so the target's fixed total latency lines up with the group's
-  presentation offset (Sendspin's 250 ms lead / AP2's render delay, §5). Account
-  for the two extra graph quanta from the loopback + mix bus (§3).
+  presentation offset (the Sendspin send-ahead lead / AP2's render delay, §5).
+  Account for the two extra graph quanta from the loopback + mix bus (§3).
+  **DONE** (2026-08-10): stored per output as `pwsink_jitter`
+  (`sync_settings.rs`, default `DEFAULT_PWSINK_JITTER_MS` = the module's own
+  100 ms), set through the same `PUT /api/outputs/{node}/latency` endpoint and
+  the same slider as the AP2 render delay, and pushed to the host by re-sending
+  `welcome` (the agent reloads its receiver on every one). Clamped to 15–2000 ms in
+  whole packet times: the module refuses a buffer below `rtp.ptime` and warns unless
+  it is an integer multiple of it, our sender's ptime is 5 ms, and the sender's
+  catch-up burst has to fit inside the buffer (hence three packets, not one, as the
+  floor).
 - **Rate**: S16/48000/2 end-to-end — the anchor bus is 48 kHz (§8), so nothing
   resamples anywhere on this path.
 - **v1 sync ceiling**: fixed-offset alignment holds phase at *start*, but the two

@@ -27,6 +27,14 @@ use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
 use tokio::io::AsyncReadExt;
 
+/// Depth of the device→app reported-volume queue ([`Connection::volume_events`]).
+///
+/// Bounded rather than unbounded (local patch): an unbounded queue in a
+/// long-running process is a memory leak waiting for a stalled consumer, and these
+/// events are human-paced — 32 is far more than a person can turn a volume knob
+/// while the consumer is momentarily busy. See `event_reader_loop`.
+const VOLUME_EVENT_DEPTH: usize = 32;
+
 /// Send one handshake request, naming the step in the log and folding it into any
 /// error.
 ///
@@ -1114,8 +1122,8 @@ impl Connection {
     /// AVRs; the implementation follows the AirPlay-2 norm (same HomeKit-framed
     /// ChaCha20-Poly1305 as the RTSP channel, decrypted with the read key on a
     /// fresh nonce stream). See [`event_reader_loop`].
-    pub fn volume_events(&mut self) -> mpsc::UnboundedReceiver<f32> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn volume_events(&mut self) -> mpsc::Receiver<f32> {
+        let (tx, rx) = mpsc::channel(VOLUME_EVENT_DEPTH);
         match (self.events_stream.take(), self.events_read_key) {
             (Some(stream), Some(read_key)) => {
                 self.events_task = Some(tokio::spawn(event_reader_loop(stream, read_key, tx)));
@@ -2107,7 +2115,7 @@ fn extract_volume(buf: &[u8]) -> Option<f32> {
 /// an implausible frame length (guards against a plaintext channel triggering a
 /// huge read), or once the receiver is dropped. Duplicate/steady values are
 /// harmless — the consumer (`Ap2Control::note_reported_volume`) de-dupes.
-async fn event_reader_loop(mut stream: TcpStream, read_key: [u8; 32], tx: mpsc::UnboundedSender<f32>) {
+async fn event_reader_loop(mut stream: TcpStream, read_key: [u8; 32], tx: mpsc::Sender<f32>) {
     let mut cipher = ControlCipher::new_unidirectional(read_key);
     let mut acc: Vec<u8> = Vec::new();
     loop {
@@ -2128,8 +2136,18 @@ async fn event_reader_loop(mut stream: TcpStream, read_key: [u8; 32], tx: mpsc::
             Ok(plain) => {
                 acc.extend_from_slice(&plain);
                 if let Some(vol) = extract_volume(&acc) {
-                    if tx.send(vol).is_err() {
-                        break; // consumer gone
+                    // `try_send`, not `send`: a bounded queue must never make this
+                    // reader wait on its consumer, or a stalled consumer would also
+                    // stop the socket being drained. A full queue means the consumer
+                    // is not running, and the *newest* volume is the one that matters
+                    // — so dropping this one is safe, and a closed channel (consumer
+                    // gone for good) still ends the task.
+                    match tx.try_send(vol) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!("AP2 event channel: volume queue full; dropping a reported volume");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break, // consumer gone
                     }
                 }
                 // Keep the scan buffer bounded across many non-volume events.

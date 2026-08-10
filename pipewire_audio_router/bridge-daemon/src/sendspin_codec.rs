@@ -324,19 +324,42 @@ impl FlacEncoder {
 /// can't survive: the client has to receive, decode and schedule each chunk before its
 /// play time, and decoding is the part that needs headroom on an MCU.
 ///
-/// The numbers are empirical, from this project's hardware:
-/// - **PCM** and **FLAC**: 0 — no floor imposed. Both play cleanly at a 100 ms lead
-///   here (FLAC decode is cheap integer work), so raising it would only add latency.
-/// - **Opus**: 250 ms — the sendspin protocol's own default send-ahead
-///   (`DEFAULT_SEND_AHEAD_US`). A 100 ms lead stutters on these speakers while a much
-///   larger one audibly improves it, so 250 ms is the conservative default rather than
-///   a measured sufficiency — a device that needs more should say so via
-///   `min_buffer_ms`, which overrides this.
-pub fn min_send_ahead_us(codec: &str) -> i64 {
+/// The numbers are measured on this project's hardware:
+/// - **PCM** and **FLAC**: 0 — no floor imposed. FLAC decode is cheap integer work,
+///   so a floor would only add latency.
+/// - **Opus**: [`DEFAULT_OPUS_FLOOR_MS`], and configurable
+///   ([`crate::sync_settings::SyncSettings::opus_floor_ms`]);
+///   [`opus_floor_lower_bound_ms`] is how low the value may go.
+///
+/// A device that states its own `min_buffer_ms` overrides this in both directions.
+pub fn min_send_ahead_us(codec: &str, opus_floor_ms: u32) -> i64 {
     match codec {
-        "opus" => 250_000,
+        "opus" => i64::from(opus_floor_ms) * 1000,
         _ => 0,
     }
+}
+
+/// Shipped Opus send-ahead floor: **40 ms**, two [`OPUS_FRAME_FRAMES`] blocks.
+///
+/// Measured on this project's hardware (Voice PE and satellite1 over 2.4 GHz WiFi):
+/// Opus plays cleanly at this lead. It covers one block of encoder output plus the
+/// WiFi hop, the MCU's decode and its scheduling.
+///
+/// Tunable per install ([`crate::sync_settings::SyncSettings::opus_floor_ms`]), since
+/// the network half of that budget belongs to the site rather than to the codec: a
+/// congested band spends more of it on retransmissions.
+pub const DEFAULT_OPUS_FLOOR_MS: u32 = 40;
+
+/// The lowest Opus floor that can mean anything, in ms — **the block size**.
+///
+/// The encoder emits nothing until it has a whole [`OPUS_FRAME_FRAMES`] block (20 ms at
+/// 48 kHz, the size sendspin-cpp's decoder is built around). Audio captured at `C`
+/// therefore leaves here no earlier than `C + 20 ms`, so a 20 ms send-ahead has it
+/// arriving exactly when it is due to play, leaving no window for the network, the
+/// decode or the scheduling. The API clamps here; a workable value is above it — see
+/// [`DEFAULT_OPUS_FLOOR_MS`].
+pub fn opus_floor_lower_bound_ms(codec: &str) -> u32 {
+    (Encoder::block_frames(codec).unwrap_or(0) * 1000 / SAMPLE_RATE as usize) as u32
 }
 
 /// How long after its timestamp a `codec`-encoded chunk would actually be *heard*,

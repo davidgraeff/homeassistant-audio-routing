@@ -109,6 +109,15 @@ pub struct SinkInfo {
     pub description: String,
 }
 
+/// Depth of the PipeWire-thread → WebSocket event queue.
+///
+/// Bounded, like every queue in this project: an unbounded one in a process that
+/// runs for weeks is a leak waiting for a stalled reader. These are state
+/// snapshots (master volume, sink list, a foreign-session note) at human/graph
+/// pace, and a *newer* snapshot supersedes an older one, so 32 is generous and a
+/// dropped one costs nothing — the next graph change re-publishes.
+pub const EVENT_DEPTH: usize = 32;
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Pushed on *every* change, including ones the user made locally — the agent
@@ -235,7 +244,7 @@ struct State {
     ramp: Option<Ramp>,
     last_published: Option<MasterState>,
     last_sinks: Option<Vec<SinkInfo>>,
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
+    events: tokio::sync::mpsc::Sender<Event>,
     /// Foreign sessions already reported, so the log/event isn't repeated.
     reported_foreign: Vec<String>,
 }
@@ -505,12 +514,12 @@ impl State {
         let state = self.master();
         if self.last_published.as_ref() != Some(&state) {
             self.last_published = Some(state.clone());
-            let _ = self.events.send(Event::Master(state));
+            let _ = self.events.try_send(Event::Master(state));
         }
         let sinks = self.sinks();
         if self.last_sinks.as_ref() != Some(&sinks) {
             self.last_sinks = Some(sinks.clone());
-            let _ = self.events.send(Event::Sinks(sinks));
+            let _ = self.events.try_send(Event::Sinks(sinks));
         }
     }
 
@@ -525,13 +534,13 @@ impl State {
             "another router's session '{session}' is also being received on this host; \
              the agent leaves it alone (see receiver-agent-plan.md §7.1)"
         );
-        let _ = self.events.send(Event::ForeignSession(session.to_string()));
+        let _ = self.events.try_send(Event::ForeignSession(session.to_string()));
     }
 }
 
 /// Spawns the worker. Events are pushed to `events`; the returned handle stops
 /// the thread (restoring ducked volumes and unloading the module) when dropped.
-pub fn spawn(events: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Result<Handle> {
+pub fn spawn(events: tokio::sync::mpsc::Sender<Event>) -> anyhow::Result<Handle> {
     let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
     // The thread's own handle on the queue, for the deferred reload above.
     let cmd_tx_self = cmd_tx.clone();
@@ -560,7 +569,7 @@ pub fn spawn(events: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Resul
 fn run(
     cmd_rx: pw::channel::Receiver<Cmd>,
     cmd_tx: pw::channel::Sender<Cmd>,
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
+    events: tokio::sync::mpsc::Sender<Event>,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> anyhow::Result<()> {
     pw::init();

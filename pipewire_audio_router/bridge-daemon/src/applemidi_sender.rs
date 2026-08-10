@@ -35,7 +35,8 @@
 //! 5. **Stream RTP** to the source address of each established data `IN`: 12-byte
 //!    RTP header (`0x80`, `PT=127`, seq++, ts += samples/packet, our SSRC) +
 //!    **L16 big-endian** payload (byte-swap the incoming native-endian S16),
-//!    ~2 ms/packet (`rate/500` frames), real-time paced. The module matches the
+//!    [`PACKET_MS`]/packet (`rate / (1000/PACKET_MS)` frames), real-time paced and
+//!    catching up after a late wakeup. The module matches the
 //!    session by our SSRC and plays it. Send to **every** established data peer.
 //! 6. On `BY` (`0x4259`) or drop, retire that peer. On `Drop` send `BY` to all,
 //!    close sockets, withdraw the advert, join threads.
@@ -73,6 +74,77 @@ const CMD_CK: u16 = 0x434B; // "CK" — clock synchronization
 const APPLEMIDI_PROTOCOL: u32 = 2;
 /// RTP payload type used by `module-rtp-session` for L16 audio (dynamic).
 const RTP_PAYLOAD_TYPE: u8 = 127;
+
+/// Audio carried by one RTP packet, in ms — the sender's `ptime`. **5 ms**: 200
+/// wakeups and 200 `sendto` calls per second per target.
+///
+/// Three constraints pin it:
+/// * **MTU.** L16 stereo at 48 kHz is 192 B/ms, so 5 ms is 960 B of payload plus 12 B
+///   RTP and 28 B IP/UDP = 1000 B, inside PipeWire's 1280 B default. (6 ms fits; 8 ms
+///   does not.)
+/// * **The rate divides exactly** — 240 frames at 48 kHz, no rounding.
+/// * **The jitter buffer divides by it.** `module-rtp-session` warns unless
+///   `sess.latency.msec` is an integer multiple of `rtp.ptime`, and its default buffer
+///   is 100 ms: divisible by 5, not by 6.
+///
+/// For scale, the other backends here: AirPlay 2 sends 352 frames (7.98 ms at
+/// 44.1 kHz), sendspin encodes 20 ms Opus blocks, and PipeWire's own `rtp-sink` packs
+/// up to `net.mtu`, landing near 6 ms for this format.
+pub const PACKET_MS: u32 = 5;
+
+/// Backlog (ms of undelivered audio) the sender aims to hold. A few packets: just
+/// enough that ordinary scheduling jitter doesn't starve the next send, and small
+/// enough to be a rounding error in the end-to-end delay.
+const TARGET_BACKLOG_MS: i64 = 6;
+
+/// Absolute ceiling on a catch-up burst, whatever the receiver's buffer allows: one
+/// session must not monopolise the CPU it just got back. 32 packets = 160 ms.
+const MAX_BURST_PACKETS: usize = 32;
+
+/// Floor on a catch-up burst: below two packets there is no catching up at all, so
+/// even the smallest configured buffer gets this much.
+const MIN_BURST_PACKETS: usize = 2;
+
+/// The two backlog limits, derived from the receiver's playout buffer.
+///
+/// Both scale with that buffer because it is the physical constraint: a burst we emit
+/// has to *fit* the far end's jitter buffer, and a backlog we choose to keep has to be
+/// one it can absorb. The ceiling is therefore always above one full burst — a lower
+/// one would discard audio the loop is about to deliver.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BacklogLimits {
+    /// Most packets one wakeup may emit back-to-back while catching up.
+    burst_packets: usize,
+    /// Past this much queued audio, the oldest is dropped back to
+    /// [`TARGET_BACKLOG_MS`]. Deliberately several bursts' worth: multi-pass
+    /// catch-up must get its chance before anything is thrown away.
+    max_backlog_ms: i64,
+}
+
+impl BacklogLimits {
+    /// `playout_ms` is the receiver's jitter buffer — what the daemon told this
+    /// target's agent to configure as `sess.latency.msec`.
+    ///
+    /// A burst gets two thirds of that buffer: enough to absorb the scheduling gaps
+    /// a loaded host actually produces, while leaving the far end headroom rather
+    /// than filling it exactly. The ceiling is three bursts, so a gap too big for
+    /// one wakeup is still caught up over the next few instead of being dropped.
+    fn for_playout(playout_ms: u16) -> Self {
+        let burst_ms = i64::from(playout_ms) * 2 / 3;
+        let burst_packets =
+            ((burst_ms / i64::from(PACKET_MS)) as usize).clamp(MIN_BURST_PACKETS, MAX_BURST_PACKETS);
+        let burst_ms = (burst_packets as i64) * i64::from(PACKET_MS);
+        Self { burst_packets, max_backlog_ms: (burst_ms * 3).max(TARGET_BACKLOG_MS * 2) }
+    }
+}
+
+/// How hard the pace is trimmed per ms of backlog error, in parts per million of
+/// the packet interval, and the ceiling on that trim. 250 ppm/ms saturates at
+/// ±20 ms of error, and ±5000 ppm (±0.5 %) is ~50× the clock mismatch between two
+/// ordinary hosts while being far too small for the receiver's resampler to care.
+const PACE_TRIM_PPM_PER_MS: i64 = 250;
+const PACE_TRIM_PPM_MAX: i64 = 5_000;
+
 /// mDNS service type `module-rtp-session` browses for audio sessions.
 const MDNS_SERVICE_TYPE: &str = "_pipewire-audio._udp.local.";
 
@@ -103,6 +175,14 @@ pub struct SessionConfig {
     pub ifname: Option<String>,
     /// Audio rate/channels (wire encoding is always L16/big-endian).
     pub format: SessionFormat,
+    /// The receiver's jitter buffer for this target, in ms — the `sess.latency.msec`
+    /// the daemon told its agent to use (`sync_settings::pwsink_jitter_effective`).
+    ///
+    /// The sender never sets this on the far end; it is told what it is, because both
+    /// of its own backlog limits have to respect it: a catch-up burst must fit that
+    /// buffer, and a backlog worth keeping must be one that buffer can absorb. See
+    /// [`BacklogLimits::for_playout`].
+    pub playout_ms: u16,
     /// Shared mDNS advertise daemon
     /// ([`crate::discovery_supervisor::shared_advertise_daemon`]). Reuse it to
     /// stay storm-safe; `None` makes the sender create its own daemon (only for
@@ -123,6 +203,10 @@ pub struct SessionStatus {
 /// session rate/channels, as captured from PipeWire. The sender byte-swaps to
 /// L16 (big-endian) on the wire and repacketizes into ~2 ms RTP packets. Task 2
 /// bridges the group-anchor capture into the channel that yields these.
+///
+/// **Feed it over a bounded channel** (`sync_channel`, as `pwsink_server` does). A
+/// queue of undelivered PCM is a queue of late audio, so the producer drops instead of
+/// growing it; `rtp_sender_loop` bounds its own end the same way ([`BacklogLimits`]).
 pub type PcmChunk = Vec<i16>;
 
 /// A running AppleMIDI sender session (one per target). Advertises over mDNS,
@@ -187,7 +271,10 @@ impl AppleMidiSender {
     /// (fed at real-time rate from the anchor capture in Task 2). The worker
     /// buffers and repacketizes into ~2 ms RTP packets.
     pub fn start(config: SessionConfig, pcm: Receiver<PcmChunk>) -> anyhow::Result<Self> {
-        let SessionConfig { session_name, control_port, ifname: _ifname, format, advertise_daemon } = config;
+        let SessionConfig { session_name, control_port, ifname: _ifname, format, playout_ms, advertise_daemon } = config;
+        // Both backlog limits follow the far end's buffer, so they are settled once
+        // here rather than guessed per packet.
+        let limits = BacklogLimits::for_playout(playout_ms);
         let data_port =
             control_port.checked_add(1).ok_or_else(|| anyhow::anyhow!("control_port {control_port} leaves no room for the data port"))?;
 
@@ -233,11 +320,18 @@ impl AppleMidiSender {
             move || reader_loop(data_sock, peers, shutdown, Channel::Data)
         }));
         // RTP sender: drains `pcm`, repacketizes into ~2 ms L16 packets, paces.
-        threads.push(std::thread::spawn({
-            let peers = peers.clone();
-            let shutdown = shutdown.clone();
-            move || rtp_sender_loop(pcm, peers, shutdown, format)
-        }));
+        // Named + RT-scheduled inside the loop (see `set_sender_realtime_priority`);
+        // the two readers above stay ordinary threads, being control-only.
+        threads.push(
+            std::thread::Builder::new()
+                .name("pwsink-rtp".into())
+                .spawn({
+                    let peers = peers.clone();
+                    let shutdown = shutdown.clone();
+                    move || rtp_sender_loop(pcm, peers, shutdown, format, limits)
+                })
+                .map_err(|e| anyhow::anyhow!("failed to spawn the pw-sink RTP sender thread: {e}"))?,
+        );
 
         Ok(Self { status, shutdown, peers, ctrl_sock: ctrl_keep, data_sock: data_keep, threads, mdns })
     }
@@ -438,23 +532,109 @@ fn reader_loop(sock: UdpSocket, peers: Arc<PeerState>, shutdown: Arc<AtomicBool>
     }
 }
 
+/// Best-effort real-time scheduling for the RTP send thread.
+///
+/// It wakes every [`PACKET_MS`] to put packets on the wire, so it belongs on the same
+/// ladder as the rest of this path: the capture runs at FIFO 45, the capture→feed relay
+/// at 40, PipeWire's data loop at 83. Priority 50 matches the AP2 path's `rt-sender`,
+/// which does the same job.
+///
+/// Without `CAP_SYS_NICE` it logs and continues at normal priority, as the capture and
+/// relay do; the catch-up logic in [`rtp_sender_loop`] is what keeps that survivable
+/// rather than lossy.
+fn set_sender_realtime_priority() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: sched_setscheduler on the current thread (pid 0) with a valid,
+    // zero-initialised sched_param; no aliasing, no ownership transfer.
+    unsafe {
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = 50;
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) == 0 {
+            tracing::info!("pwsink RTP sender: real-time priority set (SCHED_FIFO, priority 50)");
+        } else {
+            tracing::warn!(
+                "pwsink RTP sender: could not set RT priority (need CAP_SYS_NICE); running at normal priority — \
+                 expect catch-up bursts, and dropouts if the host is loaded"
+            );
+        }
+    }
+}
+
+/// How many of the **oldest** queued samples to discard, or 0 while the backlog is
+/// within bounds. Fires only past `max_backlog_ms`
+/// ([`BacklogLimits::max_backlog_ms`]), and then cuts all the way back to
+/// [`TARGET_BACKLOG_MS`] rather than just under the ceiling — a stall that reached
+/// the ceiling will reach it again in a few packets otherwise, turning one click
+/// into a stutter.
+fn overflow_drop(queued_samples: usize, samples_per_ms: usize, max_backlog_ms: i64) -> usize {
+    let samples_per_ms = samples_per_ms.max(1);
+    if (queued_samples / samples_per_ms) as i64 <= max_backlog_ms {
+        return 0;
+    }
+    queued_samples.saturating_sub(TARGET_BACKLOG_MS.max(0) as usize * samples_per_ms)
+}
+
+/// The interval to wait before the next packet: the nominal packet time, trimmed
+/// proportionally to the backlog's distance from [`TARGET_BACKLOG_MS`].
+///
+/// Above target → shorter interval (drain faster); below → longer (let it refill).
+/// The trim is capped at [`PACE_TRIM_PPM_MAX`], and the result is never allowed to
+/// reach zero, which would spin this thread instead of pacing it.
+fn paced_dt_ns(nominal_dt_ns: i64, queued_samples: usize, samples_per_ms: usize) -> i64 {
+    let error_ms = (queued_samples / samples_per_ms.max(1)) as i64 - TARGET_BACKLOG_MS;
+    let ppm = (error_ms * PACE_TRIM_PPM_PER_MS).clamp(-PACE_TRIM_PPM_MAX, PACE_TRIM_PPM_MAX);
+    (nominal_dt_ns - (nominal_dt_ns * ppm) / 1_000_000).max(1)
+}
+
 /// RTP sender loop: drain native-endian S16 PCM, repacketize into ~2 ms L16
 /// (big-endian) RTP packets, and stream to every established data peer, paced
 /// to real time. Returns when `pcm` disconnects (audio stops) or on shutdown.
-fn rtp_sender_loop(pcm: Receiver<PcmChunk>, peers: Arc<PeerState>, shutdown: Arc<AtomicBool>, format: SessionFormat) {
+///
+/// # Rate-matching, not just pacing
+/// The PCM arrives on PipeWire's graph clock while the pace is kept against this
+/// thread's monotonic clock. Any difference between the two accumulates inside `buf` as
+/// delay — 100 ppm is ~360 ms per hour — so the pace is trimmed by up to ±0.5 % to hold
+/// the backlog at [`TARGET_BACKLOG_MS`], converging the send rate on the producer's.
+/// Sending marginally fast or slow is safe: the receiving `module-rtp-session` has an
+/// adaptive resampler and a jitter buffer for it, and that buffer is what the
+/// playout-delay knob sets.
+///
+/// [`BacklogLimits`] handles what the trim cannot: a scheduling gap is caught up within
+/// one wakeup, and a gap too large for the receiver's buffer is dropped rather than
+/// carried as permanent delay.
+fn rtp_sender_loop(
+    pcm: Receiver<PcmChunk>,
+    peers: Arc<PeerState>,
+    shutdown: Arc<AtomicBool>,
+    format: SessionFormat,
+    limits: BacklogLimits,
+) {
+    set_sender_realtime_priority();
     let send_sock = match UdpSocket::bind(("0.0.0.0", 0)) {
         Ok(s) => s,
         Err(_) => return,
     };
     let channels = format.channels.max(1) as usize;
-    let frames_per_pkt = (format.rate / 500).max(1) as usize; // ~2 ms
+    let frames_per_pkt = (format.rate / (1000 / PACKET_MS)).max(1) as usize; // PACKET_MS of audio
     let samples_per_pkt = frames_per_pkt * channels;
-    let dt = Duration::from_nanos((frames_per_pkt as u64 * 1_000_000_000) / format.rate.max(1) as u64);
+    let nominal_dt_ns = ((frames_per_pkt as u64 * 1_000_000_000) / format.rate.max(1) as u64) as i64;
+    // Samples per ms of audio, for reading `buf` as a duration.
+    let samples_per_ms = ((format.rate.max(1) as usize * channels) / 1000).max(1);
 
     let mut buf: Vec<i16> = Vec::with_capacity(samples_per_pkt * 4);
     let mut seq: u16 = 0;
     let mut ts: u32 = 0;
     let mut next = Instant::now();
+    // Trim bookkeeping: how much audio the hard backstop has thrown away, and when
+    // it was last reported (a stall produces a burst of trims, and one line per
+    // burst is the useful signal).
+    let mut trimmed_ms: u64 = 0;
+    let mut last_trim_log = Instant::now();
+    // Catch-up bookkeeping: extra packets emitted because a wakeup came late. Not a
+    // fault — this is the mechanism working — so it is reported at debug, and only
+    // as a rate, to tell "the host is late but we cope" apart from the drops above.
+    let mut caught_up: usize = 0;
+    let mut last_burst_log = Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -474,7 +654,10 @@ fn rtp_sender_loop(pcm: Receiver<PcmChunk>, peers: Arc<PeerState>, shutdown: Arc
             continue;
         }
 
-        // Accumulate at least one packet's worth of samples.
+        // Accumulate at least one packet's worth of samples. Anything the feed has
+        // ready is taken in the same pass (`try_recv`), so the backlog measured
+        // below is the true one rather than one chunk of it — the trim can only act
+        // on what it can see.
         while buf.len() < samples_per_pkt {
             match pcm.recv_timeout(Duration::from_millis(200)) {
                 Ok(chunk) => buf.extend_from_slice(&chunk),
@@ -486,35 +669,100 @@ fn rtp_sender_loop(pcm: Receiver<PcmChunk>, peers: Arc<PeerState>, shutdown: Arc
                 Err(RecvTimeoutError::Disconnected) => return, // sender closed: stop audio.
             }
         }
-
-        // 12-byte RTP header + L16 big-endian payload (byte-swap S16 samples).
-        let mut pkt = Vec::with_capacity(12 + samples_per_pkt * 2);
-        pkt.push(0x80); // V=2, no padding/extension/CSRC
-        pkt.push(RTP_PAYLOAD_TYPE & 0x7f); // marker=0, PT=127
-        pkt.extend_from_slice(&seq.to_be_bytes());
-        pkt.extend_from_slice(&ts.to_be_bytes());
-        pkt.extend_from_slice(&peers.ssrc.to_be_bytes());
-        for &s in &buf[..samples_per_pkt] {
-            pkt.extend_from_slice(&s.to_be_bytes());
+        while let Ok(chunk) = pcm.try_recv() {
+            buf.extend_from_slice(&chunk);
         }
-        buf.drain(..samples_per_pkt);
 
-        if let Ok(list) = peers.data_peers.lock() {
-            for addr in list.iter() {
-                let _ = send_sock.send_to(&pkt, *addr);
+        // Hard backstop: a stall left more audio queued than any playout buffer
+        // should carry, so drop the oldest down to target. `ts` is deliberately NOT
+        // advanced past the discarded samples — the receiver must see one unbroken
+        // 2 ms-per-packet timeline (that is how it keeps playing), and advancing it
+        // would announce a gap it would then re-buffer, which is the delay we are
+        // dropping audio to get rid of.
+        let drop_samples = overflow_drop(buf.len(), samples_per_ms, limits.max_backlog_ms);
+        if drop_samples > 0 {
+            buf.drain(..drop_samples);
+            trimmed_ms += (drop_samples / samples_per_ms) as u64;
+        }
+        if trimmed_ms > 0 && last_trim_log.elapsed() >= Duration::from_secs(5) {
+            tracing::warn!(
+                "pw-sink session '{}': dropped {} ms of audio to keep the send backlog bounded \
+                 (it had grown past {} ms). Something starved this thread — check host CPU; the \
+                 audio is otherwise intact and no latency was carried forward.",
+                peers.session_name,
+                trimmed_ms,
+                limits.max_backlog_ms,
+            );
+            trimmed_ms = 0;
+            last_trim_log = Instant::now();
+        }
+
+        // Emit every packet whose deadline has already passed, not just one.
+        //
+        // One packet per wakeup would couple throughput to the *wakeup rate*: a thread
+        // scheduled 200×/s could deliver only 200 × PACKET_MS of audio per second
+        // whatever it was fed, and the shortfall would surface as either growing delay
+        // or continuous dropping depending on the queue policy. Sending all due packets
+        // decouples the two — one wakeup puts 30 ms on the wire as easily as 5 — so a
+        // late wakeup costs a burst the receiver's jitter buffer absorbs.
+        // `limits.burst_packets` keeps that burst inside the buffer; past
+        // `limits.max_backlog_ms`, `overflow_drop` above is the answer.
+        let mut burst = 0usize;
+        while buf.len() >= samples_per_pkt {
+            // 12-byte RTP header + L16 big-endian payload (byte-swap S16 samples).
+            let mut pkt = Vec::with_capacity(12 + samples_per_pkt * 2);
+            pkt.push(0x80); // V=2, no padding/extension/CSRC
+            pkt.push(RTP_PAYLOAD_TYPE & 0x7f); // marker=0, PT=127
+            pkt.extend_from_slice(&seq.to_be_bytes());
+            pkt.extend_from_slice(&ts.to_be_bytes());
+            pkt.extend_from_slice(&peers.ssrc.to_be_bytes());
+            for &s in &buf[..samples_per_pkt] {
+                pkt.extend_from_slice(&s.to_be_bytes());
             }
+            buf.drain(..samples_per_pkt);
+
+            if let Ok(list) = peers.data_peers.lock() {
+                for addr in list.iter() {
+                    let _ = send_sock.send_to(&pkt, *addr);
+                }
+            }
+
+            seq = seq.wrapping_add(1);
+            ts = ts.wrapping_add(frames_per_pkt as u32);
+            burst += 1;
+
+            // Rate-matched pace: nominal packet interval, trimmed proportionally to
+            // how far the backlog sits from target. Above target we send slightly
+            // sooner, below it slightly later, so the send rate settles on whatever
+            // rate the capture actually produces and the backlog stops drifting.
+            next += Duration::from_nanos(paced_dt_ns(nominal_dt_ns, buf.len(), samples_per_ms) as u64);
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+                break; // caught up: back to the top for more PCM
+            }
+            if burst >= limits.burst_packets {
+                // Still behind. Break to re-read the feed rather than hog the CPU we
+                // just got back — but leave `next` in the past on purpose, so the
+                // next pass carries straight on catching up. Resetting it here would
+                // abandon the rest of the debt to sit in the queue as delay until
+                // `overflow_drop` eventually threw it away.
+                break;
+            }
+            // else: the next deadline is already in the past — send it now.
         }
-
-        seq = seq.wrapping_add(1);
-        ts = ts.wrapping_add(frames_per_pkt as u32);
-
-        // Real-time pace: advance the deadline, sleep the remainder.
-        next += dt;
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
-        } else {
-            next = now; // fell behind — don't accumulate a debt.
+        if burst > 1 {
+            caught_up += burst - 1;
+        }
+        if caught_up > 0 && last_burst_log.elapsed() >= Duration::from_secs(30) {
+            tracing::debug!(
+                "pw-sink session '{}': sent {} extra packet(s) in catch-up bursts over the last 30 s \
+                 (late wakeups, absorbed without dropping audio)",
+                peers.session_name,
+                caught_up,
+            );
+            caught_up = 0;
+            last_burst_log = Instant::now();
         }
     }
 }
@@ -522,7 +770,7 @@ fn rtp_sender_loop(pcm: Receiver<PcmChunk>, peers: Arc<PeerState>, shutdown: Arc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
+    use std::sync::mpsc::sync_channel;
 
     #[test]
     fn ok_packet_matches_wire_layout() {
@@ -558,6 +806,95 @@ mod tests {
         assert_ne!(gen_ssrc(), 0);
     }
 
+    /// 48 kHz stereo: 96 samples per ms of audio.
+    const SPMS: usize = 96;
+
+    /// The default 100 ms receiver buffer, for the limits under test.
+    const DEFAULT_LIMITS: BacklogLimits = BacklogLimits { burst_packets: 13, max_backlog_ms: 195 };
+
+    #[test]
+    fn the_backlog_is_left_alone_until_it_passes_the_ceiling() {
+        let ceiling = DEFAULT_LIMITS.max_backlog_ms;
+        assert_eq!(overflow_drop(0, SPMS, ceiling), 0);
+        assert_eq!(overflow_drop(TARGET_BACKLOG_MS as usize * SPMS, SPMS, ceiling), 0);
+        // Exactly at the ceiling is still fine — only *past* it is a problem.
+        assert_eq!(overflow_drop(ceiling as usize * SPMS, SPMS, ceiling), 0);
+    }
+
+    #[test]
+    fn overflow_cuts_all_the_way_back_to_target() {
+        // A 500 ms stall: everything above target goes, so what is left is target.
+        let queued = 500 * SPMS;
+        let dropped = overflow_drop(queued, SPMS, DEFAULT_LIMITS.max_backlog_ms);
+        assert_eq!((queued - dropped) / SPMS, TARGET_BACKLOG_MS as usize);
+        // …and that is nearly the whole stall, not a token slice of it.
+        assert_eq!(dropped / SPMS, 500 - TARGET_BACKLOG_MS as usize);
+    }
+
+    /// The invariant that the stutter came from: a burst the loop is *about* to send
+    /// must never be larger than the backlog it is allowed to hold, or the drop throws
+    /// away audio that was already on its way out.
+    #[test]
+    fn the_ceiling_always_leaves_room_for_a_full_burst() {
+        for playout_ms in [4u16, 10, 20, 50, 100, 250, 500, 2000] {
+            let l = BacklogLimits::for_playout(playout_ms);
+            let burst_ms = (l.burst_packets as i64) * i64::from(PACKET_MS);
+            assert!(
+                l.max_backlog_ms > burst_ms,
+                "playout {playout_ms}: ceiling {} must exceed one burst of {burst_ms} ms",
+                l.max_backlog_ms
+            );
+        }
+    }
+
+    /// A burst has to fit the far end's jitter buffer, so it scales with it — and
+    /// stays inside it, since a burst that exactly filled the buffer would leave the
+    /// receiver no headroom for the network.
+    #[test]
+    fn the_burst_scales_with_the_receivers_buffer_and_stays_inside_it() {
+        let small = BacklogLimits::for_playout(20);
+        let default = BacklogLimits::for_playout(100);
+        let large = BacklogLimits::for_playout(600);
+        assert!(small.burst_packets < default.burst_packets);
+        assert!(default.burst_packets < large.burst_packets);
+
+        // Only across what the API permits (>= PWSINK_JITTER_MIN_MS): below that the
+        // two-packet floor *is* the whole buffer, which is exactly why that minimum
+        // is three packet times.
+        for playout_ms in [crate::sync_settings::PWSINK_JITTER_MIN_MS, 20, 50, 100, 250] {
+            let l = BacklogLimits::for_playout(playout_ms);
+            let burst_ms = (l.burst_packets as i64) * i64::from(PACKET_MS);
+            assert!(burst_ms < i64::from(playout_ms), "playout {playout_ms}: burst {burst_ms} ms must fit inside it");
+        }
+        // Clamps hold at both extremes: never useless, never unbounded.
+        assert_eq!(BacklogLimits::for_playout(0).burst_packets, MIN_BURST_PACKETS);
+        assert_eq!(BacklogLimits::for_playout(u16::MAX).burst_packets, MAX_BURST_PACKETS);
+    }
+
+    #[test]
+    fn the_pace_speeds_up_when_the_backlog_grows_and_slows_when_it_shrinks() {
+        let nominal = 2_000_000; // 2 ms in ns
+        let at_target = paced_dt_ns(nominal, TARGET_BACKLOG_MS as usize * SPMS, SPMS);
+        assert_eq!(at_target, nominal, "no error, no trim");
+
+        let behind = paced_dt_ns(nominal, 40 * SPMS, SPMS);
+        assert!(behind < nominal, "a large backlog must send sooner, got {behind}");
+        let ahead = paced_dt_ns(nominal, 0, SPMS);
+        assert!(ahead > nominal, "an empty buffer must wait longer, got {ahead}");
+    }
+
+    /// The trim exists to cancel clock drift, not to resample: it must stay small
+    /// enough that the receiver's own resampler absorbs it without artefacts.
+    #[test]
+    fn the_pace_trim_is_capped_at_half_a_percent() {
+        let nominal = 2_000_000;
+        let saturated = paced_dt_ns(nominal, 10_000 * SPMS, SPMS); // absurd backlog
+        assert_eq!(saturated, nominal - (nominal * PACE_TRIM_PPM_MAX) / 1_000_000);
+        assert!(saturated >= nominal * 995 / 1000);
+        // Never zero, whatever the arithmetic does — a zero interval spins the CPU.
+        assert!(paced_dt_ns(1, 10_000 * SPMS, SPMS) >= 1);
+    }
+
     /// Spike: prove a stock `module-rtp-session` receiver establishes the
     /// AppleMIDI handshake against this sender and plays a clean 440 Hz tone.
     ///
@@ -575,10 +912,13 @@ mod tests {
             control_port: 5004,
             ifname: None,
             format,
+            playout_ms: 100, // the module's own default, as a real target would run
             advertise_daemon: None, // standalone: create our own mDNS daemon.
         };
 
-        let (tx, rx) = channel::<PcmChunk>();
+        // Bounded like the real feed (pwsink_server::PCM_FEED_DEPTH), so the spike
+        // exercises the same drop-instead-of-grow shape the daemon runs.
+        let (tx, rx) = sync_channel::<PcmChunk>(8);
         // Feed a 440 Hz stereo tone (amplitude ~8000) at real time until the
         // sender drops the receiver end (on teardown).
         let feeder = std::thread::spawn(move || {

@@ -512,10 +512,18 @@ pub(crate) struct OutputInfo {
     ip: Option<String>,
     port: Option<u16>,
     encryption: Option<String>,
-    /// Per-output latency override in ms; `None` = the type's built-in default
-    /// (1500 ms). For AirPlay-2 it's the render delay (ap2_server.rs). Not
-    /// meaningful for sendspin (uses a separate static-delay knob).
+    /// Per-output latency override in ms; `None` = the type's built-in default.
+    /// For AirPlay-2 it's the render delay (ap2_server.rs, default 0); for
+    /// pw-sink it's the receiver's playout delay / jitter buffer
+    /// (`sync_settings::DEFAULT_PWSINK_JITTER_MS`). Not meaningful for sendspin
+    /// (uses a separate static-delay knob).
     latency_ms: Option<u16>,
+    /// The latency this output is **actually running** in ms — the override
+    /// above, or the type's default when there is none. Sent so the UI can put a
+    /// slider at the running value without hardcoding the daemon's defaults (it
+    /// used to carry its own copy of the AP2 1500, which then went stale).
+    /// `None` for kinds with no such knob (sendspin).
+    latency_effective_ms: Option<u16>,
     /// AirPlay-2 only: PTP-lock health. `Some(true)` = the receiver is currently
     /// returning gPTP to our grandmaster (heard recently); `Some(false)` = registered
     /// but not exchanging gPTP; `None` = not an AP2 output (or PTP not started). NOTE:
@@ -739,6 +747,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             let us = crate::sendspin_server::required_send_ahead_us(
                 ss.group_lead_us(),
                 codec_active,
+                ss.opus_floor_ms(),
                 std::iter::once((min_buffer_ms, static_delay)),
             );
             (us / 1000) as u32
@@ -755,6 +764,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             port: addr.map(|a| a.port()),
             encryption: Some("None".to_string()),
             latency_ms: None,
+            // Sendspin's delay knob is the static delay, reported separately.
+            latency_effective_ms: None,
             ptp_locked: None, // sendspin has no PTP
             ptp_lock_age_s: None,
             ptp_supported: None,
@@ -859,6 +870,9 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             // AirPlay 2 always uses HomeKit transient pairing + encryption.
             encryption: Some("HomeKit".to_string()),
             latency_ms: ap2_latencies.get(&node_name).copied(),
+            latency_effective_ms: Some(
+                ap2_latencies.get(&node_name).copied().unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16),
+            ),
             ptp_locked,
             ptp_lock_age_s: ptp_age.map(|a| a.as_secs()),
             ptp_supported,
@@ -902,6 +916,10 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
     };
     let mut pwsink_names: BTreeSet<String> = agent_hosts.iter().map(|h| h.node_name.clone()).collect();
     pwsink_names.extend(remembered.iter().filter(|n| n.starts_with(PWSINK_DEV_PREFIX)).cloned());
+    // Per-output playout delay overrides (the remote receiver's jitter buffer) —
+    // the pw-sink entry in the same `latency_ms` field AP2 uses for its render
+    // delay, so one slider and one endpoint serve both kinds.
+    let pwsink_jitters = state.sync_settings.lock_recover().pwsink_jitters();
     for node_name in pwsink_names {
         let host = agent_hosts.iter().find(|h| h.node_name == node_name);
         let connected = host.map(|h| h.connected).unwrap_or(false);
@@ -922,7 +940,10 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             ip: None, // the agent dials us; we never need its address
             port: None,
             encryption: Some("None".to_string()), // L16 RTP is unencrypted
-            latency_ms: None,
+            latency_ms: pwsink_jitters.get(&node_name).copied(),
+            latency_effective_ms: Some(
+                pwsink_jitters.get(&node_name).copied().unwrap_or(crate::sync_settings::DEFAULT_PWSINK_JITTER_MS),
+            ),
             ptp_locked: None,
             ptp_lock_age_s: None,
             ptp_supported: None,
@@ -1968,6 +1989,15 @@ struct SyncSettingsInfo {
     /// Which device(s) set the floor, for a UI that has to explain why the value it
     /// shows is higher than the one the user typed.
     group_lead_floor_sources: Vec<LeadFloorSource>,
+    /// Decode+network headroom imposed on an **Opus** stream, in ms — the one term of
+    /// a group's lead that is neither the user's choice nor a device's request, and the
+    /// reason an Opus group cannot go below it however low the group lead is set.
+    /// Tunable because the shipped 250 ms is a guess (sendspin_codec.rs).
+    opus_floor_ms: u32,
+    /// The lowest value `opus_floor_ms` accepts: the Opus block size, since nothing can
+    /// be sent before a whole block exists. Sent so the UI can bound its own input
+    /// instead of duplicating the arithmetic.
+    opus_floor_min_ms: u32,
 }
 
 /// One device's contribution to the send-ahead floor.
@@ -1999,6 +2029,7 @@ fn lead_floor(state: &AppState) -> (u32, Vec<LeadFloorSource>) {
     let devices = state.sendspin_devices.lock_recover().clone();
     let ss = state.sync_settings.lock_recover();
     let delays = ss.sendspin_delays();
+    let opus_floor_ms = ss.opus_floor_ms();
     let mut sources: Vec<LeadFloorSource> = devices
         .iter()
         .filter(|(_, d)| d.present)
@@ -2007,7 +2038,7 @@ fn lead_floor(state: &AppState) -> (u32, Vec<LeadFloorSource>) {
             let codec = crate::sendspin_server::resolve_codec(ss.sendspin_codec(node_name), std::iter::once(&d.supported_codecs));
             // Same rule the audio path uses: what the device asked for, else our floor
             // for its codec — and the device's static delay on top either way.
-            let codec_minimum_ms = (crate::sendspin_codec::min_send_ahead_us(codec) / 1000) as u32;
+            let codec_minimum_ms = (crate::sendspin_codec::min_send_ahead_us(codec, opus_floor_ms) / 1000) as u32;
             let (base_ms, reason) = match d.min_buffer_ms {
                 Some(m) => (m, "reported"),
                 None => (codec_minimum_ms, "codec-minimum"),
@@ -2033,22 +2064,39 @@ fn lead_floor(state: &AppState) -> (u32, Vec<LeadFloorSource>) {
 #[derive(Deserialize)]
 struct SetSyncSettingsRequest {
     group_lead_ms: u32,
+    /// Optional so a UI can change the group lead alone (and so an older client keeps
+    /// working); absent leaves the Opus floor as it is.
+    #[serde(default)]
+    opus_floor_ms: Option<u32>,
 }
 
 async fn get_sync_settings(State(state): State<AppState>) -> Json<SyncSettingsInfo> {
-    let configured = state.sync_settings.lock_recover().group_lead_ms();
+    let (configured, opus_floor_ms) = {
+        let ss = state.sync_settings.lock_recover();
+        (ss.group_lead_ms(), ss.opus_floor_ms())
+    };
     let (floor, sources) = lead_floor(&state);
     Json(SyncSettingsInfo {
         group_lead_ms: configured,
         group_lead_floor_ms: floor,
         group_lead_effective_ms: configured.max(floor),
         group_lead_floor_sources: sources,
+        opus_floor_ms,
+        opus_floor_min_ms: crate::sendspin_codec::opus_floor_lower_bound_ms("opus"),
     })
 }
 
 async fn set_sync_settings(State(state): State<AppState>, Json(req): Json<SetSyncSettingsRequest>) -> (StatusCode, Json<OutputOpResponse>) {
-    if let Err(e) = state.sync_settings.lock_recover().set_group_lead_ms(req.group_lead_ms) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+    {
+        let mut ss = state.sync_settings.lock_recover();
+        if let Err(e) = ss.set_group_lead_ms(req.group_lead_ms) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+        }
+        if let Some(ms) = req.opus_floor_ms {
+            if let Err(e) = ss.set_opus_floor_ms(ms) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            }
+        }
     }
     // Nudge the reconciler; it re-reads the lead each tick and restarts group
     // servers so the new value takes effect promptly.
@@ -3146,26 +3194,40 @@ struct SetOutputLatencyRequest {
     latency_ms: Option<u16>,
 }
 
-/// Set an AirPlay-2 output's per-output **render delay** (ms), persisted per node
-/// name in sync_settings.rs. `latency_ms: null` clears the override (back to the
-/// sender's default). This is the only per-output latency knob now that the RAOP
-/// output path is gone.
+/// Set an output's per-output playout delay (ms), persisted per node name in
+/// sync_settings.rs. `latency_ms: null` clears the override, back to the kind's
+/// default. Two kinds have such a knob, and both land here because they are the
+/// same decision — "this speaker plays too early/late, shift it":
 ///
-/// There's no PipeWire module to reload: the value is applied **live** to the
-/// running stream (the PT=87 anchor offset the streamer reads per packet) with
-/// no reconnect, and reused as the initial delay on the next (membership/rate)
-/// reconnect. Only the upper bound is enforced (the receiver's negotiated
-/// buffer); a low delay is allowed through even though it risks dropouts, since
-/// finding that threshold is exactly what this knob is for.
+/// * **AirPlay 2** — the **render delay**: no PipeWire module to reload, the
+///   value is applied *live* to the running stream (the PT=87 anchor offset the
+///   streamer reads per packet), and reused as the initial delay on the next
+///   (membership/rate) reconnect.
+/// * **pw-sink** — the remote receiver's **jitter buffer** (`sess.latency.msec`),
+///   pushed to that host's agent, which reloads its `module-rtp-session` with the
+///   new value. That reload is a sub-second gap in *that* target's audio only —
+///   there is no other lever on this path, so the gap is the price of the knob.
+///
+/// Only bounds are enforced, and only where the transport demands them (the AP2
+/// receiver's negotiated buffer; the module's refusal to run a buffer below its
+/// ptime). A *low* value is otherwise allowed straight through even though it
+/// risks dropouts: finding that threshold by ear is exactly what this knob is for,
+/// and the UI marks the low end red rather than forbidding it.
 async fn set_output_latency(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetOutputLatencyRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
+    if node_name.starts_with(PWSINK_DEV_PREFIX) {
+        return set_pwsink_jitter(state, node_name, req.latency_ms).await;
+    }
     if !node_name.starts_with(AP2_DEV_PREFIX) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not an AirPlay-2 output") }),
+            Json(OutputOpResponse {
+                ok: false,
+                message: format!("'{node_name}' has no playout-delay knob (AirPlay 2 and PipeWire hosts do)"),
+            }),
         );
     }
     let clamped = req.latency_ms.map(|ms| ms.min(crate::ap2_server::AP2_RENDER_DELAY_MAX_MS));
@@ -3188,6 +3250,47 @@ async fn set_output_latency(
         None => "default".to_string(),
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' render delay to {latency_label} (live)") }))
+}
+
+/// The pw-sink half of [`set_output_latency`]: persist the playout delay and push
+/// it to the host's agent.
+///
+/// Clamped into [`PWSINK_JITTER_MIN_MS`]..=[`PWSINK_JITTER_MAX_MS`] and rounded up
+/// to a multiple of the sender's packet time ([`crate::applemidi_sender::PACKET_MS`]).
+/// Both bounds come from the receiving module rather than from taste: it refuses a
+/// buffer below `rtp.ptime` outright, and warns when the buffer is not an integer
+/// multiple of it.
+///
+/// A disconnected host is **not** an error: the value is stored and its agent
+/// picks it up in the `welcome` of its next connect, which is how every other
+/// setting for an absent device behaves here.
+async fn set_pwsink_jitter(state: AppState, node_name: String, requested: Option<u16>) -> (StatusCode, Json<OutputOpResponse>) {
+    use crate::sync_settings::{PWSINK_JITTER_MAX_MS, PWSINK_JITTER_MIN_MS};
+
+    let packet_ms = crate::applemidi_sender::PACKET_MS as u16;
+    let clamped = requested.map(|ms| {
+        let bounded = ms.clamp(PWSINK_JITTER_MIN_MS, PWSINK_JITTER_MAX_MS);
+        // Round *up* to a whole number of packets: rounding down could re-cross the
+        // minimum, and the module wants an exact multiple either way.
+        bounded.next_multiple_of(packet_ms).min(PWSINK_JITTER_MAX_MS)
+    });
+    if let Err(e) = state.sync_settings.lock_recover().set_pwsink_jitter(&node_name, clamped) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OutputOpResponse { ok: false, message: format!("failed to persist the playout delay: {e}") }),
+        );
+    }
+    let effective = state.sync_settings.lock_recover().pwsink_jitter_effective(&node_name);
+    // Push it now. `retune` reloads the receiver on that host — a brief gap in its
+    // audio, and only its own.
+    let pushed = state.agents.lock().await.retune(&node_name, effective);
+    let _ = state.changes.send(());
+    let label = match clamped {
+        Some(ms) => format!("{ms} ms"),
+        None => format!("default ({effective} ms)"),
+    };
+    let how = if pushed { "applied now" } else { "stored; the host is not connected, so it applies when it reconnects" };
+    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' playout delay to {label} ({how})") }))
 }
 
 #[derive(serde::Deserialize)]

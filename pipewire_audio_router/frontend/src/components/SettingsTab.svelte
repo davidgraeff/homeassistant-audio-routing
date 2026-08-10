@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import { run, toast } from '../lib/toast';
+  import DelaySlider from './DelaySlider.svelte';
   import type { LeadFloorSource } from '../lib/types';
 
   let loading = $state(true);
@@ -32,6 +33,10 @@
   let exposeOutputs = $state(false);
   let exposeBusy = $state(false);
 
+  /** The group lead the daemon has stored, as opposed to the field's pending edit —
+   *  the Opus slider has to send it back unchanged. */
+  let appliedGroupLeadMs = $state(0);
+
   async function refresh() {
     loading = true;
     try {
@@ -41,6 +46,9 @@
       sendspinDelayLive = s.sendspin_delay_live;
       exposeOutputs = s.expose_outputs_as_media_players;
       if (sync) {
+        opusFloorApplied = sync.opus_floor_ms;
+        opusFloorMinMs = sync.opus_floor_min_ms;
+        appliedGroupLeadMs = sync.group_lead_ms;
         groupLeadMs = sync.group_lead_ms;
         leadFloorMs = sync.group_lead_floor_ms;
         leadEffectiveMs = sync.group_lead_effective_ms;
@@ -67,6 +75,24 @@
       discovery = next;
     }
     discoveryBusy = false;
+  }
+
+  // The Opus decode/network headroom, on its own slider: it commits on release rather
+  // than on the group lead's Apply button, because each change restarts the sendspin
+  // group's stream and one commit per gesture is the right rate for that.
+  let opusFloorApplied = $state(250);
+  let opusFloorMinMs = $state(20);
+
+  async function saveOpusFloor(ms: number) {
+    // Sent alongside the *stored* group lead, since the endpoint takes both and the
+    // lead field may be holding an edit the user hasn't applied yet.
+    try {
+      const res = await api.setGroupLead(appliedGroupLeadMs, ms);
+      toast(res.ok === false ? 'error' : 'success', res.message ?? `Opus headroom set to ${ms} ms`);
+    } catch (e) {
+      toast('error', e instanceof Error ? e.message : String(e));
+    }
+    await refresh(); // the floor it produces, and which speaker sets it, may have moved
   }
 
   async function saveGroupLead() {
@@ -140,9 +166,10 @@
     <h2>Group sync</h2>
     <p class="card-sub">
       When several outputs are routed from the same source they form a sync group off one clock. The
-      <strong>group lead</strong> is how far ahead audio is scheduled — every member must buffer within it, so raise it to
-      keep the slowest member in step (an AirPlay receiver can buffer up to ~1500 ms), or lower it for a snappier start.
-      Fine-tune an individual speaker with its per-output value on the Outputs tab.
+      <strong>group lead</strong> is how far ahead audio is scheduled. It is <em>extra</em> headroom: the daemon already
+      raises every group to what its speakers ask for, so the default of 0 means "exactly what the hardware needs and no
+      more". Raise it only if a member still can't keep up. Fine-tune an individual speaker with its per-output value on
+      the Outputs tab.
     </p>
     <div class="row">
       <div class="field" style="flex:0 0 160px">
@@ -156,7 +183,7 @@
           max="5000"
           step="10"
           bind:value={groupLeadMs}
-          placeholder="250"
+          placeholder="0"
           title={leadFloorMs > 0
             ? `At least ${leadFloorMs} ms — that is what your speakers ask for with their current codec`
             : 'How far ahead audio is scheduled'}
@@ -166,6 +193,35 @@
         <button class="primary" onclick={saveGroupLead} disabled={syncBusy || groupLeadMs === ''}>Apply</button>
       </div>
     </div>
+    <!-- The same control as every other latency knob (DelaySlider): bounded by what
+         the daemon accepts rather than by taste, and committing on release only — each
+         commit restarts the sendspin group's stream, so one value per drag is exactly
+         the right rate. -->
+    <div class="row" style="margin-top:4px">
+      <DelaySlider
+        id="opus-floor"
+        label="Opus headroom"
+        applied={opusFloorApplied}
+        min={opusFloorMinMs}
+        max={300}
+        step={10}
+        riskyBelow={30}
+        highAbove={80}
+        risk="a block has under half its own length of slack to cross the network and be decoded — expect stutter"
+        good="Head start for the WiFi hop and the speaker's Opus decode"
+        origin={opusFloorApplied === 40 ? 'the measured default' : 'your value'}
+        deferredHint=" — on release"
+        oncommit={saveOpusFloor}
+      />
+    </div>
+    <p class="muted" style="font-size:0.8rem; margin:6px 0 0">
+      <strong>Opus headroom</strong> is the part of the lead that is neither your choice nor a speaker's request: an Opus
+      block has to arrive, be decoded on the speaker's MCU and be scheduled before its play time, so every Opus group
+      gets at least this much however low the group lead is set. The default of 40 ms — two Opus blocks — plays cleanly
+      on this hardware. Raise it if a congested band spends more of the budget on retransmissions; the floor is
+      {opusFloorMinMs} ms, one block, since nothing is sent before a whole block exists. PCM and FLAC ignore it, and a
+      speaker that states its own buffer requirement overrides it.
+    </p>
     {#if leadFloorMs > 0}
       <p class="muted" style="font-size:0.8rem; margin:6px 0 0">
         At least <strong>{leadFloorMs} ms</strong> is needed here, so that is the lowest value with any effect — the

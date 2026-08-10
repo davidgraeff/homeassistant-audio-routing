@@ -28,6 +28,7 @@
 //! renamed host keeps its pairing.
 
 use crate::config::{slugify, PWSINK_DEV_PREFIX};
+use crate::locks::LockRecover;
 use crate::pw_thread::ChangeNotifier;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -46,6 +47,25 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// How often the daemon pings a connected agent. The agent's own deadline is
 /// twice this, so one missed ping is tolerated but a dead daemon is not (§9.2).
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Depth of one agent's outgoing command queue.
+///
+/// **Bounded, and generously** — the two halves of the no-unbounded-queues rule
+/// pull in opposite directions here. This is a *control* lane (volume, mute, duck,
+/// welcome, release), where dropping a message is worse than queueing one: a lost
+/// unduck leaves a host quiet indefinitely. So it gets far more room than any
+/// plausible burst (a UI drag is tens of messages, coalesced by the socket write
+/// that follows) instead of the tight depth an audio queue wants — but a ceiling
+/// all the same, because a host that has stopped reading its socket must not grow
+/// this queue until the daemon dies. Reaching it means that connection is wedged,
+/// and [`Agents::send`] says so and reports failure rather than dropping quietly.
+const AGENT_MSG_DEPTH: usize = 64;
+
+/// Depth of the process-global announcement duck queue (`duck_output` → the relay
+/// task). Two messages per announcement per host, and the relay only blocks on the
+/// registry lock, so this is orders of magnitude more than a burst of overlapping
+/// announcements can produce.
+const REMOTE_DUCK_DEPTH: usize = 64;
 
 // ---- wire protocol (mirror of pwrouter-agent/src/proto.rs) ------------------
 
@@ -241,14 +261,14 @@ struct Pending {
     /// Short code shown in the UI *and* logged by the agent, so the person
     /// approving can tell two simultaneous requests apart.
     code: String,
-    tx: mpsc::UnboundedSender<DaemonMsg>,
+    tx: mpsc::Sender<DaemonMsg>,
 }
 
 /// A live, approved connection.
 struct Live {
     label: String,
     state: HostState,
-    tx: mpsc::UnboundedSender<DaemonMsg>,
+    tx: mpsc::Sender<DaemonMsg>,
 }
 
 pub struct Agents {
@@ -378,7 +398,7 @@ impl Agents {
     }
 
     /// Handles a `Hello`. `tx` is this connection's outgoing queue.
-    pub fn hello(&mut self, claim: HelloClaim<'_>, tx: mpsc::UnboundedSender<DaemonMsg>) -> HelloOutcome {
+    pub fn hello(&mut self, claim: HelloClaim<'_>, tx: mpsc::Sender<DaemonMsg>) -> HelloOutcome {
         let HelloClaim { protocol, machine_id, hostname, user, token, pair_code: offered_code } = claim;
         if protocol != PROTOCOL_VERSION {
             return HelloOutcome::Denied(format!("protocol {protocol} is not {PROTOCOL_VERSION}; update the agent or the add-on"));
@@ -430,7 +450,7 @@ impl Agents {
         // Replace any earlier request from the same identity (a restarted agent) so
         // the list can't fill up with stale rows.
         self.pending.retain(|p| p.identity != identity);
-        let _ = tx.send(DaemonMsg::PairPending { code: code.clone() });
+        let _ = tx.try_send(DaemonMsg::PairPending { code: code.clone() });
         tracing::info!("pairing requested by '{label}' ({identity}) as {node_name}, code {code}");
         self.pending.push(Pending { identity, label, node_name, code, tx });
         let _ = self.changes.send(());
@@ -460,7 +480,7 @@ impl Agents {
         self.paired.retain(|a| a.identity != identity);
         self.paired.push(agent.clone());
         save_store(&self.path, &self.paired);
-        let _ = pending.tx.send(DaemonMsg::Paired { token });
+        let _ = pending.tx.try_send(DaemonMsg::Paired { token });
         tracing::info!("approved agent '{}' as {}", agent.label, agent.node_name);
         let _ = self.changes.send(());
         Ok(agent)
@@ -494,8 +514,8 @@ impl Agents {
         self.paired.retain(|a| a.identity != identity);
         save_store(&self.path, &self.paired);
         if let Some(live) = self.live.remove(&agent.node_name) {
-            let _ = live.tx.send(DaemonMsg::Release);
-            let _ = live.tx.send(DaemonMsg::Denied { reason: "pairing was removed".into() });
+            let _ = live.tx.try_send(DaemonMsg::Release);
+            let _ = live.tx.try_send(DaemonMsg::Denied { reason: "pairing was removed".into() });
         }
         tracing::info!("unpaired '{}' ({})", agent.label, agent.node_name);
         let _ = self.changes.send(());
@@ -518,10 +538,29 @@ impl Agents {
         }
     }
 
+    /// Queues one command for a host. False = it did not get through (not
+    /// connected, or its queue is full).
+    ///
+    /// `try_send` rather than an awaited `send`: callers hold the registry lock,
+    /// so waiting on one wedged host's socket here would block every other host's
+    /// commands behind it. [`AGENT_MSG_DEPTH`] is deep enough that Full means the
+    /// connection is broken rather than busy, which is worth a log — the ping loop
+    /// hits the same wall a moment later and closes the socket.
     fn send(&self, node_name: &str, msg: DaemonMsg) -> bool {
-        match self.live.get(node_name) {
-            Some(live) => live.tx.send(msg).is_ok(),
-            None => false,
+        let Some(live) = self.live.get(node_name) else {
+            return false;
+        };
+        match live.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "agent '{}' ({node_name}) is not draining its control queue ({AGENT_MSG_DEPTH} deep); \
+                     dropping this command — the connection is wedged and will be dropped by the ping deadline",
+                    live.label
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -547,6 +586,19 @@ impl Agents {
     /// Tells a host to stop receiving (target unrouted or removed).
     pub fn release(&self, node_name: &str) -> bool {
         self.send(node_name, DaemonMsg::Release)
+    }
+
+    /// Re-issues this host's `welcome` with a new playout delay (`jitter_ms` =
+    /// the receiver's `sess.latency.msec`). False = not connected, in which case
+    /// the stored value applies at its next hello instead.
+    ///
+    /// A second `welcome` is deliberately how this is done rather than a new
+    /// message type: the agent already reloads its receiver on every `welcome`,
+    /// unconditionally and by design (a reconnect is exactly when a
+    /// resumed-from-suspend host needs rebuilding — plan §13.4), so retuning
+    /// needs no protocol change and works with agents already deployed.
+    pub fn retune(&self, node_name: &str, jitter_ms: u16) -> bool {
+        self.send(node_name, welcome(node_name, jitter_ms))
     }
 
     /// Last reported state of a host, if connected.
@@ -633,6 +685,21 @@ impl Agents {
     }
 }
 
+/// The `welcome` for a host: which session to receive and how much to buffer.
+///
+/// `jitter_ms` is always `Some` — the *daemon* decides what a target runs at, not
+/// the module's built-in default, so that the figure the UI shows and the figure
+/// the receiver uses are the same one. `ifname` stays `None`: the agent knows the
+/// route to us better than we do.
+fn welcome(node_name: &str, jitter_ms: u16) -> DaemonMsg {
+    DaemonMsg::Welcome {
+        session_name: crate::pwsink_server::session_name_for(node_name),
+        ifname: None,
+        jitter_ms: Some(u32::from(jitter_ms)),
+        keepalive_secs: PING_INTERVAL.as_secs(),
+    }
+}
+
 // ---- remote duck relay -----------------------------------------------------
 //
 // The announce coordinator (announce.rs) is synchronous and process-global, while
@@ -656,11 +723,11 @@ enum RemoteDuck {
     Unduck { node_name: String },
 }
 
-static DUCK_TX: std::sync::OnceLock<mpsc::UnboundedSender<RemoteDuck>> = std::sync::OnceLock::new();
+static DUCK_TX: std::sync::OnceLock<mpsc::Sender<RemoteDuck>> = std::sync::OnceLock::new();
 
 /// Starts the relay. Called once from `main.rs` inside the runtime.
 pub fn spawn_duck_relay(agents: SharedAgents) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<RemoteDuck>();
+    let (tx, mut rx) = mpsc::channel::<RemoteDuck>(REMOTE_DUCK_DEPTH);
     if DUCK_TX.set(tx).is_err() {
         return; // already running
     }
@@ -688,7 +755,11 @@ pub fn duck_output(node_name: &str, depth: f32) {
         return;
     }
     if let Some(tx) = DUCK_TX.get() {
-        let _ = tx.send(RemoteDuck::Duck { node_name: node_name.to_string(), depth });
+        // Full = the relay task is not draining; an announcement's duck is worth a
+        // line, not a wait (the announcement still plays, just without the duck).
+        if tx.try_send(RemoteDuck::Duck { node_name: node_name.to_string(), depth }).is_err() {
+            tracing::warn!("remote-duck queue full or closed; '{node_name}' will not duck for this announcement");
+        }
     }
 }
 
@@ -698,7 +769,9 @@ pub fn unduck_output(node_name: &str) {
         return;
     }
     if let Some(tx) = DUCK_TX.get() {
-        let _ = tx.send(RemoteDuck::Unduck { node_name: node_name.to_string() });
+        if tx.try_send(RemoteDuck::Unduck { node_name: node_name.to_string() }).is_err() {
+            tracing::warn!("remote-duck queue full or closed; '{node_name}' may stay ducked until its next announcement");
+        }
     }
 }
 
@@ -714,7 +787,7 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
         use futures_util::StreamExt as _;
         socket.split()
     };
-    let (tx, mut rx) = mpsc::unbounded_channel::<DaemonMsg>();
+    let (tx, mut rx) = mpsc::channel::<DaemonMsg>(AGENT_MSG_DEPTH);
 
     // Outgoing pump: everything the daemon sends a host goes through this queue,
     // so no caller ever awaits a socket write while holding the registry lock.
@@ -737,7 +810,7 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
         }
     };
     let Some(AgentMsg::Hello { protocol, agent_version, machine_id, hostname, user, token, pair_code }) = hello else {
-        let _ = tx.send(DaemonMsg::Denied { reason: "expected a hello message".into() });
+        let _ = tx.try_send(DaemonMsg::Denied { reason: "expected a hello message".into() });
         writer.abort();
         return;
     };
@@ -767,7 +840,7 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
         }
         HelloOutcome::Denied(reason) => {
             tracing::warn!("agent {hostname} ({user}) denied: {reason}");
-            let _ = tx.send(DaemonMsg::Denied { reason });
+            let _ = tx.try_send(DaemonMsg::Denied { reason });
             // Give the writer a moment to flush the denial before dropping it.
             tokio::time::sleep(Duration::from_millis(200)).await;
             writer.abort();
@@ -776,15 +849,11 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
     };
 
     tracing::info!("agent '{label}' connected as {node_name} (agent {agent_version})");
-    let _ = tx.send(DaemonMsg::Welcome {
-        session_name: crate::pwsink_server::session_name_for(&node_name),
-        // The agent picks its own interface (it knows the route to us) and its own
-        // jitter buffer default; both stay `None` unless a reason appears to
-        // override them from here.
-        ifname: None,
-        jitter_ms: None,
-        keepalive_secs: PING_INTERVAL.as_secs(),
-    });
+    // The playout delay this host is configured for (its override, else the
+    // module's own default made explicit — sync_settings.rs). Sent on every hello,
+    // so a host that reconnects after the value changed comes up on the new one.
+    let jitter_ms = state.sync_settings.lock_recover().pwsink_jitter_effective(&node_name);
+    let _ = tx.try_send(welcome(&node_name, jitter_ms));
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -816,7 +885,7 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
                 }
             }
             _ = ping.tick() => {
-                if tx.send(DaemonMsg::Ping).is_err() {
+                if tx.try_send(DaemonMsg::Ping).is_err() {
                     break;
                 }
             }
@@ -848,8 +917,8 @@ mod tests {
         Agents::new(path, tokio::sync::broadcast::channel(1).0)
     }
 
-    fn channel() -> mpsc::UnboundedSender<DaemonMsg> {
-        mpsc::unbounded_channel().0
+    fn channel() -> mpsc::Sender<DaemonMsg> {
+        mpsc::channel(AGENT_MSG_DEPTH).0
     }
 
     /// A well-formed hello from `machine`/`user`, tokenless unless given one. Tests
@@ -1047,7 +1116,7 @@ mod tests {
         agents.update_state(&paired.node_name, HostState { volume: Some(0.4), ..Default::default() });
         assert_eq!(agents.state(&paired.node_name), None);
 
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(AGENT_MSG_DEPTH);
         agents.hello(claim("m1", "dave", Some(&paired.token)), tx);
         agents.update_state(&paired.node_name, HostState { volume: Some(0.4), ..Default::default() });
         assert_eq!(agents.state(&paired.node_name).and_then(|s| s.volume), Some(0.4));

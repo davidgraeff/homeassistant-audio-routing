@@ -197,8 +197,13 @@ export const api = {
 
   // Group sync settings (daemon-wide presentation lead, ms).
   syncSettings: () => request<SyncSettingsInfo>('GET', 'api/sync/settings'),
-  setGroupLead: (groupLeadMs: number) =>
-    request<OpResponse>('PUT', 'api/sync/settings', { group_lead_ms: groupLeadMs }),
+  /** `opusFloorMs` is optional: the group lead alone is the common case, and the
+   *  daemon leaves the floor untouched when it is absent. */
+  setGroupLead: (groupLeadMs: number, opusFloorMs?: number) =>
+    request<OpResponse>('PUT', 'api/sync/settings', {
+      group_lead_ms: groupLeadMs,
+      ...(opusFloorMs == null ? {} : { opus_floor_ms: opusFloorMs }),
+    }),
 
   // General app settings (announce duck default, discovery on/off). PUT is a
   // partial update — send only the fields you're changing.

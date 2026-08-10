@@ -103,7 +103,7 @@ struct AgentTray {
     notifier: Option<Notifier>,
     handle: TrayHandle,
     /// Where a menu choice goes. `None` in tests and in the spike.
-    requests: Option<tokio::sync::mpsc::UnboundedSender<Request>>,
+    requests: Option<tokio::sync::mpsc::Sender<Request>>,
 }
 
 impl AgentTray {
@@ -324,7 +324,7 @@ impl ksni::Tray for AgentTray {
                             // was actually stored right after.
                             this.target = target.clone();
                             if let Some(requests) = &requests {
-                                let _ = requests.send(Request::SetTarget(target));
+                                let _ = requests.try_send(Request::SetTarget(target));
                             }
                         }),
                         options,
@@ -595,7 +595,7 @@ impl Desktop {
         offered_code: Option<String>,
         paired: bool,
         target: Option<String>,
-        requests: Option<tokio::sync::mpsc::UnboundedSender<Request>>,
+        requests: Option<tokio::sync::mpsc::Sender<Request>>,
     ) -> Self {
         let notifier = Notifier::connect().await;
         let slot: TrayHandle = Arc::new(OnceLock::new());

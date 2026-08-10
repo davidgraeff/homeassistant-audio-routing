@@ -501,10 +501,16 @@ fn record_timing_request(
 /// `members` yields `(min_buffer_ms, static_delay_ms)` per member. The configured lead
 /// stays a floor of its own, so a user who wants more headroom than the hardware asks
 /// for still gets it.
-pub fn required_send_ahead_us(configured_us: i64, codec: &str, members: impl IntoIterator<Item = (Option<u32>, u16)>) -> i64 {
+pub fn required_send_ahead_us(
+    configured_us: i64,
+    codec: &str,
+    opus_floor_ms: u32,
+    members: impl IntoIterator<Item = (Option<u32>, u16)>,
+) -> i64 {
     // A device that reports nothing still needs enough lead to decode a compressed
     // stream, so the codec's own floor applies to it — see `min_send_ahead_us`.
-    let codec_floor = crate::sendspin_codec::min_send_ahead_us(codec);
+    // `opus_floor_ms` is the user's setting for that headroom (sync_settings.rs).
+    let codec_floor = crate::sendspin_codec::min_send_ahead_us(codec, opus_floor_ms);
     members
         .into_iter()
         .map(|(min_buffer_ms, static_delay_ms)| match min_buffer_ms {
@@ -1334,36 +1340,59 @@ mod tests {
         assert!(!report_format_support(node, &hello, "opus", &devices));
     }
 
-    #[test]
-    fn send_ahead_is_raised_to_the_largest_member_requirement() {
-        let configured = 250_000; // 250 ms, the default group lead
-                                  // Nothing reported yet (no device has connected) → the configured lead stands.
-        assert_eq!(required_send_ahead_us(configured, "pcm", [(None, 0)]), 250_000);
-        // A member asking for less than the configured lead never lowers it — the user
-        // may want more headroom than the hardware demands.
-        assert_eq!(required_send_ahead_us(configured, "pcm", [(Some(100), 0)]), 250_000);
-        // A member asking for more raises it, and the spec has the server add that
-        // member's static delay on top (players exclude it from their own figure).
-        assert_eq!(required_send_ahead_us(configured, "pcm", [(Some(400), 0)]), 400_000);
-        assert_eq!(required_send_ahead_us(configured, "pcm", [(Some(400), 60)]), 460_000);
-        // A group takes the MAXIMUM across members, so the neediest one is covered.
-        assert_eq!(required_send_ahead_us(configured, "pcm", [(Some(300), 0), (Some(500), 20), (None, 0)]), 520_000);
-    }
+    /// The shipped Opus floor, so these cases read as "with the default headroom".
+    const DEFAULT_OPUS_FLOOR: u32 = crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS;
 
     #[test]
+    fn send_ahead_is_raised_to_the_largest_member_requirement() {
+        // A user-configured 250 ms of headroom, well above any per-member floor.
+        let configured = 250_000;
+        // Nothing reported yet (no device has connected) → the configured lead stands.
+        assert_eq!(required_send_ahead_us(configured, "pcm", DEFAULT_OPUS_FLOOR, [(None, 0)]), 250_000);
+        // A member asking for less than the configured lead never lowers it — the user
+        // may want more headroom than the hardware demands.
+        assert_eq!(required_send_ahead_us(configured, "pcm", DEFAULT_OPUS_FLOOR, [(Some(100), 0)]), 250_000);
+        // A member asking for more raises it, and the spec has the server add that
+        // member's static delay on top (players exclude it from their own figure).
+        assert_eq!(required_send_ahead_us(configured, "pcm", DEFAULT_OPUS_FLOOR, [(Some(400), 0)]), 400_000);
+        assert_eq!(required_send_ahead_us(configured, "pcm", DEFAULT_OPUS_FLOOR, [(Some(400), 60)]), 460_000);
+        // A group takes the MAXIMUM across members, so the neediest one is covered.
+        assert_eq!(required_send_ahead_us(configured, "pcm", DEFAULT_OPUS_FLOOR, [(Some(300), 0), (Some(500), 20), (None, 0)]), 520_000);
+    }
+
+    /// The Opus floor is the user's to lower — it is headroom for decode and WiFi on
+    /// hardware we cannot measure from here, not a protocol constant. A device that
+    /// reports its own requirement still overrides it in both directions.
+    #[test]
+    fn the_opus_floor_is_configurable_and_a_reported_value_still_wins() {
+        let configured = 0; // "add no headroom of your own"
+        assert_eq!(required_send_ahead_us(configured, "opus", 250, [(None, 0)]), 250_000);
+        assert_eq!(required_send_ahead_us(configured, "opus", 60, [(None, 0)]), 60_000, "a lowered floor is used as-is");
+        assert_eq!(required_send_ahead_us(configured, "opus", 20, [(None, 0)]), 20_000);
+        // Static delay still rides on top of whatever the floor is.
+        assert_eq!(required_send_ahead_us(configured, "opus", 60, [(None, 40)]), 100_000);
+        // PCM and FLAC never consult it.
+        assert_eq!(required_send_ahead_us(configured, "pcm", 250, [(None, 0)]), 0);
+        assert_eq!(required_send_ahead_us(configured, "flac", 250, [(None, 0)]), 0);
+        // A reporting device bypasses the floor entirely, even a lowered one.
+        assert_eq!(required_send_ahead_us(configured, "opus", 250, [(Some(80), 0)]), 80_000);
+    }
+
+    /// The real-hardware case: these speakers report no `min_buffer_ms`, so the codec
+    /// floor is what covers their decode.
+    #[test]
     fn a_silent_device_still_gets_its_codecs_floor() {
-        // The real-hardware case: these speakers report NO min_buffer_ms, so before this
-        // a user could run Opus at a 100 ms lead — which stutters.
-        let configured = 100_000;
-        assert_eq!(required_send_ahead_us(configured, "pcm", [(None, 0)]), 100_000, "PCM imposes nothing");
-        assert_eq!(required_send_ahead_us(configured, "flac", [(None, 0)]), 100_000, "FLAC is proven at this lead");
-        assert_eq!(required_send_ahead_us(configured, "opus", [(None, 0)]), 250_000, "Opus needs decode headroom");
+        let configured = 10_000; // below every floor, so the floors are what show
+        let floor = DEFAULT_OPUS_FLOOR; // 40 ms
+        assert_eq!(required_send_ahead_us(configured, "pcm", floor, [(None, 0)]), configured, "PCM imposes nothing");
+        assert_eq!(required_send_ahead_us(configured, "flac", floor, [(None, 0)]), configured, "FLAC imposes nothing");
+        assert_eq!(required_send_ahead_us(configured, "opus", floor, [(None, 0)]), 40_000, "Opus gets its decode headroom");
         // The device's own static delay still adds on top, since it plays that early.
-        assert_eq!(required_send_ahead_us(configured, "opus", [(None, 40)]), 290_000);
+        assert_eq!(required_send_ahead_us(configured, "opus", floor, [(None, 40)]), 80_000);
         // A device that DOES report wins over the codec floor, in both directions —
         // it knows its hardware better than our table does.
-        assert_eq!(required_send_ahead_us(configured, "opus", [(Some(400), 0)]), 400_000);
-        assert_eq!(required_send_ahead_us(configured, "opus", [(Some(120), 0)]), 120_000.max(configured));
+        assert_eq!(required_send_ahead_us(configured, "opus", floor, [(Some(400), 0)]), 400_000);
+        assert_eq!(required_send_ahead_us(configured, "opus", floor, [(Some(10), 0)]), configured, "…even below the floor");
     }
 
     #[test]

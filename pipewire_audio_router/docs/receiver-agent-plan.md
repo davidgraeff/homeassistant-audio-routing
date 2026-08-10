@@ -159,7 +159,14 @@ commands it knows.
 ### 5.1 Parameters, never a module-args string
 
 `welcome` carries *parameters* (session name, optional interface, optional jitter
-buffer); the agent builds the `rtp-session` argument string itself. Passing the
+buffer); the agent builds the `rtp-session` argument string itself.
+
+The jitter buffer is now **always sent** and is the host's per-output playout-delay
+setting (`sync_settings::pwsink_jitter`, default = the module's own 100 ms): the
+daemon decides what a target runs at, so the figure the UI shows and the figure the
+receiver uses cannot disagree. Changing it re-sends `welcome` — the agent reloads
+its receiver on every one by design (§13.4), so retuning needed no new message type
+and works against already-deployed agents. Passing the
 args through would hand whatever is on the other end of the socket the ability to
 reconfigure the host's audio arbitrarily — which is precisely the property that
 disqualified the PulseAudio TCP route in §1.1, so it must not reappear here.

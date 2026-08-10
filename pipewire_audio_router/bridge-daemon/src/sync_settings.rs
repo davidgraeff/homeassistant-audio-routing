@@ -20,7 +20,15 @@
 //!   anchor shift; ap2_server.rs), keyed by AP2 node name. It's retuned LIVE on
 //!   the running stream (ap2_control → SetRenderDelay), and used as the initial
 //!   delay on the next (membership/rate) reconnect. `None` = the sender's
-//!   built-in default (1500 ms).
+//!   built-in default ([`crate::ap2_server::AP2_RENDER_DELAY_MS`], 0 ms).
+//! - **`pwsink_jitter`** — the pw-sink per-output playout delay in ms, keyed by
+//!   `pwsink-dev-*` node name. It is the receiver's jitter buffer
+//!   (`sess.latency.msec` on the remote `module-rtp-session`), pushed to that
+//!   host's agent in `welcome` and re-pushed live when it changes. `None` = the
+//!   module's own default ([`DEFAULT_PWSINK_JITTER_MS`]). This is the pw-sink
+//!   counterpart of the two knobs above: it is the *only* lever on that path's
+//!   delay, so it both delays a target that runs early and — dialled down —
+//!   trims the 100 ms the module would otherwise take.
 //!
 //! Mirrors the other `/data` stores: no `options.json` seeding, the file is
 //! authoritative and created on first mutation; a missing file means defaults.
@@ -31,13 +39,61 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Default sendspin group lead — the sendspin protocol's own default
-/// ([`sendspin::server::group::DEFAULT_SEND_AHEAD_US`] = 250 000 µs).
-pub const DEFAULT_GROUP_LEAD_MS: u32 = 250;
+/// Default sendspin group lead: **0** — no headroom beyond what the hardware asks for.
+///
+/// This is a floor, not the value used: `required_send_ahead_us` raises every group's
+/// send-ahead to the largest per-member requirement (a device's reported
+/// `min_buffer_ms` + its static delay, or the wire codec's decode floor). 0 therefore
+/// means "exactly what the members need". Raise it to buy headroom they did not ask
+/// for.
+pub const DEFAULT_GROUP_LEAD_MS: u32 = 0;
 
 fn default_group_lead_ms() -> u32 {
     DEFAULT_GROUP_LEAD_MS
 }
+
+/// The Opus send-ahead floor, in ms: the decode+network headroom every Opus stream
+/// gets whether or not a device asked for it
+/// ([`crate::sendspin_codec::min_send_ahead_us`], default
+/// [`crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS`]).
+///
+/// Configurable because the network half of that budget belongs to the site: it is the
+/// one term of a sendspin group's latency that is neither the user's choice nor a
+/// device's request. Clamped at the bottom to the codec's block size
+/// ([`crate::sendspin_codec::opus_floor_lower_bound_ms`]) — nothing can be sent before
+/// a whole block exists.
+pub fn default_opus_floor_ms() -> u32 {
+    crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS
+}
+
+/// The pw-sink playout delay used when an output has no stored override: the
+/// value `libpipewire-module-rtp-session` picks for `sess.latency.msec` when the
+/// argument is omitted, which is what every pw-sink target ran on before the knob
+/// existed. Named here so the UI and the routing-graph estimate can quote the
+/// figure a target is actually running instead of showing "unknown".
+///
+/// This path crosses a network to a host whose scheduling the add-on does not control,
+/// so the default is the receiving module's own figure. Dial it down per output for a
+/// snappier LAN, or up to align against a slower backend.
+pub const DEFAULT_PWSINK_JITTER_MS: u16 = 100;
+
+/// Largest pw-sink playout delay the API accepts, matching the AP2 render-delay
+/// ceiling ([`crate::ap2_server::AP2_RENDER_DELAY_MAX_MS`]) so the two knobs span
+/// the same range and a group can be aligned across both kinds.
+pub const PWSINK_JITTER_MAX_MS: u16 = 2000;
+
+/// Smallest pw-sink playout delay the API accepts: **three packet times**
+/// ([`crate::applemidi_sender::PACKET_MS`] = 5 ms ⇒ 15 ms).
+///
+/// Two independent reasons, both from the transport rather than from taste:
+/// * the receiving module refuses a `sess.latency.msec` below `rtp.ptime`
+///   outright ("cannot be lower than"), and warns unless it is an integer
+///   multiple of it;
+/// * the sender sizes its catch-up burst at two thirds of this buffer
+///   ([`crate::applemidi_sender::BacklogLimits`]), and a burst has to fit
+///   *inside* the buffer with headroom to spare — at two packet times it would be
+///   the entire buffer, so the smallest useful buffer is three.
+pub const PWSINK_JITTER_MIN_MS: u16 = 3 * crate::applemidi_sender::PACKET_MS as u16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SyncConfig {
@@ -46,9 +102,17 @@ struct SyncConfig {
     /// Per-sendspin-device static delay (ms), keyed by virtual device node name.
     #[serde(default)]
     sendspin_delays: BTreeMap<String, u16>,
+    /// Decode+network headroom imposed on every Opus sendspin stream, in ms.
+    #[serde(default = "default_opus_floor_ms")]
+    opus_floor_ms: u32,
     /// Per-AP2-output render delay (ms), keyed by AP2 node name.
     #[serde(default)]
     ap2_latency: BTreeMap<String, u16>,
+    /// Per-pw-sink-output playout delay (ms) = the remote receiver's
+    /// `sess.latency.msec`, keyed by `pwsink-dev-*` node name. Absent ⇒
+    /// [`DEFAULT_PWSINK_JITTER_MS`].
+    #[serde(default)]
+    pwsink_jitter: BTreeMap<String, u16>,
     /// Per-AP2-output wire sample-rate MODE (user choice), keyed by AP2 node name.
     /// Absent ⇒ `Auto`. `Auto` negotiates 48 kHz and falls back to 44.1 kHz;
     /// `Fixed44100` forces the AirPlay-standard 44.1 kHz (for receivers that
@@ -148,8 +212,10 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             group_lead_ms: DEFAULT_GROUP_LEAD_MS,
+            opus_floor_ms: default_opus_floor_ms(),
             sendspin_delays: BTreeMap::new(),
             ap2_latency: BTreeMap::new(),
+            pwsink_jitter: BTreeMap::new(),
             ap2_rate_mode: BTreeMap::new(),
             sendspin_codec: BTreeMap::new(),
             ap2_rate_cap: BTreeMap::new(),
@@ -190,6 +256,19 @@ impl SyncSettings {
         self.persist()
     }
 
+    /// The Opus send-ahead floor in ms (see [`default_opus_floor_ms`]).
+    pub fn opus_floor_ms(&self) -> u32 {
+        self.config.opus_floor_ms
+    }
+
+    /// Set the Opus floor, clamped to the codec's block size at the bottom (below
+    /// which it cannot mean anything) and to the group-lead ceiling at the top.
+    pub fn set_opus_floor_ms(&mut self, ms: u32) -> anyhow::Result<()> {
+        let lower = crate::sendspin_codec::opus_floor_lower_bound_ms("opus");
+        self.config.opus_floor_ms = ms.clamp(lower, 5000);
+        self.persist()
+    }
+
     /// Desired per-device static delays (ms) by node name.
     pub fn sendspin_delays(&self) -> BTreeMap<String, u16> {
         self.config.sendspin_delays.clone()
@@ -224,6 +303,42 @@ impl SyncSettings {
             }
             Some(ms) => {
                 self.config.ap2_latency.insert(node_name.to_string(), ms);
+            }
+        }
+        self.persist()
+    }
+
+    // ---- pw-sink playout delay (receiver jitter buffer) -------------------
+
+    /// The stored playout delay (ms) for a pw-sink output, if any (`None` = the
+    /// module's own default, [`DEFAULT_PWSINK_JITTER_MS`]).
+    pub fn pwsink_jitter(&self, node_name: &str) -> Option<u16> {
+        self.config.pwsink_jitter.get(node_name).copied()
+    }
+
+    /// The delay a pw-sink output actually runs at: its override or the default.
+    /// This is what goes on the wire to the agent, so `welcome` never carries
+    /// "unset" — the daemon, not the module, decides what a target runs at.
+    pub fn pwsink_jitter_effective(&self, node_name: &str) -> u16 {
+        self.pwsink_jitter(node_name).unwrap_or(DEFAULT_PWSINK_JITTER_MS)
+    }
+
+    /// Every stored pw-sink playout delay by node name (for the routing-graph
+    /// latency estimate and the API listing).
+    pub fn pwsink_jitters(&self) -> BTreeMap<String, u16> {
+        self.config.pwsink_jitter.clone()
+    }
+
+    /// Set (or clear, when `ms` is `None`) a pw-sink output's playout delay and
+    /// persist. Callers clamp to
+    /// [`PWSINK_JITTER_MIN_MS`]..=[`PWSINK_JITTER_MAX_MS`] first (`api.rs`).
+    pub fn set_pwsink_jitter(&mut self, node_name: &str, ms: Option<u16>) -> anyhow::Result<()> {
+        match ms {
+            None => {
+                self.config.pwsink_jitter.remove(node_name);
+            }
+            Some(ms) => {
+                self.config.pwsink_jitter.insert(node_name.to_string(), ms);
             }
         }
         self.persist()
@@ -336,15 +451,42 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut s = SyncSettings::load(&path).unwrap();
         assert_eq!(s.group_lead_ms(), DEFAULT_GROUP_LEAD_MS);
-        assert_eq!(s.group_lead_us(), 250_000);
+        // The shipped default adds no headroom of its own; the per-member floor
+        // (required_send_ahead_us) is what raises a real group's send-ahead.
+        assert_eq!(s.group_lead_us(), 0);
         s.set_group_lead_ms(600).unwrap();
         s.set_sendspin_delay("sendspin-dev-kitchen", 40).unwrap();
         s.set_ap2_latency("ap2-dev-dusche", Some(800)).unwrap();
+        s.set_pwsink_jitter("pwsink-dev-shop_david", Some(40)).unwrap();
 
         let reloaded = SyncSettings::load(&path).unwrap();
         assert_eq!(reloaded.group_lead_ms(), 600);
         assert_eq!(reloaded.sendspin_delays().get("sendspin-dev-kitchen").copied(), Some(40));
         assert_eq!(reloaded.ap2_latency("ap2-dev-dusche"), Some(800));
+        assert_eq!(reloaded.pwsink_jitter("pwsink-dev-shop_david"), Some(40));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An output with no override must still report a concrete figure — the
+    /// module default — because that is what its receiver is running, and both
+    /// the `welcome` message and the routing graph quote it as such.
+    #[test]
+    fn pwsink_jitter_falls_back_to_the_module_default_and_clears() {
+        let path = temp_path("pwsink-jitter");
+        let _ = std::fs::remove_file(&path);
+        let mut s = SyncSettings::load(&path).unwrap();
+        assert_eq!(s.pwsink_jitter("pwsink-dev-shop_david"), None);
+        assert_eq!(s.pwsink_jitter_effective("pwsink-dev-shop_david"), DEFAULT_PWSINK_JITTER_MS);
+
+        s.set_pwsink_jitter("pwsink-dev-shop_david", Some(20)).unwrap();
+        assert_eq!(s.pwsink_jitter_effective("pwsink-dev-shop_david"), 20);
+        assert_eq!(s.pwsink_jitters().len(), 1);
+
+        // Clearing is `None`, not 0: 0 is below the module's ptime floor, so it
+        // could never be a stored value the way a 0 static delay can.
+        s.set_pwsink_jitter("pwsink-dev-shop_david", None).unwrap();
+        assert!(s.pwsink_jitters().is_empty());
+        assert_eq!(s.pwsink_jitter_effective("pwsink-dev-shop_david"), DEFAULT_PWSINK_JITTER_MS);
         let _ = std::fs::remove_file(&path);
     }
 

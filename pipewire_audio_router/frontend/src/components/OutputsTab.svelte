@@ -8,6 +8,7 @@
   import GroupTitle from './GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
+  import DelaySlider from './DelaySlider.svelte';
   import VolumeControl from './VolumeControl.svelte';
 
   // Two listings, because discovery only *offers* a device: `outputs` is what
@@ -65,49 +66,160 @@
     });
   });
 
-  // Per-device sync tuning: static delays (sendspin) and per-output render delay
-  // (AirPlay 2). The daemon-wide group lead lives on the Settings tab.
-  // Per-row editable sync value (ms): AP2 render delay or sendspin static delay.
-  let edit = $state<Record<string, number | ''>>({});
 
-  // AP2 render-delay slider. The daemon's default when no override is stored
-  // (ap2_server.rs AP2_RENDER_DELAY_MS) — the slider has to show *something*, so
-  // an output with no override sits at the value it is actually running.
-  const AP2_DELAY_DEFAULT = 1500;
-  const AP2_DELAY_MAX = 2000;
-  // Below this the receiver has too little buffer to absorb send-side jitter, so
-  // packets can arrive past their play deadline and get dropped — audible as
-  // dropouts or total silence. Allowed (finding your hardware's floor is the
-  // point of the knob), but flagged.
-  const AP2_DELAY_RISKY_BELOW = 200;
-  // Above this it plays fine but you're buying latency you probably don't need.
-  const AP2_DELAY_HIGH_ABOVE = 800;
-
-  type DelayZone = 'risky' | 'good' | 'high';
-  function delayZone(ms: number): DelayZone {
-    if (ms < AP2_DELAY_RISKY_BELOW) return 'risky';
-    if (ms > AP2_DELAY_HIGH_ABOVE) return 'high';
-    return 'good';
-  }
-  function delayNote(o: OutputInfo, ms: number): string {
-    const origin = o.latency_ms == null ? `default ${AP2_DELAY_DEFAULT} ms` : 'your override';
-    if (ms < AP2_DELAY_RISKY_BELOW)
-      return `Below ${AP2_DELAY_RISKY_BELOW} ms the receiver may drop late packets — expect dropouts or silence on a jittery sender (${origin}).`;
-    if (ms > AP2_DELAY_HIGH_ABOVE)
-      return `Safe, but ${ms} ms of buffering is added latency you may not need (${origin}).`;
-    return `In the range that buffers enough without adding needless latency (${origin}).`;
-  }
-  // Slider position as a number even before anything is typed/stored.
-  const delayOf = (o: OutputInfo) => {
-    const v = edit[o.node_name];
-    return typeof v === 'number' ? v : (o.latency_ms ?? AP2_DELAY_DEFAULT);
+  // One delay slider, three kinds. AirPlay 2 shifts its render delay, a PipeWire host
+  // sets its receiver's jitter buffer, a sendspin speaker takes a static trim against
+  // its group — different mechanisms, one gesture: "this speaker is out of step, move it
+  // in time". The scales differ by an order of magnitude, so each kind brings its own
+  // spec.
+  //
+  // Defaults are not hardcoded here: the daemon reports what each output is actually
+  // running, as `latency_effective_ms`.
+  type DelaySpec = {
+    min: number;
+    max: number;
+    step: number;
+    /** Below this the low end is dangerous. **0 disables the risky zone** — for a
+     *  knob whose zero simply means "no adjustment", low is not a risk at all. */
+    riskyBelow: number;
+    highAbove: number;
+    label: string;
+    /** Sentence for the low end; only used when `riskyBelow > 0`. */
+    risk: string;
+    /** Sentence for the healthy middle, in this knob's own terms. */
+    good: string;
+    /** Push intermediate values *while* dragging, so the knob can be found by ear?
+     *  Only where applying one is cheap and gapless. */
+    liveDuringDrag: boolean;
+    /** Is there an *override* to drop (→ a "Default" button)? False for a knob whose
+     *  neutral position is 0, which the slider can already reach. */
+    clearable: boolean;
+    /** Which endpoint holds this value: the shared per-output latency, or sendspin's
+     *  own static-delay store. */
+    store: 'latency' | 'sendspin';
   };
+  const AP2_DELAY: DelaySpec = {
+    min: 0,
+    max: 2000,
+    step: 10,
+    // The daemon shifts the next PT=87 anchor on the running stream: no reconnect and
+    // nothing to reload, so hearing the drag is worth the throttled round trips.
+    liveDuringDrag: true,
+    // 0 is the normal position — the receivers render from the anchors as they arrive —
+    // so the low end carries no warning. A receiver that goes *silent* needs more delay
+    // rather than less, which its fault badge reports; it is not a slider zone.
+    riskyBelow: 0,
+    // Above this it plays fine, but the delay is latency the whole system pays for.
+    highAbove: 200,
+    label: 'Render delay',
+    risk: '',
+    good: 'Shifts when this receiver renders, relative to the rest of its group',
+    clearable: true,
+    store: 'latency',
+  };
+  const PWSINK_DELAY: DelaySpec = {
+    // Three packet times (sync_settings::PWSINK_JITTER_MIN_MS): the receiving module
+    // refuses a buffer below its packet time, and the sender needs room for a
+    // catch-up burst *inside* the buffer. 0 is not on offer here the way it is for
+    // AP2 — the daemon would clamp it anyway.
+    min: 15,
+    // Well short of what the API accepts (2000 ms), but far enough to line a remote
+    // host up against a slow receiver rather than only to tune its own buffer. The
+    // zone marks below stay where they are: past `highAbove` this is still latency
+    // you are choosing to add, which is exactly what aligning against something slow
+    // means, and the note says so rather than warning you off.
+    max: 800,
+    step: 5, // a whole number of 5 ms packets, which is what the receiver wants
+    // Four packet times: below that the receiver holds under a packet of slack for
+    // network or scheduling jitter.
+    riskyBelow: 20,
+    highAbove: 300,
+    label: 'Playout delay',
+    risk: 'the receiving host holds under a packet of slack for network or scheduling jitter — expect crackles',
+    // Applying one reloads `module-rtp-session` on the remote host — a short gap in
+    // that speaker's audio. Doing that at every step of a drag would be a stutter,
+    // so this kind commits only when you let go.
+    liveDuringDrag: false,
+    good: "Buffers the network hop and the remote host's scheduling",
+    clearable: true,
+    store: 'latency',
+  };
+  const SENDSPIN_DELAY: DelaySpec = {
+    // 0 is the *normal* position here, not a risky one: this knob trims a speaker
+    // that is consistently early against the rest of its group, so "no trim" is the
+    // resting state and there is no low-end risk zone at all.
+    min: 0,
+    // The daemon clamps a static delay at 5000 ms, so the slider reaches everything
+    // the API accepts. A tighter ceiling would make an already-stored larger value
+    // unreachable — and silently shrink it on the next drag.
+    max: 5000,
+    step: 10,
+    riskyBelow: 0,
+    highAbove: 1000,
+    label: 'Static delay',
+    risk: '',
+    good: 'Trims this speaker against the rest of its group',
+    // The change is in-band, but whether the *firmware* applies it live is a
+    // per-setup question (Settings → sendspin delay applied live). Where it does not,
+    // every change reconnects that speaker, which costs tens of seconds of silence —
+    // so this commits on release, which is right either way.
+    liveDuringDrag: false,
+    clearable: false,
+    store: 'sendspin',
+  };
+  const delaySpec = (o: OutputInfo) =>
+    o.kind === 'pwsink' ? PWSINK_DELAY : o.kind === 'sendspin' ? SENDSPIN_DELAY : AP2_DELAY;
+  /** Every adopted kind has one now; still a predicate, so the row keeps its guard. */
+  const hasDelayKnob = (o: OutputInfo) => o.kind === 'airplay2' || o.kind === 'pwsink' || o.kind === 'sendspin';
+
+  /** What the daemon has stored for this output right now — the slider's resting
+   *  position and its during-drag readout. Sendspin keeps its static delays in a store
+   *  of their own (`delayMap`); the rest ride the outputs listing. */
+  const appliedMs = (o: OutputInfo) =>
+    delaySpec(o).store === 'sendspin' ? (delayMap[o.node_name] ?? 0) : (o.latency_ms ?? o.latency_effective_ms ?? 0);
+
+  /** Where this output's current value came from, for the note's parenthetical. */
+  const originOf = (o: OutputInfo) =>
+    delaySpec(o).store === 'sendspin'
+      ? appliedMs(o) === 0
+        ? 'no trim'
+        : 'your trim'
+      : o.latency_ms == null
+        ? `default ${o.latency_effective_ms ?? 0} ms`
+        : 'your override';
+
+  // The drag machinery (ownership, throttle, popover) lives in DelaySlider — this
+  // page only says what each kind's knob *means* and where its value is stored.
+  //
+  // `applyOutputs` no longer re-seeds a slider from the pushed listing at all: the
+  // component holds its own position while the thumb is the user's, so the listing is
+  // free to arrive whenever it likes.
+  async function commitDelay(o: OutputInfo, ms: number) {
+    const spec = delaySpec(o);
+    await run(
+      () => (spec.store === 'sendspin' ? api.setSendspinDelay(o.node_name, ms) : api.setOutputLatency(o.node_name, ms)),
+      `Set '${o.name}' ${spec.label.toLowerCase()} to ${ms} ms`,
+    );
+    // Adopt whatever the daemon actually stored — it clamps, and sendspin delays are
+    // fetched rather than pushed, so without this the row could keep showing a value
+    // no device is running.
+    await refresh();
+  }
+
+  // Silent on purpose: this fires several times a second while dragging, and `run()`
+  // would raise a toast for each. The commit above reports, and a failure there says
+  // the same thing about the same endpoint.
+  const liveDelay = (o: OutputInfo, ms: number) =>
+    void (delaySpec(o).store === 'sendspin' ? api.setSendspinDelay(o.node_name, ms) : api.setOutputLatency(o.node_name, ms)).catch(
+      () => {},
+    );
 
   // Drop the override so the output follows the daemon default again. The slider
   // has no "empty" position, so clearing needs its own control.
   async function resetDelay(o: OutputInfo) {
-    if (await run(() => api.setOutputLatency(o.node_name, null), `Reset '${o.name}' render delay to default`))
-      await refresh();
+    if (await run(() => api.setOutputLatency(o.node_name, null), `Reset '${o.name}' ${delaySpec(o).label.toLowerCase()} to default`)) {
+      await refresh(); // the slider adopts the restored default from the listing
+    }
   }
 
   // True only until the first listing arrives. A re-read must not put the page
@@ -115,25 +227,18 @@
   // would blank the whole list every time a device appeared or a level changed.
   let everLoaded = $state(false);
 
-  // Sendspin static delays are the one piece not pushed over the socket, so the
-  // last fetched map is kept to re-seed the editable fields when a listing arrives.
-  let delayMap: Record<string, number> = {};
+  // Sendspin static delays are the one piece not pushed over the socket, so the last
+  // fetched map is kept — to re-seed the editable fields when a listing arrives, and
+  // as the "applied" readout while that slider is being dragged. `$state` because the
+  // template reads it now: a plain variable would leave that readout stale until
+  // something unrelated happened to re-render the row.
+  let delayMap = $state<Record<string, number>>({});
 
-  /** Adopted list → local state + the editable sync fields. */
+  /** Adopted list → local state. */
   function applyOutputs(outs: OutputInfo[]) {
     outputs = outs;
-    // Seed the editable sync fields. Adopted outputs only: the sync knobs are
-    // for outputs that are part of the system, not for a device we're still
-    // deciding about. Volume/mute are NOT seeded here — they ride the live
-    // matrix (above), which is why they stay correct after page load.
-    const next: Record<string, number | ''> = {};
-    for (const o of outs) {
-      // AP2 seeds to the running value rather than blank: its control is a
-      // slider, which has no blank position (see resetDelay for clearing).
-      next[o.node_name] =
-        o.kind === 'sendspin' ? (delayMap[o.node_name] ?? 0) : (o.latency_ms ?? AP2_DELAY_DEFAULT);
-    }
-    edit = next;
+    // Nothing to seed: each slider holds its own position (DelaySlider) and reads the
+    // stored value straight off this listing, so a push arriving mid-drag is harmless.
   }
 
   /** Offered list → local state, present devices first: a long discovered list on
@@ -535,19 +640,6 @@
     return codec;
   }
 
-  // Apply the per-row sync value: sendspin → static delay; AP2 → render delay
-  // (via setOutputLatency).
-  async function applySync(o: OutputInfo) {
-    const v = edit[o.node_name];
-    if (o.kind === 'sendspin') {
-      const ms = v === '' ? 0 : Number(v);
-      if (await run(() => api.setSendspinDelay(o.node_name, ms), `Set '${o.name}' delay to ${ms} ms`))
-        await refresh();
-    } else {
-      const ms = v === '' ? null : Number(v);
-      if (await run(() => api.setOutputLatency(o.node_name, ms), `Set '${o.name}' latency`)) await refresh();
-    }
-  }
 </script>
 
 <!-- Connection details — the same set for an added output and a discovered one,
@@ -581,6 +673,38 @@
       title="Discard this speaker's buffered audio and re-anchor it (stream/clear). Try this if it is connected but silent — it does not disturb the other speakers in its group."
       onclick={() => resync(o)}
     >{clearing[o.node_name] ? 'Resyncing…' : 'Resync'}</button>
+  {/if}
+{/snippet}
+
+<!-- The per-output delay control: AirPlay 2's render delay, a PipeWire host's
+     playout delay, a sendspin speaker's static trim. One slider for all three
+     (`delaySpec` carries what differs) rather than a number box: this is a knob you
+     hunt for the edge of by ear, and the coloured track shows which way is risky
+     before you drag there. Self-guarding like `codecField`, and a snippet because
+     `{@const}` needs a block to live in. -->
+{#snippet delayField(o: OutputInfo)}
+  {#if hasDelayKnob(o)}
+    {@const spec = delaySpec(o)}
+    <DelaySlider
+      id="sync-{o.node_name}"
+      label={spec.label}
+      applied={appliedMs(o)}
+      min={spec.min}
+      max={spec.max}
+      step={spec.step}
+      riskyBelow={spec.riskyBelow}
+      highAbove={spec.highAbove}
+      risk={spec.risk}
+      good={spec.good}
+      origin={originOf(o)}
+      live={spec.liveDuringDrag}
+      deferredHint={spec.liveDuringDrag ? '' : ' — on release'}
+      onLive={(ms) => liveDelay(o, ms)}
+      oncommit={(ms) => commitDelay(o, ms)}
+      onreset={spec.clearable ? () => resetDelay(o) : undefined}
+      resetDisabled={o.latency_ms == null}
+      resetTitle="Drop the override and follow the add-on default ({o.latency_effective_ms ?? 0} ms)"
+    />
   {/if}
 {/snippet}
 
@@ -742,72 +866,12 @@
         {#if !isCollapsed(o)}
           {@render connMeta(o)}
 
-          <!-- Guarded: with the actions moved to their own row a pw-sink output has
-               no tuning knobs left, and an empty bordered row reads as broken. -->
-          {#if o.kind === 'sendspin' || o.kind === 'airplay2'}
+          <!-- Guarded: an output kind with no tuning knobs at all would render an
+               empty bordered row, which reads as broken. Every kind has a delay
+               knob today, so this only guards against the next one that doesn't. -->
+          {#if hasDelayKnob(o)}
           <div class="out-controls">
-            {#if o.kind === 'sendspin'}
-            <div class="sync-field">
-              <label for="sync-{o.node_name}">Static delay (ms)</label>
-              <div class="sync-cell">
-                <input
-                  id="sync-{o.node_name}"
-                  type="number"
-                  min="0"
-                  max="5000"
-                  step="10"
-                  bind:value={edit[o.node_name]}
-                  placeholder="0"
-                  title="Static delay in ms (0 = none)"
-                />
-                <button onclick={() => applySync(o)} title="Apply">Set</button>
-              </div>
-            </div>
-            {/if}
-
-            {#if o.kind === 'airplay2'}
-              {@const ms = delayOf(o)}
-              {@const zone = delayZone(ms)}
-              <!-- A slider rather than a number box: this is a knob you hunt for
-                   the edge of by ear, and the coloured track shows which way is
-                   risky before you drag there. -->
-              <div class="sync-field delay-field">
-                <label for="sync-{o.node_name}">Render delay</label>
-                <div class="delay-cell">
-                  <!-- Slider and scale share one box so the tick numbers land on
-                       the colour boundaries — measured against the whole field
-                       they drift right by the readout's width. -->
-                  <div class="delay-track">
-                    <input
-                      id="sync-{o.node_name}"
-                      class="delay-slider zone-{zone}"
-                      type="range"
-                      min="0"
-                      max={AP2_DELAY_MAX}
-                      step="10"
-                      value={ms}
-                      aria-describedby="delay-note-{o.node_name}"
-                      oninput={(e) => (edit[o.node_name] = Number(e.currentTarget.value))}
-                      onchange={() => applySync(o)}
-                    />
-                    <div class="delay-scale" aria-hidden="true">
-                      <span style="left:0%">0</span>
-                      <span style="left:{(AP2_DELAY_RISKY_BELOW / AP2_DELAY_MAX) * 100}%">{AP2_DELAY_RISKY_BELOW}</span>
-                      <span style="left:{(AP2_DELAY_HIGH_ABOVE / AP2_DELAY_MAX) * 100}%">{AP2_DELAY_HIGH_ABOVE}</span>
-                      <span style="left:100%">{AP2_DELAY_MAX}</span>
-                    </div>
-                  </div>
-                  <output class="delay-read zone-{zone}" for="sync-{o.node_name}">{ms} ms</output>
-                  <button
-                    class="ghost"
-                    disabled={o.latency_ms == null}
-                    title="Drop the override and follow the add-on default ({AP2_DELAY_DEFAULT} ms)"
-                    onclick={() => resetDelay(o)}
-                  >Default</button>
-                </div>
-                <p id="delay-note-{o.node_name}" class="delay-note zone-{zone}">{delayNote(o, ms)}</p>
-              </div>
-            {/if}
+            {@render delayField(o)}
 
             {@render codecField(o)}
 
@@ -1255,66 +1319,6 @@
      to absorb sender jitter → dropped packets), green through 800 ms, yellow
      above it (fine, just needless latency). Hard stops rather than a gradient
      — the thresholds are the information. */
-  /* Its own full-width row: the track plus a readout, a reset and a note is more
-     than fits beside the sample-rate picker, which wraps below instead. */
-  .delay-field {
-    flex: 1 1 100%;
-  }
-  .delay-cell {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-  }
-  .delay-track {
-    flex: 1 1 auto;
-    min-width: 160px;
-  }
-  .delay-slider {
-    display: block;
-    width: 100%;
-    /* Own the whole control: default chrome ignores a painted track. */
-    appearance: none;
-    -webkit-appearance: none;
-    height: 18px;
-    margin: 0;
-    padding: 0;
-    background: transparent;
-    cursor: pointer;
-  }
-  /* 200/2000 = 10%, 800/2000 = 40%. The two vendor pseudo-elements must be
-     separate rules — a browser drops the whole rule if any selector in the list
-     is one it doesn't know. */
-  .delay-slider::-webkit-slider-runnable-track {
-    height: 6px;
-    border-radius: 3px;
-    background: linear-gradient(
-      to right,
-      var(--error-color) 0 10%,
-      var(--success-color) 10% 40%,
-      var(--warning-color) 40% 100%
-    );
-  }
-  .delay-slider::-moz-range-track {
-    height: 6px;
-    border-radius: 3px;
-    background: linear-gradient(
-      to right,
-      var(--error-color) 0 10%,
-      var(--success-color) 10% 40%,
-      var(--warning-color) 40% 100%
-    );
-  }
-  .delay-slider::-webkit-slider-thumb {
-    appearance: none;
-    -webkit-appearance: none;
-    width: 16px;
-    height: 16px;
-    margin-top: -5px; /* centre on the 6px track */
-    border-radius: 50%;
-    border: 2px solid var(--card-background-color, #fff);
-    background: var(--primary-text-color);
-    box-shadow: 0 1px 3px rgb(0 0 0 / 0.35);
-  }
   .delay-slider::-moz-range-thumb {
     width: 16px;
     height: 16px;
@@ -1323,76 +1327,9 @@
     background: var(--primary-text-color);
     box-shadow: 0 1px 3px rgb(0 0 0 / 0.35);
   }
-  .delay-slider:focus-visible {
-    outline: 2px solid var(--primary-color);
-    outline-offset: 3px;
-    border-radius: 3px;
-  }
-  /* The thumb takes the zone colour too, so the current value is readable
-     without comparing it against the track by eye. */
-  .delay-slider.zone-risky::-webkit-slider-thumb {
-    background: var(--error-color);
-  }
-  .delay-slider.zone-risky::-moz-range-thumb {
-    background: var(--error-color);
-  }
-  .delay-slider.zone-high::-webkit-slider-thumb {
-    background: var(--warning-color);
-  }
-  .delay-slider.zone-high::-moz-range-thumb {
-    background: var(--warning-color);
-  }
-  .delay-slider.zone-good::-webkit-slider-thumb {
-    background: var(--success-color);
-  }
-  .delay-slider.zone-good::-moz-range-thumb {
-    background: var(--success-color);
-  }
 
-  .delay-read {
-    min-width: 68px; /* "2000 ms" without the row twitching as you drag */
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    font-size: 0.9rem;
-    font-weight: 500;
-  }
-  .delay-read.zone-risky {
-    color: var(--error-color);
-  }
-  .delay-read.zone-high {
-    color: var(--warning-color);
-  }
 
-  /* Zone-edge numbers under the track, positioned at their value's fraction. */
-  .delay-scale {
-    position: relative;
-    height: 1em;
-    margin: 2px 0 0;
-    font-size: 0.7rem;
-    color: var(--secondary-text-color);
-    font-variant-numeric: tabular-nums;
-  }
-  .delay-scale span {
-    position: absolute;
-    transform: translateX(-50%);
-  }
-  /* The end labels align flush with the track's ends instead of straddling them,
-     so they don't hang out into the value readout. */
-  .delay-scale span:first-child {
-    transform: none;
-  }
-  .delay-scale span:last-child {
-    transform: translateX(-100%);
-  }
 
-  .delay-note {
-    font-size: 0.8rem;
-    margin: 4px 0 0;
-    color: var(--secondary-text-color);
-  }
-  .delay-note.zone-risky {
-    color: var(--error-color);
-  }
   /* Recovery, not playback: kept out of the Play segmented group so it doesn't read
      as a third thing to play, but adjacent to it because it answers the question the
      Play buttons raise ("it says playing and I hear nothing"). */
@@ -1429,8 +1366,5 @@
   .sync-cell select {
     min-width: 0;
     max-width: 100%;
-  }
-  .sync-cell input {
-    width: 96px;
   }
 </style>

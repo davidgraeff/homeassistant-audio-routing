@@ -58,14 +58,14 @@ const AP2_RATE: u32 = 44_100;
 /// ahead, never starve" behaviour that makes the file-path spike audible.
 const AP2_FEED_FRAMES: usize = 128;
 
-/// Render delay (ms): shifts the PT=87 anchor into the future so the receiver
-/// buffers this much audio before playing. Without it (default 0) the anchor
-/// says "play now" — with the send-side jitter a weak Pi produces (~100ms+),
-/// packets then arrive past their play deadline and are dropped, i.e. SILENCE.
-/// Kept inside the negotiated latency window (latency_max = 88200 ≈ 2s). This is
-/// the default when no per-output override is stored (sync_settings.rs); the UI
-/// exposes it as the per-output latency field.
-pub const AP2_RENDER_DELAY_MS: u32 = 1500;
+/// Render delay (ms): shifts the PT=87 anchor into the future so the receiver buffers
+/// this much audio before playing. **Default 0** — the anchor says "play now", which
+/// the target receivers handle; every ms here is latency the whole system pays for.
+///
+/// Per-output and live-tunable (sync_settings.rs). Raise it for a receiver that goes
+/// *silent* rather than merely early: that is the signature of packets arriving past
+/// their play deadline, which a receiver drops rather than plays late.
+pub const AP2_RENDER_DELAY_MS: u32 = 0;
 
 /// Upper bound for the per-output render delay: stays inside the negotiated
 /// `latency_max` (88200 frames ≈ 2 s at 44.1 kHz) so the delay fits the
@@ -239,7 +239,7 @@ async fn connect_one(
     render_delay_ms: u32,
     rate: u32,
     senders: &Arc<Mutex<Vec<(String, LiveFrameSender)>>>,
-) -> Result<(Connection, mpsc::UnboundedReceiver<f32>), ConnectFail> {
+) -> Result<(Connection, mpsc::Receiver<f32>), ConnectFail> {
     let mut last: Option<ConnectFail> = None;
     for attempt in 0..AP2_CONNECT_ATTEMPTS {
         if attempt > 0 {
@@ -276,7 +276,7 @@ async fn try_connect_once(
     render_delay_ms: u32,
     rate: u32,
     senders: &Arc<Mutex<Vec<(String, LiveFrameSender)>>>,
-) -> Result<(Connection, mpsc::UnboundedReceiver<f32>), ConnectFail> {
+) -> Result<(Connection, mpsc::Receiver<f32>), ConnectFail> {
     let device = build_device(ip);
     let config = ap2_stream_config(rate);
     // connect_auto: pair-verify if a stored identity exists, else transient (3939).

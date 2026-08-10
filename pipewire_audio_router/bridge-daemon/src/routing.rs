@@ -106,9 +106,9 @@ pub struct RoutingNode {
     /// the jitter/playout buffer configured for it, NOT a measured figure.
     /// Sources: the ingest jitter buffer (RTP `sess.latency.msec` / AirPlay
     /// producer prebuffer). Outputs: the playout lead (sendspin group send-ahead +
-    /// per-device static delay; AP2 render delay). The UI sums a route's
-    /// source + output estimates to show its rough latency. `None` when unknown
-    /// (e.g. an offline/unrecognized node). See build_matrix.
+    /// per-device static delay; AP2 render delay; pw-sink receiver jitter buffer).
+    /// The UI sums a route's source + output estimates to show its rough latency.
+    /// `None` when unknown (e.g. an offline/unrecognized node). See build_matrix.
     #[serde(skip_serializing_if = "Option::is_none")]
     latency_ms: Option<u32>,
     /// Cumulative xrun (dropped-cycle) count for this node from the PipeWire
@@ -160,11 +160,16 @@ pub struct LatencyConfig {
     pub ap2_delays: std::collections::BTreeMap<String, u16>,
     /// Default AP2 render delay when a device has no per-device override.
     pub ap2_default_ms: u32,
+    /// Per-pw-sink-host playout delay = that receiver's jitter buffer
+    /// (`sess.latency.msec`); the default applies when a host has no override.
+    pub pwsink_jitters: std::collections::BTreeMap<String, u16>,
+    /// Default pw-sink playout delay when a host has no per-host override.
+    pub pwsink_default_ms: u32,
 }
 
 /// Estimated buffering (ms) a node contributes, from config. `None` when we
-/// have no figure for the node (offline/unknown, or an output kind whose buffer
-/// we don't model, e.g. pw-sink). See [`RoutingNode::latency_ms`].
+/// have no figure for the node (offline, or a kind whose buffer we don't model).
+/// See [`RoutingNode::latency_ms`].
 fn node_latency_ms(node_name: &str, lat: &LatencyConfig) -> Option<u32> {
     // Any configured source (AirPlay or RTP), by its node name.
     if let Some(ms) = lat.source_latencies.get(node_name) {
@@ -176,6 +181,13 @@ fn node_latency_ms(node_name: &str, lat: &LatencyConfig) -> Option<u32> {
     }
     if node_name.starts_with(AP2_DEV_PREFIX) {
         return Some(lat.ap2_delays.get(node_name).map(|ms| u32::from(*ms)).unwrap_or(lat.ap2_default_ms));
+    }
+    if node_name.starts_with(PWSINK_DEV_PREFIX) {
+        // The receiver's jitter buffer is the whole of what we configure on this
+        // path. The rest of its budget (our capture quantum, the remote host's own
+        // sink buffer) is real but not ours to know, so it is left out rather than
+        // guessed — the same rule the other kinds follow.
+        return Some(lat.pwsink_jitters.get(node_name).map(|ms| u32::from(*ms)).unwrap_or(lat.pwsink_default_ms));
     }
     None
 }
@@ -433,6 +445,8 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
             sendspin_delays: sync.sendspin_delays(),
             ap2_delays: sync.ap2_latencies(),
             ap2_default_ms: crate::ap2_server::AP2_RENDER_DELAY_MS,
+            pwsink_jitters: sync.pwsink_jitters(),
+            pwsink_default_ms: u32::from(crate::sync_settings::DEFAULT_PWSINK_JITTER_MS),
         };
         (lat, source_labels)
     };
@@ -1202,6 +1216,8 @@ mod tests {
                 sendspin_delays: std::collections::BTreeMap::new(),
                 ap2_delays: std::collections::BTreeMap::new(),
                 ap2_default_ms: 0,
+                pwsink_jitters: std::collections::BTreeMap::new(),
+                pwsink_default_ms: 0,
             },
             &std::collections::HashMap::new(),
         )

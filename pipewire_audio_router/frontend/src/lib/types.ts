@@ -134,10 +134,16 @@ export interface OutputInfo {
   ip: string | null;
   port: number | null;
   encryption: string | null;
-  /** Per-output latency override in ms; null = the type's built-in default
-   * (1500 ms). For AirPlay 2 it's the render delay. Not meaningful for sendspin
-   * (uses a separate static-delay knob). */
+  /** Per-output latency override in ms; null = the type's built-in default.
+   * For AirPlay 2 it's the render delay; for a PipeWire host it's the receiver's
+   * playout delay (its jitter buffer). Not meaningful for sendspin (uses a
+   * separate static-delay knob). */
   latency_ms: number | null;
+  /** What this output is actually running: the override above, or the daemon's
+   * default when there is none. Read this for slider positions and "reset to
+   * default" hints instead of hardcoding a default in the UI. null for kinds with
+   * no such knob (sendspin). */
+  latency_effective_ms?: number | null;
   /** AirPlay 2 only: PTP-lock health. true = receiver is exchanging gPTP with our
    * grandmaster; false = present but not exchanging gPTP; undefined = not an AP2
    * output / PTP not started. NB: realtime playback does NOT require a lock (a lone
@@ -243,6 +249,13 @@ export interface SyncSettingsInfo {
   group_lead_effective_ms: number;
   /** Which devices set the floor, largest first — for explaining the number. */
   group_lead_floor_sources: LeadFloorSource[];
+  /** Decode+network headroom every **Opus** stream gets, in ms — the term that keeps
+   * an Opus group above `group_lead_ms` however low that is set. Tunable, because the
+   * shipped 250 ms is a conservative guess rather than a measurement. */
+  opus_floor_ms: number;
+  /** Lowest value the daemon accepts for `opus_floor_ms`: the Opus block size, since
+   * nothing can be sent before a whole block exists. */
+  opus_floor_min_ms: number;
 }
 
 /** One device's contribution to the send-ahead floor. */

@@ -107,7 +107,7 @@ fn run(daemon: Option<String>) -> anyhow::Result<()> {
         config::identity()
     );
 
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(pw_thread::EVENT_DEPTH);
     // Spawned before the runtime so a PipeWire failure is a plain startup error.
     let handle = pw_thread::spawn(event_tx)?;
 
@@ -192,7 +192,7 @@ fn spike_desktop(code: String) -> anyhow::Result<()> {
     runtime.block_on(async move {
         println!("posting a pairing notification and a tray icon for the fake code {code}");
         println!("(nothing is sent to the add-on; run with RUST_LOG=debug to see why either is missing)\n");
-        let (req_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (req_tx, mut requests) = tokio::sync::mpsc::channel(client::REQUEST_DEPTH);
         let desktop = desktop::Desktop::start(
             config::label(),
             Some(code.clone()),

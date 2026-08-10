@@ -34,6 +34,11 @@ use tokio_tungstenite::tungstenite::Message;
 /// mDNS service the daemon advertises for its control endpoint (plan §8).
 const CONTROL_SERVICE_TYPE: &str = "_pwrouter-ctl._tcp.local.";
 
+/// Depth of the tray → client request queue. Bounded on the same principle as
+/// every other queue here; one click produces one request, so this only has to
+/// outlast a momentary stall in the client loop.
+pub const REQUEST_DEPTH: usize = 16;
+
 /// How long to wait for mDNS to turn up a daemon before giving up on a try.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -128,7 +133,7 @@ fn host_state(master: &MasterState) -> HostState {
 /// have been reinstalled, restored from a snapshot, or had this host unpaired.
 pub async fn run(
     handle: Handle,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    mut events: tokio::sync::mpsc::Receiver<Event>,
     override_addr: Option<String>,
 ) -> anyhow::Result<()> {
     let mut config = config::load()?;
@@ -145,7 +150,7 @@ pub async fn run(
 
     // Never fails: a host with no tray and no notification server gets a `Desktop`
     // whose every method is a no-op.
-    let (req_tx, mut requests) = tokio::sync::mpsc::unbounded_channel::<Request>();
+    let (req_tx, mut requests) = tokio::sync::mpsc::channel::<Request>(REQUEST_DEPTH);
     let desktop = Desktop::start(
         config::label(),
         (!pair_code.is_empty()).then(|| pair_code.clone()),
@@ -306,9 +311,9 @@ async fn session(
     config: &mut Config,
     pair_code: &str,
     handle: &Handle,
-    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    events: &mut tokio::sync::mpsc::Receiver<Event>,
     desktop: &Desktop,
-    requests: &mut tokio::sync::mpsc::UnboundedReceiver<Request>,
+    requests: &mut tokio::sync::mpsc::Receiver<Request>,
 ) -> anyhow::Result<Outcome> {
     let url = format!("ws://{addr}/api/agent/ws");
     tracing::info!("connecting to {url}");

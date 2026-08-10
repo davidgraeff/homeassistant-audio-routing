@@ -299,8 +299,9 @@ class _SourceMetadataMixin:
 
     Position is reported with `media_position_updated_at` and Home Assistant
     extrapolates between the daemon's sparse updates. It leads the sound by the
-    ingest jitter buffer plus the output's playout latency (order 200–400 ms);
-    that drift is accepted rather than corrected.
+    ingest jitter buffer plus the output's playout latency (order 100–300 ms with
+    the shipped defaults, more if you have raised an output's delay); that drift is
+    accepted rather than corrected.
     """
 
     coordinator: PipewireRouterCoordinator
