@@ -3,7 +3,7 @@
   "name": "PipeWire Audio Router",
   "codeowners": ["@davidgraeff"],
   "config_flow": true,
-  "dependencies": ["media_source"],
+  "dependencies": ["frontend", "http", "media_source", "websocket_api"],
   "documentation": "https://github.com/davidgraeff/homeassistant-audio-routing",
   "issue_tracker": "https://github.com/davidgraeff/homeassistant-audio-routing/issues",
   "iot_class": "local_polling",

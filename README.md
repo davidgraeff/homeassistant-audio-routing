@@ -30,7 +30,7 @@ this file is just the map.
 | Component | What | README |
 |---|---|---|
 | **Bridge daemon add-on** | Rust + PipeWire/WirePlumber, packaged as a real HA add-on (`repository.yaml` at repo root) | [`pipewire_audio_router/`](pipewire_audio_router/README.md) |
-| **Home Assistant integration** | `media_player` entities backed by the add-on's REST API | [`custom_components/pipewire_audio_router/`](custom_components/pipewire_audio_router/README.md) |
+| **Home Assistant integration** | `media_player` entities backed by the add-on's REST API, plus the `custom:pipewire-router-card` dashboard card | [`custom_components/pipewire_audio_router/`](custom_components/pipewire_audio_router/README.md) |
 | **Bluetooth bridge firmware** | ESP32 + ESPHome, turns any Bluetooth device into a whole-home-audio source | [`firmware/bt-bridge/`](firmware/bt-bridge/README.md) |
 
 ## Quick install overview

@@ -112,6 +112,58 @@ add-on's `/api/routing/ws` WebSocket, so re-wiring shows up immediately.
   add-on's own web UI, another automation — reflect here without waiting
   for a poll.
 
+## Dashboard card
+
+The integration ships a Lovelace card that shows the whole house's routing at a
+glance and lets you re-wire it by tapping:
+
+```yaml
+type: custom:pipewire-router-card
+```
+
+No resource to register — the integration serves the card and loads it itself, so
+`custom:pipewire-router-card` is available on every dashboard as soon as the
+integration is set up (it is in the card picker as **PipeWire Audio Routing**).
+
+Inputs are on the left, where they play on the right — one node per **music
+group**, plus one per output that isn't in a group — and one wire per route:
+
+- **Tap an input, then tap where it should play.** Tapping a destination that is
+  already playing it removes it again. The other direction works too: tap a
+  destination first, then the input it should play.
+- **Tap a wire to remove that route.** No confirmation — redrawing it is the same
+  two taps.
+- A **dashed** wire is a group only partly on that input (something else mixed
+  it: the add-on's expert view, or an automation). Tapping completes it.
+- A **gray** wire, and gray text, mean an endpoint isn't there right now. The
+  route is kept and re-applied when it comes back.
+
+Routing a group is exclusive — the same reconciling call as its
+`media_player.select_source` — so the card cannot leave a group whose speakers
+disagree about what they play. A lone output is additive, so two inputs can
+deliberately be mixed into one.
+
+It has a **visual editor** — the card's "Edit" pane, no YAML needed. Every option
+is optional:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `show_title` | `true` | Show the heading row. |
+| `title` | `Audio routing` | The heading. (`title: ""` also hides it, as it did before `show_title` existed.) |
+| `show_hint` | `true` | Show the instruction line under the graph. It comes back by itself while an input is held — that line is the only thing saying what the next tap does and how to cancel. |
+| `entry_id` | the only one | Which router, if you have configured more than one. The editor offers a picker; the card says so if it's ambiguous. |
+
+Deliberately *not* in this card: volumes, level meters, now-playing, per-speaker
+rows, xrun badges. It answers "what is playing where, and change it" from a
+phone; the add-on's own web UI is where the rest lives.
+
+The card talks to Home Assistant, never to the add-on directly (see `ws_api.py`)
+— so it works over HA Cloud and behind a reverse proxy, where the add-on's
+ingress API is not reachable from the browser. It is built from
+`pipewire_audio_router/frontend/src/card/` with `npm run build:card` and the
+result is **committed** to `www/pipewire-router-card.js`, because HACS copies this
+directory verbatim and runs no build step. CI fails if the two disagree.
+
 ## Routing from automations
 
 The idiomatic path is `media_player.select_source`:
@@ -189,6 +241,9 @@ See `tests/README.md` for what each test actually covers.
 __init__.py       setup/teardown, coordinator (5s poll: players + RTP source; routing pushed via /api/routing/ws), platform forwarding
 config_flow.py     single-step host/port form, validates by calling the add-on
 media_player.py    the MediaPlayerEntity subclass described above (incl. select_source + link/unlink services)
+ws_api.py          WebSocket API behind the dashboard card: routing subscription + link/unlink/route_group
+frontend.py        serves www/pipewire-router-card.js and loads it into the frontend
+www/               the built dashboard card (committed; built from ../../pipewire_audio_router/frontend)
 switch.py          RTP-source enable/disable + voice-ducking on/off switches
 number.py          RTP-source port/latency + voice duck level numbers (restore-backed)
 select.py          voice duck scope: area | music_group (restore-backed)
@@ -197,5 +252,5 @@ api.py             thin async HTTP client for the add-on's REST API (media playe
 const.py           domain, default port(s), poll interval, service/source names, voice-duck defaults
 services.yaml      link/unlink service descriptions for the automation editor
 strings.json       UI strings (config flow + service descriptions)
-manifest.json      integration metadata (config_flow: true, no extra deps)
+manifest.json      integration metadata (config_flow: true; depends on frontend/http/websocket_api for the card)
 ```

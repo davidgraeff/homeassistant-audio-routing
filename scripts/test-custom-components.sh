@@ -30,6 +30,12 @@ docker build -t "$IMAGE" - <<'DOCKERFILE'
 # manifest requirements are empty).
 FROM python:3.13
 RUN pip install --no-cache-dir pytest-homeassistant-custom-component homeassistant
+# The integration depends on the `frontend` component (it serves + registers the
+# dashboard card), and that component imports `hass_frontend` when it sets up —
+# so without this package every test that loads a config entry fails on
+# "Setup failed for dependencies: ['frontend']". Pinned to whatever this HA pins,
+# read out of the installed component's own manifest.
+RUN pip install --no-cache-dir "$(python -c "import json, pathlib, homeassistant.components.frontend as f; print(json.loads((pathlib.Path(f.__file__).parent / 'manifest.json').read_text())['requirements'][0])")"
 DOCKERFILE
 
 # Default target = the whole suite; overridden if the caller passes their own

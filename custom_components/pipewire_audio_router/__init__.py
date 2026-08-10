@@ -17,8 +17,10 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from . import ws_api
 from .api import (
     AnnouncementGroup,
     MusicGroup,
@@ -40,6 +42,7 @@ from .const import (
     SERVICE_CLEANUP_ENTITIES,
     UPDATE_INTERVAL_SECONDS,
 )
+from .frontend import async_register_card
 from .voice_duck import VoiceDucker
 
 _LOGGER = logging.getLogger(__name__)
@@ -212,6 +215,17 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
                 _LOGGER.exception("unexpected error in routing websocket loop")
             # Socket closed/errored (or a bad frame) — back off, then reconnect.
             await asyncio.sleep(ROUTING_WS_RECONNECT_SECONDS)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Domain-wide setup, independent of how many daemons are configured: the
+    dashboard card's WebSocket API and the card asset itself. Both are global and
+    must survive a single entry being reloaded, so they don't belong in
+    `async_setup_entry` — which is also why the commands can be registered before
+    any coordinator exists (they resolve one per call)."""
+    ws_api.async_register(hass)
+    await async_register_card(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -138,6 +138,13 @@ The UI uses relative asset/API paths, so the same build works under both. Dev:
 `cd frontend && npm install && npm run dev` (point it at a running daemon), or
 `npm run build` → `dist/` (what the daemon serves via `--static-dir`).
 
+`frontend/` also builds a *second*, unrelated artifact: the Home Assistant
+dashboard card (`src/card/`, `npm run build:card`). It does not ship in this
+image — it goes to `custom_components/pipewire_audio_router/www/` and is committed
+there, because it is loaded by Home Assistant, not by the daemon, and talks only
+to the integration's WebSocket API. Change anything under `src/card/` and you must
+rebuild and commit it; CI fails otherwise.
+
 ## Development
 
 ```

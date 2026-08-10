@@ -98,6 +98,18 @@ jobs:
         run: npm run check
       - name: Build
         run: npm run build
+      - name: Build dashboard card
+        run: npm run build:card
+      # The card is a *committed* artifact (HACS copies the integration verbatim
+      # and runs no build step), so a change to src/card/ that wasn't rebuilt
+      # would ship the old card. This is the only thing that catches that.
+      - name: Committed card is up to date
+        working-directory: .
+        run: |
+          if ! git diff --exit-code -- custom_components/pipewire_audio_router/www/; then
+            echo "::error::the built card differs from the committed one — run 'npm run build:card' in pipewire_audio_router/frontend and commit the result"
+            exit 1
+          fi
 
   integration:
     name: HA integration (pytest)
@@ -119,6 +131,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install 'pytest-homeassistant-custom-component==0.13.346'
+          # The integration depends on the `frontend` component (it serves the
+          # dashboard card), and that component imports `hass_frontend` when it
+          # sets up — without this wheel every test that loads a config entry
+          # fails with "Setup failed for dependencies: ['frontend']". Version
+          # taken from the installed component's own manifest, so it always
+          # matches the HA the pin above resolved to.
+          pip install "$(python -c "import json, pathlib, homeassistant.components.frontend as f; print(json.loads((pathlib.Path(f.__file__).parent / 'manifest.json').read_text())['requirements'][0])")"
       - name: Pytest
         run: pytest custom_components/pipewire_audio_router/tests/ -q
 
