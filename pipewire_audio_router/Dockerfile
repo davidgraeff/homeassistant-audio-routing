@@ -70,8 +70,12 @@ RUN set -eux; \
     echo "export CARGO_BUILD_TARGET=$triple" > /build-env.sh; \
     if [ "$TARGETARCH" = "$BUILDARCH" ]; then \
         apt-get update; \
+        # g++ for the same reason the cross branch below installs g++-<triplet>:
+        # cc-rs crates that compile C++ (fdk-aac-sys) need cc1plus, and the
+        # rust:1-slim base ships gcc WITHOUT g++ — so the native path needs it
+        # spelled out too, or the AAC build dies with "cannot execute 'cc1plus'".
         apt-get install -y --no-install-recommends \
-            pkg-config clang cmake make libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libevent-dev; \
+            pkg-config clang cmake make g++ libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libevent-dev; \
     else \
         dpkg --add-architecture "$TARGETARCH"; \
         apt-get update; \
@@ -83,7 +87,7 @@ RUN set -eux; \
         # gcc-<triplet> is the C cross-compiler; g++-<triplet> is the matching
         # C++ one (provides cc1plus) — needed by cc-rs crates that build C++,
         # e.g. fdk-aac-sys. Without it the AAC build dies with "cannot execute
-        # 'cc1plus'". (Native builds get g++ from the base image's build tools.)
+        # 'cc1plus'".
         apt-get install -y --no-install-recommends \
             pkg-config clang cmake make "gcc-${gnu}" "g++-${gnu}" "libc6-dev:$TARGETARCH" \
             "libpipewire-0.3-dev:$TARGETARCH" "libspa-0.2-dev:$TARGETARCH" "libasound2-dev:$TARGETARCH" \
