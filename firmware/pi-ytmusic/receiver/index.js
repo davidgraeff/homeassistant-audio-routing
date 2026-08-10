@@ -1,16 +1,18 @@
 /**
- * YouTube Music cast receiver for the Pi bridge (WP2).
+ * YouTube Music cast receiver.
  *
  * Ties together:
  *   - `yt-cast-receiver` — DIAL discovery + the Lounge API, i.e. how the phone
- *     finds us and drives us. No Google Cast, no device certificates (see
- *     ../../../docs/pi-ytmusic-receiver-plan.md §1 for why that matters).
+ *     finds us and drives us. No Google Cast, no device certificates (a Cast
+ *     receiver would need a Google-signed device certificate; DIAL + Lounge is
+ *     YouTube's surviving pre-Cast path — see ../../../docs/ytmusic-receiver.md).
  *   - `MpvPlayer` (player.js) over `MpvClient` (mpv.js) — the actual playback,
- *     into the `ytm-out` PipeWire sink that WP1 set up, which transmits to the
- *     audio-router add-on over RTP.
+ *     into the `ytm-out` PipeWire sink (`module-rtp-sink`), which transmits to
+ *     the audio-router add-on over RTP.
  *
- * Everything is configured by environment variable so the systemd unit is the
- * single place that describes this install. Defaults suit the Pi.
+ * Everything is configured by environment variable so the systemd unit (on the
+ * Pi) or the add-on's run.sh is the single place that describes an install.
+ * Defaults suit the Pi.
  */
 
 import os from 'os';
@@ -31,8 +33,8 @@ const IGNORED_IFACE = /^(lo|docker|veth|br-|virbr|tailscale|zt|wg)/;
  * This is not cosmetic. An SSDP responder left to its own devices on a
  * multi-homed host answers on *every* interface with the same USN, and a sender
  * that keeps the wrong answer cannot fetch our device description and silently
- * drops us — which is exactly what cost an evening during WP0 on a box with a
- * `docker0`. Bind explicitly, and log what was chosen.
+ * drops us, with nothing logged on our side — measured on a box with a `docker0`,
+ * which answered every M-SEARCH twice. Bind explicitly, and log what was chosen.
  */
 function pickBindAddress(logger) {
   if (process.env.YTCR_BIND_ADDRESS) {
@@ -72,13 +74,13 @@ function buildMpvArgs() {
     // terminal *input* handling (there is no tty under systemd anyway).
     '--input-terminal=no',
     '--msg-level=all=warn',
-    // Pin the output to WP1's RTP sink. Without this WirePlumber picks a device,
-    // and on this box the wrong pick means the audio never leaves the Pi.
+    // Pin the output to the `ytm-out` RTP sink. Without this WirePlumber picks a
+    // device, and on this box the wrong pick means the audio never leaves the Pi.
     `--audio-device=${audioDevice}`,
     // Keep the device open across playlist items so the RTP sink is not torn
     // down between songs. Deliberately NOT an option that streams silence
     // forever: `ytm-out` transmits whenever it has a client, so that would put
-    // ~1.5 Mbit/s of silence on the radio around the clock (see WP1).
+    // ~1.5 Mbit/s of silence on the radio around the clock.
     '--gapless-audio=yes',
     // Prefer the native 48 kHz Opus stream: `ytm-out` is 48 kHz and so is the
     // router graph, so this keeps the whole path resample-free.
@@ -113,7 +115,7 @@ function buildMpvArgs() {
   // drop the first.
   const rawOptions = [];
 
-  // WP3: YouTube makes *authenticated* requests solve an `n` signature challenge,
+  // YouTube makes *authenticated* requests solve an `n` signature challenge,
   // which yt-dlp can only do with an external JavaScript runtime. Without one it
   // finds NO formats at all and every track fails — while anonymous playback keeps
   // working, which makes this easy to misdiagnose.
@@ -121,10 +123,10 @@ function buildMpvArgs() {
   // yt-dlp enables only `deno` by default, and on this Pi (armv7l) none of the
   // obvious choices work: deno and bun have no 32-bit ARM builds, and Raspbian's
   // node 20 is reported `(unsupported)` by yt-dlp's provider. Debian's `quickjs`
-  // does — verified with cookies on the hardware. The unit sets YTCR_JS_RUNTIME;
-  // this default matches it.
-  // The unit passes `node:<path>` for the private Node 22 (JIT: ~22 s vs ~90 s per
-  // authenticated resolve); `quickjs` is the fallback when that is not installed.
+  // does — verified with cookies on the hardware — but it has no JIT, so the setup
+  // script installs a private Node 22 and the unit passes `node:<path>` (~22 s vs
+  // ~90 s per authenticated resolve). The add-on passes plain `node`. `quickjs` is
+  // the fallback, and hence this default.
   rawOptions.push(`js-runtimes=${process.env.YTCR_JS_RUNTIME || 'quickjs'}`);
 
   // NOTE: the remote cipher server (YTCR_CIPHER_URL) is deliberately NOT passed to
@@ -134,7 +136,7 @@ function buildMpvArgs() {
   // resolver.js, which offers the providers one at a time; this path stays local
   // on purpose (see resolver.js #attempts).
 
-  // Cookies (WP3): needed for Premium/ad-free and, increasingly, to get a stream
+  // Cookies: needed for Premium/ad-free and, increasingly, to get a stream
   // at all. Read *per track*, so a freshly provisioned jar takes effect on the
   // next song with no restart. Only added when the file exists, so a missing jar
   // degrades to anonymous resolution instead of failing everything.
@@ -174,7 +176,7 @@ async function main() {
   // Two DISTINCT names on purpose: per the library, `name` is what a sender shows
   // when it found us over DIAL and `screenName` when it found us through manual
   // pairing ("Link with TV code"). Keeping them different means the picker itself
-  // tells you which path worked — a free diagnostic (WP0).
+  // tells you which path worked — a free diagnostic.
   const deviceName = process.env.YTCR_DEVICE_NAME || `Musik (${os.hostname()})`;
   const screenName = process.env.YTCR_SCREEN_NAME || `${deviceName} [code]`;
 
@@ -190,10 +192,9 @@ async function main() {
   });
   mpvClient = mpv;
 
-  // Now-playing reporting to the add-on (metadata.js, WP4 of
-  // docs/source-metadata-plan.md). Off unless the add-on host is configured: this
-  // role is otherwise a pure RTP sender that talks to nobody, and it must stay
-  // able to run that way.
+  // Now-playing reporting to the add-on (metadata.js). Off unless the add-on host
+  // is configured: this role is otherwise a pure RTP sender that talks to nobody,
+  // and it must stay able to run that way.
   const addonHost = process.env.YTCR_ADDON_HOST;
   const metadata = addonHost
     ? new MetadataReporter({

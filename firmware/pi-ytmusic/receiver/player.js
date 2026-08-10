@@ -41,8 +41,6 @@ export default class MpvPlayer extends Player {
   #volume = { level: 100, muted: false };
   /** Video id whose direct URL already got one retry, so retries cannot recurse. */
   #retriedFor = null;
-  /** Set while we are the ones stopping mpv, so `end-file` is not read as EOF. */
-  #expectingStop = false;
 
   constructor(mpv, metadata = null, resolver = null) {
     super();
@@ -52,8 +50,17 @@ export default class MpvPlayer extends Player {
 
     this.#mpv.on('end-file', (msg) => {
       const reason = msg.reason ?? 'unknown';
-      if (this.#expectingStop || reason === 'stop' || reason === 'quit' || reason === 'redirect') {
-        this.#expectingStop = false;
+      // `reason` alone decides this. There used to be an `#expectingStop` flag as
+      // well, set by doPlay to swallow the outgoing file's end-file — and it was the
+      // cause of "the queue never advances after a song finishes": when mpv is IDLE
+      // there IS no outgoing file, so the flag survived and swallowed the *current*
+      // song's genuine EOF instead. Every first track of a session ended in silence.
+      //
+      // The flag was also unnecessary. Measured on mpv 0.40: replacing a playing
+      // file emits `end-file reason=stop`, and an explicit `stop` command emits
+      // `reason=stop` too — both already covered here. (end-file also carries
+      // `playlist_entry_id`, if this ever needs to correlate precisely.)
+      if (reason === 'stop' || reason === 'quit' || reason === 'redirect') {
         return;
       }
       if (reason === 'error') {
@@ -101,7 +108,6 @@ export default class MpvPlayer extends Player {
     // derivable from the id alone, so it can be reported while yt-dlp is still
     // resolving the title (metadata.js).
     this.#metadata?.trackStarted(video.id);
-    this.#expectingStop = true; // the implicit stop of the outgoing file
     // Wait for mpv to report the file open (or fail) rather than trusting the
     // command's own acknowledgement, which only means "queued".
     const started = new Promise((resolve) => {
@@ -204,7 +210,6 @@ export default class MpvPlayer extends Player {
   }
 
   async doStop() {
-    this.#expectingStop = true;
     // Clear rather than let the add-on's TTL collect it, so Home Assistant's media
     // card collapses instead of freezing on the last track.
     this.#metadata?.stopped();
@@ -214,7 +219,6 @@ export default class MpvPlayer extends Player {
     }
     catch (e) {
       this.logger.warn(`[MpvPlayer] stop failed: ${e.message}`);
-      this.#expectingStop = false;
       return false;
     }
   }
@@ -249,9 +253,9 @@ export default class MpvPlayer extends Player {
 
   async doGetPosition() {
     // `time-pos` is the position of the *audio mpv has decoded*, so the phone's
-    // progress bar runs slightly ahead of the sound: the RTP jitter buffer plus
-    // output latency sit downstream of here (order 200-400 ms). Not worth
-    // correcting — see the plan.
+    // progress bar runs slightly ahead of the sound: mpv's own output buffer, the
+    // RTP jitter buffer and the output latency all sit downstream of here. That
+    // drift is expected and deliberately not corrected.
     return (await this.#mpv.getProperty('time-pos', 0)) ?? 0;
   }
 

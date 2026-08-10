@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision the Pi's YouTube cookie jar from this workstation (WP3).
+"""Provision the receiver's YouTube cookie jar from this workstation.
 
 Runs on the **desktop** (where a browser and a logged-in session exist), not on
 the Pi. It extracts cookies, keeps only the Google/YouTube ones, tells you what

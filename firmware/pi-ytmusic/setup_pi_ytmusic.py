@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Configure a Raspberry Pi as a YouTube Music cast receiver (WP1 + WP2).
+"""Configure a Raspberry Pi as a YouTube Music cast receiver.
 
-Implements ../../docs/pi-ytmusic-receiver-plan.md on the device:
+Sets up both halves of this signal path on the device (full documentation in
+../../docs/ytmusic-receiver.md):
 
-    YouTube Music app --DIAL/Lounge--> receiver/ (Node service, WP2)
-        --JSON IPC--> mpv --> ytm-out (module-rtp-sink, WP1)
+    YouTube Music app --DIAL/Lounge--> receiver/ (Node service)
+        --JSON IPC--> mpv --> ytm-out (module-rtp-sink)
         --UDP/RTP--> add-on --> routing matrix --> speakers
 
 The two halves stay separable on purpose, because they fail for entirely
-different reasons: the audio path (WP1) is testable with `--test-tone` and no
-YouTube code in it at all, so once it is proven, anything that breaks later is in
-the receiver or in yt-dlp. `--no-service` sets up the audio path alone.
+different reasons: the audio path is testable with `--test-tone` and no YouTube
+code in it at all, so once it is proven, anything that breaks later is in the
+receiver or in yt-dlp. `--no-service` sets up the audio path alone.
 
 The receiver service is the `receiver/` directory next to this script, so copy
 the whole role directory to the Pi, not just this file:
@@ -28,7 +29,7 @@ Why a SECOND RTP port instead of feeding the Bluetooth bridge's stream:
     the whole path at the router graph's rate — no resample on the Pi *and*
     none on the receiver — while the Bluetooth leg keeps whatever it needs.
 
-Why NO null sink in front of the RTP sink (the plan's first sketch had one):
+Why NO null sink in front of the RTP sink:
   - `module-rtp-sink` already *is* an Audio/Sink node, and mpv is an ordinary
     playback client, so it can play straight into it. The Bluetooth role needs a
     `module-loopback` only because its input is a *capture* node (bluez_input.*).
@@ -37,14 +38,14 @@ Why NO null sink in front of the RTP sink (the plan's first sketch had one):
     the radio the Pi shares with Bluetooth. The Bluetooth role measured "zero
     packets while idle" and that property is worth keeping. Idle here means the
     sink has no client, so nothing is sent.
-  - Consequence for WP2: keep ONE long-lived mpv and rely on gapless playback to
-    hold the device open *between tracks*; do not stream silence to hold it open
-    forever.
+  - Consequence for the receiver: keep ONE long-lived mpv and rely on gapless
+    playback to hold the device open *between tracks*; do not stream silence to
+    hold it open forever.
 
 What this script does (idempotent — safe to re-run):
   1. Installs pipewire/wireplumber (in case this role is set up on a Pi without
      the Bluetooth role), mpv, nodejs/npm and python3-venv (yt-dlp comes from
-     pip, in its own venv — see WP3).
+     pip, in its own venv — see ensure_ytdlp()).
   2. Enables user lingering so the PipeWire user session runs headless at boot.
   3. Writes a PipeWire drop-in loading `module-rtp-sink` as the node `ytm-out`,
      pointed at the add-on, S16LE/48000/stereo.
@@ -110,17 +111,17 @@ APT_PACKAGES = [
     "pipewire-audio",
     "pipewire-bin",
     "wireplumber",
-    "mpv",  # the WP2 player; also used by --test-tone
-    # WP2: the cast receiver is a Node service. Raspberry Pi OS Trixie ships
-    # nodejs 20 for armhf, comfortably past yt-cast-receiver's Node >= 18.
+    "mpv",  # the player the receiver drives; also used by --test-tone
+    # The cast receiver is a Node service. Raspberry Pi OS Trixie ships nodejs 20
+    # for armhf, comfortably past yt-cast-receiver's Node >= 18.
     "nodejs",
     "npm",
-    # WP3: yt-dlp comes from pip in a venv, NOT from apt. Debian trixie ships
+    # yt-dlp comes from pip in a venv, NOT from apt. Debian trixie ships
     # 2025.04.30, and YouTube breaks extractors far faster than a stable release
     # can follow — a stale yt-dlp is the single most likely cause of "casting
     # connects but nothing plays". python3-venv gives us pip.
     "python3-venv",
-    # WP3: the JS engine that solves YouTube's `n` signature challenge. See
+    # The JS engine that solves YouTube's `n` signature challenge. See
     # JS_RUNTIME below for why it is quickjs on this box and not node or deno.
     "quickjs",
 ]
@@ -212,9 +213,9 @@ COOKIES_REL = f"{STATE_DIR_REL}/cookies.txt"
 RECEIVER_UNIT = "ytmusic-receiver.service"
 #: Port the DIAL server listens on (its device description + app endpoints).
 DEFAULT_DIAL_PORT = 8099
-#: The add-on's HTTP API port. Used only for *metadata* reporting (WP4 of
-#: docs/source-metadata-plan.md) — the audio path is plain RTP and talks to nobody,
-#: and the receiver still runs with reporting off.
+#: The add-on's HTTP API port. Used only for *metadata* reporting (the daemon's
+#: source-generic POST /api/now_playing/report) — the audio path is plain RTP and
+#: talks to nobody, and the receiver still runs with reporting off.
 DEFAULT_API_PORT = 8099
 
 PW_DROPIN_NAME = "60-ytmusic-rtp.conf"
@@ -315,7 +316,7 @@ def pw_dropin(host: str, port: int, fmt: str, rate: int, channels: int) -> str:
 #
 # `module-rtp-sink` exposes an Audio/Sink node named "{SINK_NODE_NAME}" and
 # transmits whatever is played into it to the add-on's rtp-source. The player
-# (mpv, WP2) plays straight into this node — no null sink and no loopback: mpv
+# (mpv) plays straight into this node — no null sink and no loopback: mpv
 # is a playback client, and an always-on loopback would transmit silence at
 # ~1.5 Mbit/s forever over the radio this Pi shares with Bluetooth. With no
 # client connected the sink is idle and nothing is sent.
@@ -420,9 +421,8 @@ def ensure_node22(home: str) -> bool:
 def ensure_ytdlp(home: str) -> bool:
     """Install/refresh yt-dlp in its own venv. Returns whether it is usable.
 
-    Deliberately independent of the Node app and of apt: WP3's whole premise is
-    that this one component must be updatable on its own, because it is the one
-    that breaks.
+    Deliberately independent of the Node app and of apt: this one component must
+    be updatable on its own, because it is the one that breaks.
     """
     print("== Installing yt-dlp (pip, in a venv) ==")
     venv = os.path.join(home, VENV_DIR_REL)
@@ -489,9 +489,9 @@ def deploy_receiver(home: str) -> bool:
     """Copy the `receiver/` app next to this script into APP_DIR and install its
     dependencies. Returns whether the app is installed and runnable.
 
-    Tolerates the script having been copied to the Pi on its own (which is how
-    WP1 was deployed): without the app directory there is nothing to install, so
-    say so plainly and let the audio half stand alone.
+    Tolerates the script having been copied to the Pi on its own: without the app
+    directory there is nothing to install, so say so plainly and let the audio half
+    stand alone.
     """
     print("== Installing the cast receiver app ==")
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receiver")
@@ -558,7 +558,7 @@ def receiver_unit(home: str, *, device_name: str | None, dial_port: int,
     # Every value is QUOTED. systemd splits an unquoted `Environment=` line on
     # whitespace, so `Environment=YTCR_DEVICE_NAME=Turnerstr Musik` silently
     # delivers just "Turnerstr" — which then shows up as the DIAL name in the
-    # phone's Cast menu. Hit on the first WP2 deploy.
+    # phone's Cast menu.
     env = [
         f'Environment="YTCR_DIAL_PORT={dial_port}"',
         f'Environment="YTCR_AUDIO_DEVICE=pipewire/{SINK_NODE_NAME}"',
@@ -586,7 +586,7 @@ def receiver_unit(home: str, *, device_name: str | None, dial_port: int,
 {MANAGED_MARKER}
 [Unit]
 Description=YouTube Music cast receiver (DIAL + Lounge) -> {SINK_NODE_NAME}
-Documentation=file://{os.path.dirname(os.path.abspath(__file__))}/../../docs/pi-ytmusic-receiver-plan.md
+Documentation=file://{os.path.dirname(os.path.abspath(__file__))}/../../docs/ytmusic-receiver.md
 # The receiver spawns mpv, which needs the PipeWire session to exist before it
 # can open `{SINK_NODE_NAME}`. mpv is respawned by the app if it dies, so a
 # transient PipeWire restart does not need a restart of this service.
@@ -696,8 +696,8 @@ def node_present(name: str) -> bool:
 
 
 def test_tone(seconds: int = 5) -> None:
-    """Play a tone into the sink with mpv, pinned exactly the way WP2 will pin
-    it — so this also proves the pinning syntax on this box."""
+    """Play a tone into the sink with mpv, pinned exactly the way the receiver
+    pins it — so this also proves the pinning syntax on this box."""
     print(f"== Playing a {seconds}s test tone into {SINK_NODE_NAME} ==")
     cmd = [
         "mpv",
@@ -972,8 +972,9 @@ def verify_receiver_service(dial_port: int) -> None:
     import urllib.request
 
     # Probe the LAN address, NOT loopback: the DIAL server is deliberately bound
-    # to one address (see YTCR_BIND_ADDRESS / the WP0 multi-homing lesson), so
-    # 127.0.0.1 is refused even when everything is healthy.
+    # to one address (see YTCR_BIND_ADDRESS — a multi-homed responder answers
+    # M-SEARCH twice and senders drop it), so 127.0.0.1 is refused even when
+    # everything is healthy.
     base = f"http://{primary_lan_ip()}:{dial_port}/ytcr"
     # And retry: the service spawns mpv and waits for its IPC socket before
     # starting the DIAL server, which takes several seconds on a Pi Zero 2 W —
@@ -1104,7 +1105,7 @@ def main() -> None:
                          f"runtime stays as the automatic fallback). Pass 'none' to solve "
                          f"only locally. Default: {DEFAULT_CIPHER_URL}")
     ap.add_argument("--no-service", action="store_true",
-                    help="Set up only the audio path (WP1); skip installing/starting the "
+                    help="Set up only the audio path; skip installing/starting the "
                          "cast receiver service.")
     ap.add_argument("--force-restart", action="store_true",
                     help="Restart PipeWire even if a phone is connected over Bluetooth "

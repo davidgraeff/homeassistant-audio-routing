@@ -7,7 +7,7 @@ description: >-
 url: "https://github.com/davidgraeff/homeassistant-audio-routing"
 # LOCAL/PRIVATE add-on, deliberately never published: it depends on unofficial
 # protocols and on yt-dlp keeping up with YouTube, and it plays from the owner's
-# own signed-in account. See docs/pi-ytmusic-receiver-plan.md.
+# own signed-in account. See docs/ytmusic-receiver.md.
 #
 # Built on the workstation and pulled, exactly like the audio-router add-on. There
 # is no compiler involved here, but *assembling* the image still means apt +

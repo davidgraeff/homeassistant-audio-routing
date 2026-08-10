@@ -3,7 +3,7 @@
  *
  * mpv runs ONCE, long-lived, in `--idle` mode; every transport command is a
  * newline-delimited JSON message over its unix socket. Why one long-lived mpv
- * rather than one process per track (see ../../../docs/pi-ytmusic-receiver-plan.md):
+ * rather than one process per track:
  *
  *   - Process startup + `yt-dlp` extractor import costs *seconds* on a Pi Zero
  *     2 W; paying that per track would stall every transition.

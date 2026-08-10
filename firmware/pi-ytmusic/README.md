@@ -12,14 +12,20 @@ YouTube Music app --DIAL/Lounge--> receiver/ (Node)
     --UDP/RTP:46001--> add-on --> routing matrix --> speakers
 ```
 
-**Personal install, not an add-on feature.** It depends on unofficial protocols and on
+**Personal install, not a published feature.** It depends on unofficial protocols and on
 `yt-dlp` keeping pace with YouTube, so it needs ongoing maintenance and is against
-YouTube's ToS to distribute. Full rationale, work packages and hard-won gotchas:
-[`docs/pi-ytmusic-receiver-plan.md`](../../docs/pi-ytmusic-receiver-plan.md).
+YouTube's ToS to distribute. Full rationale, measurements and hard-won gotchas:
+[`docs/ytmusic-receiver.md`](../../docs/ytmusic-receiver.md).
 
 Google Cast itself is **not** used — a Cast receiver needs a Google-signed device
 certificate. DIAL + the Lounge API is YouTube's surviving pre-Cast path and needs no such
 thing.
+
+The same `receiver/` app also runs as a local Home Assistant add-on
+([`ytmusic_receiver/`](../../ytmusic_receiver/README.md), RTP port 46002, DIAL port 8098).
+The two coexist: the add-on resolves faster on a Pi 4's cores, this one keeps working
+across HA restarts and updates. This directory stays canonical, because the Pi role is
+installed by copying it wholesale.
 
 ## Install
 
@@ -36,11 +42,20 @@ ssh david@turnerstr-bluetooth.local \
 - `--port` (default `46001`): must match the add-on's RTP source for this role.
 - `--bind-address`: pin the DIAL server to one local IP. Needed on a multi-homed host —
   answering SSDP on the wrong address makes senders silently drop the device.
+- `--cipher-url`: the yt-cipher server that solves YouTube's JS challenges off-box (~3×
+  faster than this hardware manages locally; the local runtime stays as the automatic
+  fallback). `none` solves only locally.
 - `--no-service`: set up the audio path only (no cast receiver).
 - `--test-tone`: play a 440 Hz tone into the sink. **Read the warning below first.**
 - `--disable`: remove this role (leaves the Bluetooth bridge alone).
 
 Idempotent — safe to re-run. Run it **as the appliance user**, not root.
+
+The script also drops in `LimitRTPRIO=95` on `user@<uid>.service`, without which PipeWire's
+data loops run `SCHED_OTHER` here and a resolve spike is enough to stutter playback (the
+distro's `@pipewire` limits.d route does nothing on this box — `user@.service` never passes
+through `pam_limits`). That limit is only inherited when the user manager starts, so it
+needs a **reboot** to take effect; the verification asserts the live scheduling class.
 
 On the add-on, add an RTP source with `port 46001`, `rate 48000`, `source_addr 0.0.0.0`,
 and route it wherever you want the music.
@@ -77,13 +92,17 @@ Use `--ytdlp <venv>/bin/yt-dlp --remote-components none` if you would rather ins
 package than fetch at runtime.
 
 `yt-dlp` on the Pi comes from pip in `~/.local/share/pi-ytmusic-venv` — never apt (Debian's
-is over a year stale) — together with **`yt-dlp-ejs`**, and updates weekly via
-`ytmusic-ytdlp-update.timer`. Both are required: YouTube makes authenticated requests solve
-an `n` signature challenge, which needs the solver scripts **and** a JS runtime. yt-dlp
-enables only `deno` by default, and on armv7l the choice is narrow: deno and bun have no
-32-bit ARM builds, and Raspbian's node 20 is rejected as `(unsupported)`. This role therefore
-uses **quickjs** (`/usr/bin/qjs`, Debian package) via `YTCR_JS_RUNTIME`, while
-`push_cookies.py` uses node on the workstation.
+is over a year stale) — together with **`yt-dlp-ejs`** and **`yt-dlp-remote-cipher`**, and
+updates weekly via `ytmusic-ytdlp-update.timer`. The solver scripts are not optional:
+YouTube makes authenticated requests solve an `n` signature challenge, which needs them
+**and** a JS runtime. yt-dlp enables only `deno` by default, and on armv7l the choice is
+narrow: deno and bun have no 32-bit ARM builds, and Raspbian's node 20 is rejected as
+`(unsupported)`. So the script installs a **private Node 22 tarball**
+(`~/.local/opt/node22`) and passes `node:<path>` via `YTCR_JS_RUNTIME`; Debian's **quickjs**
+(`/usr/bin/qjs`) works too and is the automatic fallback, but it has no JIT — measured, an
+authenticated resolve is ~22 s with node 22 against ~90 s with quickjs. Faster still is not
+solving locally at all: `--cipher-url` hands the challenge to a yt-cipher server (~7-10 s),
+with the local runtime as fallback.
 
 Only **authenticated** requests hit that challenge, so an anonymous test proves nothing about
 it — the verification deliberately probes with the cookie jar when one is present and says so
@@ -130,8 +149,8 @@ add-on before making sound.
 | `receiver/player.js` | `Player` implementation mapping cast commands to mpv |
 | `receiver/mpv.js` | mpv JSON-IPC client (one long-lived `mpv --idle`) |
 | `receiver/resolver.js` | Pre-resolves the next track to a direct URL (30.7 s → 0.5 s per track change) |
-| `receiver/metadata.js` | Now-playing reporting to the add-on |
 | `receiver/metadata.js` | Reports the playing track to the add-on (title from mpv, artwork from the video id) |
+| `receiver/singleton.js` | Single-instance lock, so a second mpv can never join `ytm-out` and mix into the stream |
 
 Installed on the Pi to `~/.local/share/pi-ytmusic-receiver` with state (including the DIAL
 identity) in `~/.local/state/pi-ytmusic-receiver`.

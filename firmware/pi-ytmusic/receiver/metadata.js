@@ -1,11 +1,11 @@
 /**
- * Report what this receiver is playing to the audio-router add-on (WP4 of
- * ../../../docs/source-metadata-plan.md).
+ * Report what this receiver is playing to the audio-router add-on.
  *
- * The add-on models now-playing per *source*, and this Pi is one of its RTP
+ * The add-on models now-playing per *source*, and this receiver is one of its RTP
  * sources — so it reports the same way the Bluetooth bridge does: `POST
- * /api/now_playing/report` with the RTP port that identifies which source this
- * is. Nothing here knows (or needs to know) the source ids the add-on assigned.
+ * /api/now_playing/report` (see ../../../docs/api-reference.md) with the RTP port
+ * that identifies which source this is. Nothing here knows (or needs to know) the
+ * source ids the add-on assigned.
  *
  * **Where the metadata comes from — not from the phone.** The Lounge protocol
  * carries video ids and positions only: a `Video` is `{id, client, context}`, and
