@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import aiohttp
 
+_LOGGER = logging.getLogger(__name__)
+
 # Ping cadence for the routing WebSocket — lets aiohttp notice a dead
 # connection (and trigger the coordinator's reconnect) even when the daemon
 # has no routing changes to push for a while.
 WS_HEARTBEAT_SECONDS = 25
+
+# Frame `type`s on /api/routing/ws this client consumes. The daemon multiplexes
+# several onto that socket (routing.rs `Frame`); the rest are listings this
+# integration re-fetches over REST instead, and are skipped.
+ROUTING_WS_FRAME_MATRIX = "matrix"
+ROUTING_WS_FRAME_NOW_PLAYING = "now_playing"
+# Live input levels and xrun counts, on a 250 ms tick while any client watches.
+# Named so it can be skipped *silently*: it is the only high-rate frame on the
+# socket and there is nothing an HA entity could do with a peak meter, so logging
+# it as an unrecognised frame would mean a debug line four times a second
+# throughout playback.
+ROUTING_WS_FRAME_METERS = "meters"
 
 
 class PipewireRouterApiError(Exception):
@@ -69,6 +84,74 @@ class RtpSourceState:
     port: int
     latency_msec: int
     loaded: bool
+
+
+@dataclass
+class NowPlaying:
+    """What one source is currently playing (`NowPlaying` in the daemon's
+    now_playing.rs), as pushed on the routing socket's `now_playing` frame and
+    served by `GET /api/now_playing`.
+
+    Keyed elsewhere by source *node name* — the same identity the routing matrix
+    and the persisted routing intent use — so an entity can look this up with the
+    node name it already resolved for its `source` property.
+
+    `position_updated_at` is Unix milliseconds: the position is only meaningful
+    together with when it was true, and Home Assistant extrapolates from it (the
+    daemon publishes a position at most every 5 s). `image_path` is a
+    daemon-relative path for embedded cover art, already stamped with the
+    revision that changes when the picture does; `image_url` is an absolute URL
+    when a producer supplied one instead. At most one of the two is set."""
+
+    state: str  # "playing" | "paused" | "stopped"
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    duration_ms: int | None = None
+    position_ms: int | None = None
+    position_updated_at: int | None = None
+    image_url: str | None = None
+    image_path: str | None = None
+
+    @property
+    def has_metadata(self) -> bool:
+        """Whether there is anything worth showing. A bare `stopped` with no
+        fields is an entry mid-teardown, not a track."""
+        return any((self.title, self.artist, self.album))
+
+
+def _parse_now_playing(data: dict) -> dict[str, NowPlaying]:
+    """Parse a `now_playing` frame / `GET /api/now_playing` body into entries by
+    source node name. Unparseable entries are skipped rather than failing the
+    whole frame — one odd source must not blank every other entity's metadata."""
+    out: dict[str, NowPlaying] = {}
+    for node_name, item in (data.get("sources") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        art = item.get("artwork") or {}
+        out[str(node_name)] = NowPlaying(
+            state=str(item.get("state") or "stopped"),
+            title=item.get("title"),
+            artist=item.get("artist"),
+            album=item.get("album"),
+            duration_ms=item.get("duration_ms"),
+            position_ms=item.get("position_ms"),
+            position_updated_at=item.get("position_updated_at"),
+            image_url=art.get("url") if art.get("kind") == "url" else None,
+            image_path=art.get("path") if art.get("kind") == "embedded" else None,
+        )
+    return out
+
+
+@dataclass
+class NowPlayingFrame:
+    """A `now_playing` push: every source with metadata, by node name.
+
+    A distinct type (rather than a bare dict) so the routing socket can yield two
+    kinds of update and the coordinator can tell them apart without inspecting
+    shapes."""
+
+    sources: dict[str, NowPlaying]
 
 
 @dataclass
@@ -150,6 +233,12 @@ class PipewireRouterApiClient:
     def __init__(self, session: aiohttp.ClientSession, host: str, port: int) -> None:
         self._session = session
         self._base_url = f"http://{host}:{port}"
+
+    @property
+    def base_url(self) -> str:
+        """This daemon's base URL. Needed to turn a daemon-relative artwork path
+        into something Home Assistant can fetch."""
+        return self._base_url
 
     async def async_get_media_players(self) -> list[MediaPlayerState]:
         try:
@@ -415,11 +504,31 @@ class PipewireRouterApiClient:
             raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
         return _parse_routing_matrix(data)
 
-    async def async_routing_ws_messages(self) -> AsyncIterator[RoutingMatrix]:
+    async def async_routing_ws_messages(self) -> AsyncIterator[RoutingMatrix | NowPlayingFrame]:
         """Subscribe to the daemon's routing WebSocket (`/api/routing/ws`)
-        and yield a fresh `RoutingMatrix` for every push — the daemon sends
-        one immediately on connect, then one on every registry change, so
-        this replaces polling `GET /api/routing`.
+        and yield a fresh `RoutingMatrix` for every matrix push — the daemon
+        sends one immediately on connect, then one on every registry change
+        (and on its own meter tick), so this replaces polling `GET /api/routing`.
+
+        Also yields a `NowPlayingFrame` for every `now_playing` push (per-source
+        metadata, see the daemon's now_playing.rs). That frame is sent only when
+        something actually changed, which is why it is a *separate* frame from the
+        matrix and not a field on it.
+
+        **That socket carries more than matrices.** `routing.rs`'s `Frame` enum is
+        internally tagged, and alongside `{"type": "matrix", …}` it pushes
+        `outputs`, `discovered` and `agents` listing frames — the first of them
+        immediately after the initial matrix, on every connect. Frames we don't
+        consume are skipped here rather than parsed: feeding a listing frame to
+        `_parse_routing_matrix` raised `KeyError: 'display_name'` (an `OutputInfo`
+        has `node_name`/`name`, no `display_name`), which the caller's catch-all
+        turned into a reconnect — so the socket never survived its first second
+        and the push path had quietly degraded to a 5-second reconnect poll with a
+        traceback each time.
+
+        A frame with no `type` at all is treated as a matrix: the matrix frame
+        historically *was* the whole frame, and the daemon tags it internally
+        precisely so that older readers keep working.
 
         Returns normally when the socket closes (the caller reconnects);
         raises `PipewireRouterApiError` on a connect/transport failure."""
@@ -429,7 +538,19 @@ class PipewireRouterApiClient:
             ) as ws:
                 async for msg in ws:
                     if msg.type is aiohttp.WSMsgType.TEXT:
-                        yield _parse_routing_matrix(msg.json())
+                        data = msg.json()
+                        if not isinstance(data, dict):
+                            continue
+                        frame = data.get("type")
+                        if frame == ROUTING_WS_FRAME_METERS:
+                            continue
+                        if frame == ROUTING_WS_FRAME_NOW_PLAYING:
+                            yield NowPlayingFrame(_parse_now_playing(data))
+                            continue
+                        if frame is not None and frame != ROUTING_WS_FRAME_MATRIX:
+                            _LOGGER.debug("ignoring '%s' frame on the routing socket", frame)
+                            continue
+                        yield _parse_routing_matrix(data)
                     elif msg.type in (
                         aiohttp.WSMsgType.CLOSE,
                         aiohttp.WSMsgType.CLOSING,

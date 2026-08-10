@@ -1,9 +1,9 @@
 <script lang="ts">
   import { untrack, onDestroy } from 'svelte';
-  import { routing } from '../lib/routing';
+  import { artworkOf, nowPlayingOf, peakOf, routing, xrunsOf } from '../lib/routing';
   import { api } from '../lib/api';
   import { run, toast } from '../lib/toast';
-  import type { MusicGroup, RoutingNode } from '../lib/types';
+  import type { MusicGroup, NowPlaying, RoutingNode } from '../lib/types';
   import VolumeControl from './VolumeControl.svelte';
   import RoutingHelp from './RoutingHelp.svelte';
 
@@ -71,6 +71,8 @@
   const MEM_VOL_H = 42; // speaker row carrying a volume slider
   const MEM_H = 22; // speaker row without one
   const MEM_GAP = 6; // gap between speaker rows
+  const NP_H = 24; // now-playing row on a source card (see srcLayout)
+  const NP_GAP = 4; // gap between a source's name row and its now-playing row
 
   let canvasEl: HTMLDivElement | undefined = $state();
   let Wc = $state(0); // measured canvas width
@@ -120,6 +122,13 @@
     ];
   });
 
+  /** The full track, for the row's tooltip — the row itself elides at 240 px. */
+  function npTitle(np: NowPlaying): string {
+    const parts = [ np.title, np.artist, np.album ].filter(Boolean);
+    const label = parts.join(' — ') || 'playing';
+    return np.state === 'paused' ? `${label} (paused)` : label;
+  }
+
   const memberH = (n: RoutingNode) => (n.present && isVirtual(n.node_name) ? MEM_VOL_H : MEM_H);
   function targetH(t: Target): number {
     const rows = t.members.length ? t.members.map(memberH) : [MEM_H];
@@ -127,11 +136,22 @@
     return 2 * PAD + body + (t.kind === 'group' ? HEAD_H + MEM_GAP : 0);
   }
 
+  // Left column: stacked top-to-bottom like the right one, because a source card
+  // grows by one row when that input reports what it is playing (now_playing.rs).
+  // The handle stays on the *name* row's center rather than the card's, so adding a
+  // track line doesn't drag the wire down and re-draw the whole graph.
+  const srcLayout = $derived.by(() => {
+    let y = TOP;
+    return S.map((n) => {
+      const h = ROW_SRC + (nowPlayingOf($routing, n.node_name) ? NP_H + NP_GAP : 0);
+      const box = { n, top: y, h, x: COL_W, y: y + ROW_SRC / 2, name: n.node_name };
+      y += h + GAP;
+      return box;
+    });
+  });
   // Handle centers, by node name / target key. Source handles sit on the right
   // edge of the left column; target handles on the left edge of the right one.
-  const srcPos = $derived(
-    S.map((n, i) => ({ name: n.node_name, x: COL_W, y: TOP + i * (ROW_SRC + GAP) + ROW_SRC / 2 })),
-  );
+  const srcPos = $derived(srcLayout.map(({ name, x, y }) => ({ name, x, y })));
   const outX = $derived(Math.max(COL_W, Wc - COL_W));
   // Stacked top-to-bottom, each node as tall as its content needs.
   const layout = $derived.by(() => {
@@ -146,7 +166,7 @@
   const srcByName = $derived(new Map(srcPos.map((p) => [p.name, p])));
   const targetByKey = $derived(new Map(layout.map((b) => [b.t.key, b])));
 
-  const srcColH = $derived(S.length * (ROW_SRC + GAP));
+  const srcColH = $derived(srcLayout.reduce((a, b) => a + b.h + GAP, 0));
   const outColH = $derived(layout.reduce((a, b) => a + b.h + GAP, 0));
   const canvasH = $derived(Math.max(120, TOP * 2 + Math.max(srcColH, outColH) - GAP));
 
@@ -206,20 +226,23 @@
     return sources.size > 1 || linkedMembers(t, [...sources][0]).length !== t.members.length;
   }
 
-  // Animate a routed wire while its source is carrying signal. `peak` arrives as
-  // live WebSocket frames; we hold the "flowing" state for a short while past the
-  // last above-threshold frame so brief quiet passages in music don't make the
+  // Animate a routed wire while its source is carrying signal. Peaks arrive on the
+  // `meters` frame (four times a second while anything is audible, nothing at all
+  // while the house is silent); we hold the "flowing" state for a short while past
+  // the last above-threshold frame so brief quiet passages in music don't make the
   // animation stutter or drop out. Threshold matches when the meter-fill shows.
   const FLOW_THRESH = 0.02; // peak level (0–1) that counts as signal present
   const FLOW_HOLD = 1200; // ms to keep flowing after signal falls below threshold
   let flowing = $state<Record<string, boolean>>({});
   let flowTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
+  // Depends on the meters slice, NOT on the matrix: the matrix now only changes when
+  // the graph does, so tracking it here would freeze the animation between changes.
   $effect(() => {
-    const srcs = $routing.matrix.sources;
+    const meters = $routing.meters;
     untrack(() => {
-      for (const s of srcs) {
-        if (!(s.present && (s.peak ?? 0) > FLOW_THRESH)) continue;
+      for (const s of $routing.matrix.sources) {
+        if (!(s.present && (meters[s.node_name]?.peak ?? 0) > FLOW_THRESH)) continue;
         if (!flowing[s.node_name]) flowing = { ...flowing, [s.node_name]: true };
         clearTimeout(flowTimers[s.node_name]); // extend the hold on each active frame
         flowTimers[s.node_name] = setTimeout(() => {
@@ -409,28 +432,29 @@
   // count is cumulative, so a non-zero value alone means "has dropped at some
   // point"; what matters is whether it's climbing *now*. Hold a "hot" flag for a
   // short while after each increase so an actively-stuttering node lights up red
-  // (mirrors the wire-flow hold above). `null` xruns = profiling off / virtual
-  // output → no badge.
+  // (mirrors the wire-flow hold above). Absent from the `meters` frame = never
+  // dropped a cycle, profiling off, or a virtual output → no badge.
   const XRUN_HOT_HOLD = 2500; // ms to keep a node flagged after its count rises
   let xrunHot = $state<Record<string, boolean>>({});
   let prevXruns: Record<string, number> = {};
   let xrunTimers: Record<string, ReturnType<typeof setTimeout>> = {};
-  const anyXruns = $derived([...S, ...O].some((n) => (n.xruns ?? 0) > 0));
+  const anyXruns = $derived(Object.values($routing.meters).some((m) => (m.xruns ?? 0) > 0));
 
+  // Also driven by the meters slice — counts climb without the graph changing.
   $effect(() => {
-    const nodes = [...$routing.matrix.sources, ...$routing.matrix.outputs];
+    const meters = $routing.meters;
     untrack(() => {
-      for (const n of nodes) {
-        if (n.xruns == null) continue;
-        const prev = prevXruns[n.node_name];
-        if (prev != null && n.xruns > prev) {
-          if (!xrunHot[n.node_name]) xrunHot = { ...xrunHot, [n.node_name]: true };
-          clearTimeout(xrunTimers[n.node_name]);
-          xrunTimers[n.node_name] = setTimeout(() => {
-            xrunHot = { ...xrunHot, [n.node_name]: false };
+      for (const [name, m] of Object.entries(meters)) {
+        if (m.xruns == null) continue;
+        const prev = prevXruns[name];
+        if (prev != null && m.xruns > prev) {
+          if (!xrunHot[name]) xrunHot = { ...xrunHot, [name]: true };
+          clearTimeout(xrunTimers[name]);
+          xrunTimers[name] = setTimeout(() => {
+            xrunHot = { ...xrunHot, [name]: false };
           }, XRUN_HOT_HOLD);
         }
-        prevXruns[n.node_name] = n.xruns;
+        prevXruns[name] = m.xruns;
       }
     });
   });
@@ -612,23 +636,43 @@
               {#each ghosts as g, i (i)}<path class="ghost" d={g}></path>{/each}
             </svg>
 
-            {#each S as n, i (n.node_name)}
-              <div class="node src" class:offline={!n.present} style="top:{TOP + i * (ROW_SRC + GAP)}px; height:{ROW_SRC}px; width:{COL_W}px">
-                <div class="body">
-                  <span class="nm" title={n.display_name}>{n.display_name}</span>
-                  {#if !n.present}
-                    <span class="tag off">offline</span>
-                    <button class="x" title="Forget saved routing" onclick={() => forget(n)}>✕</button>
-                  {:else}
-                    <div class="meter" title="input level {Math.round(n.peak * 100)}%">
-                      <div class="meter-fill" style="width:{Math.min(100, Math.round(n.peak * 100))}%"></div>
+            {#each srcLayout as box (box.n.node_name)}
+              {@const n = box.n}
+              {@const np = nowPlayingOf($routing, n.node_name)}
+              <div class="node src" class:offline={!n.present} style="top:{box.top}px; height:{box.h}px; width:{COL_W}px">
+                <div class="sbody">
+                  <div class="body" style="height:{ROW_SRC - 12}px">
+                    <span class="nm" title={n.display_name}>{n.display_name}</span>
+                    {#if !n.present}
+                      <span class="tag off">offline</span>
+                      <button class="x" title="Forget saved routing" onclick={() => forget(n)}>✕</button>
+                    {:else}
+                      <div class="meter" title="input level {Math.round(peakOf($routing, n.node_name) * 100)}%">
+                        <div class="meter-fill" style="width:{Math.min(100, Math.round(peakOf($routing, n.node_name) * 100))}%"></div>
+                      </div>
+                      {#if fmtLat(n.latency_ms)}
+                        <span class="lat" title="Estimated input jitter buffer this source adds">{fmtLat(n.latency_ms)}</span>
+                      {/if}
+                      {#if (xrunsOf($routing, n.node_name) ?? 0) > 0}
+                        <span class="xrun" class:hot={xrunHot[n.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now, i.e. dropping out.">⚠ {xrunsOf($routing, n.node_name)}</span>
+                      {/if}
+                    {/if}
+                  </div>
+                  <!-- What this input is playing, when it says (now_playing.rs). Only
+                       present for a source with a track, so a silent house shows the
+                       same compact cards as before. -->
+                  {#if np}
+                    {@const art = artworkOf(np)}
+                    <div class="np" style="height:{NP_H}px" title={npTitle(np)}>
+                      {#if art}
+                        <!-- Cover art is best-effort decoration: a broken or slow image
+                             must not leave a gap where the title should be. -->
+                        <img class="art" src={art} alt="" onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')} />
+                      {/if}
+                      {#if np.state === 'paused'}<span class="np-state" title="Paused">⏸</span>{/if}
+                      <span class="np-title">{np.title ?? np.album ?? ''}</span>
+                      {#if np.artist}<span class="np-sub">{np.artist}</span>{/if}
                     </div>
-                    {#if fmtLat(n.latency_ms)}
-                      <span class="lat" title="Estimated input jitter buffer this source adds">{fmtLat(n.latency_ms)}</span>
-                    {/if}
-                    {#if (n.xruns ?? 0) > 0}
-                      <span class="xrun" class:hot={xrunHot[n.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now, i.e. dropping out.">⚠ {n.xruns}</span>
-                    {/if}
                   {/if}
                 </div>
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -692,8 +736,8 @@
                         {#if fmtLat(m.latency_ms)}
                           <span class="lat" title="Estimated playout buffer this speaker adds (group lead + any per-device delay)">{fmtLat(m.latency_ms)}</span>
                         {/if}
-                        {#if (m.xruns ?? 0) > 0}
-                          <span class="xrun" class:hot={xrunHot[m.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now.">⚠ {m.xruns}</span>
+                        {#if (xrunsOf($routing, m.node_name) ?? 0) > 0}
+                          <span class="xrun" class:hot={xrunHot[m.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now.">⚠ {xrunsOf($routing, m.node_name)}</span>
                         {/if}
                         {#if !m.present}
                           <span class="tag off">offline</span>
@@ -924,6 +968,64 @@
     gap: 6px;
     min-width: 0;
     flex: 1;
+  }
+  /* A source card is a column: the name/meter row, then the now-playing row when
+     that input reports one. Heights are exact so srcLayout's arithmetic (and with
+     it every wire anchor) stays true without measuring the DOM. */
+  .sbody {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+  }
+  .sbody > .body {
+    flex: none;
+  }
+  .np {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    font-size: 0.72rem;
+    color: var(--secondary-text-color);
+    /* One line, always: the card height is computed, so wrapping would push the
+       content out of its own box. */
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .np .art {
+    flex: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 3px;
+    object-fit: cover;
+    background: color-mix(in srgb, var(--secondary-text-color) 15%, transparent);
+  }
+  .np-state {
+    flex: none;
+  }
+  /* The title has priority for the 240 px of card: it shrinks only after the
+     artist has given up everything it can, and the full string is in the row's
+     tooltip either way. */
+  .np-title {
+    flex: 0 1 auto;
+    min-width: 3.5em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--primary-text-color);
+  }
+  .np-sub {
+    flex: 0 100 auto;
+    min-width: 0;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .np-sub::before {
+    content: '·';
+    margin-right: 5px;
   }
   /* Right-column card body: optional group head, then one row per speaker, each
      an exact height so the handle arithmetic above stays true. */

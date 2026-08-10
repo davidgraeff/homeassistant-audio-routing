@@ -92,6 +92,12 @@ APT_PACKAGES = [
     "bluez",
     "bluez-tools",  # provides bt-agent
     "iw",           # to disable WiFi power-save (BT coexistence)
+    # For the AVRCP metadata reporter: BlueZ exposes track info on D-Bus, and
+    # neither binding is installed on Raspberry Pi OS by default (verified on
+    # Trixie: `import dbus` and `import gi` both fail). dbus-python needs the GLib
+    # main loop from python3-gi to receive signals at all.
+    "python3-dbus",
+    "python3-gi",
 ]
 
 #: mDNS service type the add-on browses to find Bluetooth->RTP bridges. Custom,
@@ -111,11 +117,23 @@ DEFAULT_DIAG_PORT = 8080
 #: Bumped when the TXT record's meaning changes, so an old add-on can ignore an
 #: advert it would misread rather than guess.
 AVAHI_TXT_VERSION = 1
+#: Version of the metadata-reporting contract this bridge speaks (the body shape
+#: of `POST /api/now_playing/report`). Independent of AVAHI_TXT_VERSION so the
+#: reporter can evolve without touching the discovery contract.
+METADATA_CONTRACT_VERSION = 1
 
 PW_DROPIN_NAME = "60-bt-rtp-bridge.conf"
 WP_LUA_DROPIN_NAME = "51-bt-rtp-bridge.lua"        # WirePlumber 0.4.x
 WP_CONF_DROPIN_NAME = "51-bt-rtp-bridge.conf"      # WirePlumber 0.5+
 AGENT_UNIT = "bt-agent-a2dp.service"
+#: Service forwarding the phone's AVRCP metadata to the add-on
+#: (bt_metadata_reporter.py, docs/source-metadata-plan.md WP3). Separate from the
+#: audio path on purpose: if it is not installed the bridge still carries sound.
+METADATA_UNIT = "bt-metadata-reporter.service"
+METADATA_SCRIPT = "/usr/local/bin/bt-metadata-reporter"
+#: Port the add-on's HTTP API listens on. Only the *metadata* reporter needs it —
+#: the audio path is plain RTP and talks to nobody.
+DEFAULT_API_PORT = 8099
 POWERSAVE_UNIT = "wifi-powersave-off.service"
 NM_POWERSAVE_CONF = "/etc/NetworkManager/conf.d/wifi-powersave-off.conf"
 BLUEZ_MAIN_CONF = "/etc/bluetooth/main.conf"
@@ -355,6 +373,60 @@ WantedBy=bluetooth.target
     sudo(["systemctl", "enable", "--now", AGENT_UNIT])
 
 
+def install_metadata_reporter(*, host: str, api_port: int, rtp_port: int) -> None:
+    """Install + start the AVRCP metadata reporter (bt_metadata_reporter.py).
+
+    Additive and strictly optional: it forwards the phone's track info to the
+    add-on and touches neither BlueZ nor PipeWire, so a failure here leaves the
+    audio path untouched. The script is copied next to the unit rather than run
+    from the invoking user's home, so a service start does not depend on where
+    this setup script happened to be executed from.
+    """
+    print("== Installing AVRCP metadata reporter ==")
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bt_metadata_reporter.py")
+    if not os.path.exists(source):
+        print(f"  {source} not found — skipping the metadata reporter (audio is unaffected).")
+        return
+    with open(source, encoding="utf-8") as f:
+        sudo_write(METADATA_SCRIPT, f.read(), mode="0755")
+    unit = f"""\
+{MANAGED_MARKER}
+[Unit]
+Description=Report the connected phone's AVRCP metadata to the PipeWire audio-router add-on
+Documentation=https://github.com/ (docs/source-metadata-plan.md)
+After=bluetooth.service network-online.target
+Wants=network-online.target
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+# Runs as a system service because org.bluez lives on the SYSTEM bus (the audio
+# path's user session is irrelevant here). No audio, no realtime: plain default
+# scheduling, so this can never compete with the bridge's capture/relay threads.
+ExecStart={METADATA_SCRIPT} --host {host} --api-port {api_port} --rtp-port {rtp_port}
+Restart=always
+RestartSec=5
+# It only reads D-Bus and makes outbound HTTP calls.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+    sudo_write(f"/etc/systemd/system/{METADATA_UNIT}", unit)
+    sudo(["systemctl", "daemon-reload"])
+    sudo(["systemctl", "enable", "--now", METADATA_UNIT])
+
+
+def remove_metadata_reporter() -> None:
+    """Stop and remove the reporter. Idempotent."""
+    sudo(["systemctl", "disable", "--now", METADATA_UNIT], check=False)
+    sudo(["rm", "-f", f"/etc/systemd/system/{METADATA_UNIT}", METADATA_SCRIPT], check=False)
+    sudo(["systemctl", "daemon-reload"], check=False)
+
+
 def avahi_service_xml(*, name: str | None, host: str, port: int, fmt: str, rate: int,
                       channels: int, diag_port: int) -> str:
     """A static Avahi service file advertising this bridge to the add-on.
@@ -383,8 +455,17 @@ def avahi_service_xml(*, name: str | None, host: str, port: int, fmt: str, rate:
     """
     label = name.strip() if name and name.strip() else "Bluetooth bridge on %h"
     txt = [
+        # NOTE: `ver` must stay 1. The add-on's bt_bridge_discovery.rs *skips* an
+        # advert whose `ver` is newer than it understands, so bumping it would make
+        # an updated Pi vanish from a not-yet-updated add-on — taking Bluetooth
+        # discovery and adoption with it. New TXT keys are ignored by that same
+        # parser, so additions like `role`/`meta_ver` below are safe both ways.
         f"ver={AVAHI_TXT_VERSION}",
-        "role=rtp-sender",
+        # Two roles now: the RTP audio sender, and the AVRCP metadata reporter
+        # (docs/source-metadata-plan.md §3.5). `meta_ver` versions the metadata
+        # contract independently of the TXT layout.
+        "role=rtp-sender,metadata",
+        f"meta_ver={METADATA_CONTRACT_VERSION}",
         f"rtp_port={port}",
         f"rtp_dest={host}",
         f"rate={rate}",
@@ -592,6 +673,7 @@ def disable(home: str) -> None:
     ):
         user_remove(os.path.join(home, rel))
     remove_mdns_advert()
+    remove_metadata_reporter()
     sudo(["systemctl", "disable", "--now", AGENT_UNIT], check=False)
     sudo(["systemctl", "disable", "--now", POWERSAVE_UNIT], check=False)
     sudo(["rm", "-f", f"/etc/systemd/system/{AGENT_UNIT}", f"/etc/systemd/system/{POWERSAVE_UNIT}", NM_POWERSAVE_CONF], check=False)
@@ -606,6 +688,11 @@ def verify(host: str, port: int, *, diag_port: int | None = None) -> None:
     r = subprocess.run(["pw-cli", "ls", "Node"], text=True, capture_output=True, env=env)
     loaded = "rtp-bridge" in r.stdout
     print(f"  rtp-bridge sink present: {'YES' if loaded else 'NO'}")
+    r = subprocess.run(["systemctl", "is-active", METADATA_UNIT], text=True, capture_output=True)
+    active = r.stdout.strip() == "active"
+    installed = os.path.exists(f"/etc/systemd/system/{METADATA_UNIT}")
+    if installed:
+        print(f"  metadata reporter:       {'RUNNING' if active else 'NOT RUNNING'} ({METADATA_UNIT})")
     if diag_port is not None:
         advertised = os.path.exists(AVAHI_SERVICE_FILE)
         print(f"  mDNS advert installed:   {'YES' if advertised else 'NO'} "
@@ -646,6 +733,12 @@ def main() -> None:
     ap.add_argument("--diag-port", type=int, default=DEFAULT_DIAG_PORT,
                     help=f"Port the bluetooth-testing-app serves on, advertised over mDNS "
                          f"(default {DEFAULT_DIAG_PORT}).")
+    ap.add_argument("--api-port", type=int, default=DEFAULT_API_PORT,
+                    help=f"Add-on HTTP API port, used only by the AVRCP metadata reporter "
+                         f"(default {DEFAULT_API_PORT}).")
+    ap.add_argument("--no-metadata", action="store_true",
+                    help="Don't install the AVRCP metadata reporter (no track info in Home "
+                         "Assistant; the audio path is unaffected).")
     ap.add_argument("--no-mdns", action="store_true",
                     help="Don't advertise this bridge over mDNS (the add-on then can't "
                          "auto-discover it, and shows no diagnostics link).")
@@ -669,6 +762,10 @@ def main() -> None:
     disable_wifi_powersave()
     configure_bluez(args.name)
     install_pairing_agent()
+    if args.no_metadata:
+        remove_metadata_reporter()  # idempotent: also removes a previously-installed one
+    else:
+        install_metadata_reporter(host=args.host, api_port=args.api_port, rtp_port=args.port)
     write_pipewire_config(home, args.host, args.port, args.format, args.rate, args.channels)
     write_wireplumber_config(home)
     if args.no_mdns:

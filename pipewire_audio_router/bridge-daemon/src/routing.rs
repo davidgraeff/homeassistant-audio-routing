@@ -3,6 +3,15 @@
 //! that pushes a fresh matrix snapshot on every registry change instead of
 //! requiring the client to poll.
 //!
+//! **Invariant: anything that changes a field of [`RoutingNode`] or the link set
+//! must notify `AppState::changes`.** The matrix frame is pushed on that signal and
+//! on nothing else — there is no timer behind it (see [`handle_socket`]). Miss the
+//! notification and the graph, the group editors and every Home Assistant entity
+//! keep showing the old value until something unrelated happens; that visible
+//! staleness is the intended failure mode, chosen over a periodic re-check that
+//! would paper over the omission. `latency_ms` was exactly this bug, hidden for as
+//! long as the matrix went out four times a second regardless.
+//!
 //! **Source/output classification is a heuristic over live registry
 //! state, not a fixed list** — consistent with the rest of this project's
 //! "trust the observed graph" approach (api.rs's `/api/media_players`):
@@ -73,6 +82,11 @@ pub struct RoutingNode {
     configured: bool,
     /// Recent peak level (0.0–1.0) for the UI meter. Sources only (metered
     /// on-demand while the matrix is watched); `0.0` for outputs and unmetered.
+    ///
+    /// **A snapshot, not the live figure.** This is the sample taken when the matrix
+    /// was built, which now happens only on a graph change — a WebSocket client
+    /// tracks levels through [`Frame::Meters`] instead. It stays here so that
+    /// `GET /api/routing` is a complete cold read.
     peak: f32,
     /// Current volume (0.0–1.0) for outputs whose volume the daemon tracks
     /// out-of-band. Presently sendspin devices only — their in-band volume
@@ -89,8 +103,8 @@ pub struct RoutingNode {
     /// Estimated buffering (ms) this node contributes to the end-to-end path —
     /// the jitter/playout buffer configured for it, NOT a measured figure.
     /// Sources: the ingest jitter buffer (RTP `sess.latency.msec` / AirPlay
-    /// producer prebuffer). Outputs: the playout lead (sendspin group send-ahead
-    /// + per-device static delay; AP2 render delay). The UI sums a route's
+    /// producer prebuffer). Outputs: the playout lead (sendspin group send-ahead +
+    /// per-device static delay; AP2 render delay). The UI sums a route's
     /// source + output estimates to show its rough latency. `None` when unknown
     /// (e.g. an offline/unrecognized node). See build_matrix.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +114,9 @@ pub struct RoutingNode {
     /// for real graph nodes while the matrix is being watched (profiling is armed
     /// on-demand); `None` for virtual outputs (sendspin/AP2 have no graph node)
     /// and whenever profiling is off. A rising value is where dropouts originate.
+    ///
+    /// Like `peak`, a snapshot: a WebSocket client watches it climb on
+    /// [`Frame::Meters`], not here.
     #[serde(skip_serializing_if = "Option::is_none")]
     xruns: Option<u32>,
 }
@@ -184,6 +201,9 @@ fn channel_suffix(port_name: &str) -> &str {
 /// and an unadopted device must get neither a route nor an entity. Links whose
 /// output isn't adopted are filtered out too (rather than dropped from the
 /// store), so adding a device back restores the routing it had.
+// Every argument is a distinct live store the matrix is assembled from; a
+// "context" struct would just be this list under another name.
+#[allow(clippy::too_many_arguments)]
 fn build_matrix(
     reg: &RegistryState,
     devices: &BTreeMap<String, SendspinDevice>,
@@ -710,12 +730,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         let _ = state.pw_cmd.send(PwCommand::SetProfiling(true));
     }
 
-    // Peak levels change continuously, but the registry `changes` channel only
-    // fires on graph changes — so also push a fresh snapshot on a timer while
-    // watched, giving the UI a live meter. This cost is only paid while a
-    // client is connected.
+    // Peak levels and xrun counts change continuously, but the registry `changes`
+    // channel only fires on graph changes — so a timer pushes those two figures,
+    // and only those two, while a client is watching (see `Frame::Meters` for why
+    // the matrix itself is not on this timer).
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // There is deliberately **no periodic matrix re-check**. The matrix is pushed
+    // when, and only when, something notifies `changes` — so a mutation path that
+    // forgets to notify leaves a visibly stale graph instead of self-healing a
+    // fraction of a second later. That is the point: the old unconditional 250 ms
+    // push had been hiding exactly such a bug (`set_output_latency`, found and fixed
+    // with this change). A stale graph is a bug report; a 2-second self-heal is a
+    // bug that ships. The invariant to uphold instead is in this module's header.
 
     // Tear-down shared by every exit path: drop the meter watch and, if we were
     // the last matrix watcher, disarm profiling.
@@ -726,15 +754,22 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         }
     };
 
+    // What this socket has already sent, per frame kind, as serialized JSON — the
+    // matrix included, so a change that leaves the matrix identical costs nothing.
+    let mut sent = SentListings::default();
     let matrix = build_snapshot(&state).await;
     state.meters.reconcile_sources(&present_source_meters(&matrix));
-    if send_matrix(&mut socket, &matrix).await.is_err() {
+    // The node names the meters frame is allowed to talk about. Refreshed with
+    // every matrix, so the fast lane never mentions a node the client cannot place
+    // — and never carries the profiler's *whole* node map, which covers every
+    // active node in the graph, not just the ones the matrix shows.
+    let mut matrix_nodes = matrix_node_names(&matrix);
+    if push_matrix(&mut socket, &mut sent, &matrix).await.is_err() {
         teardown(&state);
         return;
     }
     // The listings the Outputs page would otherwise re-fetch. Sent once up front
     // and then only when they actually change, so the page never polls for them.
-    let mut sent = SentListings::default();
     if push_listings(&mut socket, &state, &mut sent).await.is_err() {
         teardown(&state);
         return;
@@ -749,7 +784,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let matrix = build_snapshot(&state).await;
                         state.meters.reconcile_sources(&present_source_meters(&matrix));
-                        if send_matrix(&mut socket, &matrix).await.is_err() {
+                        matrix_nodes = matrix_node_names(&matrix);
+                        if push_matrix(&mut socket, &mut sent, &matrix).await.is_err() {
                             break;
                         }
                         // A change is the only thing that can move the listings —
@@ -761,11 +797,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Live peak refresh (levels move without graph changes), and the
-            // point where any listing changes since the last tick are flushed.
+            // The fast lane: peaks and xrun counts, which move without any graph
+            // change. Deduped like every other frame, so a silent house sends the
+            // decay-to-zero frame and then nothing at all.
             _ = tick.tick() => {
-                let matrix = build_snapshot(&state).await;
-                if send_matrix(&mut socket, &matrix).await.is_err() {
+                let samples = meter_samples(&state, &matrix_nodes);
+                if push_if_changed(&mut socket, &mut sent.meters, Frame::Meters { nodes: &samples }).await.is_err() {
                     break;
                 }
                 if listings_dirty {
@@ -804,40 +841,118 @@ enum Frame<'a> {
     Discovered { outputs: &'a [crate::api::OutputInfo] },
     /// `/api/agents` — paired receiver hosts and pending pair requests.
     Agents { agents: &'a [crate::pwsink_agent::AgentInfo] },
+    /// Per-source now-playing metadata (now_playing.rs), keyed by source node
+    /// name. Its own frame rather than a field on [`Frame::Matrix`] **on purpose**:
+    /// the matrix is a large, mostly-static payload keyed by a different shape, and
+    /// a track changes once a song — so hanging titles and artwork revisions off it
+    /// would make every consumer re-read the whole graph to learn a new song
+    /// (the same cost [`Frame::Meters`] exists to avoid). Sent through the same
+    /// `push_if_changed` dedupe as the listings, so a quiet house costs nothing.
+    NowPlaying { sources: &'a BTreeMap<String, crate::now_playing::NowPlaying> },
+    /// The fast lane: the only two figures that move without a graph change —
+    /// keyed by node name, so the client merges them onto the matrix it already
+    /// has.
+    ///
+    /// **Why this exists.** The matrix frame used to be re-sent every 250 ms for
+    /// exactly this data. Measured on the live instance: a 2 210-byte frame of
+    /// which the peaks were 36 bytes — **1.6 %** — with 73 % static configuration,
+    /// 49 of 49 consecutive frames byte-identical at idle, and 9.0 KiB/s per client
+    /// of it. The cost was never the daemon's CPU (~0.2 % of a core per client);
+    /// it was that every client rebuilt its whole view four times a second — the
+    /// web UI recomputing the graph layout, the HA integration re-rendering every
+    /// entity — to learn nothing. So the matrix moved to the `changes` channel
+    /// (deduped), and this frame carries what actually ticks.
+    Meters { nodes: &'a BTreeMap<String, MeterSample> },
 }
 
-async fn send_frame(socket: &mut WebSocket, frame: Frame<'_>) -> Result<(), axum::Error> {
-    let json = match serde_json::to_string(&frame) {
-        Ok(json) => json,
-        // Unreachable in practice; dropping one frame beats killing the socket.
-        Err(e) => {
-            tracing::warn!("could not serialise a routing frame: {e}");
-            return Ok(());
-        }
-    };
-    socket.send(Message::Text(json.into())).await
+/// One node's live figures on the fast lane. Both fields are omitted when there
+/// is nothing to say, and a node with nothing to say is left out of the frame
+/// entirely — that is what makes an idle house cost zero bytes.
+#[derive(serde::Serialize)]
+pub struct MeterSample {
+    /// Recent peak level (0.0–1.0). Sources only, as in [`RoutingNode::peak`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak: Option<f32>,
+    /// Cumulative xrun count from the PipeWire profiler, as in
+    /// [`RoutingNode::xruns`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xruns: Option<u32>,
 }
 
-async fn send_matrix(socket: &mut WebSocket, matrix: &RoutingMatrix) -> Result<(), axum::Error> {
-    send_frame(socket, Frame::Matrix(matrix)).await
+/// The node names a meters frame may mention: everything the last matrix showed.
+fn matrix_node_names(matrix: &RoutingMatrix) -> Vec<String> {
+    matrix.sources.iter().chain(matrix.outputs.iter()).map(|n| n.node_name.clone()).collect()
 }
 
-/// The listing frames this socket has already sent, as serialized JSON.
+/// Build the fast-lane payload for `nodes`, dropping the ones with nothing to
+/// report.
+///
+/// Deliberately does **not** call `build_snapshot`: it takes the meter hub's and
+/// the profiler's own locks and nothing else — no PipeWire registry lock, no
+/// sendspin/AP2/agent async mutexes — because this runs four times a second per
+/// client and the registry lock is shared with the PipeWire thread.
+fn meter_samples(state: &AppState, nodes: &[String]) -> BTreeMap<String, MeterSample> {
+    let xruns = state.xruns.lock_recover().clone();
+    build_meter_samples(nodes, |name| state.meters.peak(name), &xruns)
+}
+
+/// The pure part of [`meter_samples`], so the "nothing to report is nothing sent"
+/// rule can be tested without an `AppState`.
+fn build_meter_samples(
+    nodes: &[String],
+    peak_of: impl Fn(&str) -> f32,
+    xruns: &std::collections::HashMap<String, u32>,
+) -> BTreeMap<String, MeterSample> {
+    nodes
+        .iter()
+        .filter_map(|name| {
+            // Both fields are omitted at zero, which is what keeps a quiet house at
+            // an empty frame: an untapped node's 0.0 is "no signal" rather than a
+            // measurement (and every output reports it), and a node that has never
+            // dropped a cycle has nothing to say either. **Absent therefore means
+            // zero**, and the client must read it that way — that is how a level
+            // decaying to silence and an xrun counter at rest are expressed.
+            let peak = Some(peak_of(name)).filter(|p| *p > 0.0);
+            let sample = MeterSample { peak, xruns: xruns.get(name).copied().filter(|x| *x > 0) };
+            (sample.peak.is_some() || sample.xruns.is_some()).then(|| (name.clone(), sample))
+        })
+        .collect()
+}
+
+/// Pushes the matrix if it differs from the last one this socket sent.
+///
+/// The matrix used to go out on a 250 ms timer whether or not it had changed. It
+/// is now change-driven, and the same dedupe as the listings applies — because the
+/// `changes` notifier fires for *any* daemon change, most of which the matrix does
+/// not reflect.
+async fn push_matrix(
+    socket: &mut WebSocket,
+    sent: &mut SentListings,
+    matrix: &RoutingMatrix,
+) -> Result<(), axum::Error> {
+    push_if_changed(socket, &mut sent.matrix, Frame::Matrix(matrix)).await
+}
+
+/// The frames this socket has already sent, as serialized JSON.
 ///
 /// The change notifier fires for *any* daemon change — a link, a node appearing, a
-/// volume — while these listings only change for some of them. Comparing the built
-/// payload is what keeps the socket quiet without anyone maintaining a list of
-/// "which events affect which listing", which is exactly the kind of bookkeeping
+/// volume — while each of these frames only changes for some of them. Comparing the
+/// built payload is what keeps the socket quiet without anyone maintaining a list of
+/// "which events affect which frame", which is exactly the kind of bookkeeping
 /// that goes stale when a column is added later.
 #[derive(Default)]
 struct SentListings {
+    matrix: Option<String>,
     outputs: Option<String>,
     discovered: Option<String>,
     agents: Option<String>,
+    now_playing: Option<String>,
+    meters: Option<String>,
 }
 
-/// Sends a listing frame only if its payload differs from the last one sent on this
-/// socket. `slot` holds that last payload.
+/// Sends a frame only if its payload differs from the last one sent on this socket.
+/// `slot` holds that last payload. Every frame on this socket goes out through
+/// here — there is no unconditional send left.
 async fn push_if_changed(
     socket: &mut WebSocket,
     slot: &mut Option<String>,
@@ -845,8 +960,9 @@ async fn push_if_changed(
 ) -> Result<(), axum::Error> {
     let json = match serde_json::to_string(&frame) {
         Ok(json) => json,
+        // Unreachable in practice; dropping one frame beats killing the socket.
         Err(e) => {
-            tracing::warn!("could not serialise a listing frame: {e}");
+            tracing::warn!("could not serialise a routing frame: {e}");
             return Ok(());
         }
     };
@@ -873,9 +989,11 @@ async fn push_listings(
 ) -> Result<(), axum::Error> {
     let (adopted, offered) = crate::api::outputs_listings(state).await;
     let agents = state.agents.lock().await.snapshot();
+    let now_playing = state.now_playing.snapshot();
     push_if_changed(socket, &mut sent.outputs, Frame::Outputs { outputs: &adopted }).await?;
     push_if_changed(socket, &mut sent.discovered, Frame::Discovered { outputs: &offered }).await?;
-    push_if_changed(socket, &mut sent.agents, Frame::Agents { agents: &agents }).await
+    push_if_changed(socket, &mut sent.agents, Frame::Agents { agents: &agents }).await?;
+    push_if_changed(socket, &mut sent.now_playing, Frame::NowPlaying { sources: &now_playing }).await
 }
 
 #[cfg(test)]
@@ -909,6 +1027,103 @@ mod tests {
             assert_eq!(json["type"], expected_type);
             assert!(json[payload_key].is_array(), "{expected_type} frame must carry an array: {json}");
         }
+    }
+
+    /// The metadata frame is keyed by source node name and tagged like the
+    /// listings — and, critically, is *not* part of the matrix frame: that one is a
+    /// large, mostly-static payload every consumer re-reads in full, and a title
+    /// changes once a song (see docs/source-metadata-plan.md §3.2).
+    #[test]
+    fn the_now_playing_frame_is_separate_and_keyed_by_node_name() {
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "airplay-in".to_string(),
+            crate::now_playing::NowPlaying {
+                state: crate::now_playing::PlaybackState::Playing,
+                title: Some("Song".into()),
+                artist: Some("Artist".into()),
+                album: None,
+                duration_ms: Some(200_000),
+                position_ms: Some(1000),
+                position_updated_at: Some(crate::now_playing::UnixMillis(1_700_000_000_000)),
+                artwork: None,
+            },
+        );
+        let json = serde_json::to_value(Frame::NowPlaying { sources: &sources }).unwrap();
+        assert_eq!(json["type"], "now_playing");
+        assert_eq!(json["sources"]["airplay-in"]["title"], "Song");
+        assert_eq!(json["sources"]["airplay-in"]["state"], "playing");
+        // Absent fields are omitted rather than sent as null, so a quiet frame is small.
+        assert!(json["sources"]["airplay-in"].get("album").is_none());
+
+        // And the matrix frame stays clean of it.
+        let matrix = matrix_with(&[], &[]);
+        let matrix_json = serde_json::to_value(Frame::Matrix(&matrix)).unwrap();
+        assert!(matrix_json.get("now_playing").is_none(), "metadata must not ride the matrix frame");
+    }
+
+    /// The fast lane carries the two figures that move on their own and nothing
+    /// else. Measured motivation in `Frame::Meters`: the matrix frame this replaces
+    /// was 2 210 bytes of which 36 were the peaks.
+    #[test]
+    fn the_meters_frame_carries_only_what_moves() {
+        let nodes = vec!["airplay-in".to_string(), "ap2-dev-dusche".to_string()];
+        let mut xruns = std::collections::HashMap::new();
+        xruns.insert("airplay-in".to_string(), 7);
+        let samples = build_meter_samples(&nodes, |n| if n == "airplay-in" { 0.5 } else { 0.0 }, &xruns);
+
+        let json = serde_json::to_value(Frame::Meters { nodes: &samples }).unwrap();
+        assert_eq!(json["type"], "meters");
+        assert_eq!(json["nodes"]["airplay-in"]["peak"], 0.5);
+        assert_eq!(json["nodes"]["airplay-in"]["xruns"], 7);
+        // The silent output is absent entirely rather than sent as a zero — the
+        // client reads "absent" as zero.
+        assert!(json["nodes"].get("ap2-dev-dusche").is_none(), "a node with nothing to report must be left out: {json}");
+        // And none of the matrix's static payload rides along.
+        let frame = serde_json::to_string(&Frame::Meters { nodes: &samples }).unwrap();
+        for leaked in ["display_name", "links", "latency_ms", "configured", "present"] {
+            assert!(!frame.contains(leaked), "'{leaked}' must not be on the fast lane: {frame}");
+        }
+    }
+
+    /// An idle house must cost nothing: with every peak at zero and no xruns, the
+    /// payload is empty, so `push_if_changed` sends it once and then goes quiet.
+    #[test]
+    fn a_silent_system_produces_an_empty_meters_payload() {
+        let nodes = vec!["airplay-in".to_string(), "bt-bridge-rtp".to_string()];
+        let samples = build_meter_samples(&nodes, |_| 0.0, &std::collections::HashMap::new());
+        assert!(samples.is_empty());
+        let json = serde_json::to_string(&Frame::Meters { nodes: &samples }).unwrap();
+        assert_eq!(json, r#"{"type":"meters","nodes":{}}"#);
+    }
+
+    /// A node that has never dropped a cycle reports nothing, so the profiler's
+    /// zero-valued entries — which it emits for *every* active node in the graph,
+    /// most of which the matrix never shows — cannot pad the frame.
+    #[test]
+    fn zero_xruns_are_not_reported() {
+        let nodes = vec!["airplay-in".to_string()];
+        let mut xruns = std::collections::HashMap::new();
+        xruns.insert("airplay-in".to_string(), 0);
+        assert!(build_meter_samples(&nodes, |_| 0.0, &xruns).is_empty());
+    }
+
+    /// The fast lane may only mention nodes the client can place on the matrix it
+    /// already has — the profiler's map is graph-wide, so the node list is what
+    /// bounds the frame.
+    #[test]
+    fn the_meters_frame_is_bounded_by_the_last_matrix() {
+        let matrix = matrix_with(&["ap2-dev-dusche"], &[]);
+        let names = matrix_node_names(&matrix);
+        assert!(names.contains(&"ap2-dev-dusche".to_string()));
+
+        let mut xruns = std::collections::HashMap::new();
+        xruns.insert("ap2-dev-dusche".to_string(), 3);
+        // A busy node the matrix does not show (an internal graph node the profiler
+        // reports) stays out.
+        xruns.insert("some-internal-node".to_string(), 99);
+        let samples = build_meter_samples(&names, |_| 0.0, &xruns);
+        assert_eq!(samples.keys().collect::<Vec<_>>(), vec!["ap2-dev-dusche"]);
     }
 
     use crate::airplay_source::AIRPLAY_NODE_NAME;

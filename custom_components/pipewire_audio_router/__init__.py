@@ -23,6 +23,8 @@ from .api import (
     AnnouncementGroup,
     MediaPlayerState,
     MusicGroup,
+    NowPlaying,
+    NowPlayingFrame,
     OutputMeta,
     PipewireRouterApiClient,
     PipewireRouterApiError,
@@ -71,6 +73,11 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         # one-shot REST fetch at setup (`async_init_routing`) so entities have
         # it before the socket's first push arrives.
         self.routing: RoutingMatrix = _EMPTY_ROUTING
+        # What each source is playing, by source node name — pushed on the same
+        # socket as the matrix, but in its own low-rate frame (see the daemon's
+        # now_playing.rs). Empty until the first push; a source with no entry is
+        # simply not playing anything we know about.
+        self.now_playing: dict[str, NowPlaying] = {}
         # Latest RTP-source state, refreshed each poll (best-effort — an older
         # daemon without an RTP source in `/api/sources` leaves this `None`). `None` = the
         # switch/number entities show unavailable.
@@ -154,14 +161,42 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[list[MediaPlayerState]]):
         self.routing = matrix
         self.async_update_listeners()
 
+    @callback
+    def _apply_now_playing(self, sources: dict[str, NowPlaying]) -> None:
+        """Store a pushed metadata frame and re-render.
+
+        The frame is always the *complete* picture, so assigning it (rather than
+        merging) is what makes a cleared source disappear — which is the whole
+        point of the daemon clearing on session end instead of letting its TTL
+        expire."""
+        self.now_playing = sources
+        self.async_update_listeners()
+
+    @callback
+    def now_playing_for(self, source_node_name: str | None) -> NowPlaying | None:
+        """What the given source is playing, if anything worth showing.
+
+        The single lookup both the output and the music-group `media_player` use,
+        so their metadata can never disagree about the same source."""
+        if not source_node_name:
+            return None
+        entry = self.now_playing.get(source_node_name)
+        if entry is None or not entry.has_metadata:
+            return None
+        return entry
+
     async def async_routing_ws_loop(self) -> None:
         """Hold a routing WebSocket open for the life of the config entry,
-        applying each pushed matrix and reconnecting after a drop. Ends when
-        the entry is unloaded (the background task is cancelled)."""
+        applying each pushed matrix or metadata frame and reconnecting after a
+        drop. Ends when the entry is unloaded (the background task is
+        cancelled)."""
         while True:
             try:
-                async for matrix in self.client.async_routing_ws_messages():
-                    self._apply_routing(matrix)
+                async for frame in self.client.async_routing_ws_messages():
+                    if isinstance(frame, NowPlayingFrame):
+                        self._apply_now_playing(frame.sources)
+                    else:
+                        self._apply_routing(frame)
             except PipewireRouterApiError as err:
                 _LOGGER.debug("routing websocket disconnected: %s", err)
             except Exception:  # noqa: BLE001 - never let the loop die on a bad frame

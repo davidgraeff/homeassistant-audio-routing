@@ -502,6 +502,29 @@ mod tests {
         assert_eq!(path, "/");
     }
 
+    /// A bridge that also reports AVRCP metadata advertises a *second role* and a
+    /// `meta_ver` on the same advert, keeping `ver=1` (docs/source-metadata-plan.md
+    /// §3.5). It must still parse here unchanged — the alternative, bumping `ver`,
+    /// would make such a Pi vanish from any add-on not updated in lockstep, taking
+    /// Bluetooth discovery and adoption with it.
+    #[test]
+    fn a_metadata_capable_bridge_still_parses() {
+        let get = txt(&[
+            ("ver", "1"),
+            ("role", "rtp-sender,metadata"),
+            ("meta_ver", "1"),
+            ("rtp_port", "46000"),
+            ("rtp_dest", "192.168.178.22"),
+            ("rate", "48000"),
+            ("fmt", "S16LE"),
+            ("channels", "2"),
+            ("diag_path", "/"),
+        ]);
+        let (stream, path) = parse_txt(&get).expect("an extended role must not break discovery");
+        assert_eq!(stream.rtp_port, 46000);
+        assert_eq!(path, "/");
+    }
+
     #[test]
     fn a_newer_txt_version_is_skipped_not_guessed() {
         let get = txt(&[("ver", "2"), ("rtp_port", "46000"), ("rtp_dest", "x")]);

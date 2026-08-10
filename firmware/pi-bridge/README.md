@@ -96,9 +96,14 @@ wall (see [../../docs/decisions.md](../../docs/decisions.md#raspberry-pi-bluetoo
    pointed at the add-on) + `module-loopback` bridging the phone's audio into it.
 7. **mDNS advert** (`/etc/avahi/services/pw-bt-bridge.service`): announces this
    bridge as `_pwrouter-btbridge._tcp` on the diagnostics port, carrying the
-   stream parameters in TXT (`rtp_port`, `rtp_dest`, `rate`, `fmt`, `channels`).
+   stream parameters in TXT (`rtp_port`, `rtp_dest`, `rate`, `fmt`, `channels`)
+   and its roles (`role=rtp-sender,metadata`).
    See [*Being discovered by the add-on*](#being-discovered-by-the-add-on).
-8. **WirePlumber drop-in** (SPA-JSON for 0.5, Lua for 0.4):
+8. **AVRCP metadata reporter** (`bt-metadata-reporter.service`, from
+   [`bt_metadata_reporter.py`](bt_metadata_reporter.py)) — see
+   [*Reporting what the phone is playing*](#reporting-what-the-phone-is-playing).
+   `--no-metadata` skips it.
+9. **WirePlumber drop-in** (SPA-JSON for 0.5, Lua for 0.4):
    - **`monitor.bluez.seat-monitoring = disabled`** (+ `support.logind`) —
      **critical on WirePlumber 0.5 headless.** WP 0.5 only manages Bluetooth for
      the user on the *active login seat*; a lingering headless session has no
@@ -136,6 +141,41 @@ Check the advert from any Linux box on the LAN:
 ```
 avahi-browse -rt _pwrouter-btbridge._tcp
 ```
+
+### Reporting what the phone is playing
+
+The phone sends more than audio: **AVRCP** carries title, artist, album, duration
+and play state, which BlueZ exposes on the system D-Bus as
+`org.bluez.MediaPlayer1`. None of that is in the PipeWire graph, so the RTP path
+could never have carried it — a small service forwards it instead, and Home
+Assistant then shows the track on whatever outputs this bridge's source feeds.
+
+- Unit: `bt-metadata-reporter.service` (system, not user — `org.bluez` is on the
+  system bus). No audio, no realtime: it cannot compete with the capture/relay
+  threads.
+- It reports to the add-on's HTTP API (`--host`, `--api-port`, default 8099) as
+  *"the sender on RTP port N is playing X"*, so this Pi never needs to know the
+  source ids the add-on assigned.
+- **No cover art.** AVRCP artwork is the 1.6 BIP/OBEX feature and BlueZ does not
+  expose it, so Bluetooth tracks have title/artist/album and no picture.
+- Needs `python3-dbus` + `python3-gi` (installed by the setup script; neither
+  ships on Raspberry Pi OS by default).
+
+Check it by hand — with a phone connected and playing:
+
+```
+systemctl status bt-metadata-reporter
+journalctl -u bt-metadata-reporter -n 20
+# One-shot: print/report the current state and exit (also the quickest way to see
+# whether BlueZ is exposing a player at all).
+sudo /usr/local/bin/bt-metadata-reporter --host <addon-ip> --rtp-port 46000 --once
+```
+
+The player object is **transient** — `/org/bluez/hciX/dev_.../playerN` exists only
+while a phone with an AVRCP target is connected, so `busctl tree org.bluez` showing
+only `dev_*` nodes means "nothing connected", not "broken".
+
+See [../../docs/source-metadata-plan.md](../../docs/source-metadata-plan.md).
 
 ### The audio path
 
@@ -202,6 +242,7 @@ add-on plays.
 
 ```
 setup_pi_bridge.py       the idempotent configurator (run on the Pi)
+bt_metadata_reporter.py  forwards the phone's AVRCP track info to the add-on
 bluetooth-testing-app/   live web console: waveform, codec switching, sender state
 README.md                this file
 ```

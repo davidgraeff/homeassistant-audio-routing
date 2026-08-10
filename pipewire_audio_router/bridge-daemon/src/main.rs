@@ -19,6 +19,7 @@ mod groups_store;
 mod host_assessment;
 mod locks;
 mod metering;
+mod now_playing;
 mod outputs_store;
 mod overlay_mixer;
 mod per_device_spike;
@@ -257,6 +258,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 
     let (pw_state, changes, pw_cmd, xruns) = pw_thread::spawn()?;
 
+    // Per-source now-playing metadata (now_playing.rs). Purely in-memory: it
+    // describes what is playing *right now*, so there is nothing worth persisting
+    // across a restart — a live producer re-reports within seconds, and a stale
+    // track restored from disk would be a lie.
+    let now_playing = now_playing::NowPlayingStore::new(changes.clone());
+
     // Paired receiver agents (pwsink_agent.rs): the token store *and* the source
     // of truth for pw-sink targets — a pw-sink output exists because a helper on
     // that host paired, not because something answered an mDNS browse
@@ -306,7 +313,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Start every stored source/adapter process (AirPlay source via
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
         // — the rest still start and it can be re-enabled live.
-        spawn_stored_sources(&sources, &airplay, &airplay_clients, &pw_state, pw_cmd.clone()).await;
+        spawn_stored_sources(&sources, &airplay, &airplay_clients, &now_playing, &pw_state, pw_cmd.clone()).await;
 
         // NOTE: a multicast-IGMP self-heal watchdog used to run here
         // (`rtp_membership.rs`, removed 2026-07-28). `module-rtp-source` does this
@@ -485,6 +492,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             sources,
             airplay.clone(),
             airplay_clients,
+            now_playing,
             meters,
             xruns,
             sendspin_devices,
@@ -555,6 +563,7 @@ async fn spawn_stored_sources(
     sources: &api::SharedSources,
     airplay: &api::SharedAirplay,
     airplay_clients: &airplay_clients::AirplayClientStore,
+    now_playing: &now_playing::NowPlayingStore,
     pw: &pw_thread::SharedState,
     pw_cmd: pw_thread::PwCommandSender,
 ) {
@@ -574,7 +583,7 @@ async fn spawn_stored_sources(
     // Every configured AirPlay receiver (one per AirPlay source with a name):
     // the reconciler starts each on its own node/port/mDNS name with its own
     // per-source client registry + anti-takeover flag.
-    airplay_source::reconcile(airplay, &entries, airplay_clients).await;
+    airplay_source::reconcile(airplay, &entries, airplay_clients, now_playing).await;
 }
 
 /// Completes on SIGTERM or SIGINT — the trigger for axum's graceful shutdown.

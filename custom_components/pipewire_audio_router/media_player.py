@@ -12,6 +12,7 @@ PAUSE are not exposed for the same reason.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 import voluptuous as vol
 from homeassistant.components import media_source
@@ -34,10 +35,10 @@ from homeassistant.helpers import (
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import PipewireRouterCoordinator
-from .api import AnnouncementGroup, MusicGroup
-from .api import RoutingMatrix, RoutingNode
+from .api import AnnouncementGroup, MusicGroup, NowPlaying, RoutingMatrix, RoutingNode
 from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NONE
 
 # Must match the bridge-daemon's node-name prefixes exactly — no shared source
@@ -264,7 +265,102 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     )
 
 
-class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaPlayerEntity):
+class _SourceMetadataMixin:
+    """Now-playing display for an entity whose audio comes from one router source.
+
+    Both the per-output and the music-group `media_player` show what their
+    *currently routed source* is playing — title, artist, album, cover art,
+    position — from the daemon's per-source metadata (its now_playing.rs, pushed
+    on the routing socket). Neither entity *controls* playback: the phone (or
+    whatever is feeding the source) does that, so no new feature flags are
+    declared. This is display only.
+
+    Subclasses supply `_metadata_source()`; everything below follows from it, so
+    an output and a group looking at the same source can never disagree.
+
+    Position is reported with `media_position_updated_at` and Home Assistant
+    extrapolates between the daemon's sparse updates. It leads the sound by the
+    ingest jitter buffer plus the output's playout latency (order 200–400 ms);
+    that drift is accepted rather than corrected.
+    """
+
+    coordinator: PipewireRouterCoordinator
+
+    def _metadata_source(self) -> str | None:
+        """The source *node name* whose metadata this entity shows."""
+        raise NotImplementedError
+
+    def _now_playing(self) -> NowPlaying | None:
+        return self.coordinator.now_playing_for(self._metadata_source())
+
+    @property
+    def media_content_type(self) -> MediaType | str | None:
+        return MediaType.MUSIC if self._now_playing() else None
+
+    @property
+    def media_title(self) -> str | None:
+        np = self._now_playing()
+        return np.title if np else None
+
+    @property
+    def media_artist(self) -> str | None:
+        np = self._now_playing()
+        return np.artist if np else None
+
+    @property
+    def media_album_name(self) -> str | None:
+        np = self._now_playing()
+        return np.album if np else None
+
+    @property
+    def media_duration(self) -> int | None:
+        np = self._now_playing()
+        if not np or np.duration_ms is None:
+            return None
+        return round(np.duration_ms / 1000)
+
+    @property
+    def media_position(self) -> int | None:
+        np = self._now_playing()
+        if not np or np.position_ms is None:
+            return None
+        return round(np.position_ms / 1000)
+
+    @property
+    def media_position_updated_at(self) -> datetime | None:
+        np = self._now_playing()
+        if not np or np.position_updated_at is None:
+            return None
+        return dt_util.utc_from_timestamp(np.position_updated_at / 1000)
+
+    @property
+    def media_image_url(self) -> str | None:
+        """Cover art, either a producer-supplied URL or the daemon's own bytes.
+
+        A daemon-relative `image_path` is resolved against the daemon's base URL
+        here rather than daemon-side, because only this integration knows which
+        host it is talking to."""
+        np = self._now_playing()
+        if not np:
+            return None
+        if np.image_url:
+            return np.image_url
+        if np.image_path:
+            return f"{self.coordinator.client.base_url}{np.image_path}"
+        return None
+
+    @property
+    def media_image_remotely_accessible(self) -> bool:
+        """Always False, including for a public producer URL.
+
+        Home Assistant then fetches the image server-side and hands the browser
+        its own proxy URL — so the daemon's port never has to be reachable from a
+        phone on the LAN, an ingress-only setup keeps working, and both artwork
+        cases (URL and daemon-served bytes) behave identically."""
+        return False
+
+
+class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _SourceMetadataMixin, MediaPlayerEntity):
     """A single PipeWire output (sendspin or AirPlay-2) exposed as a
     media_player.
 
@@ -491,6 +587,16 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
     def source_list(self) -> list[str]:
         return [SOURCE_NONE] + [s.display_name for s in self._matrix().sources]
 
+    def _linked_source_names(self) -> list[str]:
+        """The sources linked into this output, as *node names*, in matrix order.
+
+        The one place this output resolves "what feeds me": `source` renders it for
+        display and `_metadata_source` reads metadata for it, so the label and the
+        now-playing card can never disagree about which source they mean."""
+        matrix = self._matrix()
+        linked = {src for src, out in matrix.links if out == self.node_name}
+        return [s.node_name for s in matrix.sources if s.node_name in linked]
+
     @property
     def source(self) -> str | None:
         """The source routed into this output, or SOURCE_NONE if none. Read
@@ -498,9 +604,15 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         when this output is momentarily offline. Exclusive model → at most one;
         report the first by name if several were wired additively."""
         matrix = self._matrix()
-        linked_sources = {src for src, out in matrix.links if out == self.node_name}
-        names = [s.display_name for s in matrix.sources if s.node_name in linked_sources]
-        return names[0] if names else SOURCE_NONE
+        names = self._linked_source_names()
+        by_name = {s.node_name: s.display_name for s in matrix.sources}
+        return by_name[names[0]] if names else SOURCE_NONE
+
+    def _metadata_source(self) -> str | None:
+        """Show the metadata of the source feeding this output — the same first-of
+        several rule `source` uses."""
+        names = self._linked_source_names()
+        return names[0] if names else None
 
     def _resolve_source_name(self, source: str) -> str:
         target = next((s for s in self._matrix().sources if s.display_name == source), None)
@@ -570,7 +682,7 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], Me
         await self.coordinator.async_request_refresh()
 
 
-class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaPlayerEntity):
+class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _SourceMetadataMixin, MediaPlayerEntity):
     """A named music group as a media_player: pick the source the whole group
     plays (`select_source`, routing all members together) and set a group master
     volume (applied to every member). One entity per music group."""
@@ -610,11 +722,23 @@ class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaP
         members = set(g.members)
         return {src for src, out in self._matrix().links if out in members}
 
+    def _linked_source_names(self) -> list[str]:
+        """Member-linked sources as *node names*, in matrix order — the single
+        resolution `source` and `_metadata_source` both read."""
+        srcs = self._member_sources()
+        return [s.node_name for s in self._matrix().sources if s.node_name in srcs]
+
     @property
     def source(self) -> str | None:
-        srcs = self._member_sources()
-        names = [s.display_name for s in self._matrix().sources if s.node_name in srcs]
-        return names[0] if names else SOURCE_NONE
+        names = self._linked_source_names()
+        by_name = {s.node_name: s.display_name for s in self._matrix().sources}
+        return by_name[names[0]] if names else SOURCE_NONE
+
+    def _metadata_source(self) -> str | None:
+        """A group shows its source's metadata — the same source its `source`
+        property names, so the chip label and the media card always agree."""
+        names = self._linked_source_names()
+        return names[0] if names else None
 
     @property
     def state(self) -> MediaPlayerState | None:

@@ -39,6 +39,10 @@ handler name, which is the authoritative place to check the exact body shape.
 | `POST` | `/api/sources/{id}/clients/forget` | drop a remembered sender |
 | `POST` | `/api/sources/{id}/clients/priority` | set a sender's priority |
 | `PUT` | `/api/sources/{id}/policy` | anti-takeover policy |
+| `GET` | `/api/now_playing` | what every source is playing |
+| `GET`/`PUT`/`DELETE` | `/api/now_playing/{node_name}` | read / update / clear one source's metadata |
+| `GET` | `/api/now_playing/{node_name}/artwork` | embedded cover-art bytes |
+| `POST` | `/api/now_playing/report` | self-identifying report from a remote producer |
 | `GET` | `/api/sendspin/volumes` | all sendspin volumes |
 | `PUT` | `/api/sendspin/volume` | set one sendspin volume |
 | `PUT` | `/api/sendspin/mute` | mute one sendspin device |
@@ -396,6 +400,96 @@ Set a sender's priority, used when several compete for the source.
 Toggle one AirPlay source's anti-takeover policy: persisted into that source's config
 and applied to the running receiver live, with no restart.
 
+## Now playing (per-source metadata)
+
+What each source is currently playing — title, artist, album, position and cover art —
+from whichever producer can say. See
+[source-metadata-plan.md](source-metadata-plan.md) for the model and
+`bridge-daemon/src/now_playing.rs` for the implementation.
+
+**Keyed by source *node name*, not source id.** That is the key the routing matrix, the
+persisted routing intent and the Home Assistant integration already share, and it is what
+the WebSocket frame below is keyed by — so a consumer never has to hold both keys.
+
+Live updates arrive as a **`now_playing` frame on `/api/routing/ws`** (see *Routing
+matrix*), pushed only when something changes. Two consumers read it: the Home Assistant
+integration (on each output's and each music group's `media_player`) and this add-on's own
+routing graph, which shows a second row on every source card. These REST routes are the cold-path
+companion: a consumer that just connected, a debugging `curl`, or a producer reporting in.
+
+Entries are in-memory only, expire after 90 s without an update, and are dropped when a
+source is deleted — so nothing here ever describes a source that no longer exists.
+
+### `GET /api/now_playing`
+```json
+{
+  "sources": {
+    "airplay-in": {
+      "state": "playing",
+      "title": "Song", "artist": "Artist", "album": "Album",
+      "duration_ms": 213000,
+      "position_ms": 41000,
+      "position_updated_at": 1786000000000,
+      "artwork": { "kind": "embedded", "rev": 3, "mime": "image/jpeg", "len": 74210,
+                   "path": "/api/now_playing/airplay-in/artwork?rev=3" }
+    }
+  }
+}
+```
+Every source with something to say. Absent fields are omitted, not null. `state` is
+`playing`, `paused` or `stopped`.
+
+`position_updated_at` is Unix milliseconds: the position is only meaningful *together
+with* when it was true, and consumers extrapolate from it rather than expecting a fast
+update cadence (position is published at most every 5 s). It leads the sound by the
+ingest jitter buffer plus the output's playout latency; that drift is accepted.
+
+`artwork` is either `{"kind": "url", "url": "…"}` (fetch it yourself) or `{"kind":
+"embedded", …}` with a ready-made `path` to append to this daemon's base URL. `rev`
+changes with the picture, so the path is a safe hard-cache key.
+
+### `GET /api/now_playing/{node_name}`
+One source's entry, or `404` when nothing is known.
+
+### `GET /api/now_playing/{node_name}/artwork`
+The current cover-art bytes, with their real `Content-Type` (sniffed from the data, not
+trusted from the sender) and an `ETag`. The `?rev=` in the published path is a
+cache-buster, not a selector — the current image is always what is returned.
+
+### `PUT /api/now_playing/{node_name}`
+```json
+{ "state": "playing", "title": "Song", "artist": "Artist", "album": "Album",
+  "duration_ms": 213000, "position_ms": 41000, "artwork_url": "https://…/cover.jpg" }
+```
+Merge metadata into a source. **Every field is optional and an omitted field is left
+alone** — that is what lets a producer send title/artist and progress separately without
+clobbering itself. A *changed* `title` is treated as a new track, so the previous track's
+album, artist, duration and cover art are dropped rather than lingering under the new
+name. Blank strings count as absent. `404` if no source has that node name; `400` if the
+body carries no fields at all.
+
+An `artwork_url` never replaces embedded bytes for the current track, so a producer that
+can supply both does not downgrade itself.
+
+### `DELETE /api/now_playing/{node_name}`
+The session ended. Idempotent. Prefer this to letting the TTL collect the entry: it is
+what makes a media card in Home Assistant collapse instead of freezing on the last track.
+
+### `POST /api/now_playing/report`
+```json
+{ "rtp_port": 46000, "title": "Song", "artist": "Artist", "state": "playing" }
+```
+The entry point for a **remote** producer — the Pi bridge's reporter. It knows the UDP
+port its `module-rtp-sink` transmits to, and does not need to learn the source ids this
+daemon assigned, so `rtp_port` is resolved against the source store (the same key
+`bt_bridge_discovery` matches an advert to a source by). Metadata fields are flattened
+alongside it and merge exactly as `PUT` does.
+
+A body with **no metadata fields** means "nothing is playing any more" and clears the
+entry — so a reporter needs no second endpoint for that. `404` when no RTP source is
+configured on that port, which is not worth retrying: the bridge may simply have been set
+up before its source was added here.
+
 ## Sendspin devices
 
 Sendspin speakers (ESPHome, e.g. HA Voice PE) are **auto-discovered** over
@@ -703,15 +797,58 @@ WebSocket. Carries **typed frames**, each a JSON object with a `type`:
 
 | `type` | Payload | When it is sent |
 |---|---|---|
-| `matrix` | the `RoutingMatrix` fields at the top level (same shape as `GET /api/routing`, plus `type`) | on connect, on every registry change, and every 250 ms while watched so the input meters and volumes stay live |
+| `matrix` | the `RoutingMatrix` fields at the top level (same shape as `GET /api/routing`, plus `type`) | on connect, then on every registry change **whose payload actually differs** |
+| `meters` | `{ nodes: { <node_name>: { peak?, xruns? } } }` — the live figures only | on connect, then on a 250 ms tick while watched, deduped |
 | `outputs` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs` | on connect, then on the first 250 ms tick after a change moves that listing's payload |
 | `discovered` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs/discovered` | ditto |
 | `agents` | `{ agents: AgentInfo[] }` — same as `GET /api/agents`; receiver hosts, paired and pending. Diagnostic: the pairing UI reads the two output listings, where a host waiting to pair is a `discovered` `pwsink` output | ditto |
+| `now_playing` | `{ sources: { <node_name>: NowPlaying } }` — same as `GET /api/now_playing` | ditto |
+
+**Every frame on this socket is deduped**, the matrix included: it is sent only when
+its serialized payload differs from the last one sent on that socket.
+
+**The matrix frame has no timer behind it** — it is pushed on a change notification and
+on nothing else. Daemon-side, that makes "anything that changes a routing node's fields
+or the link set must notify `changes`" an invariant rather than a nicety: a path that
+forgets leaves every client showing the old value indefinitely. That visible staleness
+is deliberate, and preferred to a periodic re-check that would hide the omission.
+
+**`meters` is the only frame on a timer, and it is the reason the matrix is not.**
+The matrix used to be re-pushed every 250 ms so that peaks and xrun counts stayed
+live. Measured on a live instance: 2 210 bytes per frame of which the peaks were
+36 — 1.6 % — 73 % static configuration, **49 of 49 consecutive frames byte-identical
+at idle**, 9.0 KiB/s per client. The daemon's own cost was negligible (~0.2 % of a
+core per client); the cost was that every client re-read its whole view four times a
+second to learn nothing. So the two were split.
+
+In `meters`, **a field absent means zero**: a node with no signal and no xruns is
+left out of `nodes` entirely, and a silent system therefore sends
+`{"type":"meters","nodes":{}}` once and then nothing until something moves. A client
+must read absence as zero (that is how a level decaying to silence is expressed) and
+must not treat `RoutingNode.peak`/`.xruns` from a matrix frame as live — those are
+just the sample taken when the matrix was last built. `GET /api/routing` still
+carries both, so a cold read is complete.
+
+`nodes` only ever mentions nodes the last `matrix` frame showed. The profiler
+reports every active node in the graph, most of which the matrix does not display.
 
 The matrix frame is *internally* tagged so its fields stay at the top
 level: a client written against the older protocol, which parsed every
 frame as a bare `RoutingMatrix`, still works and simply ignores the
 listing frames.
+
+`now_playing` is deliberately its own frame rather than a field on `matrix`:
+the matrix is a large payload a client re-reads in full (the web UI recomputes
+its graph layout, the HA integration re-renders every entity), while a track
+changes once a song, and an artwork revision has nothing to do with routing.
+Keeping the descriptive payload off it is the design
+(see [source-metadata-plan.md](source-metadata-plan.md) §3.2), so do not move
+it back onto a routing node.
+
+**A client must switch on `type` and ignore frames it does not know.** Frame
+types get added; a client that parses every frame as a matrix will mis-read the
+listings (an `OutputInfo` has `name`, not `display_name`) or, for a payload with
+neither `sources` nor `outputs`, silently build an empty matrix.
 
 The listing frames exist so a UI does not have to poll those endpoints.
 They are only sent when the built payload differs from the last one sent

@@ -16,6 +16,7 @@
 
 use crate::airplay_clients::{self, AirplayClientStore, SharedAirplayClients};
 use crate::locks::LockRecover;
+use crate::now_playing::{MetadataUpdate, NowPlayingReporter, PlaybackState};
 use crate::sources_store::{AirplaySourceConfig, SourceConfig, SourceEntry, SourceId};
 use pipewire as pw;
 use pw::spa;
@@ -184,6 +185,7 @@ pub async fn start(
     auth_setup: bool,
     clients: SharedAirplayClients,
     prevent_takeover: SharedPreventTakeover,
+    now_playing: NowPlayingReporter,
 ) -> anyhow::Result<AirplayHandle> {
     // A config left at port 0 shouldn't reach here (the store allocates on add/
     // load), but fall back to the RAOP default rather than binding port 0.
@@ -212,7 +214,7 @@ pub async fn start(
     let producer_stop = spawn_producer(node_name.clone(), consumer, peak.clone(), target, flush.clone())
         .map_err(|e| anyhow::anyhow!("failed to start AirPlay PipeWire producer: {e}"))?;
 
-    let handler = Arc::new(Handler { ring_prod, flush, peak: peak.clone(), clients, prevent_takeover: prevent_takeover.clone() });
+    let handler = Arc::new(Handler { ring_prod, flush, peak: peak.clone(), clients, prevent_takeover: prevent_takeover.clone(), now_playing });
     let mut builder = RaopServer::builder().name(service_name.clone()).hwaddr(derive_hwaddr(&service_name)).port(port);
     // Advertise on the process-wide shared, LAN-restricted mDNS daemon so the
     // receiver's `_raop._tcp`/`_airplay._tcp` records share one interface-pinned
@@ -256,7 +258,12 @@ pub type SharedAirplayMap = Arc<tokio::sync::Mutex<BTreeMap<SourceId, AirplayHan
 /// Each receiver gets its OWN per-source client registry (from `clients`) and
 /// its own `prevent_takeover` flag seeded from the stored config. Best-effort:
 /// a receiver that fails to start is logged and skipped; the others still run.
-pub async fn reconcile(map: &SharedAirplayMap, entries: &[SourceEntry], clients: &AirplayClientStore) {
+pub async fn reconcile(
+    map: &SharedAirplayMap,
+    entries: &[SourceEntry],
+    clients: &AirplayClientStore,
+    now_playing: &crate::now_playing::NowPlayingStore,
+) {
     // Desired = AirPlay entries with a non-blank label. A blank label is the
     // "knobs configured but disabled" state (matches the singular era, where an
     // empty name meant "off"); such an entry must not run a receiver.
@@ -300,7 +307,10 @@ pub async fn reconcile(map: &SharedAirplayMap, entries: &[SourceEntry], clients:
         let node_name = entry.node_name();
         let registry = clients.registry(id);
         let prevent_takeover: SharedPreventTakeover = Arc::new(AtomicBool::new(cfg.prevent_takeover));
-        match start(node_name, entry.label.clone(), cfg.port, cfg.latency_msec, cfg.auth_setup, registry, prevent_takeover).await {
+        let reporter = now_playing.reporter(node_name.clone());
+        match start(node_name, entry.label.clone(), cfg.port, cfg.latency_msec, cfg.auth_setup, registry, prevent_takeover, reporter)
+            .await
+        {
             Ok(handle) => {
                 guard.insert(id.clone(), handle);
                 tracing::info!("AirPlay reconcile: started receiver '{id}' ('{}')", entry.label);
@@ -334,6 +344,10 @@ struct Handler {
     clients: SharedAirplayClients,
     /// Live anti-takeover policy, consulted in `authorize_session`.
     prevent_takeover: SharedPreventTakeover,
+    /// Now-playing sink for this source (now_playing.rs). A sender pushes DMAP
+    /// metadata, cover art and progress as three separate RTSP `SET_PARAMETER`
+    /// requests, in no guaranteed order; each lands in one callback below.
+    now_playing: NowPlayingReporter,
 }
 
 impl AudioHandler for Handler {
@@ -396,6 +410,50 @@ impl AudioHandler for Handler {
         // Signal the RT consumer to drop any residual buffered audio so a new
         // session starts clean (it drains + re-arms a cold prebuffer).
         self.flush.store(true, Ordering::Relaxed);
+        // The session is over, so the track is not playing any more. Clearing
+        // rather than leaving it to the TTL is what stops Home Assistant showing
+        // last night's song (now_playing.rs).
+        self.now_playing.clear();
+    }
+
+    // --- Now-playing (now_playing.rs) ---
+    //
+    // The library parses DMAP for us and offers these as no-ops; this source is
+    // the richest metadata producer in the system precisely because a sender
+    // volunteers all three.
+
+    fn on_metadata(&self, metadata: &shairplay::TrackMetadata) {
+        tracing::debug!(
+            "AirPlay metadata: title={:?} artist={:?} album={:?}",
+            metadata.title,
+            metadata.artist,
+            metadata.album
+        );
+        self.now_playing.update(MetadataUpdate {
+            state: Some(PlaybackState::Playing),
+            title: metadata.title.clone(),
+            artist: metadata.artist.clone(),
+            album: metadata.album.clone(),
+            duration_ms: metadata.duration_ms,
+            ..Default::default()
+        });
+    }
+
+    fn on_coverart(&self, coverart: &[u8]) {
+        tracing::debug!("AirPlay cover art: {} bytes", coverart.len());
+        self.now_playing.set_artwork(coverart.to_vec());
+    }
+
+    fn on_progress(&self, start: u32, current: u32, end: u32) {
+        // RTP timestamps at 44100 Hz, and `start` is the track's own origin
+        // rather than zero — so position is measured from it. Wrapping subtraction
+        // keeps a session that has run past u32 from reporting nonsense.
+        let elapsed = current.wrapping_sub(start);
+        let total = end.wrapping_sub(start);
+        let ms = |ts: u32| (u64::from(ts) * 1000 / u64::from(RATE)) as u32;
+        // A sender reports progress on every update; the reporter throttles the
+        // publish to keep this off the routing socket's hot path.
+        self.now_playing.publish_position(ms(elapsed), (total > 0).then(|| ms(total)));
     }
 }
 

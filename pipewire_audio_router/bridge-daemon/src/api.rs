@@ -56,6 +56,11 @@ pub struct AppState {
     /// per-receiver too (each running `AirplayHandle` owns its flag), so there is
     /// no process-wide flag here anymore.
     pub airplay_clients: AirplayClientStore,
+    /// Per-source now-playing metadata (now_playing.rs) — what each input is
+    /// currently playing, from whichever producer can say: the AirPlay receiver's
+    /// DMAP callbacks locally, a Pi reporter over `/api/sources/{id}/now_playing`
+    /// remotely. Read into the routing socket's `now_playing` frame.
+    pub now_playing: crate::now_playing::NowPlayingStore,
     /// On-demand source peak meters (metering.rs); taps live only while a
     /// routing-matrix WS client is connected.
     pub meters: crate::metering::SharedMeters,
@@ -142,6 +147,7 @@ pub fn router(
     sources: SharedSources,
     airplay: SharedAirplay,
     airplay_clients: AirplayClientStore,
+    now_playing: crate::now_playing::NowPlayingStore,
     meters: crate::metering::SharedMeters,
     xruns: crate::profiler::SharedXruns,
     sendspin_devices: SharedSendspinDevices,
@@ -170,6 +176,7 @@ pub fn router(
         sources,
         airplay,
         airplay_clients,
+        now_playing,
         meters,
         xruns,
         profiler_watchers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -219,6 +226,16 @@ pub fn router(
         .route("/api/sources/{id}/clients/priority", post(set_source_client_priority))
         .route("/api/sources/{id}/clients/disconnect", post(disconnect_source_client))
         .route("/api/sources/{id}/policy", put(set_source_policy))
+        // Per-source now-playing metadata (now_playing.rs). Keyed by source NODE
+        // NAME, not by source id: that is the key the routing matrix, the routing
+        // intent and the HA integration all already share, and it is what the
+        // `now_playing` WebSocket frame is keyed by — so a consumer never has to
+        // hold both keys. `report` is the self-identifying entry point for a
+        // remote producer that knows its RTP port but not our source ids.
+        .route("/api/now_playing", get(list_now_playing))
+        .route("/api/now_playing/report", post(report_now_playing))
+        .route("/api/now_playing/{node_name}", get(get_now_playing).put(put_now_playing).delete(clear_now_playing))
+        .route("/api/now_playing/{node_name}/artwork", get(get_now_playing_artwork))
         // Multi-source collection CRUD — the sole source-management API.
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/{id}", get(get_source).put(update_source).delete(delete_source))
@@ -1148,7 +1165,11 @@ async fn remove_output(State(state): State<AppState>, Path(node_name): Path<Stri
 async fn reconcile_sources(state: &AppState) {
     let entries = state.sources.lock_recover().list();
     crate::rtp_source::reconcile(&entries, &state.pw_cmd, &state.pw).await;
-    crate::airplay_source::reconcile(&state.airplay, &entries, &state.airplay_clients).await;
+    crate::airplay_source::reconcile(&state.airplay, &entries, &state.airplay_clients, &state.now_playing).await;
+    // A source that no longer exists must not leave a track behind in the
+    // listings for the TTL to eventually collect (now_playing.rs).
+    let live: Vec<String> = entries.iter().map(|e| e.node_name()).collect();
+    state.now_playing.retain_sources(&live);
 }
 
 /// One remembered AirPlay sender for the Sources tab. `key` (name if known,
@@ -1340,6 +1361,140 @@ async fn set_source_policy(
         handle.set_prevent_takeover(req.prevent_takeover);
     }
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: policy_message(req.prevent_takeover).to_string() }))
+}
+
+// ---- Now-playing metadata (now_playing.rs) --------------------------------
+//
+// Reads are the cold-path companion to the `now_playing` WebSocket frame (a
+// consumer that just connected, or `curl`). Writes are how a *remote* producer
+// reports — the local AirPlay receiver writes straight into the store through its
+// own reporter handle and never comes through here.
+
+/// `GET /api/now_playing` — every source with something to say, keyed by node
+/// name. Same payload as the socket's `now_playing` frame.
+async fn list_now_playing(State(state): State<AppState>) -> Json<NowPlayingListResponse> {
+    Json(NowPlayingListResponse { sources: state.now_playing.snapshot() })
+}
+
+/// `GET /api/now_playing/{node_name}` — one source, or 404 when nothing is known.
+async fn get_now_playing(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+) -> Result<Json<crate::now_playing::NowPlaying>, SourceError> {
+    state
+        .now_playing
+        .get(&node_name)
+        .map(Json)
+        .ok_or_else(|| source_err(StatusCode::NOT_FOUND, format!("nothing playing on '{node_name}'")))
+}
+
+/// `PUT /api/now_playing/{node_name}` — merge metadata into a source by node name.
+///
+/// Only *configured* sources are accepted. That is the one check worth making:
+/// this endpoint is unauthenticated like the rest of the API, and without it a
+/// caller could invent listings for nodes that do not exist, which would then
+/// appear in the socket frame and in Home Assistant.
+async fn put_now_playing(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+    Json(update): Json<crate::now_playing::MetadataUpdate>,
+) -> Result<Json<OutputOpResponse>, SourceError> {
+    if update.is_empty() {
+        return Err(source_err(StatusCode::BAD_REQUEST, "no metadata fields supplied".to_string()));
+    }
+    let known = state.sources.lock_recover().list().iter().any(|e| e.node_name() == node_name);
+    if !known {
+        return Err(source_err(StatusCode::NOT_FOUND, format!("no source with node name '{node_name}'")));
+    }
+    state.now_playing.reporter(node_name.clone()).update(update);
+    Ok(Json(OutputOpResponse { ok: true, message: format!("now playing updated for '{node_name}'") }))
+}
+
+/// `DELETE /api/now_playing/{node_name}` — the session ended.
+///
+/// A producer that goes away should say so rather than leave the TTL to collect
+/// it, so Home Assistant's media card collapses instead of freezing on the last
+/// track. Idempotent: clearing something already gone is a success.
+async fn clear_now_playing(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+    state.now_playing.reporter(node_name.clone()).clear();
+    Json(OutputOpResponse { ok: true, message: format!("now playing cleared for '{node_name}'") })
+}
+
+/// `GET /api/now_playing/{node_name}/artwork` — the embedded cover art bytes.
+///
+/// The `?rev=` in the published path is a cache-buster, not a selector: there is
+/// only ever one current image per source, so the query is deliberately ignored
+/// here and the *current* art is returned.
+async fn get_now_playing_artwork(State(state): State<AppState>, Path(node_name): Path<String>) -> Response {
+    match state.now_playing.artwork(&node_name) {
+        Some((bytes, mime, rev)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mime),
+                // Immutable *for this rev*: the path changes when the picture does,
+                // so a consumer (and HA's image proxy) can cache hard.
+                (header::CACHE_CONTROL, "public, max-age=3600, immutable".to_string()),
+                (header::ETAG, format!("\"{node_name}-{rev}\"")),
+            ],
+            Body::from(bytes.to_vec()),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no artwork").into_response(),
+    }
+}
+
+/// `POST /api/now_playing/report` — the self-identifying entry point for a remote
+/// producer (the Pi bridge's reporter, plan §3.4/WP3).
+///
+/// A reporter on the Pi knows its own RTP port; it does not know — and must not
+/// have to learn — the source ids this daemon assigned. So it says "I am the
+/// sender on port 46000" and the port is resolved against the source store, which
+/// is the same key `bt_bridge_discovery` already matches an advert to a source by.
+/// A port matching no configured source is a `404`, not an error worth retrying:
+/// the bridge may simply be set up before its source was added here.
+async fn report_now_playing(
+    State(state): State<AppState>,
+    Json(req): Json<NowPlayingReportRequest>,
+) -> Result<Json<OutputOpResponse>, SourceError> {
+    let node_name = {
+        let sources = state.sources.lock_recover();
+        sources
+            .list()
+            .iter()
+            .find(|e| matches!(&e.config, SourceConfig::Rtp(r) if r.port == req.rtp_port))
+            .map(|e| e.node_name())
+    };
+    let Some(node_name) = node_name else {
+        return Err(source_err(
+            StatusCode::NOT_FOUND,
+            format!("no RTP source is configured on port {}", req.rtp_port),
+        ));
+    };
+    let reporter = state.now_playing.reporter(node_name.clone());
+    // An empty body is how a reporter says "nothing is playing any more" without
+    // needing a second endpoint — its BlueZ player object simply went away.
+    if req.metadata.is_empty() {
+        reporter.clear();
+        return Ok(Json(OutputOpResponse { ok: true, message: format!("now playing cleared for '{node_name}'") }));
+    }
+    reporter.update(req.metadata);
+    Ok(Json(OutputOpResponse { ok: true, message: format!("now playing updated for '{node_name}'") }))
+}
+
+#[derive(Serialize)]
+struct NowPlayingListResponse {
+    sources: std::collections::BTreeMap<String, crate::now_playing::NowPlaying>,
+}
+
+#[derive(Deserialize)]
+struct NowPlayingReportRequest {
+    /// The UDP port this reporter's `module-rtp-sink` transmits to — the key that
+    /// identifies which of our sources it is feeding.
+    rtp_port: u16,
+    /// The metadata itself, flattened, so the body reads as one object rather than
+    /// a wrapper: `{"rtp_port": 46000, "title": "…", "artist": "…"}`.
+    #[serde(flatten)]
+    metadata: crate::now_playing::MetadataUpdate,
 }
 
 // ---- RTP source (Bluetooth bridge firmware target) ------------------------
@@ -2910,6 +3065,10 @@ async fn set_output_latency(
     // the persisted value then applies on the next connect).
     let effective = clamped.unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16);
     state.ap2_control.lock().await.set_render_delay(&node_name, effective).await;
+    // `latency_ms` is on the routing matrix, and the matrix is only pushed when
+    // something says it changed — this used to reach the graph on the next 250 ms
+    // meter tick, which no longer carries it (routing.rs `Frame::Meters`).
+    let _ = state.changes.send(());
     let latency_label = match clamped {
         Some(ms) => format!("{ms} ms"),
         None => "default".to_string(),
@@ -3323,6 +3482,44 @@ mod tests {
             .route("/api/outputs/{node_name}/adopt", post(|| async { "added" }));
         // Building it is the assertion (a conflict would have panicked above).
         drop(app);
+    }
+
+    /// `/api/now_playing/report` is a *static* sibling of
+    /// `/api/now_playing/{node_name}` — the same trap as the discovered/remove
+    /// pairing above, and a conflict would panic at daemon startup. It also pins
+    /// the precedence: a source could in principle be named `report`.
+    #[test]
+    fn now_playing_report_and_node_routes_coexist() {
+        let app: Router = Router::new()
+            .route("/api/now_playing", get(|| async { "all" }))
+            .route("/api/now_playing/report", post(|| async { "reported" }))
+            .route("/api/now_playing/{node_name}", get(|| async { "one" }).put(|| async { "updated" }))
+            .route("/api/now_playing/{node_name}/artwork", get(|| async { "art" }));
+        drop(app);
+    }
+
+    /// The wire shape a remote reporter sends: its port alongside the metadata
+    /// fields *flattened*, not nested. The Pi's reporter is written against this.
+    #[test]
+    fn a_report_body_is_the_port_plus_flattened_metadata() {
+        let req: NowPlayingReportRequest = serde_json::from_str(
+            r#"{"rtp_port":46000,"title":"Song","artist":"Artist","state":"playing","position_ms":1234}"#,
+        )
+        .expect("parses");
+        assert_eq!(req.rtp_port, 46000);
+        assert_eq!(req.metadata.title.as_deref(), Some("Song"));
+        assert_eq!(req.metadata.artist.as_deref(), Some("Artist"));
+        assert_eq!(req.metadata.state, Some(crate::now_playing::PlaybackState::Playing));
+        assert_eq!(req.metadata.position_ms, Some(1234));
+    }
+
+    /// A bare port with no fields is how a reporter says "nothing is playing" —
+    /// `report_now_playing` turns that into a clear, so it must parse, and
+    /// `is_empty()` must recognize it.
+    #[test]
+    fn a_report_body_may_carry_no_metadata_at_all() {
+        let req: NowPlayingReportRequest = serde_json::from_str(r#"{"rtp_port":46001}"#).expect("parses");
+        assert!(req.metadata.is_empty());
     }
 
     fn airplay_entry() -> SourceEntry {

@@ -1,5 +1,27 @@
 // Shapes returned by the bridge-daemon REST API (see docs/api-reference.md).
 
+/** What one source is currently playing, from the socket's `now_playing` frame
+ *  (bridge-daemon/src/now_playing.rs). Keyed by source node name. Every
+ *  descriptive field is optional: producers differ in what they can say — an
+ *  AirPlay sender gives title/artist/album and cover art, AVRCP gives no artwork
+ *  at all, and YouTube Music gives one combined title. */
+export interface NowPlaying {
+  state: 'playing' | 'paused' | 'stopped';
+  title?: string;
+  artist?: string;
+  album?: string;
+  duration_ms?: number;
+  position_ms?: number;
+  /** Unix ms at which `position_ms` was true. A consumer that wants a moving
+   *  position extrapolates from this; the daemon publishes at most every 5 s. */
+  position_updated_at?: number;
+  artwork?:
+    | { kind: 'url'; url: string }
+    /** `path` is daemon-relative and already rev-stamped, so it can be used as an
+     *  `<img src>` as-is — including behind Home Assistant ingress. */
+    | { kind: 'embedded'; rev: number; mime: string; len: number; path: string };
+}
+
 export interface RoutingNode {
   /** Stable node name — the primary key for routing (survives reloads/churn). */
   node_name: string;
