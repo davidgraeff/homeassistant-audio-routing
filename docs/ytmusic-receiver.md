@@ -106,7 +106,7 @@ they coexist rather than one replacing the other:
 | JS runtime | private Node 22 tarball (Raspbian ships 20) | distro nodejs 22 |
 | cookie jar | `~/.local/state/pi-ytmusic-receiver/cookies.txt` | the add-on's `/data/cookies.txt` |
 | provision cookies | `push_cookies.py` | `push_cookies.py --addon` |
-| authenticated resolve | ~22 s local, ~7-10 s via remote cipher | faster: the Pi 4 is ~3.3× per core |
+| authenticated resolve | ~22 s local, ~7-10 s via remote cipher (both pre-daemon) | **2.6-3.5 s** measured live with the long-lived resolver and the resident worker; a *prefetched* track change reaches audio in **1.1-1.3 s** |
 
 The app directory stays canonical on the Pi side because that role is installed by copying
 it wholesale; `scripts/deploy-dev.sh ytmusic` stages a copy into `ytmusic_receiver/receiver/`
@@ -552,6 +552,28 @@ load-bearing — it is now `entry`); and `YoutubeDL.extract_info` returns **None
 raising when yt-dlp handled a failure non-fatally, which surfaced as
 `AttributeError: 'NoneType' object has no attribute 'get'` instead of a diagnosis.
 
+#### What a play logs, and how to read it
+
+Three lines per track, because "it took 20 seconds" was unattributable for most of this
+work — `resolver.js` timed the resolve, and everything after it was dark:
+
+```
+[resolver] resolved <id> in 3.4s via local node (daemon)
+[MpvPlayer] <id> loaded after 4.6s (resolve 4.1s, mpv 0.5s)
+[MpvPlayer] <id> audio flowing after 6.2s
+```
+
+`loaded` is mpv's `file-loaded`; `audio flowing` is mpv's own `playback-restart`, the closest
+event to sound actually starting. What sits **outside** these numbers, in order: the phone's
+DIAL + Lounge handshake before `Player.play()` arrives (the app's time, not ours), and after
+`playback-restart` the RTP hop plus the router's buffering — about 0.6 s, per the latency
+budget in the Bluetooth-bridge notes.
+
+This immediately settled one question: in a 13.1 s start, mpv accounted for **1.8 s** and the
+resolve for 11.2 s, of which two thirds was a rejected URL and a second resolve. mpv, the
+`--audio-buffer=1`, and the mid-stream seek were never the problem. A prefetched track change
+reads `resolve 0.0s`, `mpv 1.1s`, audio at 1.2 s.
+
 #### The 403 at the verify step: unexplained, mitigated (2026-08-10)
 
 **Symptom:** a resolve succeeds, and the resolved URL then answers `HTTP 403` to a two-byte
@@ -727,6 +749,39 @@ logs whether it was served warm:
 [resolver] resolved <id> in 2.6s via local node (daemon)
 [resolver] resolved <id> in 4.1s via local node (daemon, cold)
 ```
+
+
+#### Resolver traps already handled
+
+Small things that cost real time to find, so that none of them is "tidied up" later:
+
+- **Closing a listening socket does not wake a blocked `accept()`** on Linux. The daemon's
+  escalation path logged "exiting" and then sat there until the next connection arrived —
+  and `SIGTERM` had the same defect. `serve()` therefore polls with a 1 s timeout instead of
+  trusting the close.
+- **Waiting for a restart needs its own flag.** `waitUntilRunning()` first returned
+  immediately after an escalation, because the child had not exited yet, so `running` was
+  still true and the caller fell through to the per-track spawn it was trying to avoid.
+  `#restartPending` is set when the restart is *requested* and cleared only when the
+  replacement answers `ping`.
+- **`MAX_WARM_AGE_S` (300 s) is not what it looks like.** A mode's `YoutubeDL` is rebuilt on
+  that interval, but *not* because age causes the 403s — a session seconds old fails too.
+  It is kept because a rebuild is the cheapest recurring moment to also clear the
+  process-wide PO-token cache, and it costs about a second (measured: 3.4 s for a stale
+  resolve against 4.3 s for a rebuilt one, the resident worker and both disk caches
+  surviving).
+- **A unix socket path is capped at ~108 bytes**, and `bind()` reports that as a bare
+  `OSError: AF_UNIX path too long` naming nothing. The daemon checks the length itself and
+  says which path it meant.
+- **The daemon files have to be deployed explicitly.** `scripts/deploy-dev.sh` stages
+  `receiver/*.py` alongside the `*.js` and *fails* if `ytdlp_daemon.py`, `jsc_resident.py` or
+  `jsc_worker.js` is missing, and the Dockerfile `COPY`s `receiver/*.py`. Without that the
+  image still plays — silently falling back to one `yt-dlp` per track and a 15 s challenge,
+  which is exactly the kind of regression a deploy step should not be able to ship. The Pi
+  installer copies every plain file in `receiver/`, so it needs no list.
+- **`setup_pi_ytmusic.py` verifies the venv's own Python can `import yt_dlp`** and prints
+  `long-lived resolver usable: YES/NO`. That import is what the daemon needs, and a failure
+  is otherwise invisible: the receiver logs one warning and goes back to per-track spawns.
 
 ---
 
@@ -1158,15 +1213,16 @@ instead of 22-30 s.
 
 **Not yet confirmed:**
 
-- The **authenticated end-to-end** resolve time, on either box. Every *stage* is now measured
-  on real hardware — the daemon cuts an anonymous Pi Zero resolve from 6.3-7.3 s to
-  2.6-4.1 s, and the resident worker cuts the challenge from 17.9 s to 4-48 ms on the same
-  box — but the two have never run together against a cookie jar, which is the only test that
-  answers "is a track change ~2 s?". Needs `./scripts/deploy-dev.sh ytmusic` and a real cast;
-  watch for `[resolver] resolved <id> in Xs via <label> (daemon)` together with
-  `jsc: solved N challenge(s) … [memory]`.
-- Whether `cipher_url` should then be turned off (see *Remote cipher*): expected, but it is a
-  config change to make on evidence from that same log.
+- **The Pi Zero has not been redeployed** with the long-lived resolver or the resident worker.
+  Every stage is measured there (6.3-7.3 s → 2.6-4.1 s for the process; 17.9 s → 4-48 ms for
+  the challenge) but the two have never run together on that box, and it is the one where the
+  memory budget is tight — a rebuild there costs a player re-download on a 424 MB machine.
+- **How often the client ladder is needed**, and whether `web_embedded` (which serves opus)
+  rescues as reliably as `web_safari` (which drops to HLS) did. One live session had two
+  rescues; that is not a rate.
+- **What the default client is actually being denied** when it 403s. A
+  `/data/403-diagnostics/` report from a live window is the artefact that would answer it; none
+  has been produced yet, because the ladder has recovered every failure so far.
 - Whether `--prewarm` is a *net* win on the Zero 2 W specifically. It spends a full cold
   resolve at boot (nice 19, ionice idle, ~88 MB for the JS runtime on a 424 MB box) to make
   the first track of the first session fast. On the add-on this is free; on the Zero, if it
