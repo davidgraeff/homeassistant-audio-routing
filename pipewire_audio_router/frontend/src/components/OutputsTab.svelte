@@ -2,7 +2,8 @@
   import { onDestroy, onMount, untrack } from 'svelte';
   import { api, MIN_OUTPUT_NAME_CHARS } from '../lib/api';
   import { routing } from '../lib/routing';
-  import { run, toast } from '../lib/toast';
+  import { run, runUndoable, toast } from '../lib/toast';
+  import { askConfirm, removeOutputConfirm } from '../lib/confirm.svelte';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../lib/types';
   import GroupTitle from './GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
@@ -437,18 +438,21 @@
   // "take this out of my outputs" and "stop trusting that machine" are not two
   // things a user wants separately. Its agent keeps dialling in, so it returns
   // below as pairable — ignore it there to put it away for good.
-  function remove(o: OutputInfo) {
+  async function remove(o: OutputInfo) {
     if (o.kind === 'pwsink') {
-      if (
-        !confirm(
-          `Unpair '${o.name}'?\n\nIts pairing is revoked, and its routing, group membership and Home Assistant media_player are removed. The agent on that machine keeps asking to pair, so it reappears below as a discovered device — ignore it there if you don't want it back.`,
-        )
-      )
-        return;
+      const ok = await askConfirm({
+        title: `Unpair '${o.name}'?`,
+        body: [
+          'Its pairing is revoked, and its routing, group membership and Home Assistant media_player are removed.',
+          "The agent on that machine keeps asking to pair, so it comes back below as a discovered device — ignore it there if you don't want it back.",
+        ],
+        confirmLabel: 'Unpair',
+        danger: true,
+      });
+      if (!ok) return;
       return decide(o, () => api.unpairOutput(o.node_name));
     }
-    const back = o.present ? `'${o.name}' stays on the network and will reappear below as a discovered device.` : `'${o.name}' is offline, so it will disappear from this page until it shows up again.`;
-    if (!confirm(`Remove '${o.name}' from your outputs?\n\nIts routing, group membership and Home Assistant media_player are removed. ${back}`)) return;
+    if (!(await askConfirm(removeOutputConfirm(o.name, o.present)))) return;
     return decide(o, () => api.removeOutput(o.node_name));
   }
 
@@ -463,9 +467,27 @@
   // Drop the rename: the output goes back to the name its device announces. Only
   // offered for an output that actually carries one (`renamed`) — the discovered
   // name isn't in this listing, so there's nothing to preview and no point
-  // offering the control otherwise. Routed through `decide` for its toast of the
-  // daemon's own message, which is what names the result.
-  const resetName = (o: OutputInfo) => decide(o, () => api.renameOutput(o.node_name, null));
+  // offering the control otherwise.
+  //
+  // Not asked about, because it is exactly undoable: the name we're dropping is
+  // the one on screen, so putting it back is the same call with it. The old
+  // *reason* for asking — that the device's announced name is shown nowhere, so
+  // you couldn't type your way back — is what the Undo answers.
+  async function resetName(o: OutputInfo) {
+    const previous = o.name;
+    const restore = async () => {
+      const res = await api.renameOutput(o.node_name, previous);
+      if (res.ok === false) throw new Error(res.message ?? `Could not restore '${previous}'`);
+      await refresh();
+    };
+    await runUndoable(
+      () => api.renameOutput(o.node_name, null),
+      `Dropped '${previous}' — using the name this device announces`,
+      restore,
+      `Named '${previous}' again`,
+    );
+    await refresh();
+  }
 
   // AirPlay-2 wire sample-rate mode (auto vs forced 44.1 kHz). Restarts the group.
   async function setRateMode(o: OutputInfo, e: Event) {
@@ -657,8 +679,8 @@
                  device's mDNS name is often no help in a house (four speakers
                  all called "Yamaha"), and this name is what the routing graph,
                  the group chips and Home Assistant show. The clear icon appears
-                 only once a name of your own is stored, and asks first — the
-                 device's own name isn't shown anywhere to type back. -->
+                 only once a name of your own is stored, and offers an Undo rather
+                 than asking — see `resetName`. -->
             <h3>
               <GroupTitle
                 name={o.name}
@@ -667,7 +689,6 @@
                 onRename={(name) => rename(o, name)}
                 onReset={o.renamed ? () => resetName(o) : undefined}
                 resetTitle="Use the name this device announces"
-                resetConfirm={`Drop the name '${o.name}' and use the one this device announces?`}
               />
             </h3>
           </div>

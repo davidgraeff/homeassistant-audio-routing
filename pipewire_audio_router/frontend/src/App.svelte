@@ -2,6 +2,7 @@
   import { routing } from './lib/routing';
   import ThemeToggle from './components/ThemeToggle.svelte';
   import Toasts from './components/Toasts.svelte';
+  import ConfirmDialog from './components/ConfirmDialog.svelte';
   import OutputsTab from './components/OutputsTab.svelte';
   import MusicGroupsTab from './components/MusicGroupsTab.svelte';
   import AnnouncementsTab from './components/AnnouncementsTab.svelte';
@@ -56,6 +57,8 @@
 </main>
 
 <Toasts />
+<!-- One instance for the whole app: every `askConfirm()` renders here. -->
+<ConfirmDialog />
 
 <style>
   .app-header {

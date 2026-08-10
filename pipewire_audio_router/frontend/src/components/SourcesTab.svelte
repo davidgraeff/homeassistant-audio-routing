@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
-  import { routing } from '../lib/routing';
+  import { peakOf, routing } from '../lib/routing';
   import { run } from '../lib/toast';
+  import { askConfirm } from '../lib/confirm.svelte';
   import { align } from '../lib/align.svelte';
   import RtpSenderDocs from './RtpSenderDocs.svelte';
   import AlignDocs from './AlignDocs.svelte';
@@ -117,13 +118,12 @@
   });
 
   // Live input-level meters. Subscribing to the `routing` store opens the same
-  // WebSocket the routing matrix uses, whose snapshots carry each present
-  // source's current peak (0.0–1.0). Match by the daemon's stable source node
-  // name — every SourceView carries its `node_name`.
-  const liveSources = $derived($routing.matrix.sources);
+  // WebSocket the routing matrix uses, whose `meters` frame carries each metered
+  // source's current peak (0.0–1.0) — absent meaning no signal. Match by the
+  // daemon's stable source node name; every SourceView carries its `node_name`.
   const pct = (peak: number) => Math.min(100, Math.round(peak * 100));
   function peakFor(nodeName: string): number {
-    return liveSources.find((s) => s.node_name === nodeName)?.peak ?? 0;
+    return peakOf($routing, nodeName);
   }
 
   function kindLabel(kind: SourceKind): string {
@@ -296,8 +296,17 @@
     }
   }
 
+  // Destructive of configuration the daemon can't hand back — the source's ports
+  // and settings go with it, and re-adding it later is a new, unrouted source —
+  // so this one is asked.
   async function remove(s: SourceView) {
-    if (!confirm(`Remove source '${s.label}'? Its routing will be forgotten.`)) return;
+    const ok = await askConfirm({
+      title: `Remove source '${s.label}'?`,
+      body: 'Its routing is forgotten: anything it was playing on stops, and adding it back starts from an unrouted source.',
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
     if (form && form.type === 'edit' && form.id === s.id) closeForm();
     if (await run(() => api.deleteSource(s.id), `Removed source '${s.label}'`)) await refresh();
   }

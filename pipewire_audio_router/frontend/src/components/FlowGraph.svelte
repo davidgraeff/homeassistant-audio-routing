@@ -2,7 +2,8 @@
   import { untrack, onDestroy } from 'svelte';
   import { artworkOf, nowPlayingOf, peakOf, routing, xrunsOf } from '../lib/routing';
   import { api } from '../lib/api';
-  import { run, toast } from '../lib/toast';
+  import { run, runUndoable, toast } from '../lib/toast';
+  import { askConfirm, removeOutputConfirm } from '../lib/confirm.svelte';
   import type { MusicGroup, NowPlaying, RoutingNode } from '../lib/types';
   import VolumeControl from './VolumeControl.svelte';
   import RoutingHelp from './RoutingHelp.svelte';
@@ -459,18 +460,58 @@
     });
   });
 
-  /** Click a wire to remove that route — for a group, from every member on it. */
+  /** Click a wire to remove that route — for a group, from every member on it.
+   *
+   *  The most-clicked destructive control in the app, and the cheapest to get
+   *  wrong: re-drawing the wire is the same drag that made it. So it just does it
+   *  and offers an Undo, which relinks exactly the members it unlinked — asking
+   *  first taxed every deliberate click to guard a stray one. */
   async function removeEdge(e: Edge) {
     const what = e.target.kind === 'group' ? `group ${e.target.name}` : e.target.name;
-    if (!confirm(`Remove route: ${disp(srcInfo, e.source)} → ${what}?`)) return;
+    // Captured before the first unlink: `linkedMembers` reads the live matrix, and
+    // the undo has to relink exactly the members this click took off.
     const members = linkedMembers(e.target, e.source);
-    for (const m of members) {
-      if (!(await run(() => api.unlink(e.source, m.node_name)))) return;
+    const each = async (call: (output: string) => Promise<{ ok?: boolean; message?: string }>, failed: string) => {
+      for (const m of members) {
+        const res = await call(m.node_name);
+        if (res.ok === false) throw new Error(res.message ?? failed);
+      }
+    };
+    await runUndoable(
+      () => each((o) => api.unlink(e.source, o), 'Could not remove the route'),
+      `Removed route: ${disp(srcInfo, e.source)} → ${what}`,
+      () => each((o) => api.link(e.source, o), 'Could not restore the route'),
+      'Route restored',
+    );
+  }
+
+  // Asked in a bubble anchored to the node's own ✕, not in the app's modal: a
+  // backdrop over the graph hides the one thing the question is about — which of a
+  // dozen look-alike cards this is.
+  //
+  // Positioned in viewport coordinates, taken from the button at click time, and
+  // rendered outside the graph card: the canvas scrolls and is exactly as tall as
+  // its computed layout, so a bubble living inside it is clipped the moment it
+  // hangs off the bottom card. A scroll therefore dismisses it (see `onKey`'s
+  // neighbours on <svelte:window>) rather than leaving it behind.
+  let forgetting = $state<{ node: RoutingNode; x: number; y: number } | null>(null);
+  const CPOP_W = 250;
+
+  function askForget(node: RoutingNode, btn: HTMLElement) {
+    if (forgetting?.node.node_name === node.node_name) {
+      forgetting = null;
+      return;
     }
+    const r = btn.getBoundingClientRect();
+    forgetting = {
+      node,
+      x: Math.max(8, Math.min(r.left - 8, window.innerWidth - CPOP_W - 8)),
+      y: Math.min(r.bottom + 8, window.innerHeight - 130),
+    };
   }
 
   async function forget(node: RoutingNode) {
-    if (!confirm(`Remove '${node.display_name}'? It's offline; its saved routing will be forgotten (a real device reappears unrouted).`)) return;
+    forgetting = null;
     await run(() => api.forgetEntity(node.node_name), `Forgot '${node.display_name}'`);
   }
 
@@ -479,13 +520,11 @@
   // leave the row sitting there and the ✕ would look broken. Removing un-adds it
   // — routing, group membership and Home Assistant entity go with it, and a
   // device that's still on the network reappears as a discovered offer.
+  // Same wording as the Outputs page's Remove (`removeOutputConfirm`) — it is the
+  // same call on the same thing, and the two used to explain themselves
+  // differently.
   async function removeOutput(node: RoutingNode) {
-    if (
-      !confirm(
-        `Remove '${node.display_name}' from your outputs? It's offline. Its saved routing, group membership and Home Assistant media_player are removed; if the device turns up again it appears on the Outputs page as a discovered device.`,
-      )
-    )
-      return;
+    if (!(await askConfirm(removeOutputConfirm(node.display_name, node.present)))) return;
     await run(() => api.removeOutput(node.node_name), `Removed '${node.display_name}'`);
   }
 
@@ -549,6 +588,15 @@
     if (e.type !== 'keydown' || e.key !== 'Escape') return;
     helpOpen = false;
     dragging = null;
+    forgetting = null;
+  }
+
+  /** A pointer landing anywhere but the bubble (or the ✕ that owns it) puts the
+   *  forget question away — the graph's own version of clicking the backdrop. */
+  function onGlobalDown(e: PointerEvent) {
+    if (!forgetting) return;
+    if ((e.target as Element | null)?.closest('.cpop, .x')) return;
+    forgetting = null;
   }
 
   async function onVolume(nodeName: string, pct: number) {
@@ -574,9 +622,12 @@
 <svelte:window
   onpointermove={onMove}
   onpointerup={onUp}
+  onpointerdown={onGlobalDown}
   onkeydown={onKey}
   onkeyup={onKey}
   onblur={() => (modHeld = false)}
+  onscroll={() => (forgetting = null)}
+  onresize={() => (forgetting = null)}
 />
 
 <!-- Folded away by default: the title row is the whole card until you open it,
@@ -645,7 +696,12 @@
                     <span class="nm" title={n.display_name}>{n.display_name}</span>
                     {#if !n.present}
                       <span class="tag off">offline</span>
-                      <button class="x" title="Forget saved routing" onclick={() => forget(n)}>✕</button>
+                      <button
+                        class="x"
+                        title="Forget saved routing"
+                        aria-expanded={forgetting?.node.node_name === n.node_name}
+                        onclick={(e) => askForget(n, e.currentTarget)}>✕</button
+                      >
                     {:else}
                       <div class="meter" title="input level {Math.round(peakOf($routing, n.node_name) * 100)}%">
                         <div class="meter-fill" style="width:{Math.min(100, Math.round(peakOf($routing, n.node_name) * 100))}%"></div>
@@ -781,6 +837,19 @@
   {/if}
 </div>
 
+{#if forgetting}
+  {@const f = forgetting}
+  <!-- The forget question, at the ✕ it came from. Outside the graph card on
+       purpose — see `askForget`. -->
+  <div class="cpop" style="left:{f.x}px; top:{f.y}px" role="dialog" aria-label="Forget saved routing">
+    <p>Forget <strong>{f.node.display_name}</strong>’s saved routing? It’s offline; a real device reappears unrouted.</p>
+    <div class="cpop-row">
+      <button class="ghost" type="button" onclick={() => (forgetting = null)}>Cancel</button>
+      <button class="danger" type="button" onclick={() => forget(f.node)}>Forget</button>
+    </div>
+  </div>
+{/if}
+
 {#if helpOpen}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="modal-backdrop" onclick={() => (helpOpen = false)}>
@@ -877,6 +946,14 @@
     fill: none;
     stroke: var(--primary-color);
     stroke-width: 2.5;
+  }
+  /* Hovering the (invisible, fatter) hit path colors the wire it belongs to: the
+     click removes the route immediately now, so the affordance has to say so
+     before the click, not after. Sibling selector — `.hit` is emitted directly
+     before its `.wire`. */
+  .hit:hover + .wire {
+    stroke: var(--error-color, #d33);
+    opacity: 1;
   }
   .wire.off {
     stroke: var(--secondary-text-color);
@@ -1216,7 +1293,44 @@
     padding: 0 2px;
     line-height: 1;
   }
-  .x:hover {
+  .x:hover,
+  .x[aria-expanded='true'] {
     color: var(--error-color, #d33);
+  }
+
+  /* The confirm bubble: a modal over the graph would hide which card is being
+     asked about, so the question hangs off that card's ✕ instead. Fixed, and
+     rendered outside the graph — the canvas clips (it scrolls, and its height is
+     exactly its computed layout), and the card it points at is dimmed when
+     offline, which a child could not undo. */
+  .cpop {
+    position: fixed;
+    width: 250px;
+    z-index: 60;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border: 1px solid var(--ha-card-border-color, var(--divider-color));
+    border-radius: 10px;
+    background: var(--card-background-color, #fff);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+  }
+  .cpop p {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--secondary-text-color);
+  }
+  .cpop strong {
+    color: var(--primary-text-color);
+  }
+  .cpop-row {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .cpop-row button {
+    padding: 4px 10px;
+    font-size: 0.78rem;
   }
 </style>

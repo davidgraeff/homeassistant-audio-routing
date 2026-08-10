@@ -17,24 +17,17 @@
     /** Drop the name and fall back to whatever the thing is called by default.
      *  Omit it — as a group does, having no name but the one it was given — and
      *  no clear control appears; the caller should also omit it when there is
-     *  nothing to clear, so the icon never offers a no-op. */
+     *  nothing to clear, so the icon never offers a no-op.
+     *
+     *  Fires on the click, unasked: the caller still holds the old name, so this
+     *  is the caller's to offer as an Undo (which is what it used to ask about). */
     onReset?: () => void;
-    /** Tooltip on the clear button. */
+    /** Tooltip on the clear button. Name the default there when the caller knows
+     *  it — it isn't shown anywhere else, and then the click isn't a blind one. */
     resetTitle?: string;
-    /** Confirmation prompt for the clear. Losing a name you typed isn't
-     *  recoverable from the UI (the default name isn't shown anywhere), so it is
-     *  always asked about. */
-    resetConfirm?: string;
   }
-  let {
-    name,
-    onRename,
-    minLength = 1,
-    title = 'Rename group',
-    onReset,
-    resetTitle = 'Use the default name again',
-    resetConfirm = 'Drop this name and use the default one again?',
-  }: Props = $props();
+  let { name, onRename, minLength = 1, title = 'Rename group', onReset, resetTitle = 'Use the default name again' }: Props =
+    $props();
 
   // null = not editing; a string = the draft being typed.
   let draft = $state<string | null>(null);
@@ -58,9 +51,6 @@
     if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
     else if (e.key === 'Escape') draft = null;
   }
-  function askReset() {
-    if (onReset && confirm(resetConfirm)) onReset();
-  }
 </script>
 
 {#if draft !== null}
@@ -73,7 +63,7 @@
   <!-- Emitted only when the caller passes `onReset`, so a group title is exactly
        the single element it has always been. -->
   {#if onReset}
-    <button class="gclear" type="button" aria-label={resetTitle} title={resetTitle} onclick={askReset}>
+    <button class="gclear" type="button" aria-label={resetTitle} title={resetTitle} onclick={() => onReset?.()}>
       <svg class="x" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" /></svg>
     </button>
   {/if}
