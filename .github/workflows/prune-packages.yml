@@ -1,0 +1,66 @@
+name: Prune old GHCR dev images
+
+# GHCR has no native retention policy — "keep the newest N versions" only exists as
+# something you run. So this is the scheduled equivalent of
+# scripts/prune-ghcr-tags.sh, which does the same job by hand.
+#
+# The two are deliberately kept as separate implementations of one rule rather than
+# the workflow shelling out to the script: the script needs a PAT with
+# delete:packages, while this runs on the repo's own GITHUB_TOKEN. Keep KEEP and the
+# protected-tag pattern below in step with the script's.
+on:
+  schedule:
+    # Weekly. Dev tags accumulate roughly per deploy, and a week's worth is a few
+    # dozen — small enough to be harmless, frequent enough not to pile up.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Dev versions to keep per package"
+        default: "3"
+      dry_run:
+        description: "Only report what would be deleted"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Required to delete package versions. Note this only reaches packages LINKED to
+  # this repository — which is what the
+  # `LABEL org.opencontainers.image.source` in each Dockerfile establishes. An
+  # unlinked package (as ytmusic_receiver was on its first push) is invisible here
+  # and has to be pruned with the script and a PAT instead.
+  packages: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    strategy:
+      # One job per package so a failure on one (e.g. an arch never pushed) does not
+      # hide the others' results.
+      fail-fast: false
+      matrix:
+        package:
+          - aarch64-addon-pipewire_audio_router
+          - amd64-addon-pipewire_audio_router
+          - aarch64-addon-ytmusic_receiver
+          - amd64-addon-ytmusic_receiver
+    steps:
+      - name: Prune ${{ matrix.package }}
+        uses: actions/delete-package-versions@v5
+        with:
+          owner: ${{ github.repository_owner }}
+          package-name: ${{ matrix.package }}
+          package-type: container
+          # Keep this many of the versions that are NOT ignored below.
+          min-versions-to-keep: ${{ github.event.inputs.keep || 3 }}
+          # Never touch releases, `latest`, or the buildx cache. Same rule as the
+          # script: a tag that is not recognisably a dev build is protected.
+          #   ^\d+\.\d+\.\d+$  release versions (X.Y.Z)
+          #   latest, buildcache
+          # Everything else — X.Y.<timestamp> and the legacy X.Y.Z.<stamp> — is
+          # prunable. `ignore-versions` is a regex over the version's tags.
+          ignore-versions: '^(latest|buildcache|\d+\.\d+\.\d+)$'
+          delete-only-pre-release-versions: "false"
+          dry-run: ${{ github.event.inputs.dry_run || false }}
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,69 @@
+name: YouTube Music Cast Receiver
+version: "0.1.0"
+slug: ytmusic_receiver
+description: >-
+  Makes the Cast button in the YouTube Music app target the PipeWire Audio Router,
+  by running a DIAL + Lounge receiver and feeding its audio in as an RTP source.
+url: "https://github.com/davidgraeff/homeassistant-audio-routing"
+# LOCAL/PRIVATE add-on, deliberately never published: it depends on unofficial
+# protocols and on yt-dlp keeping up with YouTube, and it plays from the owner's
+# own signed-in account. See docs/pi-ytmusic-receiver-plan.md.
+#
+# Built on the workstation and pulled, exactly like the audio-router add-on. There
+# is no compiler involved here, but *assembling* the image still means apt +
+# npm install + a pip venv, and doing that under emulation on a Pi 4 is the slow
+# part — so `image:` is set, which makes Supervisor treat this as image-based
+# (build: false) and pull.
+#
+# NOTE: a freshly created GHCR package is PRIVATE by default, and Supervisor then
+# fails the pull with `401 unauthorized` (hit on the first deploy). The package has
+# to be visible to the host — either public, like the router's, or with registry
+# credentials registered via `ha docker registries`.
+image: "ghcr.io/davidgraeff/{arch}-addon-ytmusic_receiver"
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+# Required, and for two independent reasons:
+#   * DIAL discovery is SSDP multicast on 239.255.255.250:1900 — the phone can
+#     only find this receiver if it shares the host's LAN interface.
+#   * The RTP audio goes to the audio-router add-on, which also runs with host
+#     networking; on the same host that is loopback (127.0.0.1) and free.
+host_network: true
+# SYS_NICE lets PipeWire's realtime module raise its data loop to SCHED_FIFO
+# directly, so a resolve (or anything else on the host) cannot starve playback.
+# No IPC_LOCK: unlike the router, nothing here mlocks the audio path.
+privileged:
+  - SYS_NICE
+# No ingress/panel: the phone's YouTube Music app IS the control surface. There is
+# no web UI to serve, and adding one would only duplicate the app's transport.
+options:
+  device_name: "Musik (Home Assistant)"
+  rtp_host: "127.0.0.1"
+  rtp_port: 46002
+  dial_port: 8098
+  cipher_url: "https://cipher.kikkia.dev"
+  report_metadata: true
+  log_level: info
+schema:
+  # Name shown in the YouTube Music app's Cast menu.
+  device_name: str
+  # Where the RTP audio is sent: the audio-router add-on. Loopback when both run
+  # on this host. The router needs a matching RTP source on `rtp_port`.
+  rtp_host: str
+  # Deliberately NOT 46000/46001: those belong to the Bluetooth bridge and the
+  # Raspberry Pi receiver, which keep running independently.
+  rtp_port: int(1024,65535)
+  # DIAL/SSDP HTTP port. Not 8099 — that is the audio router's own port.
+  dial_port: int(1024,65535)
+  # yt-cipher server that solves YouTube's JS challenges off-box (~3x faster than
+  # solving locally). Leave empty to always solve locally.
+  cipher_url: str?
+  # Pin the DIAL server to one local IP. Leave empty to auto-detect; only needed
+  # on a multi-homed host, where answering SSDP on the wrong address makes senders
+  # silently drop the device.
+  bind_address: str?
+  # Report now-playing (title/artwork/position) to the audio router's API.
+  report_metadata: bool
+  log_level: list(debug|info|warn|error)

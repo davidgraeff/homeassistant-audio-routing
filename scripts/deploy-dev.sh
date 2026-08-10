@@ -45,8 +45,28 @@ BUILDER="ha-addon-builder"             # dedicated buildx builder (see below)
 DEV_TAGS_KEEP=3                        # how many dev image tags to retain on GHCR
 
 usage() {
-  echo "usage: $0 addon|integration" >&2
+  echo "usage: $0 addon|ytmusic|integration" >&2
   exit 1
+}
+
+# The YouTube Music receiver add-on shares its application code with the
+# Raspberry Pi deployment, which lives at firmware/pi-ytmusic/receiver/ and stays
+# canonical: that role is installed by `scp -r firmware/pi-ytmusic`, so it has to
+# remain self-contained. Docker cannot COPY from outside its build context, so the
+# app is staged into the add-on directory here, immediately before the build.
+#
+# Staged rather than symlinked (Docker does not follow symlinks out of context) and
+# rather than moved (that would break the Pi's install path).
+stage_ytmusic_receiver() {
+  local src="$REPO_ROOT/firmware/pi-ytmusic/receiver"
+  local dst="$REPO_ROOT/ytmusic_receiver/receiver"
+  [ -f "$src/index.js" ] || { echo "ERROR: $src/index.js missing" >&2; exit 1; }
+  echo "--- staging shared receiver app from firmware/pi-ytmusic/receiver ---"
+  rm -rf "$dst"
+  mkdir -p "$dst"
+  # Only the app files. node_modules is npm's job inside the image, and copying a
+  # host build of it would mean armv7 binaries in an aarch64 image.
+  cp "$src"/*.js "$src"/package.json "$dst/"
 }
 
 # Map the target's `uname -m` to Home Assistant's arch name and the buildx
@@ -338,6 +358,15 @@ deploy_integration() {
 
 case "${1:-}" in
   addon) deploy_addon ;;
+  ytmusic)
+    # Same cross-build/push/pull machinery as the router: deploy_addon() is already
+    # parameterised by these two globals. Assembling this image on the Pi would be
+    # apt + npm + pip under emulation, which is the slow part even without a compiler.
+    ADDON_SLUG="local_ytmusic_receiver"
+    ADDON_NAME="ytmusic_receiver"
+    stage_ytmusic_receiver
+    deploy_addon
+    ;;
   integration) deploy_integration ;;
   *) usage ;;
 esac
