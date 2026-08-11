@@ -2,7 +2,7 @@
 //! (docs/mic-alignment-plan.md §12.1, §12.3).
 //!
 //! Alignment used to resolve a group from an existing *source set* and required one to
-//! already exist (`calibrate.rs`), which is why its panel lived on source cards. The
+//! already exist (`align/calibrate.rs`), which is why its panel lived on source cards. The
 //! target scenario inverts that: the user picks speakers on the Outputs page and
 //! alignment forms a group around them.
 //!
@@ -40,7 +40,7 @@
 //! that cannot half-succeed, is idempotent, and does the right thing even if the
 //! process dies (a restart reads the unmodified store). The only state that genuinely
 //! *is* mutated, and therefore genuinely needs snapshot/restore, is per-device level
-//! and mute; `calibrate.rs` owns that snapshot, and it is a small, bounded set.
+//! and mute; `align/calibrate.rs` owns that snapshot, and it is a small, bounded set.
 //!
 //! ## What exclusivity covers, and what it does not
 //!
@@ -99,7 +99,7 @@
 //! dials anyway — so a superset re-forms and says so, rather than acquiring a second
 //! formation mechanism with its own restore obligations.
 //!
-//! ## Intended call sequence (the seam `align_measure.rs` is wired to)
+//! ## Intended call sequence (the seam `align/measure.rs` is wired to)
 //!
 //! 1. `calibrate::AlignManager::start_outputs(&HoldDeps, outputs, mode)` —
 //!    validates the selection ([`validate_selection`]), forms and holds the group
@@ -108,7 +108,7 @@
 //!    hold does not cover the new selection is torn down first — one that **does** is
 //!    kept and re-scoped instead (§12.3.1 above), which is the whole point.
 //! 2. `AlignManager::solo(node, level)` for the level-setting round (plan §12.2:
-//!    exactly **one** member audible, default level [`crate::calibrate::DEFAULT_ALIGN_LEVEL`]),
+//!    exactly **one** member audible, default level [`crate::align::calibrate::DEFAULT_ALIGN_LEVEL`]),
 //!    or `AlignManager::set_audible(members, level)` for §7's all-play round. Both go
 //!    through the same set-based audibility, so "reference + target" is no longer a
 //!    special case — it is `set_audible([reference, target])`, which is what
@@ -125,8 +125,8 @@
 //! Steps 2–4 work in any state and at any point, including while formation is still
 //! settling; that is required by plan §12.2's "stop must work at every point".
 
+use crate::align::calibrate::{AlignMember, MemberKind};
 use crate::announce_arbiter::ReservationId;
-use crate::calibrate::{AlignMember, MemberKind};
 use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use crate::pw_thread::ChangeNotifier;
 use crate::routing_store::{RoutingLink, SharedRouting};
@@ -241,7 +241,7 @@ pub struct Interference {
 /// The live hold, as the rest of the daemon sees it.
 ///
 /// A process-global single slot: exactly one alignment session exists at a time
-/// (`calibrate.rs` enforces that), and the two reporters — the announce path and the
+/// (`align/calibrate.rs` enforces that), and the two reporters — the announce path and the
 /// overlay mixer — need a cheap, lock-light "is this output reserved?" that does not
 /// reach into the reconciler or the arbiter.
 #[derive(Default)]
@@ -516,7 +516,7 @@ impl ExclusiveHold {
     /// A hold that has taken **only** the routing override on the reconciler it is
     /// given — no process-global registry entry, no announce reservation.
     ///
-    /// For tests in other modules that need a `Session` to exist (`calibrate.rs`'s
+    /// For tests in other modules that need a `Session` to exist (`align/calibrate.rs`'s
     /// union-hold tests) without a PipeWire graph to produce an anchor. Deliberately
     /// keeps its hands off the two process-global singletons: exactly one test —
     /// `a_hold_takes_exclusivity_reports_violations_and_gives_everything_back` — drives
@@ -671,7 +671,7 @@ impl ExclusiveHold {
     /// [`HoldRegistry::close`]: a hold that releases late can only ever unmute an output it
     /// held itself, never a newer session's member.
     fn unmute_relay(&self) {
-        let cleared = crate::relay_delay::RelayDelay::global().unmute_all(self.held.iter().map(String::as_str));
+        let cleared = crate::align::relay_delay::RelayDelay::global().unmute_all(self.held.iter().map(String::as_str));
         if cleared > 0 {
             tracing::debug!("alignment hold {}: dropped {cleared} relay calibration mute(s)", self.id);
         }
@@ -1065,7 +1065,7 @@ mod tests {
     /// unmuting a *newer* session's member.
     #[tokio::test]
     async fn releasing_or_dropping_a_hold_drops_its_relay_calibration_mutes() {
-        let relay = crate::relay_delay::RelayDelay::global();
+        let relay = crate::align::relay_delay::RelayDelay::global();
         let groups: SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
         let (changes, _rx) = tokio::sync::broadcast::channel(4);
         let others = "pwsink-dev-someone-elses-mute";

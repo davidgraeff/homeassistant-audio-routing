@@ -10,7 +10,7 @@
 //!
 //! Only 16-bit PCM is handled, which is all this daemon ever produces —
 //! everything converges on `wav::build_wav` at 16-bit (decode.rs via
-//! symphonia, calibrate.rs for the click track).
+//! symphonia, align/calibrate.rs for the click track).
 
 use pipewire as pw;
 use pw::spa;

@@ -205,13 +205,13 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
         .spawn(move || {
             set_relay_realtime_priority();
             let mixer = crate::overlay_mixer::OverlayMixer::global();
-            // Provisional per-device alignment delay (relay_delay.rs), applied AFTER the
+            // Provisional per-device alignment delay (align/relay_delay.rs), applied AFTER the
             // overlay so it shifts everything this target renders — as the playout-delay
             // knob it stands in for does. One block out per block in, so the sender's
             // packet cadence, RTP timestamps and backlog are untouched. With no alignment
             // running this is one relaxed atomic load per target per chunk.
-            let delayer = crate::relay_delay::RelayDelay::global();
-            let delay_fmt = crate::relay_delay::PcmFormat::new(format.rate, format.channels);
+            let delayer = crate::align::relay_delay::RelayDelay::global();
+            let delay_fmt = crate::align::relay_delay::PcmFormat::new(format.rate, format.channels);
             let mut mix_buf: Vec<u8> = Vec::new();
             let mut delay_buf: Vec<u8> = Vec::new();
             // Per-target dropped-chunk counters + one shared report cadence: a

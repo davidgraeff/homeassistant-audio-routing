@@ -25,7 +25,7 @@
 //     while an announcement occupies it, and un-ducks when none does.
 //   * **Reservations (plan §12.3):** something that is *not* an announcement can
 //     claim outputs exclusively — today an alignment session's temporary group
-//     (align_group.rs). A reservation counts as occupancy for admission, so an
+//     (align/group.rs). A reservation counts as occupancy for admission, so an
 //     ordinary announcement queues (or is rejected per `OnBusy`) instead of
 //     playing over a calibration tone. It deliberately does **not** stop a
 //     `barge_in`: nobody wants a fire alarm suppressed by a calibration, so the
@@ -52,7 +52,7 @@ pub type Output = String;
 
 /// Identifies one **reservation**: an exclusive claim on a set of outputs held by
 /// something that is not an announcement (today an alignment session's temporary
-/// group — see `align_group.rs`).
+/// group — see `align/group.rs`).
 pub type ReservationId = u64;
 
 /// What to do when the requested outputs are busy.

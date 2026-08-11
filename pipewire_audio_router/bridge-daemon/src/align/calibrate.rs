@@ -5,13 +5,13 @@
 //! members it names audible** and the rest muted. Which members are audible is what
 //! the two consumers differ on: the by-ear path makes two audible (a fixed
 //! **reference** and the **target** being tuned) and the user drags the target's
-//! delay until they coincide; the microphone path (align_measure.rs) solos **one**
+//! delay until they coincide; the microphone path (align/measure.rs) solos **one**
 //! at a time so a per-member SNR can be attributed at all (plan §12.2, §7.1).
 //!
 //! ## The group is formed by the session, not found by it
 //!
 //! A session takes an arbitrary **selection of outputs** and forms a temporary
-//! exclusive group around them (`align_group.rs`, plan §12.1) — it no longer
+//! exclusive group around them (`align/group.rs`, plan §12.1) — it no longer
 //! requires a group to already exist for some source set. While the session runs,
 //! nothing else reaches those speakers. The by-ear path goes through the same
 //! machinery, which is what stops it being a special case: `start` resolves an
@@ -103,7 +103,7 @@
 //!   ([`AlignState::unlevellable`], [`AlignState::level_note`]) because it sets the clip
 //!   ceiling the others have to fit under (plan §7).
 //!
-//! [`align_levels::LevelRestore::level`]: crate::align_levels::LevelRestore::level
+//! [`align_levels::LevelRestore::level`]: crate::align::levels::LevelRestore::level
 //!
 //! ## Test signal
 //!
@@ -126,7 +126,7 @@
 //! Adjusting a member's offset reuses the existing knobs (sendspin static
 //! delay), so this module only owns playback + muting, not the persisted offsets.
 
-use crate::align_group::{AlignMode, ExclusiveHold, HoldDeps, Interference};
+use crate::align::group::{AlignMode, ExclusiveHold, HoldDeps, Interference};
 use crate::ap2_volume::SharedAp2Control;
 use crate::sendspin_volume::SharedSendspinControl;
 use crate::sync_group::SharedGroups;
@@ -415,8 +415,8 @@ impl LevelChannel {
     /// Two answers to "is this member levellable?" is how a member ends up adjustable in
     /// the solver and un-levellable in the UI, so this conversion exists rather than a
     /// second match somewhere else.
-    pub fn knob(self) -> crate::align_levels::LevelKnob {
-        use crate::align_levels::LevelKnob;
+    pub fn knob(self) -> crate::align::levels::LevelKnob {
+        use crate::align::levels::LevelKnob;
         match self {
             Self::SendspinLive => LevelKnob::Live,
             Self::Ap2Snapshot | Self::OutOfBand => LevelKnob::SnapshotRestore,
@@ -1020,7 +1020,7 @@ impl AlignManager {
     pub async fn groups(&self) -> Vec<AlignGroup> {
         let snap = self.groups.lock().await.snapshot();
         snap.into_iter()
-            .filter(|g| g.sources != [crate::align_group::ALIGN_HOLD_SOURCE])
+            .filter(|g| g.sources != [crate::align::group::ALIGN_HOLD_SOURCE])
             .map(|g| {
                 let mut members = Vec::new();
                 for n in g.sendspin_members {
@@ -1095,7 +1095,7 @@ impl AlignManager {
         // its anchor and its click loop all stay exactly as they are.
         let plan = {
             let guard = self.session.lock().await;
-            crate::align_group::plan_hold(guard.as_ref().map(|s| s.hold.held()), &outputs)
+            crate::align::group::plan_hold(guard.as_ref().map(|s| s.hold.held()), &outputs)
         };
         let why = match plan.form_reason() {
             None => return self.rescope(key, outputs, mode).await,
@@ -1398,7 +1398,7 @@ impl AlignManager {
         let wanted = audibility_plan(members, audible);
         let plan = silence_plan(&wanted, self.out_of_band.get()).await;
         let mut levels = level_plan(&wanted, self.out_of_band.get()).await;
-        let relay = crate::relay_delay::RelayDelay::global();
+        let relay = crate::align::relay_delay::RelayDelay::global();
 
         // The relay mute goes first, and as one batch under one lock: it is instant and
         // local, so a member the run wants silent is silent *now* — including one that is
@@ -1557,7 +1557,7 @@ impl AlignManager {
     /// cannot skip the restores after it.
     ///
     /// The **relay** mutes are not restored here but dropped by
-    /// [`ExclusiveHold::release`](crate::align_group::ExclusiveHold::release) at the end —
+    /// [`ExclusiveHold::release`](crate::align::group::ExclusiveHold::release) at the end —
     /// one infallible removal scoped to exactly the outputs that hold took, so no exit
     /// path can skip it and a late release can never silence a newer session's member.
     async fn teardown(&self, mut session: Session) {
@@ -2100,7 +2100,7 @@ mod tests {
             let (sendspin, ap2) = (crate::sendspin_volume::shared(), crate::ap2_volume::shared());
             let mgr = AlignManager::new(sendspin.clone(), ap2.clone(), groups.clone());
             let members: Vec<AlignMember> = held.iter().map(|(n, k)| member(n, *k)).collect();
-            let hold = crate::align_group::ExclusiveHold::for_test(
+            let hold = crate::align::group::ExclusiveHold::for_test(
                 &groups,
                 &changes,
                 members.clone(),
@@ -2294,7 +2294,7 @@ mod tests {
         // And after a pass that really resolved it (no seam ⇒ nothing can level it).
         f.mgr.solo("sendspin-dev-pwska".into(), 20).await.unwrap();
         expect_reported(f.mgr.status().await, "resolved");
-        let relay = crate::relay_delay::RelayDelay::global();
+        let relay = crate::align::relay_delay::RelayDelay::global();
         assert!(relay.is_muted("pwsink-dev-office"), "un-levellable is not un-silenceable (W17)");
         f.mgr.stop().await;
     }
@@ -2350,7 +2350,7 @@ mod tests {
 
         // And the bridge to the solver agrees with all of that, so a member cannot be
         // adjustable in the solve and un-levellable in the UI.
-        use crate::align_levels::LevelKnob;
+        use crate::align::levels::LevelKnob;
         assert_eq!(LevelChannel::SendspinLive.knob(), LevelKnob::Live);
         assert_eq!(LevelChannel::Ap2Snapshot.knob(), LevelKnob::SnapshotRestore);
         assert_eq!(LevelChannel::OutOfBand.knob(), LevelKnob::SnapshotRestore, "the same shape as AP2, for the same reason");
@@ -2381,7 +2381,7 @@ mod tests {
         // Its mute followed the same solo out of band, so the level it was given is the level
         // it plays, and the relay is not also holding it down.
         assert_eq!(host.is_muted(host_node), Some(false));
-        assert!(!crate::relay_delay::RelayDelay::global().is_muted(host_node));
+        assert!(!crate::align::relay_delay::RelayDelay::global().is_muted(host_node));
         // A silenced member gets no level write, exactly as for sendspin and AP2.
         let writes = host.level_writes().len();
         f.mgr.solo(spin.into(), 30).await.unwrap();
@@ -2445,7 +2445,7 @@ mod tests {
         assert_eq!(state.unlevellable, vec![host_node.to_string()], "and it is reported, not silently skipped");
         assert!(state.level_note.expect("named").contains("clip ceiling"));
         // Audibility still holds, at the relay: losing the level must not lose the solo.
-        assert!(!crate::relay_delay::RelayDelay::global().is_muted(host_node), "this member is the soloed one");
+        assert!(!crate::align::relay_delay::RelayDelay::global().is_muted(host_node), "this member is the soloed one");
         f.mgr.stop().await;
 
         // The race the capability query cannot close: `level` answered `Some`, and the write
@@ -2506,7 +2506,7 @@ mod tests {
         //    session (the generation check in `begin`), and `Drop` without a release is
         //    `align_group`'s last resort, tested there. Neither can skip the restore, because
         //    both go through this one function.
-        crate::relay_delay::RelayDelay::global().unmute_all([host_node]);
+        crate::align::relay_delay::RelayDelay::global().unmute_all([host_node]);
     }
 
     /// The second scale meeting point (W20). Same silent-failure surface as the AP2 one: a
@@ -2525,7 +2525,7 @@ mod tests {
     /// channels have to be exercised on one member list.
     #[tokio::test]
     async fn audibility_silences_every_member_through_the_channel_it_actually_has() {
-        let relay = crate::relay_delay::RelayDelay::global();
+        let relay = crate::align::relay_delay::RelayDelay::global();
         let (spin, ap2_node) = ("sendspin-dev-chan", "ap2-dev-chan");
         // Two pw-sink members: one whose host agent owns it, one no agent can reach (or
         // whose sink has no volume lever at all — same answer, "cannot").
@@ -2593,7 +2593,7 @@ mod tests {
     /// channel was resolved and the write still did not take.
     #[tokio::test]
     async fn a_host_write_that_does_not_take_falls_back_to_the_relay_mute() {
-        let relay = crate::relay_delay::RelayDelay::global();
+        let relay = crate::align::relay_delay::RelayDelay::global();
         let (spin, node) = ("sendspin-dev-refuse", "pwsink-dev-refuse");
         let m = vec![member(spin, MemberKind::Sendspin), member(node, MemberKind::PwSink)];
         let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
@@ -2609,7 +2609,7 @@ mod tests {
     /// per path, because that is the property that breaks silently.
     #[tokio::test]
     async fn every_teardown_path_drops_the_relay_calibration_mute() {
-        let relay = crate::relay_delay::RelayDelay::global();
+        let relay = crate::align::relay_delay::RelayDelay::global();
 
         // 1. A normal stop.
         let f =

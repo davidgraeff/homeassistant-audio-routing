@@ -386,14 +386,14 @@ pub fn start(
             // (announce.rs), so music and overlay are the same rate here — the mix is
             // pure sample addition. `mix_buf` is reused across chunks AND devices.
             let mixer = crate::overlay_mixer::OverlayMixer::global();
-            // Provisional per-device alignment delay (relay_delay.rs), applied AFTER the
+            // Provisional per-device alignment delay (align/relay_delay.rs), applied AFTER the
             // overlay so it shifts everything this receiver renders — as the AP2 render-
             // delay knob it stands in for does. It emits exactly what it is fed, one
             // block per block, so the feed cadence and the receiver's buffering are
             // unchanged; only the content is older. `delay_buf` is reused like `mix_buf`,
             // and with no alignment running the call is one relaxed atomic load.
-            let delayer = crate::relay_delay::RelayDelay::global();
-            let delay_fmt = crate::relay_delay::PcmFormat::new(rate, crate::sendspin_capture::CHANNELS);
+            let delayer = crate::align::relay_delay::RelayDelay::global();
+            let delay_fmt = crate::align::relay_delay::PcmFormat::new(rate, crate::sendspin_capture::CHANNELS);
             let mut mix_buf: Vec<u8> = Vec::new();
             let mut delay_buf: Vec<u8> = Vec::new();
             while let Some(pcm) = pcm_rx.blocking_recv() {

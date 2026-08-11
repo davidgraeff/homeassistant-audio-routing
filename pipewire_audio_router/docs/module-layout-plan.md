@@ -27,9 +27,9 @@ backend, or that `applemidi_sender` is its transport.
 | file | code | tests | crate deps |
 |---|---:|---:|---:|
 | `api.rs` | 3659 | 224 | 45 |
-| `align_measure.rs` | 3108 | 941 | 8 |
+| `align/measure.rs` | 3108 | 941 | 8 |
 | `sync_group.rs` | 1847 | 367 | 21 |
-| `align_levels.rs` | 1520 | 507 | 2 |
+| `align/levels.rs` | 1520 | 507 | 2 |
 
 `api.rs` depends on 45 of the other 59 modules — it is the crate's hub, and its
 `AppState` is why.
@@ -95,7 +95,6 @@ src/
 
   outputs/                audio out of the graph (§4, §5)
     overlay_mixer.rs      per-output duck+overlay frame
-    relay_delay.rs        per-output provisional delay
     sendspin/  server.rs codec.rs discovery.rs liveness.rs volume.rs
     ap2/       server.rs discovery.rs liveness.rs health.rs probe.rs
                volume.rs ptp.rs
@@ -113,6 +112,7 @@ src/
   align/
     measure.rs estimator.rs levels.rs group.rs mic.rs
     calibrate.rs          the manual (non-mic) alignment path
+    relay_delay.rs        per-output provisional delay — see §10.3
 
   api/                    §9 control plane; see §5 for the split
     mod.rs                the route table, and nothing else
@@ -177,7 +177,7 @@ everything else is pure relocation.
 | 23 | `now_playing.rs` | `sources/now_playing.rs` |
 | 24 | `bt_bridge_discovery.rs` | `sources/bt_bridge.rs` |
 | 25 | `overlay_mixer.rs` | `outputs/overlay_mixer.rs` |
-| 26 | `relay_delay.rs` | `outputs/relay_delay.rs` |
+| 26 ✔ | `relay_delay.rs` | `align/relay_delay.rs` — §10.3, not `outputs/` |
 | 27 | `sendspin_server.rs` | `outputs/sendspin/server.rs` |
 | 28 | `sendspin_codec.rs` | `outputs/sendspin/codec.rs` |
 | 29 | `sendspin_discovery.rs` | `outputs/sendspin/discovery.rs` |
@@ -202,16 +202,20 @@ everything else is pure relocation.
 | 48 | `sync_settings.rs` | `routing/sync_settings.rs` |
 | 49 | `announce.rs` | `announce/mod.rs` |
 | 50 | `announce_arbiter.rs` | `announce/arbiter.rs` |
-| 51 | `align_measure.rs` | `align/measure.rs` |
-| 52 | `align_estimator.rs` | `align/estimator.rs` |
-| 53 | `align_levels.rs` | `align/levels.rs` |
-| 54 | `align_group.rs` | `align/group.rs` |
-| 55 | `align_mic.rs` | `align/mic.rs` |
-| 56 | `calibrate.rs` | `align/calibrate.rs` |
+| 51 ✔ | `align_measure.rs` | `align/measure.rs` |
+| 52 ✔ | `align_estimator.rs` | `align/estimator.rs` |
+| 53 ✔ | `align_levels.rs` | `align/levels.rs` |
+| 54 ✔ | `align_group.rs` | `align/group.rs` |
+| 55 ✔ | `align_mic.rs` | `align/mic.rs` |
+| 56 ✔ | `calibrate.rs` | `align/calibrate.rs` |
 | 57 | `per_device_spike.rs` | `spike/per_device.rs` |
 | 58 | `ap2_spike.rs` | `spike/ap2.rs` |
 | 59 | `pw_sink_spike.rs` | `spike/pwsink.rs` |
 | 60 | `api.rs` | `api/` + `state.rs` — see §5 |
+
+`✔` marks rows already landed. The left column stays at the pre-move spelling on
+purpose — it is the record of what moved, and §7's stale-reference grep should
+skip this table.
 
 Naming decisions worth defending: `pw_sink.rs` → `module_args.rs` because its
 entire content is the two SPA-JSON `args` strings; `pw_sink_liveness` →
@@ -300,7 +304,7 @@ not (§8).
 | `api/announce.rs` | 2538–2698 | `ag_announce` + PCM acquisition |
 | `api/duck.rs` | 2699–2856 | duck holds |
 | `api/groups.rs` | 2857–3061 | music + announcement groups |
-| `api/align.rs` | 3062–3213 | manual alignment (`calibrate.rs`) |
+| `api/align.rs` | 3062–3213 | manual alignment (`align/calibrate.rs`) |
 | `api/measure.rs` | 3214–3659 | mic-assisted measurement |
 
 The 224 inline test lines split by subject: the route-table shape tests stay in
@@ -358,8 +362,8 @@ not just a sed.
 
 ## 8. Non-goals
 
-**The other three god-files.** `align_measure.rs` (3108 code + 941 test lines),
-`sync_group.rs` (1847), `align_levels.rs` (1520) need real decomposition
+**The other three god-files.** `align/measure.rs` (3108 code + 941 test lines),
+`sync_group.rs` (1847), `align/levels.rs` (1520) need real decomposition
 thought, and they must not ride along in a rename commit. They land in
 `align/` and `routing/` at full size; splitting them is separate, later work
 against a tree where their neighbours are already visible.
@@ -414,18 +418,18 @@ under time pressure. It is still **separate from the move commit**.
 
 | file | total | code | test |
 |---|---:|---:|---:|
-| `align_measure.rs` | 5830 | **4075** | 1755 |
-| `align_levels.rs` | 2028 | 1521 | 507 |
-| `calibrate.rs` | 2086 | 1284 | 802 |
-| `relay_delay.rs` | 1364 | 868 | 496 |
-| `align_estimator.rs` | 1501 | 951 | 550 |
-| `align_group.rs` | 1204 | 862 | 342 |
-| `align_mic.rs` | 699 | 520 | 179 |
+| `align/measure.rs` | 5830 | **4075** | 1755 |
+| `align/levels.rs` | 2028 | 1521 | 507 |
+| `align/calibrate.rs` | 2086 | 1284 | 802 |
+| `align/relay_delay.rs` | 1364 | 868 | 496 |
+| `align/estimator.rs` | 1501 | 951 | 550 |
+| `align/group.rs` | 1204 | 862 | 342 |
+| `align/mic.rs` | 699 | 520 | 179 |
 
-~14.7k lines total, and `align_measure.rs` alone is now larger than `api.rs` was
+~14.7k lines total, and `align/measure.rs` alone is now larger than `api.rs` was
 when §1 was written. It is the priority; the rest are defensible at their size.
 
-### 10.2 `align_measure.rs` → `align/measure/`
+### 10.2 `align/measure.rs` → `align/measure/`
 
 The file has **one** reason to be large: it holds the run's *reported shape*, its
 *seams*, its *pure arithmetic* and its *driver* in one place. Those four have
@@ -477,20 +481,20 @@ Two cautions specific to this file:
 
 ### 10.3 The other three
 
-- **`calibrate.rs` → `align/calibrate/`**: `mod.rs` (AlignManager + Session +
+- **`align/calibrate.rs` → `align/calibrate/`**: `mod.rs` (AlignManager + Session +
   teardown), `audibility.rs` (the per-output `SilenceChannel`/level-channel
   resolution and its application — a self-contained decision table), `click.rs`
   (`click_wav` and the tone constants, which nothing else needs). Teardown stays
   with the session on purpose: it is one funnel every path reaches, and splitting
   it is how a restore step gets skipped.
-- **`align_levels.rs`**: already a pure library with no I/O; 1521 lines is not
+- **`align/levels.rs`**: already a pure library with no I/O; 1521 lines is not
   alarming. If split: `crosstalk.rs` (the matrix and its verdict) is the one
   genuinely separable piece. Low priority.
-- **`relay_delay.rs`**: not in §2's tree because it postdates it. It belongs at
-  `align/relay_delay.rs` — it exists only for alignment (§1.1.1's provisional
-  delays and W17's calibration mute), even though it is *called* from the three
-  output relays. Do not file it under `outputs/`: the hook is there, the reason
-  is not.
+- **`align/relay_delay.rs`**: postdates §2's tree, which is why §3 row 26 first
+  filed it under `outputs/`. It belongs in `align/` — it exists only for alignment
+  (§1.1.1's provisional delays and W17's calibration mute), even though it is
+  *called* from the three output relays. Do not file it under `outputs/`: the hook
+  is there, the reason is not. §2 and §3 row 26 now say so.
 
 ### 10.4 What must not ride along
 

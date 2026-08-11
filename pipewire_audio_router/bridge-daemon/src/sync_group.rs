@@ -273,7 +273,7 @@ pub struct GroupReconciler {
     /// On-demand announce sessions for unrouted AP2 receivers / pw-sink targets,
     /// keyed by output node name (`ap2-dev-*` / `pwsink-dev-*`).
     announce_sessions: HashMap<String, AnnounceSession>,
-    /// An **alignment hold** (align_group.rs): outputs taken exclusively for a
+    /// An **alignment hold** (align/group.rs): outputs taken exclusively for a
     /// calibration session. While set, [`Self::effective_intent`] rewrites routing
     /// intent so these outputs belong to one synthetic group and nothing else, which
     /// is how a temporary group is formed around an arbitrary selection.
@@ -441,7 +441,7 @@ fn announce_sink_name(output: &str) -> String {
     }
 }
 
-/// Shared handle so the alignment API (calibrate.rs) can read the live group
+/// Shared handle so the alignment API (align/calibrate.rs) can read the live group
 /// layout the reconcile task owns.
 pub type SharedGroups = std::sync::Arc<tokio::sync::Mutex<GroupReconciler>>;
 
@@ -906,7 +906,7 @@ impl GroupReconciler {
         }
     }
 
-    /// Take `outputs` exclusively for alignment hold `id` (align_group.rs). The
+    /// Take `outputs` exclusively for alignment hold `id` (align/group.rs). The
     /// caller must nudge a reconcile afterwards (ChangeNotifier).
     ///
     /// Replaces any previous hold: one alignment session exists at a time, and a
@@ -940,7 +940,7 @@ impl GroupReconciler {
     /// *exclusive* and *independent of current routing*:
     ///
     /// - every link into a held output is **dropped**, so no music source reaches it;
-    /// - one synthetic link [`crate::align_group::ALIGN_HOLD_SOURCE`] → each held
+    /// - one synthetic link [`crate::align::group::ALIGN_HOLD_SOURCE`] → each held
     ///   output is **injected**, so all held outputs share a source set nothing else
     ///   has and the reconciler materialises exactly one group for them, with an
     ///   anchor the calibration player can write into. That source is not a real
@@ -957,7 +957,7 @@ impl GroupReconciler {
         let Some((_, held)) = &self.align_hold else { return intent };
         let mut out: Vec<RoutingLink> = intent.into_iter().filter(|l| !held.contains(&l.output)).collect();
         for output in held {
-            out.push(RoutingLink { source: crate::align_group::ALIGN_HOLD_SOURCE.to_string(), output: output.clone() });
+            out.push(RoutingLink { source: crate::align::group::ALIGN_HOLD_SOURCE.to_string(), output: output.clone() });
         }
         out
     }
@@ -1124,7 +1124,7 @@ impl GroupReconciler {
         // a merely discovered device.
         let adopted_set = crate::outputs_store::adopted_snapshot(adopted);
         let intent: Vec<RoutingLink> = routing_store::snapshot(routing).into_iter().filter(|l| adopted_set.contains(&l.output)).collect();
-        // An alignment session's temporary exclusive group (align_group.rs) is an
+        // An alignment session's temporary exclusive group (align/group.rs) is an
         // override on this intent, not an edit of the store — see `effective_intent`.
         let intent = self.effective_intent(intent);
         let devices_map = devices.lock_recover().clone();
@@ -1888,7 +1888,7 @@ mod tests {
         // see `a_static_delay_change_within_the_running_lead_touches_only_that_device`.)
     }
 
-    // --- the alignment hold (align_group.rs, plan §12.1) ---
+    // --- the alignment hold (align/group.rs, plan §12.1) ---
 
     fn link(source: &str, output: &str) -> RoutingLink {
         RoutingLink { source: source.to_string(), output: output.to_string() }
@@ -1927,7 +1927,7 @@ mod tests {
         // Nothing feeds a held output but the synthetic source...
         for output in ["sendspin-dev-kitchen", "ap2-dev-dusche"] {
             let sources = routing::source_set_of(&eff, output);
-            assert_eq!(sources.into_iter().collect::<Vec<_>>(), vec![crate::align_group::ALIGN_HOLD_SOURCE], "{output}");
+            assert_eq!(sources.into_iter().collect::<Vec<_>>(), vec![crate::align::group::ALIGN_HOLD_SOURCE], "{output}");
         }
         // ...and the outputs left behind keep exactly the routing they had.
         assert_eq!(routing::source_set_of(&eff, "sendspin-dev-bath"), routing::source_set_of(&intent, "sendspin-dev-bath"));
@@ -1963,13 +1963,13 @@ mod tests {
         .into_iter()
         .collect();
         let desired = compute_desired(&eff, &devices, &ap2, &BTreeMap::new(), &PwsinkHosts::new());
-        let align = desired.get(crate::align_group::ALIGN_HOLD_SOURCE).expect("the held group exists");
+        let align = desired.get(crate::align::group::ALIGN_HOLD_SOURCE).expect("the held group exists");
         assert_eq!(align.sendspin_node_names, vec!["sendspin-dev-kitchen".to_string()]);
         assert_eq!(align.ap2_members.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(), vec!["ap2-dev-dusche"]);
         // The kitchen speaker is in NO other group, which is what "exclusive" means
         // for music: its old group can't reach it.
         for (key, g) in &desired {
-            if key != crate::align_group::ALIGN_HOLD_SOURCE {
+            if key != crate::align::group::ALIGN_HOLD_SOURCE {
                 assert!(!g.sendspin_node_names.contains(&"sendspin-dev-kitchen".to_string()), "still in group {key}");
             }
         }

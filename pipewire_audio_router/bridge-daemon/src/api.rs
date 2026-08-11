@@ -109,8 +109,8 @@ pub struct AppState {
     pub settings: SharedSettings,
     /// Runtime mDNS on/off, driven by the discovery flag above.
     pub discovery: crate::discovery_supervisor::DiscoverySupervisor,
-    /// Latency-alignment session manager (calibrate.rs) for the alignment panel.
-    pub align: crate::calibrate::AlignManager,
+    /// Latency-alignment session manager (align/calibrate.rs) for the alignment panel.
+    pub align: crate::align::calibrate::AlignManager,
     /// Live sync-group layout (sync_group.rs) — used to restart a group's
     /// sendspin stream when a static-delay change needs it to take effect.
     pub groups: crate::sync_group::SharedGroups,
@@ -160,7 +160,7 @@ pub fn router(
     sync_settings: crate::sync_settings::SharedSyncSettings,
     settings: SharedSettings,
     discovery: crate::discovery_supervisor::DiscoverySupervisor,
-    align: crate::calibrate::AlignManager,
+    align: crate::align::calibrate::AlignManager,
     groups: crate::sync_group::SharedGroups,
     groups_config: crate::groups_store::SharedGroupsStore,
     version: String,
@@ -269,25 +269,25 @@ pub fn router(
         // for the sequential measurement, all of them for §7's all-play round.
         .route("/api/align/audible", post(align_audible))
         .route("/api/align/volume", post(align_volume))
-        // Microphone-assisted alignment (align_mic.rs): the phone's capture socket
+        // Microphone-assisted alignment (align/mic.rs): the phone's capture socket
         // and the status the UI's level meter reads.
-        .route("/api/align/mic/ws", get(crate::align_mic::mic_ws))
-        .route("/api/align/mic", get(crate::align_mic::mic_status))
+        .route("/api/align/mic/ws", get(crate::align::mic::mic_ws))
+        .route("/api/align/mic", get(crate::align::mic::mic_status))
         // Whether the level is good enough to measure — the meter cannot say.
         .route("/api/align/mic/signal", get(mic_signal))
-        // Measurement orchestration (align_measure.rs, plan §11). `apply` is a
+        // Measurement orchestration (align/measure.rs, plan §11). `apply` is a
         // separate, explicit step: the user sees the proposed deltas and the
         // confidence before a single delay is written.
         .route("/api/align/measure", get(measure_status).delete(measure_abandon))
         // Pushed run status (plan §11): one full `MeasureStatus` on connect, then one
         // per change. The polling `GET` above stays, and the UI falls back to it —
         // a run that looks frozen because a socket dropped is worse than a poll.
-        .route("/api/align/measure/ws", get(crate::align_measure::measure_ws))
+        .route("/api/align/measure/ws", get(crate::align::measure::measure_ws))
         // The relay-vs-device equivalence experiment (plan §1.1.1). Separate from a
         // measurement run — and it refuses while one is live, since both drive the same
         // session.
         .route("/api/align/equivalence", get(equivalence_status).post(equivalence_start).delete(equivalence_abandon))
-        .route("/api/align/equivalence/ws", get(crate::align_measure::equivalence_ws))
+        .route("/api/align/equivalence/ws", get(crate::align::measure::equivalence_ws))
         .route("/api/align/measure/start", post(measure_start))
         // Near field only (plan §1, W8a). The daemon cannot see where the phone is, so
         // the walk is driven by the user: one `arrival` per speaker while standing at
@@ -2514,7 +2514,7 @@ struct AgAnnounceRequest {
     /// Use the built-in test-announcement clip (no url needed).
     #[serde(default)]
     test: bool,
-    /// Use the built-in calibration tone (the `calibrate.rs` click track) as a
+    /// Use the built-in calibration tone (the `align/calibrate.rs` click track) as a
     /// quick "is this speaker alive and correctly wired" check.
     #[serde(default)]
     tone: bool,
@@ -2553,9 +2553,9 @@ async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String
         return Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch));
     }
     if req.tone {
-        // The calibration click (calibrate.rs) — already 16-bit PCM WAV, so no
+        // The calibration click (align/calibrate.rs) — already 16-bit PCM WAV, so no
         // decode step; just standardize to the announce mix format.
-        let wav = crate::calibrate::click_wav();
+        let wav = crate::align::calibrate::click_wav();
         let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("tone clip not a PCM WAV")?;
         return Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch));
     }
@@ -2792,7 +2792,7 @@ async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>)
     // A duck hold outranks an alignment hold (plan §12.3) — the session gets a
     // structured report through `align_group`, and it is worth a log line at the point
     // of cause too, so "why was my measurement discarded?" is answerable from the log.
-    let aligning: Vec<&str> = targets.iter().filter(|t| crate::align_group::registry().is_reserved(t)).map(String::as_str).collect();
+    let aligning: Vec<&str> = targets.iter().filter(|t| crate::align::group::registry().is_reserved(t)).map(String::as_str).collect();
     if !aligning.is_empty() {
         tracing::warn!(
             "duck hold {id} lands on speaker(s) currently being aligned [{}] — their measurements will be discarded",
@@ -3077,23 +3077,23 @@ async fn get_status(State(state): State<AppState>) -> Json<StatusInfo> {
     })
 }
 
-// ---- Latency alignment (calibrate.rs) -----------------------------------
+// ---- Latency alignment (align/calibrate.rs) -----------------------------
 
 /// Alignable groups (a source-set with its present members), for the picker.
-async fn align_groups(State(state): State<AppState>) -> Json<Vec<crate::calibrate::AlignGroup>> {
+async fn align_groups(State(state): State<AppState>) -> Json<Vec<crate::align::calibrate::AlignGroup>> {
     Json(state.align.groups().await)
 }
 
 /// Current calibration state (active session or not).
-async fn align_status(State(state): State<AppState>) -> Json<crate::calibrate::AlignState> {
+async fn align_status(State(state): State<AppState>) -> Json<crate::align::calibrate::AlignState> {
     Json(state.align.status().await)
 }
 
 /// The shared handles an alignment session needs to form and hold its temporary
-/// exclusive group (align_group.rs). Assembled here so `AlignManager` — which
+/// exclusive group (align/group.rs). Assembled here so `AlignManager` — which
 /// main.rs builds with three handles — needs no new constructor arguments.
-fn hold_deps(state: &AppState) -> crate::align_group::HoldDeps<'_> {
-    crate::align_group::HoldDeps { groups: &state.groups, changes: &state.changes, routing: &state.routing, outputs: &state.outputs }
+fn hold_deps(state: &AppState) -> crate::align::group::HoldDeps<'_> {
+    crate::align::group::HoldDeps { groups: &state.groups, changes: &state.changes, routing: &state.routing, outputs: &state.outputs }
 }
 
 #[derive(Deserialize)]
@@ -3128,7 +3128,7 @@ struct AlignStartRequest {
     /// `outputs`; a `sources` start is by-ear by construction. Changing it on a
     /// reusing `start` is free — the mode describes the run, not the group.
     #[serde(default)]
-    mode: crate::align_group::AlignMode,
+    mode: crate::align::group::AlignMode,
 }
 
 /// `POST /api/align/start` — hold a set of speakers exclusively for an alignment run.
@@ -3139,7 +3139,7 @@ struct AlignStartRequest {
 async fn align_start(
     State(state): State<AppState>,
     Json(req): Json<AlignStartRequest>,
-) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
     let deps = hold_deps(&state);
     let result = match (req.outputs.is_empty(), req.sources.is_empty()) {
         (false, _) => {
@@ -3172,7 +3172,7 @@ struct AlignAudibleRequest {
 async fn align_audible(
     State(state): State<AppState>,
     Json(req): Json<AlignAudibleRequest>,
-) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
     let level = match req.level {
         Some(l) => l,
         None => state.align.status().await.volume,
@@ -3196,7 +3196,7 @@ struct AlignSelectRequest {
 async fn align_select(
     State(state): State<AppState>,
     Json(req): Json<AlignSelectRequest>,
-) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
     state
         .align
         .select(req.reference, req.target)
@@ -3214,7 +3214,7 @@ struct AlignVolumeRequest {
 async fn align_volume(
     State(state): State<AppState>,
     Json(req): Json<AlignVolumeRequest>,
-) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
     state
         .align
         .set_level(req.volume)
@@ -3225,11 +3225,11 @@ async fn align_volume(
 
 /// Stop the session: click off, every member's level/mute restored, the temporary
 /// exclusive group released so the displaced music comes back.
-async fn align_stop(State(state): State<AppState>) -> Json<crate::calibrate::AlignState> {
+async fn align_stop(State(state): State<AppState>) -> Json<crate::align::calibrate::AlignState> {
     Json(state.align.stop().await)
 }
 
-// ---- Microphone-assisted alignment (align_measure.rs, plan §11) ----------
+// ---- Microphone-assisted alignment (align/measure.rs, plan §11) ----------
 //
 // The measurement rides *beside* the by-ear session rather than replacing it: it
 // needs that session running (the click track has to be playing on every member
@@ -3237,7 +3237,7 @@ async fn align_stop(State(state): State<AppState>) -> Json<crate::calibrate::Ali
 // a time. `apply` is deliberately a separate step — the user sees the proposed
 // deltas and their confidence before anything is written.
 
-use crate::align_measure::{DelayWriter, MeasureDeps, MeasureStatus, Mode, Refusal, RefusalKind, SendAheadContext, Timing};
+use crate::align::measure::{DelayWriter, MeasureDeps, MeasureStatus, Mode, Refusal, RefusalKind, SendAheadContext, Timing};
 
 /// Writes one member's delay knob **through the existing endpoint handlers**.
 ///
@@ -3254,17 +3254,17 @@ impl DelayWriter for ApiDelayWriter {
     fn write(
         &self,
         node_name: String,
-        kind: crate::calibrate::MemberKind,
+        kind: crate::align::calibrate::MemberKind,
         delay_ms: u16,
-    ) -> crate::align_measure::Fut<'_, Result<String, String>> {
+    ) -> crate::align::measure::Fut<'_, Result<String, String>> {
         Box::pin(async move {
             let (status, Json(resp)) = match kind {
-                crate::calibrate::MemberKind::Sendspin => {
+                crate::align::calibrate::MemberKind::Sendspin => {
                     set_sendspin_delay_handler(State(self.state.clone()), Json(SetSendspinDelayRequest { node_name, delay_ms })).await
                 }
                 // pw-sink shares AP2's per-output latency endpoint (its playout
                 // delay); the handler clamps to `PWSINK_JITTER_MIN_MS`.
-                crate::calibrate::MemberKind::Airplay2 | crate::calibrate::MemberKind::PwSink => {
+                crate::align::calibrate::MemberKind::Airplay2 | crate::align::calibrate::MemberKind::PwSink => {
                     set_output_latency(
                         State(self.state.clone()),
                         Path(node_name),
@@ -3316,11 +3316,11 @@ fn measure_deps(state: &AppState, mode: Mode, chained: bool, link_to: Vec<String
         chained,
         link_to,
         session: std::sync::Arc::new(state.align.clone()),
-        mic: std::sync::Arc::new(crate::align_measure::LiveMic),
+        mic: std::sync::Arc::new(crate::align::measure::LiveMic),
         writer: std::sync::Arc::new(ApiDelayWriter { state: state.clone() }),
         // The provisional delay line a chain applies its per-step delays to (plan
         // §1.1.1). Process-global, like the mic ingest: there is one set of relays.
-        relay: std::sync::Arc::new(crate::align_measure::LiveRelay),
+        relay: std::sync::Arc::new(crate::align::measure::LiveRelay),
         current_delays,
         send_ahead,
         timing: Timing::real(),
@@ -3402,27 +3402,27 @@ struct EquivalenceStartRequest {
 async fn equivalence_start(
     State(state): State<AppState>,
     Json(req): Json<EquivalenceStartRequest>,
-) -> Result<Json<crate::align_measure::EquivalenceStatus>, (StatusCode, Json<Refusal>)> {
+) -> Result<Json<crate::align::measure::EquivalenceStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: start the relay-vs-device equivalence experiment ({:?})", req.node_name);
-    let deps = crate::align_measure::EquivalenceDeps {
+    let deps = crate::align::measure::EquivalenceDeps {
         // The same deps a measurement run uses — including the provisional delay line the
         // relay arm drives, so there is one handle on it rather than two that could
         // differ. `mode`/`chained`/`link_to` are unused here.
         base: measure_deps(&state, Mode::SweetSpot, false, Vec::new()),
         member: req.node_name,
     };
-    crate::align_measure::equivalence().start(deps).await.map(Json).map_err(refused)
+    crate::align::measure::equivalence().start(deps).await.map(Json).map_err(refused)
 }
 
 /// `GET /api/align/equivalence` — the experiment's state, including both arms' numbers,
 /// the resolution bound and what it cannot tell you.
-async fn equivalence_status() -> Json<crate::align_measure::EquivalenceStatus> {
-    Json(crate::align_measure::equivalence().status())
+async fn equivalence_status() -> Json<crate::align::measure::EquivalenceStatus> {
+    Json(crate::align::measure::equivalence().status())
 }
 
 /// `DELETE /api/align/equivalence` — abandon. Restore still runs.
-async fn equivalence_abandon() -> Json<crate::align_measure::EquivalenceStatus> {
-    Json(crate::align_measure::equivalence().abandon())
+async fn equivalence_abandon() -> Json<crate::align::measure::EquivalenceStatus> {
+    Json(crate::align::measure::equivalence().abandon())
 }
 
 /// `POST /api/align/measure/start` — begin the run.
@@ -3431,7 +3431,7 @@ async fn measure_start(
     Json(req): Json<MeasureStartRequest>,
 ) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: start microphone-assisted alignment measurement ({:?}, chain={})", req.mode, req.chain);
-    crate::align_measure::shared().start(measure_deps(&state, req.mode, req.chain, req.link_to)).await.map(Json).map_err(refused)
+    crate::align::measure::shared().start(measure_deps(&state, req.mode, req.chain, req.link_to)).await.map(Json).map_err(refused)
 }
 
 #[derive(Deserialize)]
@@ -3465,7 +3465,7 @@ struct MeasurePositionRequest {
 /// the overlap a later position needs.
 async fn measure_position(Json(req): Json<MeasurePositionRequest>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: align position [{}] through overlap(s) [{}]", req.members.join(", "), req.overlaps.join(", "));
-    crate::align_measure::shared().position(req.members, req.overlaps).map(Json).map_err(refused)
+    crate::align::measure::shared().position(req.members, req.overlaps).map(Json).map_err(refused)
 }
 
 /// `POST /api/align/measure/finish` — "every speaker is aligned at some position".
@@ -3476,7 +3476,7 @@ async fn measure_position(Json(req): Json<MeasurePositionRequest>) -> Result<Jso
 /// Refused while any held speaker is still unaligned.
 async fn measure_finish() -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: finish the multi-position chain");
-    crate::align_measure::shared().finish().map(Json).map_err(refused)
+    crate::align::measure::shared().finish().map(Json).map_err(refused)
 }
 
 #[derive(Deserialize)]
@@ -3501,7 +3501,7 @@ struct MeasureArrivalRequest {
 /// this speaker, or has never heard of it.
 async fn measure_arrival(Json(req): Json<MeasureArrivalRequest>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: near-field arrival at '{}'", req.node_name);
-    crate::align_measure::shared().arrival(req.node_name, req.level).map(Json).map_err(refused)
+    crate::align::measure::shared().arrival(req.node_name, req.level).map(Json).map_err(refused)
 }
 
 /// `POST /api/align/measure/close` — near field's closure reading.
@@ -3512,14 +3512,14 @@ async fn measure_arrival(Json(req): Json<MeasureArrivalRequest>) -> Result<Json<
 /// every member has been visited.
 async fn measure_close() -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: close the near-field walk");
-    crate::align_measure::shared().close().map(Json).map_err(refused)
+    crate::align::measure::shared().close().map(Json).map_err(refused)
 }
 
 /// `GET /api/align/measure` — phase, per-member state, SNR, uncertainties and
 /// refusal reasons. Poll-only for now; pushing it belongs on the alignment
 /// panel's existing subscription (plan §11), which is W6's frontend work.
 async fn measure_status() -> Json<MeasureStatus> {
-    Json(crate::align_measure::shared().status())
+    Json(crate::align::measure::shared().status())
 }
 
 /// `GET /api/align/mic/signal` — plan §12's per-channel SNR readout: is the level
@@ -3531,8 +3531,8 @@ async fn measure_status() -> Json<MeasureStatus> {
 /// succeed. This runs the estimator over the recent capture and grades the weaker
 /// tone, which is what actually decides it. Session-independent and side-effect
 /// free, so it can be polled while the user is still turning a volume knob.
-async fn mic_signal() -> Json<crate::align_measure::SignalCheck> {
-    Json(crate::align_measure::signal_check(crate::align_estimator::PATTERN_SECS * 1000.0))
+async fn mic_signal() -> Json<crate::align::measure::SignalCheck> {
+    Json(crate::align::measure::signal_check(crate::align::estimator::PATTERN_SECS * 1000.0))
 }
 
 /// `POST /api/align/measure/apply` — write the solved delays, then settle and
@@ -3546,9 +3546,9 @@ async fn mic_signal() -> Json<crate::align_measure::SignalCheck> {
 /// `chained` from the run's own state — so the two cannot disagree; this just keeps the
 /// log honest.
 async fn measure_apply(State(state): State<AppState>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
-    let mode = crate::align_measure::shared().status().mode;
+    let mode = crate::align::measure::shared().status().mode;
     tracing::info!("USER ACTION: apply measured alignment delays ({mode:?})");
-    crate::align_measure::shared().apply(measure_deps(&state, mode, false, Vec::new())).await.map(Json).map_err(refused)
+    crate::align::measure::shared().apply(measure_deps(&state, mode, false, Vec::new())).await.map(Json).map_err(refused)
 }
 
 /// `POST /api/align/measure/revert` — restore the start-of-session delay
@@ -3556,13 +3556,13 @@ async fn measure_apply(State(state): State<AppState>) -> Result<Json<MeasureStat
 async fn measure_revert(State(state): State<AppState>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: revert alignment delays to the pre-measurement snapshot");
     let writer = ApiDelayWriter { state };
-    crate::align_measure::shared().revert(&writer).await.map(Json).map_err(refused)
+    crate::align::measure::shared().revert(&writer).await.map(Json).map_err(refused)
 }
 
 /// `DELETE /api/align/measure` — abandon, leaving delays untouched.
 async fn measure_abandon() -> Json<MeasureStatus> {
     tracing::info!("USER ACTION: abandon the alignment measurement");
-    Json(crate::align_measure::shared().abandon())
+    Json(crate::align::measure::shared().abandon())
 }
 
 #[derive(Deserialize)]

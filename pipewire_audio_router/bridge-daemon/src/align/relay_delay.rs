@@ -68,7 +68,7 @@
 //! replaced with exact silence of the same length. It is the universal fallback, not the
 //! preferred mechanism — where a device or its host can mute itself that is better,
 //! because the stream keeps flowing and the receiver's jitter buffer never re-anchors.
-//! `calibrate.rs` resolves which mechanism each member gets, per output.
+//! `align/calibrate.rs` resolves which mechanism each member gets, per output.
 //!
 //! Two properties make it safe to compose with everything else here:
 //!
@@ -166,7 +166,7 @@
 //! produce the same audible shift", to be retired by measuring once. This module
 //! provides the relay arm — [`RelayDelay::set_delay_us`] plus [`RelayDelay::status`] for
 //! the exact applied sample count — and deliberately does not orchestrate it. The
-//! orchestration is W21, in `align_measure.rs` (`plan_equivalence`, `EquivalenceReport`);
+//! orchestration is W21, in `align/measure.rs` (`plan_equivalence`, `EquivalenceReport`);
 //! read its section header for what the experiment turned out to measure, which is not
 //! what §1.1.1 expected:
 //!
@@ -770,7 +770,7 @@ impl RelayDelay {
     // The universal fallback for audibility: it needs no cooperation from the device or
     // its host, so it covers a member whose transport has no mute of its own, a pw-sink
     // host whose agent is gone or whose sink has no volume lever, and any future kind.
-    // `calibrate.rs` decides per output which mechanism a member gets.
+    // `align/calibrate.rs` decides per output which mechanism a member gets.
 
     /// Silence `output` at the relay hook, or stop silencing it. Returns the previous
     /// state, so a caller can tell a change from a no-op.

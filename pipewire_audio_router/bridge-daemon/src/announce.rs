@@ -84,7 +84,7 @@ impl Inner {
         // reason naming the doorbell instead of the user's hand.
         for hit in effects.reservations_hit {
             for output in hit.outputs {
-                crate::align_group::registry().note(&output, crate::align_group::InterferenceCause::BargeIn { announcement: hit.by });
+                crate::align::group::registry().note(&output, crate::align::group::InterferenceCause::BargeIn { announcement: hit.by });
             }
         }
     }
@@ -153,9 +153,9 @@ impl AnnounceCoordinator {
     }
 
     /// Claim `outputs` for a non-announcement holder — today an alignment session's
-    /// temporary exclusive group (align_group.rs). While held, ordinary announcements
+    /// temporary exclusive group (align/group.rs). While held, ordinary announcements
     /// to those outputs queue (or are rejected per `OnBusy`); a `barge_in` still
-    /// plays and is reported back through [`crate::align_group::registry`].
+    /// plays and is reported back through [`crate::align::group::registry`].
     pub fn reserve_outputs(&self, id: crate::announce_arbiter::ReservationId, outputs: Vec<String>) {
         self.inner.lock().unwrap().sched.reserve(id, outputs);
     }

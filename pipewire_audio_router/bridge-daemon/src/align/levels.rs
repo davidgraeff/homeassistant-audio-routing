@@ -16,7 +16,7 @@
 //!
 //! ## How it is driven
 //!
-//! The orchestrator (`align_measure.rs`, W3) owns the audio, the volume knobs and
+//! The orchestrator (`align/measure.rs`, W3) owns the audio, the volume knobs and
 //! the API; this module owns only the arithmetic:
 //!
 //! ```ignore
@@ -78,8 +78,8 @@
 
 #![allow(dead_code)] // driven by the orchestration in W3 (plan §14); unit-tested now.
 
-use crate::align_estimator::{ChannelEstimate, Estimate, MIN_PEAK_SNR_DB};
-use crate::calibrate::MemberKind;
+use crate::align::calibrate::MemberKind;
+use crate::align::estimator::{ChannelEstimate, Estimate, MIN_PEAK_SNR_DB};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -190,13 +190,13 @@ pub const SEQUENTIAL_ROUNDS_SLACK: usize = 4;
 /// A member's leakage into another member's band arrives at a *different* time
 /// than that band's own burst, so it competes as the estimator's "second peak".
 /// The estimator refuses when the runner-up is within
-/// [`MIN_SECOND_PEAK_RATIO`](crate::align_estimator::MIN_SECOND_PEAK_RATIO) (1.4× ≈ −3 dB) of the winner, so −20 dB (10×) keeps
+/// [`MIN_SECOND_PEAK_RATIO`](crate::align::estimator::MIN_SECOND_PEAK_RATIO) (1.4× ≈ −3 dB) of the winner, so −20 dB (10×) keeps
 /// a 7× margin over its own ambiguity floor — room enough for the room to add a
 /// reflection of its own at a similar level without tipping the verdict.
 pub const MAX_CROSSTALK_DB: f64 = -20.0;
 
 /// Crosstalk between this and [`MAX_CROSSTALK_DB`] is *marginal*: still ~4× clear
-/// of the estimator's [`MIN_SECOND_PEAK_RATIO`](crate::align_estimator::MIN_SECOND_PEAK_RATIO), so nothing refuses today, but a
+/// of the estimator's [`MIN_SECOND_PEAK_RATIO`](crate::align::estimator::MIN_SECOND_PEAK_RATIO), so nothing refuses today, but a
 /// single early reflection off the leaking speaker can close the remaining gap —
 /// and plan §5.6 is explicit that a merged early reflection is the one error this
 /// signal design cannot detect. Reassign frequencies if it can be done cheaply.
@@ -996,7 +996,7 @@ impl LevelSolver {
     }
 
     /// Restores for teardown: only members whose level this solve actually wrote.
-    /// `calibrate.rs` already snapshots sendspin volumes, so the [`LevelKnob::Live`]
+    /// `align/calibrate.rs` already snapshots sendspin volumes, so the [`LevelKnob::Live`]
     /// entries are belt-and-braces; the [`LevelKnob::SnapshotRestore`] ones are the
     /// reason this exists (plan §7: an AP2 receiver's level — and a pw-sink host's
     /// master level — is device-authoritative outside the session, and the
@@ -1578,7 +1578,7 @@ impl LevelSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align_estimator::MIN_SECOND_PEAK_RATIO;
+    use crate::align::estimator::MIN_SECOND_PEAK_RATIO;
 
     // -- a simulated room --------------------------------------------------
     //

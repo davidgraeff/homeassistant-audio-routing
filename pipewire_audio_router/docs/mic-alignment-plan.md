@@ -6,7 +6,7 @@ and the daemon computes each group member's render offset in milliseconds from t
 mic signal, writes the delays, and verifies the result — instead of the user
 dragging a slider until two clicks sound like one.
 
-**What stays.** The existing session model in `calibrate.rs` — server-owned
+**What stays.** The existing session model in `align/calibrate.rs` — server-owned
 playback, volume snapshot/restore, safety timeout, the two-tone click track — is
 the right shape and is reused wholesale. This plan adds a measurement path beside
 the by-ear path, not instead of it: by-ear remains the fallback when the phone has
@@ -365,21 +365,21 @@ Two practical costs this section originally glossed over:
 
 ### 2.1 The session
 
-`calibrate.rs` owns one alignment session at a time:
+`align/calibrate.rs` owns one alignment session at a time:
 
-- `click_wav()` (`calibrate.rs:60`) builds a 2 s S16LE/44.1k stereo loop: an 8 ms
+- `click_wav()` (`align/calibrate.rs:60`) builds a 2 s S16LE/44.1k stereo loop: an 8 ms
   Hann-enveloped 3000 Hz burst ("A") at t=0, an 8 ms 1500 Hz burst ("B") at
   t=1.0 s, amplitude 0.5.
-- `start()` (`calibrate.rs:213`) resolves the group, snapshots sendspin volumes,
+- `start()` (`align/calibrate.rs:213`) resolves the group, snapshots sendspin volumes,
   and loops the WAV into the group's **sync anchor** via
   `player::play_loop_to_target(anchor, …)` (`player.rs:79`).
-- `apply_audibility()` (`calibrate.rs:319`) solos the reference + target and mutes
+- `apply_audibility()` (`align/calibrate.rs:319`) solos the reference + target and mutes
   everyone else — sendspin via the protocol mute (`sendspin_volume.rs:293`, a live
   transient push, no reconnect), AP2 via `ap2_volume::set_muted`.
 - `arm_timeout()` tears the session down after 15 min so a closed tab cannot leave
   the room muted with a click looping.
 
-Members are `Sendspin | Airplay2` only (`calibrate.rs:92`); pw-sink outputs are
+Members are `Sendspin | Airplay2` only (`align/calibrate.rs:92`); pw-sink outputs are
 not modelled.
 
 ### 2.2 Correction: both speakers play both tones
@@ -464,7 +464,7 @@ mislabelled as a broken stream.
 This plan said "all three are additive only — you can delay a speaker, never advance
 it", and therefore that the reference must be the *latest*-arriving member (§9.1). For
 AP2 render delay and pw-sink playout delay that is right. **For sendspin it appears to
-be exactly backwards**, and the solver in `align_measure.rs` currently assumes the
+be exactly backwards**, and the solver in `align/measure.rs` currently assumes the
 wrong sign.
 
 Three independent readings, all pointing the same way:
@@ -972,7 +972,7 @@ Round bounds, both enforced: parallel `6 + N` (6 ramp rounds plus one solo per m
 for the matrix), sequential `2N + 4`.
 
 Knob availability differs by member kind and the session's member model does not
-currently reflect it (`calibrate.rs:92` knows only Sendspin and Airplay2):
+currently reflect it (`align/calibrate.rs:92` knows only Sendspin and Airplay2):
 
 | Kind | Level knob | Note |
 |---|---|---|
@@ -1224,7 +1224,7 @@ deltas and the confidence before anything is written.
 ### 12.1 The wizard, and where it lives
 
 **It belongs on the Outputs page, not on a source card.** The panel currently lives on
-source cards because a group *is* its source set (`calibrate.rs:213` resolves the group
+source cards because a group *is* its source set (`align/calibrate.rs:213` resolves the group
 from `sources`, and requires it to already exist with ≥2 present members). The new
 model inverts that: the user picks *speakers*, and alignment forms a group around
 them. Moving the entry point and forming a temporary group are the same change, and it
@@ -1346,7 +1346,7 @@ It also composes with §1.1.1: with the union held once and provisional delays i
 relay, a whole multi-position run contains exactly two reconnect waves — the formation
 and the final real write.
 
-**How it is implemented** (`align_group.rs`, `calibrate.rs`, `api.rs`):
+**How it is implemented** (`align/group.rs`, `align/calibrate.rs`, `api.rs`):
 
 - `POST /api/align/start {outputs}` means "**hold all of these for the whole run**". Its
   doc comment says so, because it reads counter-intuitively next to a wizard that then
@@ -1528,7 +1528,7 @@ and the final real write.
     that silently does nothing.
 
     So **W17 is a per-device calibration mute at the relay hook** — the same
-    `mix_into(node, …)` site `relay_delay.rs` already uses, transport-agnostic — kept as
+    `mix_into(node, …)` site `align/relay_delay.rs` already uses, transport-agnostic — kept as
     the **universal fallback** for a disconnected agent, a lever-less sink, or a future
     output kind. Reusing the duck-hold path instead would make the session report
     interference against itself (§12.3), so it needs its own mechanism. The "how do I
@@ -1591,7 +1591,7 @@ Open questions:
   measurement session only? If yes, the settling stage collapses and iterative
   refinement becomes affordable — which would change §8 substantially.
 - Should pw-sink members become first-class in the session's member model
-  (`calibrate.rs:92`), or stay out of scope for v1?
+  (`align/calibrate.rs:92`), or stay out of scope for v1?
 - Near-field mode without soloing assumes ≥15 dB near/far dominance. Does that
   hold in a small room with a speaker on each wall?
 
@@ -1623,16 +1623,16 @@ Nothing. **W7** is next in the daemon, **W6c** in the frontend (§14.1).
 | WP | What it delivered |
 |---|---|
 | **W0** | Device spike — passed on Android (§14.4) |
-| **W1** | `align_mic.rs`: WS ingest, gap detection, AudioWorklet client, `MicCapture.svelte` |
-| **W2** | `align_estimator.rs`: the DSP, with the measured accuracy in §5.4.1 |
-| **W3** | `align_measure.rs`: run state machine, the loop-phase gate, §11 endpoints |
-| **W4** | `align_levels.rs`: the two-sided level solver and crosstalk verdict |
+| **W1** | `align/mic.rs`: WS ingest, gap detection, AudioWorklet client, `MicCapture.svelte` |
+| **W2** | `align/estimator.rs`: the DSP, with the measured accuracy in §5.4.1 |
+| **W3** | `align/measure.rs`: run state machine, the loop-phase gate, §11 endpoints |
+| **W4** | `align/levels.rs`: the two-sided level solver and crosstalk verdict |
 | **W5** | Solve / write / settle / verify — landed inside W3. Merged-peak **dropped by decision** (§10.3), not deferred |
 | **W6a** | Wizard shell, run page, review page, and the measure client |
 | **W6b** | Selection page, per-speaker solo and level, WS push with polling fallback |
-| **W10** | `align_group.rs`: the temporary exclusive group, as a routing-intent override |
+| **W10** | `align/group.rs`: the temporary exclusive group, as a routing-intent override |
 | **W11** | Arbiter reservation; barge-in still wins and is *reported* as `InterferenceCause` |
-| **W13** | `relay_delay.rs`: the per-device provisional delay line. Found §2.4.1 and §1.1.2 |
+| **W13** | `align/relay_delay.rs`: the per-device provisional delay line. Found §2.4.1 and §1.1.2 |
 | **W14** | The §2.4.2 feasible-interval solver, replacing the inverted reference-member rule |
 | **W15** | `MemberKind::PwSink` — pw-sink outputs are alignable |
 | **W16** | `revert_scope`, the run-status push channel, the faster pre-flight window, display names in interference |

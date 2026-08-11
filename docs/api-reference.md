@@ -641,7 +641,7 @@ test:
 
 | | What it is | Use it for |
 |---|---|---|
-| `"tone": true` | the calibration pattern: an alternating two-tone **8 ms click**, one per second in a 2 s loop (`calibrate.rs`, `CLICK_MS = 8.0`) | *aligning* two speakers — comparing arrival times |
+| `"tone": true` | the calibration pattern: an alternating two-tone **8 ms click**, one per second in a 2 s loop (`align/calibrate.rs`, `CLICK_MS = 8.0`) | *aligning* two speakers — comparing arrival times |
 | `"test": true` | the committed speech clip `bridge-daemon/assets/test-announcement.mp3` | *"is this speaker working?"* |
 
 The tone is deliberately a tick, not a tone — at 20 ms blocks roughly one block in fifty

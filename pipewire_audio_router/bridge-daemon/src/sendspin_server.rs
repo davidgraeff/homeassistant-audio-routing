@@ -771,11 +771,12 @@ pub async fn start_server_per_device(
             .spawn(move || {
                 set_relay_realtime_priority();
                 let mixer = crate::overlay_mixer::OverlayMixer::global();
-                // Provisional per-device alignment delay (relay_delay.rs). Costs one
+                // Provisional per-device alignment delay (align/relay_delay.rs). Costs one
                 // relaxed atomic load per device per block while no alignment run is
                 // active, which is always unless one is in progress.
-                let delayer = crate::relay_delay::RelayDelay::global();
-                let delay_fmt = crate::relay_delay::PcmFormat::new(crate::sendspin_capture::SAMPLE_RATE, crate::sendspin_capture::CHANNELS);
+                let delayer = crate::align::relay_delay::RelayDelay::global();
+                let delay_fmt =
+                    crate::align::relay_delay::PcmFormat::new(crate::sendspin_capture::SAMPLE_RATE, crate::sendspin_capture::CHANNELS);
                 // Reused across chunks AND across devices within a chunk so the
                 // per-device overlay mix allocates at most once (only relevant
                 // while an announcement is overlaying; the plain-music path never
@@ -836,7 +837,7 @@ pub async fn start_server_per_device(
                             // it shifts everything this device renders — which is what
                             // the device-side delay knob it stands in for does. Same
                             // length in as out, so `ts` above and the send-ahead lead
-                            // are untouched (relay_delay.rs §RT-safety).
+                            // are untouched (align/relay_delay.rs §RT-safety).
                             let src: &[u8] = match dev_node {
                                 Some(node) if delayer.delay_into(node, delay_fmt, mixed, &mut delay_buf) => &delay_buf,
                                 _ => mixed,

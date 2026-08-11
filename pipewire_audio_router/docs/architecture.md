@@ -247,7 +247,7 @@ between. `run.sh` (PID 1) waits up to ~8 s for the daemon before stopping
 PipeWire, so the bound fits inside the supervisor's ~10 s stop grace.
 
 **Alignment.** An AP2 group is alignable from its source card on the Sources page
-(`calibrate.rs`, `frontend/src/components/AlignPanel.svelte`):
+(`align/calibrate.rs`, `frontend/src/components/AlignPanel.svelte`):
 members are muted/soloed via `ap2_control` (device-authoritative mute) and
 each one's offset is tuned by ear with its **live render delay** — there is
 no node-volume path (AP2 outputs are virtual).

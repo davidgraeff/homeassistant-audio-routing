@@ -3,9 +3,9 @@
 //!
 //! Drives the state machine that turns a microphone capture into a set of
 //! per-member delay corrections: arm → learn → measure → solve → write → settle →
-//! verify. Owns the binding between an alignment session (`calibrate.rs`) and the
-//! mic ingest (`align_mic.rs`), and feeds the captured audio to the estimator
-//! (`align_estimator.rs`).
+//! verify. Owns the binding between an alignment session (`align/calibrate.rs`) and the
+//! mic ingest (`align/mic.rs`), and feeds the captured audio to the estimator
+//! (`align/estimator.rs`).
 //!
 //! Every transition into a measuring state passes through one gate: **re-acquire
 //! loop-phase lock with stable amplitude before accepting a window**. That single
@@ -97,12 +97,12 @@
 //! track's two *frequency* channels (A at 3 kHz, B at 1.5 kHz), which every
 //! soloed member emits (plan §2.2).
 
-use crate::align_estimator::{
+use crate::align::calibrate::MemberKind;
+use crate::align::estimator::{
     Estimator, EstimatorConfig, Quality, RejectReason, CLICK_A_LABEL, CLICK_B_LABEL, MIN_PEAK_SNR_DB, MIN_PERIODS_USED,
 };
-use crate::align_levels::TARGET_PEAK_SNR_DB;
-use crate::align_mic::{MicStatus, MicWindow};
-use crate::calibrate::MemberKind;
+use crate::align::levels::TARGET_PEAK_SNR_DB;
+use crate::align::mic::{MicStatus, MicWindow};
 use crate::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -121,7 +121,7 @@ use tokio::time::Instant;
 const POLL: Duration = Duration::from_millis(250);
 
 /// The pattern the anchor is looping: `calibrate::click_wav`'s 2 s A/B loop.
-const PATTERN_MS: f64 = crate::align_estimator::PATTERN_SECS * 1000.0;
+const PATTERN_MS: f64 = crate::align::estimator::PATTERN_SECS * 1000.0;
 
 /// Frames handed to the estimator in one push. ~100 ms at either capture rate:
 /// large enough that the per-block oscillator re-anchoring is negligible, small
@@ -967,7 +967,7 @@ pub struct ChainOverlap {
 /// One member's provisional delay, as the relay is applying it right now.
 ///
 /// Provisional means exactly that: it lives in the per-device delay line
-/// (`relay_delay.rs`), nothing is persisted, and a daemon restart drops it (plan
+/// (`align/relay_delay.rs`), nothing is persisted, and a daemon restart drops it (plan
 /// §1.1.1). The real knobs are written **once**, at the end of the chain.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProvisionalDelay {
@@ -1291,7 +1291,7 @@ impl SessionSnapshot {
     }
 }
 
-/// What the orchestration needs from the alignment session (`calibrate.rs`).
+/// What the orchestration needs from the alignment session (`align/calibrate.rs`).
 ///
 /// Deliberately two methods: this module must **not** own muting, volume,
 /// playback or teardown — that machinery already exists and is live-tested, and a
@@ -1307,10 +1307,10 @@ pub trait SessionControl: Send + Sync {
     /// Draining rather than peeking, because every entry is consumed here: one for the
     /// member being measured aborts its window with the cause named, and one for any
     /// other member still becomes a warning, so nothing is silently dropped.
-    fn take_interference(&self) -> Fut<'_, Vec<crate::align_group::Interference>>;
+    fn take_interference(&self) -> Fut<'_, Vec<crate::align::group::Interference>>;
 }
 
-impl SessionControl for crate::calibrate::AlignManager {
+impl SessionControl for crate::align::calibrate::AlignManager {
     fn snapshot(&self) -> Fut<'_, SessionSnapshot> {
         Box::pin(async move {
             let s = self.status().await;
@@ -1324,8 +1324,8 @@ impl SessionControl for crate::calibrate::AlignManager {
         })
     }
 
-    fn take_interference(&self) -> Fut<'_, Vec<crate::align_group::Interference>> {
-        Box::pin(async move { crate::calibrate::AlignManager::take_interference(self).await })
+    fn take_interference(&self) -> Fut<'_, Vec<crate::align::group::Interference>> {
+        Box::pin(async move { crate::align::calibrate::AlignManager::take_interference(self).await })
     }
 
     fn solo(&self, node_name: String, level: u8) -> Fut<'_, Result<(), String>> {
@@ -1354,11 +1354,11 @@ pub struct LiveMic;
 
 impl MicFeed for LiveMic {
     fn status(&self) -> MicStatus {
-        crate::align_mic::shared().status()
+        crate::align::mic::shared().status()
     }
 
     fn window_from(&self, first_frame: u64, frames: usize) -> Option<MicWindow> {
-        crate::align_mic::shared().window_from(first_frame, frames)
+        crate::align::mic::shared().window_from(first_frame, frames)
     }
 }
 
@@ -3155,11 +3155,11 @@ pub struct LevelSeam {
     // `the_level_seam_matches_what_the_level_solver_actually_takes` but not by the
     // pass-through itself — same convention as `align_mic::MicWindow`'s W3 fields.
     #[allow(dead_code)]
-    pub specs: Vec<crate::align_levels::LevelMemberSpec>,
+    pub specs: Vec<crate::align::levels::LevelMemberSpec>,
     /// The Stage-1 configuration — see [`learn_levels`] for why it must be
     /// sequential.
     #[allow(dead_code)]
-    pub config: crate::align_levels::LevelConfig,
+    pub config: crate::align::levels::LevelConfig,
     pub note: String,
     /// False while the level-learning phase is unimplemented.
     pub learned: bool,
@@ -3201,7 +3201,7 @@ pub struct LevelSeam {
 ///   !self.aggregate_ok"). The session's audibility control makes **at most two**
 ///   members audible (`calibrate::apply_audibility` solos reference + target), so
 ///   a group of three or more cannot honour that round. It needs W7's per-device
-///   `cal_gate`, or a new all-members mode in `calibrate.rs`.
+///   `cal_gate`, or a new all-members mode in `align/calibrate.rs`.
 /// * AP2 members' level knob is `LevelKnob::SnapshotRestore`, i.e. it requires a
 ///   pre-session snapshot restored on teardown. That snapshot belongs next to
 ///   `calibrate::Session::saved_sendspin` (plan §7 says so explicitly), and
@@ -3213,7 +3213,7 @@ pub struct LevelSeam {
 /// and the user is told so, rather than being left to wonder why a far speaker was
 /// too quiet to measure.
 fn learn_levels(session_level: u8, members: &[SessionMember]) -> LevelSeam {
-    use crate::align_levels::{LevelConfig, LevelMemberKind, LevelMemberSpec};
+    use crate::align::levels::{LevelConfig, LevelMemberKind, LevelMemberSpec};
     LevelSeam {
         levels: members.iter().map(|m| (m.node_name.clone(), session_level)).collect(),
         specs: members
@@ -4562,7 +4562,7 @@ async fn next_command(
 /// One position measures its own speakers **plus its overlaps** — [`measure_set`], two
 /// alternating passes, exactly as a single-position run measures a group — and then
 /// [`chain_step`] does §1.1's algebra on the result. The delays it produces are
-/// **provisional**: they go into the per-device delay line (`relay_delay.rs`, plan
+/// **provisional**: they go into the per-device delay line (`align/relay_delay.rs`, plan
 /// §1.1.1) so the user can hear the alignment and so the *next* position measures each
 /// overlap through the delay it is carrying, which is what makes the chain composable.
 /// The real knobs are written **once**, by `apply`, after the last position.
@@ -5542,13 +5542,13 @@ impl SignalCheck {
 /// Run the signal check over the live ingest. `None` from the mic means no
 /// capture is connected or too little audio has arrived yet.
 pub fn signal_check(pattern_ms: f64) -> SignalCheck {
-    let status = crate::align_mic::shared().status();
+    let status = crate::align::mic::shared().status();
     if !status.connected {
         return SignalCheck::unusable("No microphone is connected — press start on the capture control.", status.sample_rate);
     }
     let rate = status.sample_rate;
     let frames = ((pattern_ms / 1000.0) * f64::from(rate) * PREFLIGHT_PERIODS as f64) as usize;
-    match crate::align_mic::shared().window(frames) {
+    match crate::align::mic::shared().window(frames) {
         Some(w) => signal_check_window(&w, pattern_ms),
         None => SignalCheck::unusable(
             format!("Still collecting audio — {PREFLIGHT_PERIODS} pattern periods are needed before the level can be judged."),
@@ -5651,7 +5651,7 @@ pub fn signal_check_window(w: &MicWindow, pattern_ms: f64) -> SignalCheck {
 // ---- W21: is a relay-side delay a device-side delay? (plan §1.1.1) --------
 //
 // The deferred-write scheme rests on an assumption: a provisional delay of *d* in the
-// relay (`relay_delay.rs`) and a knob of *d* on the device produce the same audible
+// relay (`align/relay_delay.rs`) and a knob of *d* on the device produce the same audible
 // shift. If they do not, every position the user walks is verified against a geometry
 // the real write then fails to reproduce, and §10's verification only finds out at the
 // end of the apartment. This section retires the assumption by measuring it — once,
@@ -5739,7 +5739,7 @@ pub const EQUIV_STEPS: usize = 6;
 /// conclusion is that no audio is reaching that output at all.
 const EQUIV_PRIME_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The provisional delay line (`relay_delay.rs`), as this module drives it: the
+/// The provisional delay line (`align/relay_delay.rs`), as this module drives it: the
 /// equivalence experiment's relay arm, and every step of a chain (plan §1.1.1).
 ///
 /// A trait for the same reason [`MicFeed`] and [`DelayWriter`] are: both callers have to
@@ -5749,7 +5749,7 @@ pub trait RelayControl: Send + Sync {
     /// Apply a provisional delay of `delay_ms` to `output` (`0` clears it).
     fn set_delay_ms(&self, output: &str, delay_ms: u16) -> Result<(), String>;
     /// What the line is doing — the **applied** frame count and whether it has primed.
-    fn status(&self, output: &str) -> Option<crate::relay_delay::DelayStatus>;
+    fn status(&self, output: &str) -> Option<crate::align::relay_delay::DelayStatus>;
     /// Drop `output`'s provisional delay. Infallible: it is a teardown step.
     fn clear(&self, output: &str);
 }
@@ -5761,15 +5761,18 @@ pub struct LiveRelay;
 
 impl RelayControl for LiveRelay {
     fn set_delay_ms(&self, output: &str, delay_ms: u16) -> Result<(), String> {
-        crate::relay_delay::RelayDelay::global().set_delay_us(output, u64::from(delay_ms) * 1_000).map(|_| ()).map_err(|e| e.to_string())
+        crate::align::relay_delay::RelayDelay::global()
+            .set_delay_us(output, u64::from(delay_ms) * 1_000)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
-    fn status(&self, output: &str) -> Option<crate::relay_delay::DelayStatus> {
-        crate::relay_delay::RelayDelay::global().status(output)
+    fn status(&self, output: &str) -> Option<crate::align::relay_delay::DelayStatus> {
+        crate::align::relay_delay::RelayDelay::global().status(output)
     }
 
     fn clear(&self, output: &str) {
-        crate::relay_delay::RelayDelay::global().clear(output);
+        crate::align::relay_delay::RelayDelay::global().clear(output);
     }
 }
 
@@ -6582,7 +6585,7 @@ async fn equiv_wait_primed(deps: &EquivalenceDeps, st: &EquivState, cancel: &Ato
                 format!("the provisional delay on '{output}' disappeared before it could be measured"),
             ));
         };
-        let applied_ms = crate::relay_delay::us_for_frames(status.delay_frames, status.rate) as f64 / 1000.0;
+        let applied_ms = crate::align::relay_delay::us_for_frames(status.delay_frames, status.rate) as f64 / 1000.0;
         if status.primed {
             return Ok(applied_ms);
         }
@@ -7686,7 +7689,7 @@ mod tests {
         soloed: Arc<Mutex<Option<String>>>,
         active: Arc<AtomicBool>,
         /// Exclusivity violations to hand out on the next drain (plan §12.3).
-        interference: Arc<Mutex<Vec<crate::align_group::Interference>>>,
+        interference: Arc<Mutex<Vec<crate::align::group::Interference>>>,
         /// The session's per-member level map (`calibrate`'s W19 field), which is where
         /// a near-field arrival's level comes from when the request does not override
         /// it (plan §12.2).
@@ -7694,7 +7697,7 @@ mod tests {
     }
 
     impl SessionControl for FakeSession {
-        fn take_interference(&self) -> Fut<'_, Vec<crate::align_group::Interference>> {
+        fn take_interference(&self) -> Fut<'_, Vec<crate::align::group::Interference>> {
             Box::pin(async move { std::mem::take(&mut *self.interference.lock_recover()) })
         }
 
@@ -8270,7 +8273,7 @@ mod tests {
 
     #[test]
     fn the_level_seam_matches_what_the_level_solver_actually_takes() {
-        use crate::align_levels::{LevelConfig, LevelSolver, RampMode};
+        use crate::align::levels::{LevelConfig, LevelSolver, RampMode};
         let members = [member("a"), SessionMember { node_name: "ap2-dev-x".into(), kind: MemberKind::Airplay2 }];
         let seam = learn_levels(42, &members);
         assert!(!seam.learned);
@@ -8288,7 +8291,7 @@ mod tests {
         assert!(err.contains("one measurement channel per member"), "{err}");
         // AP2's knob needs a snapshot/restore the session does not have yet — the
         // documented half of why this is still a seam.
-        assert_eq!(seam.specs[1].kind.knob(), crate::align_levels::LevelKnob::SnapshotRestore);
+        assert_eq!(seam.specs[1].kind.knob(), crate::align::levels::LevelKnob::SnapshotRestore);
         assert!(seam.specs.iter().all(|s| s.snapshot_level.is_none()));
     }
 
@@ -9493,7 +9496,7 @@ mod tests {
     // ------------------------------- relay ≡ device equivalence (W21), end to end
 
     /// The provisional delay line as the experiment drives it: a **real**
-    /// [`crate::relay_delay::RelayDelay`] for the value arithmetic, the cap and — the
+    /// [`crate::align::relay_delay::RelayDelay`] for the value arithmetic, the cap and — the
     /// part that matters here — the real priming state, plus a stand-in for the relay
     /// thread, because a line only fills from audio that actually flows and there is no
     /// PipeWire graph in a unit test.
@@ -9502,7 +9505,7 @@ mod tests {
     /// arrival shift a delay produces is injected separately ([`EquivPhysics`]) so a
     /// test can inject one that disagrees with it.
     struct FakeRelay {
-        rd: crate::relay_delay::RelayDelay,
+        rd: crate::align::relay_delay::RelayDelay,
         /// Frames the stand-in relay thread pushes per status poll. 480 (10 ms) is
         /// deliberately less than the 20 ms step, so priming takes more than one poll and
         /// the wait is a tested path rather than a no-op.
@@ -9512,19 +9515,19 @@ mod tests {
 
     impl FakeRelay {
         fn new() -> Self {
-            Self { rd: crate::relay_delay::RelayDelay::new(), frames_per_poll: 480, buf: Mutex::new(Vec::new()) }
+            Self { rd: crate::align::relay_delay::RelayDelay::new(), frames_per_poll: 480, buf: Mutex::new(Vec::new()) }
         }
 
         /// What the line is applying right now, in ms — read *without* pumping, because
         /// the arrival physics reads it once per capture window.
         fn applied_ms(&self, output: &str) -> f64 {
-            self.rd.status(output).map(|s| crate::relay_delay::us_for_frames(s.delay_frames, s.rate) as f64 / 1000.0).unwrap_or(0.0)
+            self.rd.status(output).map(|s| crate::align::relay_delay::us_for_frames(s.delay_frames, s.rate) as f64 / 1000.0).unwrap_or(0.0)
         }
 
         fn pump(&self, output: &str) {
             let mut buf = self.buf.lock_recover();
             let src = vec![0u8; self.frames_per_poll * 4];
-            let _ = self.rd.delay_into(output, crate::relay_delay::PcmFormat::new(48_000, 2), &src, &mut buf);
+            let _ = self.rd.delay_into(output, crate::align::relay_delay::PcmFormat::new(48_000, 2), &src, &mut buf);
         }
     }
 
@@ -9533,7 +9536,7 @@ mod tests {
             self.rd.set_delay_us(output, u64::from(delay_ms) * 1_000).map(|_| ()).map_err(|e| e.to_string())
         }
 
-        fn status(&self, output: &str) -> Option<crate::relay_delay::DelayStatus> {
+        fn status(&self, output: &str) -> Option<crate::align::relay_delay::DelayStatus> {
             self.pump(output); // the relay thread ran between two polls
             self.rd.status(output)
         }

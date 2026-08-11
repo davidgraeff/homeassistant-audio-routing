@@ -950,7 +950,7 @@ pub struct AgentSilencer(pub SharedAgents);
 /// must stay structurally identical to the trait's signature.
 type OobFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
-impl crate::calibrate::OutOfBandMute for AgentSilencer {
+impl crate::align::calibrate::OutOfBandMute for AgentSilencer {
     fn muted<'a>(&'a self, output: &'a str) -> OobFut<'a, Option<bool>> {
         Box::pin(async move { self.0.lock().await.state(output).and_then(|s| s.muted) })
     }
@@ -1198,7 +1198,7 @@ mod tests {
     /// instead of believing it silenced or levelled a speaker it did not.
     #[tokio::test]
     async fn the_alignment_seam_answers_cannot_until_a_host_reports_a_lever() {
-        use crate::calibrate::OutOfBandMute as _;
+        use crate::align::calibrate::OutOfBandMute as _;
 
         let mut agents = registry();
         agents.hello(claim("m1", "dave", None), channel());

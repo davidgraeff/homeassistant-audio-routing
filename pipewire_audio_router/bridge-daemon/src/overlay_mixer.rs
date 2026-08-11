@@ -201,9 +201,9 @@ impl OverlayMixer {
         }
         // Outside the `ducks` lock: the registry takes its own, and no lock order
         // between the two is worth establishing for a report.
-        let holds = crate::align_group::registry();
+        let holds = crate::align::group::registry();
         for output in targets {
-            holds.note(output, crate::align_group::InterferenceCause::DuckHold { hold: id });
+            holds.note(output, crate::align::group::InterferenceCause::DuckHold { hold: id });
         }
         id
     }
