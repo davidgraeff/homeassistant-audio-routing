@@ -294,6 +294,10 @@ pub fn router(
         // it, then `close` back at the first one for the drift measurement.
         .route("/api/align/measure/arrival", post(measure_arrival))
         .route("/api/align/measure/close", post(measure_close))
+        // Multi-position chaining (plan §1.1): one position per listening spot, then
+        // finish — which renormalises the whole chain and proposes the single write.
+        .route("/api/align/measure/position", post(measure_position))
+        .route("/api/align/measure/finish", post(measure_finish))
         .route("/api/align/measure/apply", post(measure_apply))
         .route("/api/align/measure/revert", post(measure_revert))
         .route("/api/routing", get(routing::get_routing))
@@ -3279,7 +3283,7 @@ impl DelayWriter for ApiDelayWriter {
 }
 
 /// Assemble what a run needs from `AppState`, so `align_measure` never sees it.
-fn measure_deps(state: &AppState, mode: Mode, link_to: Vec<String>) -> MeasureDeps {
+fn measure_deps(state: &AppState, mode: Mode, chained: bool, link_to: Vec<String>) -> MeasureDeps {
     // Every knob the two member kinds have, as persisted — the value a revert
     // restores and the value the solve adds to.
     // Snapshotted before the sync-settings lock is taken: two locks in one expression
@@ -3309,10 +3313,14 @@ fn measure_deps(state: &AppState, mode: Mode, link_to: Vec<String>) -> MeasureDe
     };
     MeasureDeps {
         mode,
+        chained,
         link_to,
         session: std::sync::Arc::new(state.align.clone()),
         mic: std::sync::Arc::new(crate::align_measure::LiveMic),
         writer: std::sync::Arc::new(ApiDelayWriter { state: state.clone() }),
+        // The provisional delay line a chain applies its per-step delays to (plan
+        // §1.1.1). Process-global, like the mic ingest: there is one set of relays.
+        relay: std::sync::Arc::new(crate::align_measure::LiveRelay),
         current_delays,
         send_ahead,
         timing: Timing::real(),
@@ -3327,6 +3335,10 @@ fn refusal_status(kind: RefusalKind) -> StatusCode {
         // well-formed, the run is simply not at that step (plan §11 — a refusal is a
         // state the user can act on, never a 500 and never a malformed-input error).
         RefusalKind::NoSession | RefusalKind::MicMissing | RefusalKind::Internal | RefusalKind::WalkOutOfOrder => StatusCode::CONFLICT,
+        // Chaining's out-of-order cases are the same shape: the request is well-formed,
+        // the chain is simply not at that step, or the position it describes is not one
+        // the chain can link (a missing overlap is "do this differently", not a fault).
+        RefusalKind::ChainOutOfOrder | RefusalKind::OverlapMissing => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -3349,10 +3361,21 @@ struct MeasureStartRequest {
     ///   it holds everywhere.
     #[serde(default = "default_measure_mode")]
     mode: Mode,
+    /// Run the multi-position mode as a **chain** (plan §1.1): align a locally-audible
+    /// set, reposition, align the next through overlaps.
+    ///
+    /// `false` (the default) is the single-position case — which is a chain with one step,
+    /// and behaves exactly as it did before W12. `true` parks the run in `positioning` and
+    /// expects one `POST /api/align/measure/position` per listening spot, then
+    /// `POST /api/align/measure/finish`. Ignored for `near_field`, which has its own
+    /// acquisition and needs no overlaps at all.
+    #[serde(default)]
+    chain: bool,
     /// Speakers aligned in an **earlier** run that this one should be made coherent
     /// with (plan §12.1's "link, or keep independent?"). Not implemented — send it and
     /// the run is refused with `mode_unsupported`, which is deliberate: a run that
-    /// claimed to link and did not would be worse than one that refuses.
+    /// claimed to link and did not would be worse than one that refuses. Chaining
+    /// *within* one run is `chain` above.
     #[serde(default)]
     link_to: Vec<String>,
 }
@@ -3382,9 +3405,10 @@ async fn equivalence_start(
 ) -> Result<Json<crate::align_measure::EquivalenceStatus>, (StatusCode, Json<Refusal>)> {
     tracing::info!("USER ACTION: start the relay-vs-device equivalence experiment ({:?})", req.node_name);
     let deps = crate::align_measure::EquivalenceDeps {
-        // The same deps a measurement run uses; `mode`/`link_to` are unused here.
-        base: measure_deps(&state, Mode::SweetSpot, Vec::new()),
-        relay: std::sync::Arc::new(crate::align_measure::LiveRelay),
+        // The same deps a measurement run uses — including the provisional delay line the
+        // relay arm drives, so there is one handle on it rather than two that could
+        // differ. `mode`/`chained`/`link_to` are unused here.
+        base: measure_deps(&state, Mode::SweetSpot, false, Vec::new()),
         member: req.node_name,
     };
     crate::align_measure::equivalence().start(deps).await.map(Json).map_err(refused)
@@ -3406,8 +3430,53 @@ async fn measure_start(
     State(state): State<AppState>,
     Json(req): Json<MeasureStartRequest>,
 ) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
-    tracing::info!("USER ACTION: start microphone-assisted alignment measurement ({:?})", req.mode);
-    crate::align_measure::shared().start(measure_deps(&state, req.mode, req.link_to)).await.map(Json).map_err(refused)
+    tracing::info!("USER ACTION: start microphone-assisted alignment measurement ({:?}, chain={})", req.mode, req.chain);
+    crate::align_measure::shared().start(measure_deps(&state, req.mode, req.chain, req.link_to)).await.map(Json).map_err(refused)
+}
+
+#[derive(Deserialize)]
+struct MeasurePositionRequest {
+    /// The speakers to align at this position — the ones the user can hear clearly from
+    /// where they are standing.
+    members: Vec<String>,
+    /// Speakers **already** aligned at an earlier position that are still audible here.
+    /// These are what tie the two regions together (plan §1.1).
+    ///
+    /// Empty is correct for the first position and refused for every later one. **Two is
+    /// what you want:** the shift a step derives from its overlaps is applied as a common
+    /// delay to every speaker aligned so far and anchors everything measured afterwards,
+    /// so with one overlap nothing checks it. One is accepted — a user may genuinely have
+    /// only one shared speaker — and reported as reduced confidence.
+    #[serde(default)]
+    overlaps: Vec<String>,
+}
+
+/// `POST /api/align/measure/position` — a chain's "these are the speakers I can hear
+/// from where I am now" (plan §1.1).
+///
+/// The call that makes multi-position chaining work, and the reason it exists rather than
+/// the daemon working it out: nothing in a capture says which speakers are *locally
+/// audible*, so the user says it. The run then measures those speakers plus the overlaps,
+/// applies the resulting delays **provisionally** in the relay (nothing is written, no
+/// speaker reconnects), and parks for the next position.
+///
+/// Refused — never 500 — when the run is not chained, is busy, names a speaker it is not
+/// holding, re-aligns one that is already aligned, offers an overlap that is not, or omits
+/// the overlap a later position needs.
+async fn measure_position(Json(req): Json<MeasurePositionRequest>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: align position [{}] through overlap(s) [{}]", req.members.join(", "), req.overlaps.join(", "));
+    crate::align_measure::shared().position(req.members, req.overlaps).map(Json).map_err(refused)
+}
+
+/// `POST /api/align/measure/finish` — "every speaker is aligned at some position".
+///
+/// Where plan §1.1's **global renormalisation** happens: every step could only ever *add*
+/// delay, so the floor ratchets upward across an apartment, and this takes it back out —
+/// a common shift, so all relative alignment survives it — before proposing the one write.
+/// Refused while any held speaker is still unaligned.
+async fn measure_finish() -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: finish the multi-position chain");
+    crate::align_measure::shared().finish().map(Json).map_err(refused)
 }
 
 #[derive(Deserialize)]
@@ -3472,12 +3541,14 @@ async fn mic_signal() -> Json<crate::align_measure::SignalCheck> {
 /// The mode is read off the **run** rather than taken from the request, because how
 /// the arrivals were acquired decides how the write can be checked: a near-field
 /// proposal is verified by walking again (a residual measured from one spot would be
-/// each speaker's distance to that spot, not the write). `apply` asserts this itself,
-/// so the two cannot disagree — this just keeps the log honest.
+/// each speaker's distance to that spot, not the write), and a chain's is checked at the
+/// last position only. `apply` asserts this itself — it overwrites both `mode` and
+/// `chained` from the run's own state — so the two cannot disagree; this just keeps the
+/// log honest.
 async fn measure_apply(State(state): State<AppState>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
     let mode = crate::align_measure::shared().status().mode;
     tracing::info!("USER ACTION: apply measured alignment delays ({mode:?})");
-    crate::align_measure::shared().apply(measure_deps(&state, mode, Vec::new())).await.map(Json).map_err(refused)
+    crate::align_measure::shared().apply(measure_deps(&state, mode, false, Vec::new())).await.map(Json).map_err(refused)
 }
 
 /// `POST /api/align/measure/revert` — restore the start-of-session delay

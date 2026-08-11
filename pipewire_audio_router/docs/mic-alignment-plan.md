@@ -16,12 +16,13 @@ no usable microphone (§4.1) or the room defeats the estimator (§5.5).
 
 ## 0. Status
 
-**Viable and largely built; two features left; never run against real speakers.** The
-microphone path is proven on hardware, the DSP is measured, the orchestration runs end to
-end in tests, and the UI renders it. What remains is concentrated: **parallel excitation**
-(W7) and **multi-position chaining** (W12), with most other open items hanging off W12.
+**Viable and largely built; one feature left in the daemon; never run against real
+speakers.** The microphone path is proven on hardware, the DSP is measured, the
+orchestration runs end to end in tests, and the UI renders it. What remains in the daemon
+is **parallel excitation** (W7); **multi-position chaining** (W12) is built, which
+unblocks W6c (the chaining UI) and W8b.
 
-Verified 2026-08-11: **437 daemon tests passing / 0 failing**, `cargo clippy --all-targets`
+Verified 2026-08-11: **450 daemon tests passing / 0 failing**, `cargo clippy --all-targets`
 at exactly its 6 pre-existing warnings (2 `derivable_impls`, 4 `chunks_exact` — none from
 this work), frontend `npm run check` **160 files / 0 errors / 0 warnings**,
 `frontend/dist` untouched.
@@ -46,6 +47,7 @@ written earlier:
 | W17 | §12.3.2 — silencing is a per-**output** capability, not a kind property |
 | W18 | §7/§12.2 understated it: an AP2 member with an unknown level was not merely level-fixed during a session, it was **silent** |
 | W20 | §7's table was wrong that a pw-sink member has "none in this path" — the **level** is a per-output capability too. And the two capabilities are not one: a host can report a level with **no mute** (a virtual sink's node `Props`), and unlike the mute the level has **no fallback**, because the relay has no gain |
+| W12 | **§1.2's "comparability across steps" does not apply to a chain** — what crosses a position boundary is a delay in milliseconds, not a phase, so only the position *in flight* is voided by a reconnect; §1.1's "subtract the global minimum" is not expressible with mixed polarities and had to become the §2.4.2 solver; §1.1 did not say where the aligned set *is* when two overlaps disagree (it is their mean, and half the disagreement is the joint's error) |
 
 ### Decisions taken
 
@@ -267,6 +269,40 @@ And one operational asymmetry: only the **real** write feeds `required_send_ahea
 only it can cross the group's high-water mark (§9.2). The provisional delays never do,
 which means the walk cannot feel the mark approaching. Check it before writing, not after.
 
+### 1.1.4 Five things this section did not say, from building it (W12)
+
+1. **Where the aligned set "arrives" at a new position is ambiguous, and the mean is the
+   answer.** §1.1 says to measure two overlaps and refuse on disagreement but never says
+   what to do when they disagree *within* tolerance — which is the normal case. Their
+   arrivals bracket the aligned set, so the anchor is their **mean**, and **half the
+   disagreement is that joint's error**, reported per step and summed across the chain
+   (`ChainError`). One overlap gives no such estimate at all, so a chain containing one
+   single-overlap step reports **no total** rather than a total with a hole in it.
+2. **The tolerance is 8 ms, and what it is checking is not precision.** What two overlaps
+   read apart at a new position is a *difference of differences* — how their relative
+   geometry changed between the two spots — which is real and unbounded by anything in
+   the capture. 8 ms ≈ 2.7 m of that at §1's 3 ms/m; the failures it exists to catch (an
+   overlap that was never aligned, a wrapped phase, a §5.6 reflection lock at +5 ms, a
+   speaker that was moved) are 5 ms to hundreds. A 1–2 ms per-speaker bias sails through
+   it, exactly as it sails through §10.2.
+3. **Refusing the *step* is not refusing the run.** Everything already aligned is still
+   good and still carries its provisional delays, so a disagreement (or a failed
+   transitivity/repeatability at that position) parks the chain with the reason and lets
+   the user stand there and try again. Only the run's *bindings* — session, capture, delay
+   line, cancellation — are fatal. Losing an apartment's chain to one bad joint would be
+   the wrong trade.
+4. **"Subtract the global minimum" is not expressible.** With mixed polarities the
+   minimum is not a delay anyone can subtract (§2.4.2), so the renormalisation *is* the
+   interval solver: feed it `max(p) − pᵢ` as each member's arrival and its own target
+   choice becomes the free common shift — which it then picks to keep the largest knob
+   smallest (§9.2). A sendspin-only chain still lands on its earliest member at advance 0.
+5. **The chain's state has to be what the line is *applying*, not what the step solved
+   for.** The line and the knobs are both whole milliseconds; a model carrying the exact
+   ideal would disagree with reality by up to 0.5 ms per step, and that error would land
+   in the alignment between the aligned set and every position after it. Rounding when
+   the delay is applied keeps the two identical, and the error stops accumulating because
+   every later position measures its overlaps *through* the line.
+
 ### 1.2 The reference frame is one continuous microphone capture
 
 This is the rule both modes' overlap requirements follow from, and it is worth stating
@@ -294,6 +330,20 @@ Consequences:
 
 So the advice to users is: **prefer one continuous session for everything that should
 be coherent**, and split only when you must.
+
+**Correction from W12: a chain does not depend on capture continuity across positions,
+and saying it does costs the user a re-walk.** The first bullet above is the right rule
+stated slightly too strongly. What crosses a position boundary in a chain is a
+**provisional delay in milliseconds**, not a phase, and every position re-measures its
+overlaps in its own frame — so a capture that reconnects *between* two positions costs
+nothing, which is what this section's own parenthetical ("if the capture was interrupted —
+its own frame") is pointing at. What is genuinely not survivable is a reconnect *inside*
+one position, and that voids **that position only**: its readings are discarded, the user
+stands there again, and everything aligned earlier is untouched. Each step therefore
+records its own `grid_epoch`, no two steps' observations are ever compared, and the
+honest bound on a joint is the overlap disagreement (§1.1.4) rather than the capture's
+continuity. Voiding the whole chain instead would send someone round the apartment again
+for nothing.
 
 Two practical costs this section originally glossed over:
 
@@ -1115,6 +1165,17 @@ the phone partway through", which pass-to-pass agreement does catch for multi-po
 walk has **fewer** independent cross-checks than a stationary run — transitivity and
 closure, not three.
 
+**The same rule applies to a chain, for the same reason (W12).** A chain's write can only
+be checked where the phone is, which is the **last** position: that position's own set —
+its speakers *and* its overlaps, which its Δ put in step with them — is the one set that is
+genuinely aligned there. The earlier positions were aligned at *their* spots, so
+re-measuring them from here would read their path difference to this spot and fail however
+correct the chain is. So the residual is scoped to the last position and
+`Verification::scope_note` says so in a sentence; re-checking the rest means walking the
+chain again. Each position's own §10 checks (transitivity, repeatability) run and **block
+that step** as it is measured, which is where they are cheap and where a failure is still
+retryable.
+
 ---
 
 ## 11. API surface
@@ -1140,10 +1201,18 @@ than adding a second WebSocket.
 | `POST` | `/api/align/measure/arrival` | "I am at this speaker now" — solo it, apply its level, gate, measure |
 | `POST` | `/api/align/measure/close` | the closure reading, back at the walk's first speaker |
 
-and `measure/start` gains `link_to`, which is **refused** while W8b is unbuilt so a
-client cannot believe in cross-session coherence that does not exist (§12.1's "one
-overlap needed to link to earlier sessions" reads as though linking already works — it
-does not).
+and it cannot express a **chain** either (§1.1), which gains:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/align/measure/position` | `{members, overlaps}` — "these are the speakers I can hear from where I am now, and these already-aligned ones link it to the rest". Measures them, applies the step's delays **provisionally** (§1.1.1), parks for the next position |
+| `POST` | `/api/align/measure/finish` | every held speaker is aligned somewhere: renormalise the whole chain globally and propose the single write |
+
+`measure/start` gains `chain: bool` (default `false` — the single-position case is a chain
+with one step and needs no calls), and `link_to`, which is **refused** while W8b is unbuilt
+so a client cannot believe in cross-session coherence that does not exist. Chaining now
+exists *within* a run; what does not exist is a store of a finished run's aligned set with
+its delays, which is what linking two **runs** would propagate a shift into.
 
 `apply` being a separate, explicit step is deliberate: the user sees the proposed
 deltas and the confidence before anything is written.
@@ -1534,21 +1603,20 @@ The authoritative list. §0 summarises status in prose and does **not** repeat t
 
 ### 14.1 Remaining
 
-Two features carry almost everything that is left — **parallel excitation** (W7) and
-**multi-position chaining** (W12) — and most other open items hang off W12.
+One feature carries most of what is left in the daemon — **parallel excitation** (W7) —
+and the frontend's chaining UI (W6c) is now unblocked.
 
 | WP | Content | Depends on | Size |
 |---|---|---|---|
-| **W12** | **Chaining** (§1.1): overlap selection, the two-overlap consistency refusal, Δ propagation to the whole already-aligned set, and the final global renormalisation. The hold is already union-shaped (§12.3.1) so this steps *inside* one hold. Unblocks W6c and W8b | W10, W13 | medium |
 | **W7** | **Parallel excitation** (§6.2): the content generator, a per-device `cal_gate` in all three relays, analytic group-delay compensation, frequency assignment plus the runtime crosstalk validation §7.1 requires. Independent of W12 | W5 | large |
-| **W6c** | Frontend: the **chaining UI** — overlap picking, per-step Δ, renormalisation — and the **Outputs-page move** (§12.1), which is one `<AlignWizard …/>` tag now that the wizard is self-contained | W12 | medium |
-| **W8b** | Near-field **across sessions**: optional linking to an already-aligned set through an overlap (§1.2). Blocked on W12's Δ-propagation machinery, not on anything near-field-specific | W12 | small |
+| **W6c** | Frontend: the **chaining UI** — position posting, overlap picking, per-step Δ and confidence, the error statement — and the **Outputs-page move** (§12.1), which is one `<AlignWizard …/>` tag now that the wizard is self-contained. The daemon side is done: `chain: true`, `POST measure/position`, `POST measure/finish`, and `MeasureStatus.chain` | W12 | medium |
+| **W8b** | Near-field **across sessions**: optional linking to an already-aligned set through an overlap (§1.2). No longer blocked on Δ propagation (W12 built it) — what it needs is a **store** of a finished run's aligned set with its applied delays, which nothing has | W12 | small |
 | **W9** | Chirp + matched filter. **Re-motivated:** not a noise fix (noise is a non-problem, §5.4.1) but the only proper fix for §5.6's early-reflection bias — the one risk no check in this design can see. Conditional on what real rooms show | W3 | medium |
 | **W22** | **Live acceptance on real speakers.** Nothing here has ever run against hardware beyond the W0 mic spike: formation cost, mute-settling time, real reconnect duration, whether the amplitude-stability gate survives a real room, and whether §5.6 bites are all unmeasured. Needs a deploy | most of the above | — |
 
 ### 14.2 In flight
 
-Nothing. **W12** is next (§14.1).
+Nothing. **W7** is next in the daemon, **W6c** in the frontend (§14.1).
 
 ### 14.3 Done
 
@@ -1573,6 +1641,7 @@ Nothing. **W12** is next (§14.1).
 | **W19** | Per-member calibration levels are session-owned, so they survive a reload |
 | **W20** | Per-**output** level knob: the `OutOfBandMute` seam grew a level pair, a pw-sink host with a live agent is levelled and restored like AP2, and only genuinely lever-less outputs are named as setting the clip ceiling. Corrected §7's table row and §12.3.2 |
 | **W21** | The relay-vs-device equivalence experiment: six bracketed readings, three writes, reporting scale and sign with a resolution bound and no silent correction. Corrected §1.1.3 |
+| **W12** | **Multi-position chaining** (§1.1): `POST measure/position` per listening spot, the two-overlap consistency **refusal**, Δ propagation to the whole already-aligned set, provisional delays in the relay throughout and **one** write wave at the end, the global renormalisation through the §2.4.2 solver, and a per-joint error statement that withholds a total when a joint had one overlap. Steps *inside* the union hold (§12.3.1) — no formation path was added. Corrected §1.2 (a chain does not depend on capture continuity across positions), §1.1 (five things it did not say — §1.1.4) and §10.4 (a chain's residual covers the last position only) |
 | **W8a** | Near-field walk with the closure measurement. **Depends on W19** (the per-arrival level lives in `AlignState.levels`), which §14.1 did not list. Corrected §10.4 (a stationary residual cannot verify a walk), §5.3 (the closure *is* the drift fit) and §1.2 (a 15-minute deadline a walk would hit) |
 
 ### 14.4 W0 — the device spike, step by step

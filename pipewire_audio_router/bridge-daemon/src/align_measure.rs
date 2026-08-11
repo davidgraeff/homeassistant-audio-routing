@@ -37,7 +37,10 @@
 //! * **Multi-position** ([`Mode::SweetSpot`], the default): the phone sits at a
 //!   listening position and the run walks the member list itself, twice. Each
 //!   arrival is electrical delay **+** the propagation path to that spot, so the
-//!   result aligns *that spot*.
+//!   result aligns *that spot*. With [`MeasureDeps::chained`] it becomes a
+//!   **chain**: the user aligns one locally-audible set, repositions, and aligns
+//!   the next through shared **overlap** speakers ([`run_chain`], plan §1.1). A
+//!   plain single-position run is the one-step case of the same thing.
 //! * **Near field** ([`Mode::NearField`], W8a): the **user** walks to each speaker
 //!   and holds the phone at it, one speaker at a time, and tells the daemon so
 //!   ([`MeasureManager::arrival`]). At arm's length the path term collapses below
@@ -267,6 +270,49 @@ pub const REPEATABILITY_TOL_MS: f64 = 1.0;
 /// granularity plus rounding, plus a little for the measurement itself.
 pub const RESIDUAL_TOL_MS: f64 = 2.0;
 
+/// How far a chain step's **two overlaps** may disagree at the new position before
+/// the step is refused, in ms (plan §1.1).
+///
+/// **This is a plausibility bound, not a precision one, and the difference is the
+/// whole point.** Two overlaps will *not* read the same at a new position, and
+/// nothing is wrong when they do not: the previous step aligned them at the
+/// *previous* position, so what is left here is how their relative geometry changed
+/// between the two spots — `(path₁(P2) − path₁(P1)) − (path₂(P2) − path₂(P1))` — which
+/// is real, and which nothing in the capture can separate from a measurement error.
+///
+/// 8 ms is ~2.7 m of that change at §1's 3 ms per metre, which covers two speakers in
+/// one room read from an adjoining position. What it *does* catch is the class of
+/// failure that would poison the chain, because the shift a step derives from its
+/// overlaps is applied to **every** speaker aligned so far: an overlap that was never
+/// really aligned, a phase that wrapped, a reflection the estimator locked onto (§5.6
+/// measured +5.2 ms and called it excellent), a speaker that has been moved between
+/// positions. Those are 5 ms to hundreds of ms, not a couple.
+///
+/// What it cannot catch is the 1–2 ms per-speaker bias §5.6 describes — the same blind
+/// spot [`TRANSITIVITY_TOL_MS`] has and for the same reason. So half the measured
+/// disagreement is *reported* as that joint's contribution to the chain's error
+/// ([`ChainError`]) rather than being treated as zero.
+pub const OVERLAP_AGREEMENT_TOL_MS: f64 = 8.0;
+
+/// Times one position of a chain may be measured again after the capture reconnected
+/// (plan §1.2).
+///
+/// Higher than [`MAX_SET_RESTARTS`] for the same reason [`MAX_WALK_RESTARTS`] is: a
+/// reconnect here costs the **user** a position, not the daemon a loop. It voids the
+/// position being measured and nothing else — see [`run_chain`] for why the earlier
+/// positions survive a new frame and what makes that safe rather than convenient.
+const MAX_CHAIN_STEP_RESTARTS: u32 = 2;
+
+/// How long a provisional delay line is given to fill before the position that has to
+/// be measured *through* it is measured.
+///
+/// `relay_delay`'s docs make this a precondition rather than a detail: an un-primed
+/// line emits silence, and a reading taken through one is a dropout the gate would
+/// diagnose as something else. Filling costs exactly the delay itself in audio, so this
+/// is generous — and if it expires, the useful conclusion is that no audio is reaching
+/// that output at all.
+const PROVISIONAL_PRIME_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Every wall-clock quantity the run loop depends on, in one place.
 ///
 /// Real runs use [`Timing::real`], which is the constants above. It is a struct
@@ -441,6 +487,12 @@ pub enum Phase {
     /// is alive and holding the group — so `start` still refuses until it is
     /// abandoned.
     Walking,
+    /// Chained multi-position only: parked between positions, waiting for the user to
+    /// say which speakers they can hear from where they are now
+    /// ([`ChainProgress::next`]). Not terminal, for the same reason [`Self::Walking`]
+    /// is not — the run is alive, the group is held, and the aligned set carries
+    /// provisional delays that a second `start` would strand.
+    Positioning,
     Measuring,
     Solving,
     Proposed,
@@ -488,6 +540,20 @@ pub enum RefusalKind {
     /// for — an unknown speaker, one already measured, or closing before every
     /// member has been visited.
     WalkOutOfOrder,
+    /// Chaining: a `position`/`finish` call does not match where the chain is — an
+    /// unknown speaker, one already aligned at an earlier position, an overlap that
+    /// was never aligned, or finishing with speakers still unaligned.
+    ChainOutOfOrder,
+    /// Chaining: a step after the first named **no** overlap, so there is nothing
+    /// tying this position to the speakers already aligned (plan §1.1).
+    OverlapMissing,
+    /// Chaining: the step's two overlaps disagree by more than plausible geometry can
+    /// explain, so the common shift this step would apply to the *whole* already-aligned
+    /// set cannot be trusted (plan §1.1, [`OVERLAP_AGREEMENT_TOL_MS`]).
+    OverlapDisagreement,
+    /// Chaining: the provisional delay line refused the value the chain asked it for —
+    /// the ratchet of plan §1.1 has run past `relay_delay::MAX_DELAY_MS`.
+    ProvisionalRange,
     /// Near field: nobody said "I am at a speaker" within
     /// [`Timing::walk_arrival_timeout`].
     WalkTimeout,
@@ -570,6 +636,17 @@ pub enum WarningKind {
     /// when the affected window was successfully retaken, because it explains why the
     /// run took longer than it should have.
     Interference,
+    /// A chain step was linked to the already-aligned set through **one** overlap.
+    /// That reading is applied as a common shift to every speaker aligned so far and
+    /// anchors everything after it, and with one overlap nothing checks it — so the
+    /// step is weaker than the others and the chain's error stops being boundable
+    /// (plan §1.1).
+    OneOverlap,
+    /// Every position of a chain is aligned at *its own* spot, so speakers aligned at
+    /// different positions are related only through the overlaps — approximate in the
+    /// doorway between two rooms. Raised on every chained run, because the failure it
+    /// describes looks like a perfectly good result.
+    ChainScope,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -839,6 +916,177 @@ const WALK_LEVEL_NOTE: &str = "each speaker is measured at the level set for it 
      there, and watch /api/align/mic/signal go green): at arm's length a level chosen anywhere else is wrong, and the danger is \
      clipping rather than being too quiet.";
 
+// --------------------------------------------- multi-position chaining (W12, §1.1)
+
+/// What a chained multi-position run expects the UI to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainAction {
+    /// `POST /api/align/measure/position` naming the speakers audible from where the
+    /// user is standing now, plus the overlaps from the already-aligned set.
+    Position,
+    /// Every held speaker has been aligned at some position: `POST
+    /// /api/align/measure/finish` renormalises the whole chain and proposes the write.
+    /// A further position is still accepted while this is showing — a user may want to
+    /// re-link a region through more overlaps before finishing.
+    Finish,
+    /// A position is being measured; the accepted call is already being served.
+    Busy,
+    /// The chain is over (see [`MeasureStatus::phase`]). Kept visible rather than
+    /// cleared, because the per-step numbers are the verdict.
+    Done,
+}
+
+/// How well a step's link to the already-aligned set could be checked (plan §1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapConfidence {
+    /// The first position. Nothing was aligned yet, so there is nothing to link to and
+    /// nothing to check — this step *defines* the chain's reference.
+    Origin,
+    /// One overlap. The step is anchored, but that single reading is applied as a
+    /// common shift to the entire already-aligned set **and** anchors everything
+    /// measured after it, with nothing to check it against.
+    Single,
+    /// Two or more overlaps: their disagreement is an independent estimate of this
+    /// joint's error — spatial redundancy, which is what §1.1 asks for.
+    Checked,
+}
+
+/// One overlap as it read at the new position.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainOverlap {
+    pub node_name: String,
+    /// Its arrival at *this* position, on this step's own scale. Already includes the
+    /// provisional delay it is carrying — that is what makes the chain work (plan §1.1).
+    pub arrival_ms: f64,
+    /// The provisional delay it was carrying while this reading was taken.
+    pub applied_ms: f64,
+}
+
+/// One member's provisional delay, as the relay is applying it right now.
+///
+/// Provisional means exactly that: it lives in the per-device delay line
+/// (`relay_delay.rs`), nothing is persisted, and a daemon restart drops it (plan
+/// §1.1.1). The real knobs are written **once**, at the end of the chain.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisionalDelay {
+    pub node_name: String,
+    /// What the chain's arithmetic holds for this member, ms — exact, so a step's Δ
+    /// does not accumulate rounding.
+    pub delay_ms: f64,
+    /// What was actually pushed to the line, in whole ms. The line itself is
+    /// sample-accurate; this rounding is the same 1 ms granularity the final write has
+    /// (plan §1.1.2 item 4), and for an overlap it is *observed* rather than assumed,
+    /// because the next position measures the overlap through it.
+    pub applied_ms: u16,
+}
+
+/// One position of a chain, after it was measured (plan §1.1).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainStep {
+    /// 1-based, in the order the user walked.
+    pub index: usize,
+    /// The speakers this position aligned — the ones that were not already aligned.
+    pub members: Vec<String>,
+    /// The already-aligned speakers this position was linked through.
+    pub overlaps: Vec<ChainOverlap>,
+    pub confidence: OverlapConfidence,
+    /// Worst pairwise disagreement between the overlaps at this position, ms. `None`
+    /// for a first or single-overlap step, which have nothing to compare.
+    pub disagreement_ms: Option<f64>,
+    /// The pair [`Self::disagreement_ms`] came from.
+    pub worst_pair: Option<(String, String)>,
+    pub tolerance_ms: f64,
+    /// Where the already-aligned set is judged to arrive at this position: the mean of
+    /// the overlap readings. `None` for the first step.
+    pub anchor_ms: Option<f64>,
+    /// The common delay this step added to **every** member of the already-aligned
+    /// set, ms. Non-zero exactly when a new member at this position arrived *later*
+    /// than the aligned set does — and it goes to all of them, not just the overlap,
+    /// because a common delay added to an aligned set preserves its internal
+    /// alignment. That is the trick the whole feature rests on (plan §1.1).
+    pub delta_ms: f64,
+    /// The arrival this position was aligned at, on this step's own scale.
+    pub target_ms: f64,
+    /// Arrival spread across this position's members, ms.
+    pub spread_ms: f64,
+    /// Mic-vs-audio clock drift fitted at *this* position, ppm. Each position has its
+    /// own fit; there is no single figure for a chain.
+    pub drift_ppm: f64,
+    /// Half of [`Self::disagreement_ms`] — how far this joint's common shift can be
+    /// out, given that the anchor is the mean of two readings that disagree by that
+    /// much. `None` when the step had nothing to check it with, which is what makes the
+    /// chain's total unboundable (see [`ChainError`]).
+    pub joint_error_ms: Option<f64>,
+    /// Which capture this position was measured in. Positions can differ — the overlap
+    /// re-measurement is what bridges a new frame — and a position whose *own* readings
+    /// spanned two captures is discarded rather than solved (plan §1.2).
+    pub grid_epoch: u64,
+    /// The §10 checks over this position's own readings. They block the step: a chain
+    /// must not carry a position that failed transitivity into every position after it.
+    pub checks: Checks,
+    pub note: String,
+}
+
+/// What the chain's accumulated error can and cannot be said to be (plan §1.1).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainError {
+    /// True when *every* joint was checked by two overlaps.
+    pub bounded: bool,
+    /// The joints' worst case: the sum of each step's [`ChainStep::joint_error_ms`].
+    /// `None` — deliberately, rather than a partial sum — when any joint was linked
+    /// through a single overlap, because a total that silently omitted the one
+    /// unmeasurable joint would be worse than no total.
+    pub joint_ms: Option<f64>,
+    pub message: String,
+}
+
+/// A chained run's live state: where the chain is, what it wants next, and the two
+/// things about a chain's *result* the user has to be told rather than infer.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainProgress {
+    pub next: ChainAction,
+    pub steps: Vec<ChainStep>,
+    /// Every speaker aligned so far, in the order they were aligned.
+    pub aligned: Vec<String>,
+    /// Held speakers not aligned at any position yet. `finish` refuses while this is
+    /// non-empty: a member with no reading has nothing to write.
+    pub remaining: Vec<String>,
+    /// What the relay is applying right now (plan §1.1.1). Nothing is persisted.
+    pub provisional: Vec<ProvisionalDelay>,
+    /// The smallest provisional delay in the aligned set, ms — the floor that ratchets
+    /// upward because every step can only *add*. `finish` subtracts it globally, which
+    /// is a common shift and therefore free (plan §1.1, §2.4.2).
+    pub floor_ms: f64,
+    /// The position being measured right now.
+    pub measuring: Option<usize>,
+    /// Times the position in flight has been restarted because the capture reconnected.
+    pub restarts: u32,
+    pub prompt: String,
+    pub error: ChainError,
+    /// Why the last position was rejected, when it was.
+    ///
+    /// The chain **stays alive** through this: the positions already aligned keep their
+    /// provisional delays, and the user can stand where they are and post the position
+    /// again with better overlaps or the phone further from a wall. Losing a whole
+    /// apartment's chain because one joint's overlaps disagreed would be the wrong
+    /// trade. Cleared as soon as a position is accepted.
+    pub refusal: Option<Refusal>,
+    /// What a chain's result is coherent *with*, said plainly because the flattering
+    /// reading is the easy one to assume (plan §1.1).
+    pub scope_note: &'static str,
+}
+
+/// Plan §1.1's honesty clause, stated on every chained run rather than inferred from
+/// the numbers.
+const CHAIN_SCOPE_NOTE: &str =
+    "each position is aligned at the spot it was measured from, and the positions are tied to one another only through their overlap \
+     speakers. Two speakers aligned at *different* positions are therefore related only indirectly: in the doorway between two rooms they \
+     are approximate, and the overlap disagreements above are the only bound on how approximate. That is inherent to measuring from \
+     several places with one microphone — given the premise that no single position hears everything, it is the trade this mode makes. A \
+     result that is right everywhere at once is what near-field mode is for.";
+
 /// §10.3's merged-peak check — a documented seam, not an implementation.
 #[derive(Debug, Clone, Serialize)]
 pub struct MergedPeakCheck {
@@ -938,6 +1186,17 @@ pub struct Verification {
     pub merged_peak: MergedPeakCheck,
     pub observations: Vec<MemberObservation>,
     pub passed: bool,
+    /// What this verification covered, when that is less than "the group". `None` for a
+    /// single-position run, where every member was re-measured.
+    ///
+    /// A **chain** can only be verified where the phone is, which is the last position:
+    /// the residual is measured over that position's own set (its new members *and* its
+    /// overlaps, which the step's Δ put in step with them), and the earlier positions
+    /// are not re-measured. Saying so is the same honesty §10.4 needed for a walk — a
+    /// residual taken from one spot over speakers aligned at another would fail every
+    /// time and report a correct chain as broken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_note: Option<String>,
 }
 
 /// What the gate is doing right now, surfaced so a stuck run explains itself.
@@ -976,6 +1235,11 @@ pub struct MeasureStatus {
     /// multi-position run, which needs nothing from the user between arrivals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub walk: Option<WalkProgress>,
+    /// Chained multi-position only: where the chain is, what it wants next, the
+    /// per-position numbers and what the result is *not* coherent with. `None` for a
+    /// single-position run and for a near-field walk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<ChainProgress>,
     /// `POST measure/apply` will be accepted.
     pub can_apply: bool,
     /// `POST measure/revert` has something to restore.
@@ -1112,19 +1376,34 @@ pub trait DelayWriter: Send + Sync {
 /// module never sees `AppState`.
 pub struct MeasureDeps {
     pub mode: Mode,
+    /// Run the multi-position mode as a **chain** (plan §1.1): park between positions
+    /// and take one [`MeasureManager::position`] call per listening spot, each naming
+    /// the speakers audible there plus the overlaps from the already-aligned set.
+    ///
+    /// Opt-in rather than inferred, because it changes who drives the run. `false` is
+    /// the single-position case — which is a chain with one step, and behaves exactly as
+    /// it did before W12: the daemon measures every member itself from wherever the
+    /// phone is sitting. Ignored for [`Mode::NearField`], which has its own acquisition
+    /// (a walk needs no overlaps at all, §1.2).
+    pub chained: bool,
     /// Speakers from an **earlier**, already-aligned run that this one should be made
     /// coherent with, through a shared overlap member (plan §1.2's cross-session case,
     /// §12.1's "link this set or keep it independent?").
     ///
-    /// Empty means independent, which is the only thing implemented. A non-empty list
-    /// is refused as [`RefusalKind::ModeUnsupported`] rather than accepted and quietly
-    /// ignored: propagating a Δ into a previously aligned set is W12's machinery (W8b
-    /// for the near-field case), and a run that *said* it linked but did not would
-    /// leave the user believing in a coherence that does not exist.
+    /// Empty means independent, which is the only thing implemented. Chaining *within*
+    /// one run exists ([`Self::chained`]); linking across **runs** does not, because
+    /// nothing stores a finished run's aligned set with its delays — that is W8b. A
+    /// non-empty list is refused as [`RefusalKind::ModeUnsupported`] rather than
+    /// accepted and quietly ignored: a run that *said* it linked but did not would leave
+    /// the user believing in a coherence that does not exist.
     pub link_to: Vec<String>,
     pub session: Arc<dyn SessionControl>,
     pub mic: Arc<dyn MicFeed>,
     pub writer: Arc<dyn DelayWriter>,
+    /// The provisional delay line (plan §1.1.1). A chain applies its per-step delays
+    /// here and writes the real knobs once, at the end; a single-position run never
+    /// touches it.
+    pub relay: Arc<dyn RelayControl>,
     /// Each member's currently persisted delay, keyed by node name.
     pub current_delays: HashMap<String, u16>,
     pub send_ahead: SendAheadContext,
@@ -1827,6 +2106,28 @@ impl MemberInterval {
     }
 }
 
+/// Build one [`MemberInterval`] per arrival, from the member's kind and its current
+/// knob value.
+///
+/// Shared by the single-position solve and the chain's final renormalisation, because
+/// §2.4.2's model is the same in both — what differs is only where the arrivals came
+/// from (measured at one spot, or synthesised from the chain's provisional delays; see
+/// [`solve_chain`]).
+fn intervals_for(arrivals: &[(String, f64)], members: &[SessionMember], current_delays: &HashMap<String, u16>) -> Vec<MemberInterval> {
+    let kinds: HashMap<&str, MemberKind> = members.iter().map(|m| (m.node_name.as_str(), m.kind)).collect();
+    arrivals
+        .iter()
+        .map(|(name, arrival)| {
+            MemberInterval::new(
+                name.clone(),
+                kinds.get(name.as_str()).copied().unwrap_or(MemberKind::Sendspin),
+                current_delays.get(name).copied().unwrap_or(0),
+                *arrival,
+            )
+        })
+        .collect()
+}
+
 /// The common arrival the group will be moved to, and the interval it came from.
 #[derive(Debug, Clone, Copy)]
 pub struct KnobSolution {
@@ -1946,6 +2247,189 @@ fn infeasible(floor: &MemberInterval, ceiling: &MemberInterval) -> Refusal {
     )
 }
 
+/// The arrival pipeline shared by a single-position solve and one chain step: refuse a
+/// set that spans two captures, fit the common drift out, put every member on one
+/// linear scale with the earliest at 0, and refuse a spread too close to the wrap.
+///
+/// Extracted rather than duplicated because a chain runs it **per position** — each
+/// position is its own capture-relative set of arrivals — and the chain's arithmetic
+/// (plan §1.1) consumes exactly this and nothing else.
+struct Arrivals {
+    fit: DriftFit,
+    /// Earliest member at 0, in `order`.
+    linear: Vec<(String, f64)>,
+    spread_ms: f64,
+    /// Where the reported per-member drift corrections are quoted from: the earliest
+    /// reading in the set. A common shift cancels in every difference, so the choice is
+    /// presentational — but it has to be *stated*, because "0.4 ms of drift" means
+    /// nothing without saying since when.
+    drift_origin: f64,
+}
+
+fn arrivals_of(observations: &[MemberObservation], order: &[String], timing: &Timing) -> Result<Arrivals, Refusal> {
+    let pattern_ms = timing.pattern_ms;
+    if let Some(first) = observations.first() {
+        if observations.iter().any(|o| o.grid_epoch != first.grid_epoch) {
+            return Err(Refusal::new(
+                RefusalKind::MicReconnected,
+                "the microphone capture restarted during the measurement, so the phases come from two different timing \
+                 references and cannot be compared",
+            ));
+        }
+    }
+    let fit = fit_drift(observations, pattern_ms, |o| o.m.phase_a_ms);
+    let drift_origin = observations.iter().map(|o| o.period_centre).fold(f64::INFINITY, f64::min);
+    let linear = linearise(&fit.offsets, order, pattern_ms);
+    let spread_ms = linear.iter().map(|(_, d)| *d).fold(0.0, f64::max);
+    if spread_ms > pattern_ms * MAX_TRUSTED_SPREAD_FRACTION {
+        return Err(Refusal::new(
+            RefusalKind::AmbiguousSpread,
+            format!(
+                "the members' arrivals span {spread_ms:.0} ms, which is too close to half the 2 s test pattern \
+                 ({:.0} ms) to be told apart from its own wrap-around — align this group roughly by ear first, then \
+                 measure again",
+                pattern_ms / 2.0
+            ),
+        ));
+    }
+    Ok(Arrivals { fit, linear, spread_ms, drift_origin })
+}
+
+impl Arrivals {
+    /// How much of one member's phase was attributed to mic-vs-audio clock drift, ms,
+    /// relative to [`Self::drift_origin`]. See [`ProposedDelay::drift_correction_ms`].
+    fn drift_correction(&self, observations: &[MemberObservation], name: &str) -> f64 {
+        let mut n = 0.0;
+        let mut sum = 0.0;
+        for o in observations.iter().filter(|o| o.node_name == name) {
+            sum += o.period_centre - self.drift_origin;
+            n += 1.0;
+        }
+        if n == 0.0 {
+            0.0
+        } else {
+            self.fit.slope_ms_per_period * (sum / n)
+        }
+    }
+}
+
+/// The largest per-member standard error each member was measured with.
+fn worst_std_errors(observations: &[MemberObservation]) -> HashMap<String, f64> {
+    let mut m: HashMap<String, f64> = HashMap::new();
+    for o in observations {
+        let e = m.entry(o.node_name.clone()).or_insert(0.0);
+        *e = e.max(o.m.std_error_ms);
+    }
+    m
+}
+
+/// The knob half of a proposal: turn a solved target into per-member writes, name the
+/// member left at the smallest knob, and refuse a value the rounding pushed out of range.
+struct ProposedKnobs {
+    members: Vec<ProposedDelay>,
+    reference: String,
+    largest_knob_ms: u16,
+    /// Only the [`KnobPolarity::Advance`] members, before and after — the two sets the
+    /// §9.2 high-water check compares.
+    current_advances: HashMap<String, u16>,
+    proposed_advances: HashMap<String, u16>,
+}
+
+fn propose_knobs(
+    intervals: &[MemberInterval],
+    solution: &KnobSolution,
+    std_errors: &HashMap<String, f64>,
+    drift_correction: &dyn Fn(&str) -> f64,
+) -> Result<ProposedKnobs, Refusal> {
+    let mut proposed_advances: HashMap<String, u16> = HashMap::new();
+    let mut current_advances: HashMap<String, u16> = HashMap::new();
+    let mut members = Vec::new();
+    for iv in intervals {
+        let exact = iv.knob_for(solution.target_ms);
+        // The knobs are integer milliseconds (plan §1.1.2: the write-back, not the
+        // estimator, is the precision bottleneck), so this rounds — and a value the
+        // rounding pushed outside the range is refused rather than silently clamped
+        // into a setting nobody solved for.
+        let rounded = exact.round();
+        if rounded < f64::from(iv.knob.min_ms) || rounded > f64::from(iv.knob.max_ms) {
+            let noun = iv.knob.polarity.noun();
+            return Err(Refusal::for_member(
+                RefusalKind::KnobRange,
+                &iv.node_name,
+                format!(
+                    "'{}' would need {rounded:.0} ms of {noun}, but its knob only accepts {}–{} ms",
+                    iv.node_name, iv.knob.min_ms, iv.knob.max_ms
+                ),
+            ));
+        }
+        let new_ms = rounded as u16;
+        if iv.knob.polarity == KnobPolarity::Advance {
+            proposed_advances.insert(iv.node_name.clone(), new_ms);
+            current_advances.insert(iv.node_name.clone(), iv.current_ms);
+        }
+        members.push(ProposedDelay {
+            is_reference: false, // filled in below, once every knob is known
+            node_name: iv.node_name.clone(),
+            kind: iv.kind,
+            arrival_ms: iv.arrival_ms,
+            current_delay_ms: iv.current_ms,
+            new_delay_ms: new_ms,
+            added_ms: i32::from(new_ms) - i32::from(iv.current_ms),
+            std_error_ms: std_errors.get(&iv.node_name).copied().unwrap_or(0.0),
+            drift_correction_ms: drift_correction(&iv.node_name),
+            polarity: iv.knob.polarity,
+            knob_min_ms: iv.knob.min_ms,
+            knob_max_ms: iv.knob.max_ms,
+            achievable_lo_ms: iv.lo_ms,
+            achievable_hi_ms: iv.hi_ms,
+            effect: iv.describe(new_ms),
+        });
+    }
+    // What the target choice minimised, as it will actually be written. Rounding is
+    // monotonic, so this can only differ from the exact optimum by the rounding.
+    let largest_knob_ms = members.iter().map(|m| m.new_delay_ms).max().unwrap_or(0);
+    debug_assert!((f64::from(largest_knob_ms) - solution.largest_knob_ms).abs() <= 0.5 + 1e-9);
+
+    // The member left with the smallest knob is the one the others were moved
+    // towards, and the arrival the post-write residual is measured against.
+    let reference = members
+        .iter()
+        .fold(None::<&ProposedDelay>, |acc, m| match acc {
+            Some(best) if best.new_delay_ms <= m.new_delay_ms => acc,
+            _ => Some(m),
+        })
+        .map(|m| m.node_name.clone())
+        .ok_or_else(|| Refusal::new(RefusalKind::Internal, "no members to solve"))?;
+    for m in &mut members {
+        m.is_reference = m.node_name == reference;
+    }
+    Ok(ProposedKnobs { members, reference, largest_knob_ms, current_advances, proposed_advances })
+}
+
+/// §9.2's other half: warn before a write lifts the group's send-ahead high-water
+/// mark, because that reconfigures every member's stream instead of reconnecting one
+/// device.
+///
+/// After §2.4.1 the quantity that lifts it is an **advance** — a sendspin device plays
+/// its static delay early, so the lead has to cover it — which is why this compares
+/// advances and not delays. And per §1.1.2's operational asymmetry the provisional
+/// delays never feed the mark at all, so for a chain this is the *first* time the mark
+/// is checked: before the write, not after.
+fn send_ahead_warning(ctx: &SendAheadContext, current: &HashMap<String, u16>, proposed: &HashMap<String, u16>) -> Option<Warning> {
+    let before = ctx.mark_ms(current);
+    let after = ctx.mark_ms(proposed);
+    (after > before).then(|| {
+        Warning::new(
+            WarningKind::SendAheadHighWater,
+            format!(
+                "these settings raise the group's send-ahead from {before} ms to {after} ms, which reconfigures the whole \
+                 group's stream — every speaker in it goes quiet for tens of seconds, not just the ones being changed. It is \
+                 the sendspin advances that do this: a device plays its static delay early, so the group's lead has to cover it"
+            ),
+        )
+    })
+}
+
 /// Everything [`solve`] needs. Pure data, so the whole §9 arithmetic is testable
 /// without a mic, a session or a runtime.
 pub struct SolveInput<'a> {
@@ -1991,18 +2475,9 @@ pub fn solve(input: &SolveInput<'_>) -> Result<Proposal, Refusal> {
             ));
         }
     }
-    if let Some(first) = input.observations.first() {
-        if input.observations.iter().any(|o| o.grid_epoch != first.grid_epoch) {
-            return Err(Refusal::new(
-                RefusalKind::MicReconnected,
-                "the microphone capture restarted during the measurement, so the phases come from two different timing \
-                 references and cannot be compared",
-            ));
-        }
-    }
-
     let mut warnings = Vec::new();
-    let fit = fit_drift(input.observations, pattern_ms, |o| o.m.phase_a_ms);
+    let arrivals = arrivals_of(input.observations, &order, &input.timing)?;
+    let (fit, spread_ms) = (&arrivals.fit, arrivals.spread_ms);
     if !fit.fitted {
         warnings.push(Warning::new(
             WarningKind::NoDriftFit,
@@ -2010,148 +2485,19 @@ pub fn solve(input: &SolveInput<'_>) -> Result<Proposal, Refusal> {
              correction was applied",
         ));
     }
-    // The origin the reported per-member drift corrections are quoted against: the
-    // earliest reading in the run. A common shift cancels in every difference the
-    // solve consumes, so the choice is presentational — but it has to be *stated*,
-    // because "0.4 ms of drift" means nothing without saying since when.
-    let drift_origin = input.observations.iter().map(|o| o.period_centre).fold(f64::INFINITY, f64::min);
-    let drift_correction = |name: &str| -> f64 {
-        let mut n = 0.0;
-        let mut sum = 0.0;
-        for o in input.observations.iter().filter(|o| o.node_name == name) {
-            sum += o.period_centre - drift_origin;
-            n += 1.0;
-        }
-        if n == 0.0 {
-            0.0
-        } else {
-            fit.slope_ms_per_period * (sum / n)
-        }
-    };
-
-    // Where each member's sound *arrived*, earliest at 0.
-    let arrivals = linearise(&fit.offsets, &order, pattern_ms);
-    let spread_ms = arrivals.iter().map(|(_, d)| *d).fold(0.0, f64::max);
-    if spread_ms > pattern_ms * MAX_TRUSTED_SPREAD_FRACTION {
-        return Err(Refusal::new(
-            RefusalKind::AmbiguousSpread,
-            format!(
-                "the members' arrivals span {spread_ms:.0} ms, which is too close to half the 2 s test pattern \
-                 ({:.0} ms) to be told apart from its own wrap-around — align this group roughly by ear first, then \
-                 measure again",
-                pattern_ms / 2.0
-            ),
-        ));
-    }
 
     // §2.4.2: model each member's knob as a polarity plus a range, intersect the
     // achievable arrivals, and take the target that minimises the largest knob.
     // There is no reference member to pick — which member ends at knob zero falls
     // out of the arithmetic (see [`choose_target`]).
-    let kinds: HashMap<&str, MemberKind> = input.members.iter().map(|m| (m.node_name.as_str(), m.kind)).collect();
-    let intervals: Vec<MemberInterval> = arrivals
-        .iter()
-        .map(|(name, arrival)| {
-            MemberInterval::new(
-                name.clone(),
-                kinds.get(name.as_str()).copied().unwrap_or(MemberKind::Sendspin),
-                input.current_delays.get(name).copied().unwrap_or(0),
-                *arrival,
-            )
-        })
-        .collect();
+    let intervals = intervals_for(&arrivals.linear, input.members, input.current_delays);
     let solution = choose_target(&intervals)?;
 
-    let std_errors: HashMap<&str, f64> = {
-        let mut m: HashMap<&str, f64> = HashMap::new();
-        for o in input.observations {
-            let e = m.entry(o.node_name.as_str()).or_insert(0.0);
-            *e = e.max(o.m.std_error_ms);
-        }
-        m
-    };
-
-    // Only the advances feed the group's send-ahead lead (see `SendAheadContext`).
-    let mut proposed_advances: HashMap<String, u16> = HashMap::new();
-    let mut current_advances: HashMap<String, u16> = HashMap::new();
-    let mut members = Vec::new();
-    for iv in &intervals {
-        let exact = iv.knob_for(solution.target_ms);
-        // The knobs are integer milliseconds (plan §1.1.2: the write-back, not the
-        // estimator, is the precision bottleneck), so this rounds — and a value the
-        // rounding pushed outside the range is refused rather than silently clamped
-        // into a setting nobody solved for.
-        let rounded = exact.round();
-        if rounded < f64::from(iv.knob.min_ms) || rounded > f64::from(iv.knob.max_ms) {
-            let noun = iv.knob.polarity.noun();
-            return Err(Refusal::for_member(
-                RefusalKind::KnobRange,
-                &iv.node_name,
-                format!(
-                    "'{}' would need {rounded:.0} ms of {noun}, but its knob only accepts {}–{} ms",
-                    iv.node_name, iv.knob.min_ms, iv.knob.max_ms
-                ),
-            ));
-        }
-        let new_ms = rounded as u16;
-        if iv.knob.polarity == KnobPolarity::Advance {
-            proposed_advances.insert(iv.node_name.clone(), new_ms);
-            current_advances.insert(iv.node_name.clone(), iv.current_ms);
-        }
-        members.push(ProposedDelay {
-            is_reference: false, // filled in below, once every knob is known
-            node_name: iv.node_name.clone(),
-            kind: iv.kind,
-            arrival_ms: iv.arrival_ms,
-            current_delay_ms: iv.current_ms,
-            new_delay_ms: new_ms,
-            added_ms: i32::from(new_ms) - i32::from(iv.current_ms),
-            std_error_ms: std_errors.get(iv.node_name.as_str()).copied().unwrap_or(0.0),
-            drift_correction_ms: drift_correction(&iv.node_name),
-            polarity: iv.knob.polarity,
-            knob_min_ms: iv.knob.min_ms,
-            knob_max_ms: iv.knob.max_ms,
-            achievable_lo_ms: iv.lo_ms,
-            achievable_hi_ms: iv.hi_ms,
-            effect: iv.describe(new_ms),
-        });
-    }
-    // What the target choice minimised, as it will actually be written. Rounding is
-    // monotonic, so this can only differ from the exact optimum by the rounding.
-    let largest_knob_ms = members.iter().map(|m| m.new_delay_ms).max().unwrap_or(0);
-    debug_assert!((f64::from(largest_knob_ms) - solution.largest_knob_ms).abs() <= 0.5 + 1e-9);
-
-    // The member left with the smallest knob is the one the others were moved
-    // towards, and the arrival the post-write residual is measured against.
-    let reference = members
-        .iter()
-        .fold(None::<&ProposedDelay>, |acc, m| match acc {
-            Some(best) if best.new_delay_ms <= m.new_delay_ms => acc,
-            _ => Some(m),
-        })
-        .map(|m| m.node_name.clone())
-        .ok_or_else(|| Refusal::new(RefusalKind::Internal, "no members to solve"))?;
-    for m in &mut members {
-        m.is_reference = m.node_name == reference;
-    }
-
-    // §9.2's other half: warn before a write lifts the group's send-ahead
-    // high-water mark, because that reconfigures every member's stream instead of
-    // reconnecting one device. After §2.4.1 the quantity that lifts it is an
-    // **advance** — a sendspin device plays its static delay early, so the lead has
-    // to cover it — which is why this compares advances and not delays.
-    let before = input.send_ahead.mark_ms(&current_advances);
-    let after = input.send_ahead.mark_ms(&proposed_advances);
-    if after > before {
-        warnings.push(Warning::new(
-            WarningKind::SendAheadHighWater,
-            format!(
-                "these settings raise the group's send-ahead from {before} ms to {after} ms, which reconfigures the whole \
-                 group's stream — every speaker in it goes quiet for tens of seconds, not just the ones being changed. It is \
-                 the sendspin advances that do this: a device plays its static delay early, so the group's lead has to cover it"
-            ),
-        ));
-    }
+    let knobs = propose_knobs(&intervals, &solution, &worst_std_errors(input.observations), &|name| {
+        arrivals.drift_correction(input.observations, name)
+    })?;
+    let ProposedKnobs { members, reference, largest_knob_ms, current_advances, proposed_advances } = knobs;
+    warnings.extend(send_ahead_warning(input.send_ahead, &current_advances, &proposed_advances));
 
     let checks = Checks {
         transitivity: transitivity(input.observations, &input.timing, TRANSITIVITY_TOL_MS),
@@ -2161,7 +2507,7 @@ pub fn solve(input: &SolveInput<'_>) -> Result<Proposal, Refusal> {
         // [`Checks::repeatability`].
         repeatability: match input.closure {
             Some(_) => None,
-            None => repeatability(input.observations, &fit, pattern_ms, REPEATABILITY_TOL_MS),
+            None => repeatability(input.observations, fit, pattern_ms, REPEATABILITY_TOL_MS),
         },
         merged_peak: MergedPeakCheck::seam(),
         closure: input.closure.clone(),
@@ -2228,6 +2574,411 @@ pub fn solve(input: &SolveInput<'_>) -> Result<Proposal, Refusal> {
         checks,
         warnings,
         blocked,
+    })
+}
+
+// ------------------------------------------- the chain's arithmetic (plan §1.1)
+
+/// One position of a chain, as the arithmetic sees it. Pure data: the whole of §1.1's
+/// algebra is testable without a mic, a session, a relay or a runtime.
+pub struct ChainStepInput<'a> {
+    /// Every already-aligned member with the **provisional** delay it is carrying, ms.
+    /// Empty for the first position.
+    pub aligned: &'a HashMap<String, f64>,
+    /// This position's arrivals, earliest at 0, from [`arrivals_of`] — the step's new
+    /// members *and* its overlaps, all measured in this one capture.
+    pub arrivals: &'a [(String, f64)],
+    /// Which of [`Self::arrivals`] are overlaps. Must be a subset of
+    /// [`Self::aligned`], and must be non-empty for every position after the first.
+    pub overlaps: &'a [String],
+    pub tolerance_ms: f64,
+}
+
+/// What one position decided.
+#[derive(Debug, Clone)]
+pub struct ChainSolution {
+    /// The arrival this position was aligned at, on this step's own scale: the
+    /// **latest** of the step's members and the aligned set's anchor.
+    pub target_ms: f64,
+    /// Where the already-aligned set is judged to arrive here (the mean of the overlap
+    /// readings). `None` for the first position.
+    pub anchor_ms: Option<f64>,
+    /// The common delay every member of the already-aligned set must gain.
+    pub delta_ms: f64,
+    /// The new provisional delay for every member this step touches: the step's new
+    /// members, plus — when `delta_ms > 0` — every member of the aligned set.
+    pub provisional: HashMap<String, f64>,
+    pub overlaps: Vec<ChainOverlap>,
+    pub disagreement_ms: Option<f64>,
+    pub worst_pair: Option<(String, String)>,
+    pub confidence: OverlapConfidence,
+    /// Half the disagreement: how far this joint's common shift can be out.
+    pub joint_error_ms: Option<f64>,
+    /// The sentence describing what this step did, including its confidence.
+    pub note: String,
+}
+
+/// Plan §1.1's algebra, in one function.
+///
+/// **The target is the latest arrival among the step's members**, where "the aligned
+/// set" counts as one member arriving at the mean of its overlaps. Each new member is
+/// then delayed to that target. If a *new* member arrives later than the aligned set
+/// does, the aligned set has to gain Δ — and because **a common delay added to an
+/// already-aligned set preserves that set's internal alignment**, Δ goes to *every*
+/// member of it, not just to the overlap that was measured. That is the trick the whole
+/// feature rests on, and it is the reason the chain can only ever *add* (hence §1.1's
+/// ratcheting floor, and hence the global renormalisation in [`solve_chain`]).
+///
+/// **Why the anchor is the mean of two overlaps rather than one reading.** Two overlaps
+/// will not read the same here — they were aligned at the *previous* position and their
+/// paths differ at this one (see [`OVERLAP_AGREEMENT_TOL_MS`]) — so where the aligned
+/// set "arrives" at this position is ambiguous by their disagreement. The mean is the
+/// choice that minimises the worst error, and half the disagreement is reported as this
+/// joint's error rather than being rounded to zero.
+///
+/// **Why disagreement refuses instead of warning.** The shift derived here is applied as
+/// a common delay to the entire already-aligned set *and* anchors every position
+/// measured afterwards. A §5.6 reflection bias on it therefore propagates to the whole
+/// apartment with nothing downstream able to see it. With one overlap there is no
+/// redundancy at all at exactly that point; with two there is, and spending it on a
+/// warning nobody reads would be the same as not having it.
+pub fn chain_step(input: &ChainStepInput<'_>) -> Result<ChainSolution, Refusal> {
+    let arrival_of = |n: &str| input.arrivals.iter().find(|(m, _)| m == n).map(|(_, v)| *v);
+    let new_members: Vec<(String, f64)> = input.arrivals.iter().filter(|(n, _)| !input.overlaps.iter().any(|o| o == n)).cloned().collect();
+    if new_members.is_empty() {
+        return Err(Refusal::new(
+            RefusalKind::ChainOutOfOrder,
+            "this position named no speakers that are not already aligned, so there is nothing for it to align",
+        ));
+    }
+
+    let mut overlaps = Vec::new();
+    for o in input.overlaps {
+        let Some(arrival_ms) = arrival_of(o) else {
+            return Err(Refusal::for_member(
+                RefusalKind::Internal,
+                o,
+                format!("the overlap '{o}' was not measured at this position, so this step cannot be linked to the aligned set"),
+            ));
+        };
+        let Some(applied_ms) = input.aligned.get(o).copied() else {
+            return Err(Refusal::for_member(
+                RefusalKind::ChainOutOfOrder,
+                o,
+                format!("'{o}' was offered as an overlap but has not been aligned at an earlier position, so it links to nothing"),
+            ));
+        };
+        overlaps.push(ChainOverlap { node_name: o.clone(), arrival_ms, applied_ms });
+    }
+
+    // The first position defines the chain's reference; every later one has to be tied
+    // to it, and the only thing that can tie it is a speaker measured in both places.
+    if overlaps.is_empty() && !input.aligned.is_empty() {
+        return Err(Refusal::new(
+            RefusalKind::OverlapMissing,
+            format!(
+                "this position named no overlap, so nothing relates it to the {} speaker(s) already aligned — the two sets would each \
+                 be internally aligned and mutually meaningless. Name one or two speakers you can hear from *both* places (two is what \
+                 lets the step be checked, one is accepted but cannot be), or align this position in a separate run.",
+                input.aligned.len()
+            ),
+        ));
+    }
+
+    // The overlaps' worst pairwise disagreement: an independent estimate of this
+    // joint's error, and the only check the chain has at its most dangerous point.
+    let mut disagreement_ms = None;
+    let mut worst_pair = None;
+    for (i, a) in overlaps.iter().enumerate() {
+        for b in overlaps.iter().skip(i + 1) {
+            let d = (a.arrival_ms - b.arrival_ms).abs();
+            if disagreement_ms.is_none_or(|w| d > w) {
+                disagreement_ms = Some(d);
+                worst_pair = Some((a.node_name.clone(), b.node_name.clone()));
+            }
+        }
+    }
+    if let (Some(d), Some((a, b))) = (disagreement_ms, worst_pair.clone()) {
+        if d > input.tolerance_ms {
+            return Err(Refusal::for_member(
+                RefusalKind::OverlapDisagreement,
+                &a,
+                format!(
+                    "'{a}' and '{b}' are both already aligned, so from here they should still read as a plausible pair — but they arrive \
+                     {d:.1} ms apart at this position, and the limit is {:.0} ms. Two overlaps are *not* expected to read identically: \
+                     they were aligned at the previous position, and from this one their paths differ, so a few ms is normal and is \
+                     exactly what the limit allows for. {d:.1} ms is more than the geometry of one room explains, so one of the two \
+                     readings is wrong — an early reflection the microphone locked onto, an overlap that was not really aligned, or a \
+                     speaker that has been moved. This step's shift would be applied to *every* speaker aligned so far, so a wrong \
+                     reading here moves the whole apartment: nothing was changed. Pick overlaps you can hear clearly from where you are, \
+                     keep the phone away from walls, and measure this position again.",
+                    input.tolerance_ms
+                ),
+            ));
+        }
+    }
+
+    let anchor_ms = match overlaps.is_empty() {
+        true => None,
+        false => Some(overlaps.iter().map(|o| o.arrival_ms).sum::<f64>() / overlaps.len() as f64),
+    };
+    // Target = the latest arrival among the step's members, the aligned set included.
+    let latest_new = new_members.iter().map(|(_, a)| *a).fold(f64::NEG_INFINITY, f64::max);
+    let target_ms = anchor_ms.map_or(latest_new, |a| a.max(latest_new));
+    let delta_ms = anchor_ms.map_or(0.0, |a| (target_ms - a).max(0.0));
+
+    let mut provisional: HashMap<String, f64> = HashMap::new();
+    for (name, arrival) in &new_members {
+        // ≥ 0 by construction: `target_ms` is at least the latest new arrival, and the
+        // relay can only delay (plan §1.1.1 — the chain never needs to advance).
+        provisional.insert(name.clone(), (target_ms - arrival).max(0.0));
+    }
+    if delta_ms > 0.0 {
+        // The whole aligned set, not just the overlap that was measured.
+        for (name, applied) in input.aligned {
+            provisional.insert(name.clone(), applied + delta_ms);
+        }
+    }
+
+    let confidence = match overlaps.len() {
+        0 => OverlapConfidence::Origin,
+        1 => OverlapConfidence::Single,
+        _ => OverlapConfidence::Checked,
+    };
+    let joint_error_ms = disagreement_ms.map(|d| d / 2.0);
+    let note = chain_note(&overlaps, confidence, disagreement_ms, delta_ms, input.aligned.len());
+    Ok(ChainSolution {
+        target_ms,
+        anchor_ms,
+        delta_ms,
+        provisional,
+        overlaps,
+        disagreement_ms,
+        worst_pair,
+        confidence,
+        joint_error_ms,
+        note,
+    })
+}
+
+/// One sentence saying what a step did and how well it could be checked.
+fn chain_note(
+    overlaps: &[ChainOverlap],
+    confidence: OverlapConfidence,
+    disagreement_ms: Option<f64>,
+    delta_ms: f64,
+    aligned: usize,
+) -> String {
+    let names: Vec<&str> = overlaps.iter().map(|o| o.node_name.as_str()).collect();
+    let shift = match delta_ms > 0.005 {
+        true => format!(
+            "A speaker at this position arrives later than the set aligned so far, so all {aligned} of those speakers gained {delta_ms:.1} \
+             ms — a common delay, which is why their alignment with each other survives it. "
+        ),
+        false => format!("The set aligned so far already arrives last here, so none of its {aligned} speakers had to move. "),
+    };
+    match confidence {
+        OverlapConfidence::Origin => "the first position: these speakers define the chain's reference, and there is nothing yet for them \
+             to be checked against."
+            .to_string(),
+        OverlapConfidence::Single => format!(
+            "{shift}Linked through the single overlap '{}'. That one reading is what places this position against everything already \
+             aligned, and with only one overlap nothing checks it — this joint is the weakest in the chain.",
+            names.first().copied().unwrap_or_default()
+        ),
+        OverlapConfidence::Checked => format!(
+            "{shift}Linked through {} overlaps ({}), which disagree by {:.1} ms here — expected, since they were aligned at the previous \
+             position and their paths differ at this one. Half of that, {:.1} ms, is this joint's own error.",
+            names.len(),
+            names.join(", "),
+            disagreement_ms.unwrap_or(0.0),
+            disagreement_ms.unwrap_or(0.0) / 2.0
+        ),
+    }
+}
+
+/// What the chain's accumulated error can honestly be said to be (plan §1.1).
+///
+/// The joints are the *only* thing that is measurable here: each step's two overlaps
+/// bound how far its common shift can be out, and those shifts compose, so the worst
+/// case is their sum. One single-overlap step anywhere in the chain removes the bound
+/// entirely — that joint has no independent estimate at all — and the honest answer is
+/// then no total rather than a total with a hole in it.
+///
+/// What no arrangement of this bounds is the per-speaker bias of §5.6, which is why the
+/// message says so instead of letting a small number read as an accuracy claim.
+pub fn chain_error(steps: &[ChainStep]) -> ChainError {
+    let joints: Vec<&ChainStep> = steps.iter().filter(|s| s.confidence != OverlapConfidence::Origin).collect();
+    let unchecked: Vec<String> = joints
+        .iter()
+        .filter(|s| s.confidence == OverlapConfidence::Single)
+        .map(|s| format!("position {} ('{}')", s.index, s.overlaps.first().map(|o| o.node_name.as_str()).unwrap_or("?")))
+        .collect();
+    if !unchecked.is_empty() {
+        return ChainError {
+            bounded: false,
+            joint_ms: None,
+            message: format!(
+                "the chain's accumulated error cannot be bounded: {} was linked through a single overlap, so that joint has no \
+                 independent error estimate — nothing here can say how far its common shift is out, and every position aligned after it \
+                 inherits the same unknown. No total is given, because a total that quietly left out the one joint it could not measure \
+                 would be worse than none.",
+                unchecked.join(" and ")
+            ),
+        };
+    }
+    if joints.is_empty() {
+        return ChainError {
+            bounded: true,
+            joint_ms: Some(0.0),
+            message: "one position, so there are no joints between positions to accumulate error across. What is left is the ordinary \
+                      single-position result: aligned at the spot it was measured from."
+                .to_string(),
+        };
+    }
+    let total: f64 = joints.iter().filter_map(|s| s.joint_error_ms).sum();
+    let each: Vec<String> = joints.iter().map(|s| format!("position {}: {:.1} ms", s.index, s.joint_error_ms.unwrap_or(0.0))).collect();
+    ChainError {
+        bounded: true,
+        joint_ms: Some(total),
+        message: format!(
+            "every joint was checked by two overlaps, and their disagreements bound how far each joint's common shift can be out ({}). \
+             Composed, the worst these joints can be wrong by is {total:.1} ms — that is the error *between* regions, i.e. how far a \
+             speaker aligned at one position can be out relative to one aligned at another. It says nothing about per-speaker bias: an \
+             early reflection inside the analysis window (plan §5.6) biases a speaker by 1–2 ms while every check in this design still \
+             passes, and that is not included here because nothing here can measure it.",
+            each.join("; ")
+        ),
+    }
+}
+
+/// The chain's final solve: renormalise globally, then write once (plan §1.1, §2.4.2).
+pub struct ChainSolveInput<'a> {
+    pub timing: Timing,
+    /// Every held member — the chain must have aligned all of them.
+    pub members: &'a [SessionMember],
+    /// Each member's provisional delay at the end of the chain, ms.
+    pub provisional: &'a HashMap<String, f64>,
+    pub current_delays: &'a HashMap<String, u16>,
+    pub send_ahead: &'a SendAheadContext,
+    /// The positions, in order — for the aggregate checks and the error statement.
+    pub steps: &'a [ChainStep],
+    /// Every reading the chain took, for the per-member standard errors.
+    pub observations: &'a [MemberObservation],
+}
+
+/// Turn the finished chain into the single write (plan §1.1's "renormalise globally at
+/// the end", through §2.4.2's solver).
+///
+/// **Why the renormalisation is the interval solver and not a subtraction.** §1.1 says
+/// "subtract the global minimum from every speaker", and that is right for a set of pure
+/// delays — but the *knobs* are not pure delays: a sendspin knob is an advance (§2.4.1),
+/// so with mixed polarities "the minimum" is not a delay anyone can subtract, and the
+/// free common shift has to be chosen inside the intersection of what every member's
+/// knob can reach. That is exactly [`choose_target`]'s job, so this hands the chain to
+/// it rather than reimplementing normalisation beside it.
+///
+/// **The one line that makes that possible.** A member the chain gave `pᵢ` of provisional
+/// delay to must, after the write, arrive `pᵢ` later than it did at chain start. The
+/// chain aligned them, so they all arrive *together* afterwards — which means at chain
+/// start they arrived at `max(p) − pᵢ`. Feeding that as the "measured arrival" makes the
+/// solver's own target the free common shift: `knobᵢ(T) = dᵢ + pᵢ + (T − max p)` for a
+/// delay and `aᵢ − pᵢ − (T − max p)` for an advance, so picking `T` *is* renormalising,
+/// and it picks the one that keeps the largest knob smallest (§9.2). A sendspin-only
+/// chain therefore still lands on its earliest member with advance 0.
+///
+/// The arrivals are **not** acoustic here and the field says so: they are the chain's
+/// own bookkeeping, and the last position's overlaps are the only place a single capture
+/// ever saw two regions at once.
+pub fn solve_chain(input: &ChainSolveInput<'_>) -> Result<Proposal, Refusal> {
+    for m in input.members {
+        if !input.provisional.contains_key(&m.node_name) {
+            return Err(Refusal::for_member(
+                RefusalKind::ChainOutOfOrder,
+                &m.node_name,
+                format!("'{}' was not aligned at any position, so the chain cannot be written", m.node_name),
+            ));
+        }
+    }
+    let floor = input.provisional.values().copied().fold(f64::INFINITY, f64::min);
+    let ceiling = input.provisional.values().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !floor.is_finite() || !ceiling.is_finite() {
+        return Err(Refusal::new(RefusalKind::Internal, "the chain aligned no speakers, so there is nothing to write"));
+    }
+    // "Arrival at chain start" per the doc comment above: the member that needed the
+    // most provisional delay is the one that arrived earliest.
+    let arrivals: Vec<(String, f64)> = input
+        .members
+        .iter()
+        .map(|m| (m.node_name.clone(), ceiling - input.provisional.get(&m.node_name).copied().unwrap_or(0.0)))
+        .collect();
+    let intervals = intervals_for(&arrivals, input.members, input.current_delays);
+    let solution = choose_target(&intervals)?;
+    let std_errors = worst_std_errors(input.observations);
+    let knobs = propose_knobs(&intervals, &solution, &std_errors, &|_| 0.0)?;
+    let ProposedKnobs { members, reference, largest_knob_ms, current_advances, proposed_advances } = knobs;
+
+    let mut warnings = Vec::new();
+    // §1.1.2's operational asymmetry: the provisional delays never feed
+    // `required_send_ahead_us`, so the walk cannot feel the mark approaching. This is
+    // the first and only time the chain can check it — before the write, not after.
+    warnings.extend(send_ahead_warning(input.send_ahead, &current_advances, &proposed_advances));
+    if let Some(one) = input.steps.iter().find(|s| s.confidence == OverlapConfidence::Single) {
+        warnings.push(Warning::new(
+            WarningKind::OneOverlap,
+            format!(
+                "position {} is linked to the rest of the chain through the single overlap '{}'. That one reading was applied as a common \
+                 shift to every speaker aligned before it and anchors everything aligned after it, and with one overlap there is nothing \
+                 to check it against — a reflection biasing it (plan §5.6) would move the whole chain with no check here noticing. Where \
+                 the room allows it, use two shared speakers.",
+                one.index,
+                one.overlaps.first().map(|o| o.node_name.as_str()).unwrap_or("?")
+            ),
+        ));
+    }
+    warnings.push(Warning::new(WarningKind::ChainScope, CHAIN_SCOPE_NOTE));
+
+    // The aggregate checks are the **worst** any position produced, not a re-derivation
+    // across positions: the arrivals of two positions are not comparable (that is the
+    // premise of the whole mode), so there is no cross-position triangle to close. Every
+    // step already blocked on its own checks, so these are reporting, not gating.
+    let checks = Checks {
+        transitivity: input
+            .steps
+            .iter()
+            .map(|s| s.checks.transitivity.clone())
+            .fold(None::<TransitivityCheck>, |acc, t| match acc {
+                Some(w) if w.worst_ms >= t.worst_ms => Some(w),
+                _ => Some(t),
+            })
+            .unwrap_or_else(|| transitivity(&[], &input.timing, TRANSITIVITY_TOL_MS)),
+        repeatability: input.steps.iter().filter_map(|s| s.checks.repeatability.clone()).fold(
+            None::<RepeatabilityCheck>,
+            |acc, r| match acc {
+                Some(w) if w.worst_ms >= r.worst_ms => Some(w),
+                _ => Some(r),
+            },
+        ),
+        merged_peak: MergedPeakCheck::seam(),
+        closure: None,
+    };
+    Ok(Proposal {
+        reference,
+        pattern_ms: input.timing.pattern_ms,
+        // The ratchet §1.1 warns about, and what the renormalisation removed: how much
+        // delay the chain accumulated from its floor, not an acoustic spread.
+        spread_ms: ceiling - floor,
+        // Per position, so there is no single figure; the largest is the honest one to
+        // put on a summary, and every step carries its own.
+        drift_ppm: input.steps.iter().map(|s| s.drift_ppm).fold(0.0, |a, b| if b.abs() > a.abs() { b } else { a }),
+        target_ms: solution.target_ms,
+        feasible_lo_ms: solution.lo_ms,
+        feasible_hi_ms: solution.hi_ms,
+        largest_knob_ms,
+        members,
+        checks,
+        warnings,
+        blocked: None,
     })
 }
 
@@ -2482,16 +3233,25 @@ fn learn_levels(session_level: u8, members: &[SessionMember]) -> LevelSeam {
     }
 }
 
-/// What the user's "I am at this speaker" / "I am back at the first one" calls turn
-/// into. The daemon cannot see where the phone is — auto-detecting the nearest
-/// speaker would need per-speaker excitation (W7), which does not exist — so the walk
-/// is driven by these and by nothing else.
+/// What the user's "I am here now" calls turn into — the one channel both
+/// user-driven acquisitions are parked on.
+///
+/// The daemon cannot see where the phone is (auto-detecting the nearest speaker would
+/// need per-speaker excitation, which is W7 and does not exist), so both a near-field
+/// walk and a multi-position chain are driven by these and by nothing else. One channel
+/// rather than two, so the "validate under the state lock, then mark busy" rule that
+/// makes a double-tap impossible exists once.
 #[derive(Debug, Clone)]
-enum WalkCommand {
-    /// Solo this speaker at this level, gate, and take its reading.
+enum RunCommand {
+    /// Near field: solo this speaker at this level, gate, and take its reading.
     Arrival { node_name: String, level: Option<u8> },
-    /// Take the closure reading at the walk's first speaker.
+    /// Near field: take the closure reading at the walk's first speaker.
     Close,
+    /// Chaining: measure this position — these speakers, linked to the already-aligned
+    /// set through these overlaps (plan §1.1).
+    Position { members: Vec<String>, overlaps: Vec<String> },
+    /// Chaining: every held speaker is aligned; renormalise globally and propose.
+    Finish,
 }
 
 /// Why a member's measurement stopped short.
@@ -2505,6 +3265,11 @@ enum StepError {
 struct Inner {
     phase: Phase,
     mode: Mode,
+    /// The run is a chain (plan §1.1): it takes [`MeasureManager::position`] calls, and
+    /// `apply` reads this rather than trusting the request, for the same reason it reads
+    /// [`Self::mode`] — how the arrivals were acquired decides how the write can be
+    /// checked.
+    chained: bool,
     sources: Vec<String>,
     sample_rate: u32,
     message: String,
@@ -2518,11 +3283,24 @@ struct Inner {
     /// Near field only (see [`WalkProgress`]). Kept after the run ends so the closure
     /// numbers stay next to the verdict.
     walk: Option<WalkProgress>,
-    /// Where [`MeasureManager::arrival`] and [`MeasureManager::close`] post to. Owned
-    /// by the state rather than by the run task so the *validation* happens under this
-    /// lock — which is what makes a double-tap on "I'm here" impossible rather than
-    /// merely unlikely.
-    walk_tx: Option<tokio::sync::mpsc::UnboundedSender<WalkCommand>>,
+    /// Chained multi-position only (see [`ChainProgress`]). Kept after the run ends so
+    /// the per-position numbers stay next to the verdict.
+    chain: Option<ChainProgress>,
+    /// Where [`MeasureManager::arrival`], [`MeasureManager::close`],
+    /// [`MeasureManager::position`] and [`MeasureManager::finish`] post to. Owned by the
+    /// state rather than by the run task so the *validation* happens under this lock —
+    /// which is what makes a double-tap on "I'm here" impossible rather than merely
+    /// unlikely.
+    cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<RunCommand>>,
+    /// The provisional delay line, and what this run currently has applied to it, ms
+    /// (plan §1.1.1).
+    ///
+    /// On the state rather than only in the run task because **`abandon` has to be able
+    /// to put them back too**: nothing is persisted, but a line left applied keeps
+    /// shifting that speaker's audio for as long as the daemon runs, and a closed tab
+    /// must not be able to leave one behind.
+    relay: Option<Arc<dyn RelayControl>>,
+    provisional: HashMap<String, f64>,
     /// §9.4: every member's delay at session start, for one-click revert.
     snapshot: HashMap<String, (MemberKind, u16)>,
     /// Members whose delay this session actually wrote — and therefore the only
@@ -2553,6 +3331,7 @@ impl Inner {
         Self {
             phase: Phase::Idle,
             mode: Mode::SweetSpot,
+            chained: false,
             sources: Vec::new(),
             sample_rate: 0,
             message: "no measurement has been started".to_string(),
@@ -2564,7 +3343,10 @@ impl Inner {
             warnings: Vec::new(),
             gate: None,
             walk: None,
-            walk_tx: None,
+            chain: None,
+            cmd_tx: None,
+            relay: None,
+            provisional: HashMap::new(),
             snapshot: HashMap::new(),
             written: Vec::new(),
             revert_sources: Vec::new(),
@@ -2597,6 +3379,7 @@ impl Inner {
             warnings: self.warnings.clone(),
             gate: self.gate.clone(),
             walk: self.walk.clone(),
+            chain: self.chain.clone(),
             can_apply: self.phase == Phase::Proposed && self.proposal.as_ref().is_some_and(|p| p.blocked.is_none()),
             can_revert: !self.written.is_empty(),
             revert_scope: (!self.written.is_empty()).then(|| self.revert_sources.clone()),
@@ -2629,6 +3412,24 @@ impl Inner {
             self.written.push(node_name.to_string());
         }
         self.bump();
+    }
+
+    /// Drop every provisional delay this run has applied (plan §1.1.1: nothing is
+    /// persisted, but a live line keeps shifting audio for as long as the daemon runs).
+    ///
+    /// Idempotent, infallible and safe to call from anywhere — it is the teardown, and
+    /// the one thing a chain owes the user back whatever else happened.
+    fn clear_provisional(&mut self) -> usize {
+        let applied = std::mem::take(&mut self.provisional);
+        if let Some(relay) = self.relay.clone() {
+            for name in applied.keys() {
+                relay.clear(name);
+            }
+        }
+        if let Some(c) = self.chain.as_mut() {
+            c.provisional.clear();
+        }
+        applied.len()
     }
 }
 
@@ -2663,19 +3464,21 @@ impl MeasureManager {
     /// Refuses up front on everything that can be known without playing anything: no
     /// alignment session, too few members, no microphone.
     ///
-    /// **Both modes start here**, and what differs afterwards is who steps the member
-    /// list: a multi-position run does it itself, twice; a near-field run parks in
-    /// [`Phase::Walking`] and waits for [`Self::arrival`] once per speaker, then
-    /// [`Self::close`] (plan §1, §12.2).
+    /// **Every mode starts here**, and what differs afterwards is who steps the member
+    /// list: a single-position run does it itself, twice; a **chained** run parks in
+    /// [`Phase::Positioning`] and waits for [`Self::position`] once per listening spot,
+    /// then [`Self::finish`]; a near-field run parks in [`Phase::Walking`] and waits for
+    /// [`Self::arrival`] once per speaker, then [`Self::close`] (plan §1, §1.1, §12.2).
     pub async fn start(&self, deps: MeasureDeps) -> Result<MeasureStatus, Refusal> {
         if !deps.link_to.is_empty() {
             return Err(Refusal::new(
                 RefusalKind::ModeUnsupported,
                 format!(
-                    "this run cannot be linked to speakers aligned earlier ({}). Making two runs coherent means propagating a \
-                     common shift into the set that was already aligned, and that machinery does not exist yet — so a run's \
-                     result is coherent within itself and unrelated to any earlier one, even where the two share a speaker. \
-                     Align everything that has to sound coherent in one run.",
+                    "this run cannot be linked to speakers aligned in an earlier *run* ({}). Chaining positions inside one run \
+                     exists — start with `chain: true` and post a position per listening spot — but nothing stores a finished run's \
+                     aligned set together with the delays it applied, so there is nothing for a new run to propagate a shift into. \
+                     A run's result is therefore coherent within itself and unrelated to any earlier one, even where the two share a \
+                     speaker: align everything that has to sound coherent in one run.",
                     deps.link_to.join(", ")
                 ),
             ));
@@ -2715,10 +3518,12 @@ impl MeasureManager {
             .map(|m| (m.node_name.clone(), (m.kind, deps.current_delays.get(&m.node_name).copied().unwrap_or(0))))
             .collect();
         let cancel = Arc::new(AtomicBool::new(false));
-        // Near field needs a way for the user to say where they are. Unbounded because
-        // every send is gated by the state check in `arrival`/`close`, so at most one
-        // command is ever in flight.
-        let (walk_tx, walk_rx) = match deps.mode.is_walk() {
+        // Both user-driven acquisitions need a way for the user to say where they are:
+        // near field per speaker, a chain per position. Unbounded because every send is
+        // gated by the state check in `arrival`/`close`/`position`/`finish`, so at most
+        // one command is ever in flight.
+        let chained = deps.chained && !deps.mode.is_walk();
+        let (cmd_tx, cmd_rx) = match deps.mode.is_walk() || chained {
             true => {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 (Some(tx), Some(rx))
@@ -2730,9 +3535,13 @@ impl MeasureManager {
             // The notifier outlives the state it reports on, so an open `measure_ws`
             // sees the new run rather than being silently disconnected.
             *inner = Inner::idle_watching(inner.changes.clone());
-            inner.walk_tx = walk_tx;
+            inner.cmd_tx = cmd_tx;
             inner.phase = Phase::Arming;
             inner.mode = deps.mode;
+            inner.chained = chained;
+            // Held from the start, so `abandon` can drop a provisional delay even if the
+            // run task is wedged between two positions (plan §1.1.1).
+            inner.relay = Some(deps.relay.clone());
             inner.sources = session.sources.clone();
             inner.sample_rate = mic.sample_rate;
             inner.message = "arming: checking the session, the capture and the loop-phase lock".to_string();
@@ -2758,7 +3567,7 @@ impl MeasureManager {
         };
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let outcome = run_measure(&deps, &inner, &cancel, walk_rx).await;
+            let outcome = run_measure(&deps, &inner, &cancel, cmd_rx).await;
             finish(&inner, &cancel, outcome);
         });
         Ok(status)
@@ -2795,6 +3604,187 @@ impl MeasureManager {
         self.command(None, None)
     }
 
+    /// `POST /api/align/measure/position` — a chain's "these are the speakers I can hear
+    /// from where I am now" (plan §1.1).
+    ///
+    /// `members` are the speakers to align at this position; `overlaps` are speakers
+    /// *already* aligned at an earlier position that are still audible here, and they are
+    /// what ties the two regions together. **Two overlaps rather than one** is the whole
+    /// reason this is not a warning: the shift a step derives from its overlaps is applied
+    /// as a common delay to every speaker aligned so far *and* anchors everything measured
+    /// after it, so with one overlap a §5.6 reflection bias propagates through the whole
+    /// apartment with nothing able to see it. One is accepted — a user may genuinely have
+    /// only one shared speaker — and reported as reduced confidence.
+    ///
+    /// Everything is validated **under the state lock** and the chain is marked
+    /// [`ChainAction::Busy`] before it is released, so a second tap refuses rather than
+    /// queueing a duplicate position.
+    pub fn position(&self, members: Vec<String>, overlaps: Vec<String>) -> Result<MeasureStatus, Refusal> {
+        let mut g = self.inner.lock_recover();
+        let (known, aligned) = self.chain_preflight(&g)?;
+        if members.is_empty() {
+            return Err(Refusal::new(
+                RefusalKind::ChainOutOfOrder,
+                "a position has to name at least one speaker to align. Post the speakers you can hear from where you are standing, \
+                 plus one or two you have already aligned and can still hear from here.",
+            ));
+        }
+        if members.len() + overlaps.len() < 2 {
+            return Err(Refusal::new(
+                RefusalKind::ChainOutOfOrder,
+                "a position needs at least two speakers to be worth measuring: one to align, and something to align it *to* — either \
+                 another speaker at this position or an overlap from the set already aligned.",
+            ));
+        }
+        for name in members.iter().chain(overlaps.iter()) {
+            if !known.iter().any(|n| n == name) {
+                return Err(Refusal::for_member(
+                    RefusalKind::ChainOutOfOrder,
+                    name,
+                    format!("'{name}' is not one of the speakers this run is holding, so it cannot be measured here"),
+                ));
+            }
+            if members.iter().filter(|n| *n == name).count() + overlaps.iter().filter(|n| *n == name).count() > 1 {
+                return Err(Refusal::for_member(
+                    RefusalKind::ChainOutOfOrder,
+                    name,
+                    format!("'{name}' is named twice in this position; each speaker is either being aligned here or used as an overlap"),
+                ));
+            }
+        }
+        for name in &members {
+            if aligned.iter().any(|n| n == name) {
+                return Err(Refusal::for_member(
+                    RefusalKind::ChainOutOfOrder,
+                    name,
+                    format!(
+                        "'{name}' was already aligned at an earlier position. Offer it as an *overlap* instead — that is exactly what an \
+                         overlap is, and it is what links this position to the earlier one."
+                    ),
+                ));
+            }
+        }
+        // Ordered deliberately: at the first position "there is nothing to overlap with"
+        // is the useful sentence, and "that speaker is not aligned" would be technically
+        // true of every speaker and help nobody.
+        if aligned.is_empty() && !overlaps.is_empty() {
+            return Err(Refusal::new(
+                RefusalKind::ChainOutOfOrder,
+                "this is the first position, so nothing has been aligned yet and there is nothing to overlap with — post just the \
+                 speakers you can hear from here. They become the reference the rest of the chain is built on.",
+            ));
+        }
+        for name in &overlaps {
+            if !aligned.iter().any(|n| n == name) {
+                return Err(Refusal::for_member(
+                    RefusalKind::ChainOutOfOrder,
+                    name,
+                    format!(
+                        "'{name}' was offered as an overlap but has not been aligned at any earlier position, so it links this position to \
+                         nothing. An overlap has to be a speaker that already has a delay from an earlier position."
+                    ),
+                ));
+            }
+        }
+        if !aligned.is_empty() && overlaps.is_empty() {
+            return Err(Refusal::new(
+                RefusalKind::OverlapMissing,
+                format!(
+                    "this position named no overlap, so nothing would relate it to the {} speaker(s) already aligned: the two sets would \
+                     each be internally aligned and mutually meaningless. Name one or two speakers you can hear from *both* places — two \
+                     is what lets this joint be checked against itself, one is accepted but cannot be.",
+                    aligned.len()
+                ),
+            ));
+        }
+        self.dispatch(&mut g, RunCommand::Position { members, overlaps }, "measuring this position — stay where you are and hold still")
+    }
+
+    /// `POST /api/align/measure/finish` — "every speaker is aligned at some position".
+    ///
+    /// This is where plan §1.1's **global renormalisation** happens and where the single
+    /// write is solved. Refused while any held speaker is still unaligned: a member with
+    /// no reading anywhere has nothing to write, and silently leaving it at its old knob
+    /// would produce a group that is *partly* aligned without saying so.
+    pub fn finish(&self) -> Result<MeasureStatus, Refusal> {
+        let mut g = self.inner.lock_recover();
+        let (_, aligned) = self.chain_preflight(&g)?;
+        let remaining: Vec<String> = g.chain.as_ref().map(|c| c.remaining.clone()).unwrap_or_default();
+        if !remaining.is_empty() {
+            return Err(Refusal::new(
+                RefusalKind::ChainOutOfOrder,
+                format!(
+                    "{} speaker(s) have not been aligned at any position yet ({}), and a speaker with no reading has nothing to write. \
+                     Either walk to a position where you can hear them — with one or two of the {} already-aligned speakers as overlaps — \
+                     or abandon this run and start one holding only the speakers you mean to align.",
+                    remaining.len(),
+                    remaining.join(", "),
+                    aligned.len()
+                ),
+            ));
+        }
+        self.dispatch(&mut g, RunCommand::Finish, "renormalising the chain and solving the knobs to write")
+    }
+
+    /// The state a chaining call needs, or the reason it cannot be accepted here. Shared
+    /// by [`Self::position`] and [`Self::finish`] so the two cannot disagree about which
+    /// states accept what.
+    fn chain_preflight(&self, g: &Inner) -> Result<(Vec<String>, Vec<String>), Refusal> {
+        if !g.chained {
+            return Err(Refusal::new(
+                RefusalKind::ChainOutOfOrder,
+                match g.mode.is_walk() {
+                    true => "this is a near-field walk: it takes one arrival per speaker (/api/align/measure/arrival) and a closure, not \
+                             positions. A walk needs no overlaps at all — it is one continuous capture from end to end."
+                        .to_string(),
+                    false => "this run is not chained: it measures every held member itself, from wherever the phone is sitting, and \
+                              aligns that one position. Start it with `chain: true` to align a set, reposition, and align the next \
+                              through overlaps."
+                        .to_string(),
+                },
+            ));
+        }
+        if g.phase != Phase::Positioning {
+            return Err(Refusal::new(
+                RefusalKind::ChainOutOfOrder,
+                format!("the chain is not waiting for you right now (it is {:?})", g.phase),
+            ));
+        }
+        match g.chain.as_ref().map(|c| c.next) {
+            Some(ChainAction::Position | ChainAction::Finish) => {}
+            Some(ChainAction::Busy) => {
+                return Err(Refusal::new(RefusalKind::ChainOutOfOrder, "the chain is busy measuring a position; wait for it to finish"))
+            }
+            Some(ChainAction::Done) => {
+                return Err(Refusal::new(RefusalKind::ChainOutOfOrder, "this chain is finished; it has nothing left to measure"))
+            }
+            // `Phase::Positioning` is only ever set after the chain state is published,
+            // so this is a daemon bug rather than a state a user can be in — say that
+            // instead of blaming the user.
+            None => return Err(Refusal::new(RefusalKind::Internal, "the run says it is chaining but has no chain state")),
+        }
+        let known: Vec<String> = g.members.iter().map(|m| m.node_name.clone()).collect();
+        let aligned: Vec<String> = g.chain.as_ref().map(|c| c.aligned.clone()).unwrap_or_default();
+        Ok((known, aligned))
+    }
+
+    /// Hand a validated chaining command to the run task and mark the chain busy, under
+    /// the lock the validation ran under — the same ordering [`Self::command`] uses, and
+    /// what makes a double-tap impossible rather than merely unlikely.
+    fn dispatch(&self, g: &mut Inner, cmd: RunCommand, prompt: &str) -> Result<MeasureStatus, Refusal> {
+        let tx = g.cmd_tx.clone().ok_or_else(|| Refusal::new(RefusalKind::Internal, "this run is no longer accepting positions"))?;
+        if tx.send(cmd).is_err() {
+            return Err(Refusal::new(RefusalKind::Internal, "the measurement run has ended, so it cannot take this position"));
+        }
+        if let Some(c) = g.chain.as_mut() {
+            c.next = ChainAction::Busy;
+            c.refusal = None;
+            c.prompt = prompt.to_string();
+        }
+        g.bump();
+        Ok(g.status())
+    }
+
     /// The shared half of [`Self::arrival`] and [`Self::close`]: one validation path,
     /// so the two cannot drift apart on which states accept what.
     fn command(&self, node_name: Option<String>, level: Option<u8>) -> Result<MeasureStatus, Refusal> {
@@ -2802,8 +3792,14 @@ impl MeasureManager {
         if !g.mode.is_walk() {
             return Err(Refusal::new(
                 RefusalKind::WalkOutOfOrder,
-                "this is a multi-position run: it measures every member itself, from wherever the phone is sitting, and takes \
-                 no arrivals. Near-field mode is the one that walks.",
+                match g.chained {
+                    true => "this is a chained multi-position run: it takes one position per listening spot \
+                             (/api/align/measure/position) and a finish, not arrivals. Near-field mode is the one that walks."
+                        .to_string(),
+                    false => "this is a multi-position run: it measures every member itself, from wherever the phone is sitting, and \
+                              takes no arrivals. Near-field mode is the one that walks."
+                        .to_string(),
+                },
             ));
         }
         if g.phase != Phase::Walking {
@@ -2866,10 +3862,10 @@ impl MeasureManager {
                 ));
             }
         }
-        let tx = g.walk_tx.clone().ok_or_else(|| Refusal::new(RefusalKind::Internal, "this run is no longer accepting arrivals"))?;
+        let tx = g.cmd_tx.clone().ok_or_else(|| Refusal::new(RefusalKind::Internal, "this run is no longer accepting arrivals"))?;
         let cmd = match node_name.clone() {
-            Some(node_name) => WalkCommand::Arrival { node_name, level },
-            None => WalkCommand::Close,
+            Some(node_name) => RunCommand::Arrival { node_name, level },
+            None => RunCommand::Close,
         };
         // Sent before the state is marked busy and while the lock is still held: the
         // run task cannot act on it until it can take this lock, so there is no window
@@ -2889,15 +3885,21 @@ impl MeasureManager {
 
     /// `POST /api/align/measure/apply` — the explicit write step (plan §11).
     ///
-    /// The **run's** mode wins over the request's: a near-field proposal can only be
-    /// verified by walking again (see [`WalkPurpose::Verify`] for why a stationary
-    /// residual would fail every time), so which verification runs is a property of
-    /// how the arrivals were acquired, not of this call.
+    /// The **run's** mode and chaining win over the request's: a near-field proposal can
+    /// only be verified by walking again (see [`WalkPurpose::Verify`] for why a stationary
+    /// residual would fail every time) and a chain's can only be verified at the position
+    /// the phone is standing at, so which verification runs is a property of how the
+    /// arrivals were acquired, not of this call.
+    ///
+    /// This is also the **one write wave** of a chained run (plan §1.1.1): the provisional
+    /// delay lines are dropped here, because the knobs now carry what they were standing
+    /// in for.
     pub async fn apply(&self, deps: MeasureDeps) -> Result<MeasureStatus, Refusal> {
         let mut deps = deps;
         let proposal = {
             let inner = self.inner.lock_recover();
             deps.mode = inner.mode;
+            deps.chained = inner.chained;
             if inner.running {
                 return Err(Refusal::new(RefusalKind::Internal, "the measurement is still running"));
             }
@@ -2913,7 +3915,7 @@ impl MeasureManager {
         let cancel = Arc::new(AtomicBool::new(false));
         // A fresh channel for the verification walk: the measurement walk's is closed
         // by now, and reusing it could deliver a stale command to the new walk.
-        let (walk_tx, walk_rx) = match deps.mode.is_walk() {
+        let (cmd_tx, cmd_rx) = match deps.mode.is_walk() {
             true => {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 (Some(tx), Some(rx))
@@ -2927,7 +3929,10 @@ impl MeasureManager {
             inner.verification = None;
             inner.refusal = None;
             inner.walk = None;
-            inner.walk_tx = walk_tx;
+            // The chain state stays: its per-position numbers are part of the verdict, and
+            // `run_apply` reads the last position's set to decide what a chain's residual
+            // can honestly cover.
+            inner.cmd_tx = cmd_tx;
             inner.cancel = cancel.clone();
             inner.running = true;
             inner.bump();
@@ -2935,7 +3940,7 @@ impl MeasureManager {
         };
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let outcome = run_apply(&deps, &inner, &cancel, &proposal, walk_rx).await;
+            let outcome = run_apply(&deps, &inner, &cancel, &proposal, cmd_rx).await;
             finish(&inner, &cancel, outcome);
         });
         Ok(status)
@@ -2982,13 +3987,22 @@ impl MeasureManager {
     pub fn abandon(&self) -> MeasureStatus {
         let mut inner = self.inner.lock_recover();
         inner.cancel.store(true, Ordering::Relaxed);
+        // Nothing was persisted (plan §1.1.1), but a delay line left applied keeps
+        // shifting that speaker for as long as the daemon runs — so a closed tab must not
+        // be able to leave one behind. Dropped *before* the state is replaced, since the
+        // state is what remembers which lines are live.
+        let lines = inner.clear_provisional();
         let snapshot = std::mem::take(&mut inner.snapshot);
         let written = std::mem::take(&mut inner.written);
         let revert_sources = std::mem::take(&mut inner.revert_sources);
         let changes = inner.changes.clone();
         *inner = Inner::idle_watching(changes);
+        let provisional = match lines {
+            0 => String::new(),
+            n => format!(" the {n} provisional delay(s) the chain was applying are gone, so the speakers are back to their stored knobs;"),
+        };
         if written.is_empty() {
-            inner.message = "measurement abandoned; no delays were changed".to_string();
+            inner.message = format!("measurement abandoned;{provisional} no delays were changed");
         } else {
             // The snapshot outlives the run, so a user who applied and *then*
             // abandoned can still get back — and `revert_scope` outlives it too, so
@@ -3019,10 +4033,15 @@ fn finish(inner: &Arc<Mutex<Inner>>, cancel: &AtomicBool, outcome: Result<Phase,
     g.gate = None;
     // The walk itself stays visible — its closure numbers are part of the verdict —
     // but nothing more can be posted to it.
-    g.walk_tx = None;
+    g.cmd_tx = None;
     if let Some(w) = g.walk.as_mut() {
         w.next = WalkAction::Done;
         w.reading = None;
+    }
+    // Same for the chain: its per-position numbers are the verdict and stay readable.
+    if let Some(c) = g.chain.as_mut() {
+        c.next = ChainAction::Done;
+        c.measuring = None;
     }
     match outcome {
         Ok(phase) => {
@@ -3032,6 +4051,12 @@ fn finish(inner: &Arc<Mutex<Inner>>, cancel: &AtomicBool, outcome: Result<Phase,
             }
         }
         Err(refusal) => {
+            // A run that ends without a write owes its provisional delays back: the
+            // proposal it was standing behind is gone, so leaving the lines applied would
+            // silently misalign normal playback (plan §1.1.1). A *successful* run keeps
+            // them — the user is listening to the proposal, and `run_apply` drops them as
+            // the real knobs take over.
+            g.clear_provisional();
             g.message = refusal.message.clone();
             g.refusal = Some(refusal);
             g.phase = Phase::Refused;
@@ -3053,10 +4078,20 @@ async fn run_measure(
     deps: &MeasureDeps,
     inner: &Arc<Mutex<Inner>>,
     cancel: &AtomicBool,
-    walk_rx: Option<tokio::sync::mpsc::UnboundedReceiver<WalkCommand>>,
+    cmd_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RunCommand>>,
 ) -> Result<Phase, Refusal> {
     let session = bind(deps, inner, cancel).await?;
     let rate = deps.mic.status().sample_rate;
+
+    // A chain has its own acquisition *and* its own solve (plan §1.1's global
+    // renormalisation), so it owns the path all the way to `Proposed` rather than
+    // handing observations back to the single-position solve below — the two positions'
+    // arrivals are not comparable, which is the premise of the whole mode.
+    if deps.chained && !deps.mode.is_walk() {
+        let mut rx =
+            cmd_rx.ok_or_else(|| Refusal::new(RefusalKind::Internal, "a chained run was started without a way to accept positions"))?;
+        return run_chain(deps, inner, cancel, &mut rx, &session, rate).await;
+    }
 
     // Plan §12.2: "near field breaks the two-phase shape". Its level is only
     // meaningful *at* the speaker and the risk there inverts from too-quiet to
@@ -3065,7 +4100,7 @@ async fn run_measure(
     // instead of two.
     let (observations, closure) = if deps.mode.is_walk() {
         let mut rx =
-            walk_rx.ok_or_else(|| Refusal::new(RefusalKind::Internal, "a near-field run was started without a way to accept arrivals"))?;
+            cmd_rx.ok_or_else(|| Refusal::new(RefusalKind::Internal, "a near-field run was started without a way to accept arrivals"))?;
         inner.lock_recover().warn(Warning::new(
             WarningKind::NearFieldPathAssumed,
             "near field measures the wiring rather than one listening position, and it does so by assuming the phone is *at* each \
@@ -3131,57 +4166,78 @@ async fn measure_passes(
 
     let mut epoch = 0u64;
     let mut restarts = 0u32;
-    let observations = 'set: loop {
-        let mut observations: Vec<MemberObservation> = Vec::new();
+    loop {
         {
             let mut g = inner.lock_recover();
             g.observations.clear();
             g.bump();
         }
-        for pass in 0..MEASURE_PASSES {
-            // Alternate the order so a mic-clock drift averages out across members
-            // instead of accumulating down the list (plan §6.1).
-            let mut order: Vec<&SessionMember> = session.members.iter().collect();
-            if pass % 2 == 1 {
-                order.reverse();
-            }
-            for member in order {
-                set_phase(inner, Phase::Measuring, format!("measuring '{}' (pass {}/{})", member.node_name, pass + 1, MEASURE_PASSES));
-                let level = plan.levels.get(&member.node_name).copied().unwrap_or(session.level);
-                let cfg = GateConfig::mute_settle(&deps.timing);
-                match measure_member(deps, inner, cancel, member, level, cfg, pass, epoch, rate).await {
-                    Ok(o) => {
-                        let mut g = inner.lock_recover();
-                        if let Some(p) = g.members.iter_mut().find(|m| m.node_name == member.node_name) {
-                            p.passes_done += 1;
-                            p.last = Some(o.m.clone());
-                        }
-                        g.observations.push(o.clone());
-                        g.bump();
-                        observations.push(o);
-                    }
-                    Err(StepError::Refuse(r)) => return Err(r),
-                    Err(StepError::RestartSet(r)) => {
-                        if restarts >= MAX_SET_RESTARTS {
-                            return Err(r);
-                        }
-                        restarts += 1;
-                        epoch += 1;
-                        let mut g = inner.lock_recover();
-                        g.warn(Warning::new(WarningKind::MicReconnected, r.message.clone()));
-                        for m in &mut g.members {
-                            m.passes_done = 0;
-                            m.last = None;
-                        }
-                        g.bump();
-                        drop(g);
-                        continue 'set;
-                    }
+        match measure_set(deps, inner, cancel, &session.members, &plan.levels, session.level, "", epoch, rate).await {
+            Ok(observations) => return Ok(observations),
+            Err(StepError::Refuse(r)) => return Err(r),
+            Err(StepError::RestartSet(r)) => {
+                if restarts >= MAX_SET_RESTARTS {
+                    return Err(r);
                 }
+                restarts += 1;
+                epoch += 1;
+                let mut g = inner.lock_recover();
+                g.warn(Warning::new(WarningKind::MicReconnected, r.message.clone()));
+                for m in &mut g.members {
+                    m.passes_done = 0;
+                    m.last = None;
+                }
+                g.bump();
             }
         }
-        break observations;
-    };
+    }
+}
+
+/// One set of members, measured [`MEASURE_PASSES`] times with the pass order
+/// **alternating** (plan §6.1), inside one grid epoch.
+///
+/// The unit both stationary acquisitions are built from: a single-position run measures
+/// the whole group this way, and a chain measures **one position's** members plus its
+/// overlaps this way. A capture reconnect is returned as [`StepError::RestartSet`]
+/// rather than retried here, because what a new frame costs differs — a set can simply
+/// be retaken, while for a chain it is a position the *user* has to stand at again
+/// (plan §1.2).
+#[allow(clippy::too_many_arguments)] // one set's worth of context; a struct would only move the list
+async fn measure_set(
+    deps: &MeasureDeps,
+    inner: &Arc<Mutex<Inner>>,
+    cancel: &AtomicBool,
+    members: &[SessionMember],
+    levels: &HashMap<String, u8>,
+    default_level: u8,
+    label: &str,
+    epoch: u64,
+    rate: u32,
+) -> Result<Vec<MemberObservation>, StepError> {
+    let mut observations: Vec<MemberObservation> = Vec::new();
+    for pass in 0..MEASURE_PASSES {
+        // Alternate the order so a mic-clock drift averages out across members
+        // instead of accumulating down the list (plan §6.1).
+        let mut order: Vec<&SessionMember> = members.iter().collect();
+        if pass % 2 == 1 {
+            order.reverse();
+        }
+        for member in order {
+            set_phase(inner, Phase::Measuring, format!("{label}measuring '{}' (pass {}/{})", member.node_name, pass + 1, MEASURE_PASSES));
+            let level = levels.get(&member.node_name).copied().unwrap_or(default_level);
+            let cfg = GateConfig::mute_settle(&deps.timing);
+            let o = measure_member(deps, inner, cancel, member, level, cfg, pass, epoch, rate).await?;
+            let mut g = inner.lock_recover();
+            if let Some(p) = g.members.iter_mut().find(|m| m.node_name == member.node_name) {
+                p.passes_done += 1;
+                p.last = Some(o.m.clone());
+            }
+            g.observations.push(o.clone());
+            g.bump();
+            drop(g);
+            observations.push(o);
+        }
+    }
     Ok(observations)
 }
 
@@ -3231,7 +4287,7 @@ async fn run_walk(
     deps: &MeasureDeps,
     inner: &Arc<Mutex<Inner>>,
     cancel: &AtomicBool,
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<WalkCommand>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
     purpose: WalkPurpose,
     session: &SessionSnapshot,
     rate: u32,
@@ -3273,14 +4329,21 @@ async fn run_walk(
             );
             set_phase(inner, Phase::Walking, prompt);
 
-            let command = next_walk_command(deps, inner, cancel, rx).await?;
+            let command = next_command(deps, inner, cancel, rx, "walked to a speaker").await?;
             // Which member, at which level, and which pass this reading belongs to.
             let (name, level, pass) = match &command {
-                WalkCommand::Arrival { node_name, level } => {
+                RunCommand::Arrival { node_name, level } => {
                     let level = level.unwrap_or_else(|| session.level_for(node_name));
                     (node_name.clone(), level, 0usize)
                 }
-                WalkCommand::Close => {
+                // Unreachable: `MeasureManager::command` refuses a chain call on a walk
+                // under the state lock before anything is sent. Named rather than
+                // ignored, so a future channel change fails loudly instead of quietly
+                // dropping a user's call.
+                RunCommand::Position { .. } | RunCommand::Finish => {
+                    return Err(Refusal::new(RefusalKind::Internal, "a chaining call reached the near-field walk"))
+                }
+                RunCommand::Close => {
                     let Some(anchor) = order.first().cloned() else {
                         return Err(Refusal::new(
                             RefusalKind::WalkOutOfOrder,
@@ -3301,7 +4364,7 @@ async fn run_walk(
                     format!("'{name}' is not a member of the group being aligned"),
                 ));
             };
-            let closing = matches!(command, WalkCommand::Close);
+            let closing = matches!(command, RunCommand::Close);
             set_phase(
                 inner,
                 Phase::Measuring,
@@ -3449,12 +4512,17 @@ fn closure_prompt(c: &ClosureReport) -> String {
 /// session timed out three minutes ago wastes the walk. A microphone that disconnects
 /// while parked is fatal for the same reason it is fatal mid-reading — the capture is
 /// the timing reference (plan §1.2) — and [`bind`] says so in those words.
-async fn next_walk_command(
+///
+/// Shared by the walk and the chain: both park waiting for a person to move, and
+/// [`Timing::walk_arrival_timeout`] is the same budget either way. `did` names what the
+/// user did not do, so the timeout reads correctly for both.
+async fn next_command(
     deps: &MeasureDeps,
     inner: &Arc<Mutex<Inner>>,
     cancel: &AtomicBool,
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<WalkCommand>,
-) -> Result<WalkCommand, Refusal> {
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
+    did: &str,
+) -> Result<RunCommand, Refusal> {
     let deadline = Instant::now() + deps.timing.walk_arrival_timeout;
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -3466,7 +4534,7 @@ async fn next_walk_command(
             return Err(Refusal::new(
                 RefusalKind::WalkTimeout,
                 format!(
-                    "nothing was measured for {} minutes, so the walk gave up rather than holding these speakers indefinitely. \
+                    "nobody {did} for {} minutes, so the run gave up rather than holding these speakers indefinitely. \
                      Start the measurement again — the alignment session is still yours.",
                     deps.timing.walk_arrival_timeout.as_secs() / 60
                 ),
@@ -3484,13 +4552,524 @@ async fn next_walk_command(
     }
 }
 
+// ------------------------------------------- chained multi-position (W12, plan §1.1)
+
+/// The chain's acquisition stage: the user aligns a locally-audible set, repositions,
+/// and aligns the next through shared **overlap** speakers.
+///
+/// ## What each position does
+///
+/// One position measures its own speakers **plus its overlaps** — [`measure_set`], two
+/// alternating passes, exactly as a single-position run measures a group — and then
+/// [`chain_step`] does §1.1's algebra on the result. The delays it produces are
+/// **provisional**: they go into the per-device delay line (`relay_delay.rs`, plan
+/// §1.1.1) so the user can hear the alignment and so the *next* position measures each
+/// overlap through the delay it is carrying, which is what makes the chain composable.
+/// The real knobs are written **once**, by `apply`, after the last position.
+///
+/// ## The two costs this deliberately does not pay
+///
+/// * **One hold for the whole run** (plan §12.3.1). The union was held by
+///   `POST /api/align/start` and nothing here re-forms it: a position is a *subset*, and
+///   the audibility it needs is the sequential solo the measurement already does. Five
+///   positions therefore cost one formation wave, not ten.
+/// * **One write wave** (plan §1.1.1). Nothing between positions touches a device knob,
+///   so no speaker reconnects during the walk.
+///
+/// ## Plan §1.2, and where this had to differ from it
+///
+/// §1.2's rule is that everything comparable lives in one continuous capture. A
+/// *position* obeys it strictly: its own readings are one epoch, and a reconnect mid-position
+/// discards that position's readings and asks the user to stand there again
+/// ([`MAX_CHAIN_STEP_RESTARTS`]) rather than solving across the seam.
+///
+/// Across positions it is **not** a shared frame that carries the chain, and that is
+/// deliberate: what crosses a position boundary is a *provisional delay in
+/// milliseconds*, not a phase, and every position re-measures its overlaps in its own
+/// frame. So a capture that reconnects *between* two positions costs nothing — the
+/// overlap reading is what re-anchors the new frame, which is exactly what §1.2's
+/// parenthetical ("each step is its own position but also — if the capture was
+/// interrupted — its own frame") is pointing at. Each step therefore records its
+/// [`ChainStep::grid_epoch`], and nothing in the chain ever compares two steps'
+/// observations; the honest bound on the joint is the overlap disagreement, not the
+/// capture's continuity.
+async fn run_chain(
+    deps: &MeasureDeps,
+    inner: &Arc<Mutex<Inner>>,
+    cancel: &AtomicBool,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
+    session: &SessionSnapshot,
+    rate: u32,
+) -> Result<Phase, Refusal> {
+    let all: Vec<String> = session.members.iter().map(|m| m.node_name.clone()).collect();
+    set_phase(inner, Phase::Learning, "learning playback levels");
+    let plan = learn_levels(session.level, &session.members);
+    {
+        let mut g = inner.lock_recover();
+        if !plan.learned {
+            g.warn(Warning::new(WarningKind::LevelLearningSkipped, plan.note.clone()));
+        }
+        for m in &mut g.members {
+            m.level = plan.levels.get(&m.node_name).copied().unwrap_or(session.level);
+        }
+        g.bump();
+    }
+
+    // The chain's whole state: what each aligned member is carrying, in the order it was
+    // aligned, plus the positions and every reading they took.
+    let mut provisional: HashMap<String, f64> = HashMap::new();
+    let mut aligned: Vec<String> = Vec::new();
+    let mut steps: Vec<ChainStep> = Vec::new();
+    let mut all_obs: Vec<MemberObservation> = Vec::new();
+    let mut epoch = 0u64;
+    let mut refusal: Option<Refusal> = None;
+
+    loop {
+        let remaining: Vec<String> = all.iter().filter(|n| !aligned.contains(n)).cloned().collect();
+        let next = if remaining.is_empty() { ChainAction::Finish } else { ChainAction::Position };
+        let prompt = chain_prompt(next, &remaining, steps.len());
+        set_chain(inner, chain_progress(next, &steps, &aligned, &remaining, &provisional, None, 0, prompt.clone(), refusal.clone()));
+        set_phase(inner, Phase::Positioning, prompt);
+
+        let (members, overlaps) = match next_command(deps, inner, cancel, rx, "posted a position").await? {
+            RunCommand::Position { members, overlaps } => (members, overlaps),
+            RunCommand::Finish => break,
+            // Unreachable: `MeasureManager::command` refuses a walk call on a chained run
+            // under the state lock. Named rather than ignored, so a future channel change
+            // fails loudly instead of quietly dropping a user's call.
+            RunCommand::Arrival { .. } | RunCommand::Close => {
+                return Err(Refusal::new(RefusalKind::Internal, "a near-field call reached the multi-position chain"))
+            }
+        };
+        refusal = None;
+        let index = steps.len() + 1;
+        // The step's members, in one deterministic order: its own speakers first, then
+        // the overlaps. That order is the drift fit's abscissa and the linearisation's
+        // anchor, so it is a decision rather than an accident.
+        let step_members: Vec<SessionMember> =
+            members.iter().chain(overlaps.iter()).filter_map(|n| session.members.iter().find(|m| &m.node_name == n).cloned()).collect();
+        let order: Vec<String> = step_members.iter().map(|m| m.node_name.clone()).collect();
+
+        let mut restarts = 0u32;
+        let outcome = loop {
+            let base = all_obs.len();
+            {
+                let mut g = inner.lock_recover();
+                g.observations.truncate(base);
+                if let Some(c) = g.chain.as_mut() {
+                    c.next = ChainAction::Busy;
+                    c.measuring = Some(index);
+                    c.restarts = restarts;
+                    c.prompt = format!("measuring position {index} — stay where you are and keep still");
+                }
+                g.bump();
+            }
+            match measure_set(deps, inner, cancel, &step_members, &plan.levels, session.level, &format!("position {index}: "), epoch, rate)
+                .await
+            {
+                Ok(obs) => break Ok(obs),
+                Err(StepError::Refuse(r)) => break Err(r),
+                Err(StepError::RestartSet(r)) => {
+                    // Plan §1.2: this position's readings came from two captures, so they
+                    // are not comparable with each other. The *chain* survives — the
+                    // positions already aligned are linked by delays, not by this frame —
+                    // but this position has to be measured again from where the user is.
+                    epoch += 1;
+                    if restarts >= MAX_CHAIN_STEP_RESTARTS {
+                        break Err(Refusal {
+                            message: format!(
+                                "{} Position {index} has already been restarted {restarts} time(s); the phone's capture is not staying \
+                                 connected long enough to measure one position, so there is no point asking again. The {} speaker(s) \
+                                 aligned at earlier positions are untouched and still carry their provisional delays.",
+                                r.message,
+                                aligned.len()
+                            ),
+                            ..r
+                        });
+                    }
+                    restarts += 1;
+                    inner.lock_recover().warn(Warning::new(
+                        WarningKind::MicReconnected,
+                        format!(
+                            "the microphone capture restarted while position {index} was being measured. Everything measured within one \
+                             capture is comparable and nothing is comparable across a restart, so this position's readings have been \
+                             discarded and it is being measured again. The {} speaker(s) aligned at earlier positions are not affected: \
+                             what carries a chain from one position to the next is the delay each speaker is holding, and this position \
+                             re-measures its overlaps in the new capture — that re-measurement is what re-anchors it.",
+                            aligned.len()
+                        ),
+                    ));
+                }
+            }
+        };
+
+        let accepted =
+            match outcome.and_then(|obs| chain_solve_step(deps, index, &step_members, &order, &overlaps, &provisional, epoch, obs)) {
+                Ok(step) => step,
+                Err(r) => {
+                    if !chain_step_retryable(r.kind) {
+                        return Err(r);
+                    }
+                    // The chain stays parked: the aligned set and its provisional delays
+                    // are untouched, and the user can try this position again.
+                    tracing::info!("alignment chain: position {index} refused ({:?}) — {}", r.kind, r.message);
+                    refusal = Some(r);
+                    continue;
+                }
+            };
+
+        // The chain's state is what the **line is applying**, not the ideal the step
+        // solved for. Both the line and the knobs are set in whole milliseconds (plan
+        // §1.1.2 item 4), and a model that disagreed with reality by half a millisecond
+        // would put that error into the alignment between the already-aligned set and
+        // every position measured after it. Rounding *here* keeps the two identical, and
+        // the error stays ≤0.5 ms per member instead of accumulating down the chain —
+        // every later position re-measures its overlaps through the line, so what was
+        // applied is observed rather than assumed.
+        let applied: HashMap<String, f64> = accepted.provisional.iter().map(|(n, v)| (n.clone(), v.round())).collect();
+        // Applied *before* the step counts as accepted, so a line that refuses cannot
+        // leave the chain believing in a delay nobody applied.
+        let changed: Vec<(String, f64)> = applied
+            .iter()
+            .filter(|(n, v)| provisional.get(*n).is_none_or(|prev| (prev - *v).abs() > 1e-9))
+            .map(|(n, v)| (n.clone(), *v))
+            .collect();
+        apply_provisional(deps, inner, cancel, &changed).await?;
+
+        for (name, value) in &applied {
+            provisional.insert(name.clone(), *value);
+        }
+        for name in &members {
+            if !aligned.contains(name) {
+                aligned.push(name.clone());
+            }
+        }
+        all_obs.extend(accepted.observations);
+        if accepted.step.confidence == OverlapConfidence::Single {
+            let one = accepted.step.overlaps.first().map(|o| o.node_name.clone()).unwrap_or_default();
+            inner.lock_recover().warn(Warning::new(
+                WarningKind::OneOverlap,
+                format!(
+                    "position {index} is linked to everything aligned before it through the single overlap '{one}'. That one reading is \
+                     applied as a common shift to every speaker already aligned and anchors every position after it, and with one overlap \
+                     there is nothing to check it against — so this joint is the chain's weakest, and the chain's total error can no \
+                     longer be bounded.",
+                ),
+            ));
+        }
+        steps.push(accepted.step);
+        {
+            let mut g = inner.lock_recover();
+            g.provisional = provisional.clone();
+            g.bump();
+        }
+    }
+
+    // ---- finish: renormalise globally, then propose the single write ----------
+    set_phase(inner, Phase::Solving, "renormalising the whole chain, then solving the knobs to write");
+    {
+        let mut g = inner.lock_recover();
+        if let Some(c) = g.chain.as_mut() {
+            c.next = ChainAction::Busy;
+            c.measuring = None;
+            c.prompt = "renormalising: taking the accumulated delay back out as a common shift, which moves nothing relative to \
+                        anything else"
+                .to_string();
+        }
+        g.bump();
+    }
+    let proposal = solve_chain(&ChainSolveInput {
+        timing: deps.timing,
+        members: &session.members,
+        provisional: &provisional,
+        current_delays: &deps.current_delays,
+        send_ahead: &deps.send_ahead,
+        steps: &steps,
+        observations: &all_obs,
+    })?;
+    let blocked = proposal.blocked.clone();
+    {
+        let mut g = inner.lock_recover();
+        for w in &proposal.warnings {
+            g.warn(w.clone());
+        }
+        g.proposal = Some(proposal);
+        let done = chain_progress(
+            ChainAction::Done,
+            &steps,
+            &aligned,
+            &[],
+            &provisional,
+            None,
+            0,
+            "the chain is solved: review the proposed knobs, then apply them. Nothing has been written yet — what you are hearing is the \
+             provisional delay line."
+                .to_string(),
+            None,
+        );
+        g.chain = Some(done);
+        g.bump();
+    }
+    if let Some(blocked) = blocked {
+        return Err(blocked);
+    }
+    set_phase(inner, Phase::Proposed, "the chain is measured; review the proposed delays, then apply them");
+    Ok(Phase::Proposed)
+}
+
+/// One position's arithmetic and its own §10 checks, kept out of [`run_chain`] so the
+/// orchestration reads as orchestration.
+///
+/// The checks **block the step**, exactly as they block a single-position write: a
+/// position that failed transitivity would otherwise be carried into every position
+/// after it, since its shift is applied to the whole aligned set.
+struct AcceptedStep {
+    step: ChainStep,
+    /// The new provisional delay for every member this position touches — the step's own
+    /// speakers, plus the whole already-aligned set when Δ > 0.
+    provisional: HashMap<String, f64>,
+    observations: Vec<MemberObservation>,
+}
+
+#[allow(clippy::too_many_arguments)] // one position's worth of context; a struct would only move the list
+fn chain_solve_step(
+    deps: &MeasureDeps,
+    index: usize,
+    step_members: &[SessionMember],
+    order: &[String],
+    overlaps: &[String],
+    aligned: &HashMap<String, f64>,
+    epoch: u64,
+    observations: Vec<MemberObservation>,
+) -> Result<AcceptedStep, Refusal> {
+    let arrivals = arrivals_of(&observations, order, &deps.timing)?;
+    let solution = chain_step(&ChainStepInput { aligned, arrivals: &arrivals.linear, overlaps, tolerance_ms: OVERLAP_AGREEMENT_TOL_MS })?;
+    let checks = Checks {
+        transitivity: transitivity(&observations, &deps.timing, TRANSITIVITY_TOL_MS),
+        repeatability: repeatability(&observations, &arrivals.fit, deps.timing.pattern_ms, REPEATABILITY_TOL_MS),
+        merged_peak: MergedPeakCheck::seam(),
+        closure: None,
+    };
+    if !checks.transitivity.passed {
+        let (a, b) = checks.transitivity.worst_pair.clone().unwrap_or_default();
+        return Err(Refusal::new(
+            RefusalKind::Transitivity,
+            format!(
+                "at position {index} the two test tones disagree by {:.2} ms about how far apart '{a}' and '{b}' are (limit {:.1} ms). A \
+                 speaker's arrival is being pulled by an early reflection, or its crossover delays the two tones differently — either \
+                 way the measured offset is not the electrical one. This position was not accepted; the speakers aligned at earlier \
+                 positions are untouched. Move the phone away from walls and hard surfaces and measure this position again.",
+                checks.transitivity.worst_ms, checks.transitivity.tolerance_ms
+            ),
+        ));
+    }
+    if let Some(rep) = checks.repeatability.as_ref().filter(|r| !r.passed) {
+        let who = rep.worst_member.clone().unwrap_or_default();
+        return Err(Refusal::for_member(
+            RefusalKind::Repeatability,
+            &who,
+            format!(
+                "at position {index}, '{who}' measured {:.2} ms differently between the two passes (limit {:.1} ms) — the phone or the \
+                 room moved while this position was being measured. Put the phone down where you are listening and measure this position \
+                 again; nothing aligned earlier was affected.",
+                rep.worst_ms, rep.tolerance_ms
+            ),
+        ));
+    }
+    let step = ChainStep {
+        index,
+        members: step_members.iter().map(|m| m.node_name.clone()).filter(|n| !overlaps.contains(n)).collect(),
+        overlaps: solution.overlaps.clone(),
+        confidence: solution.confidence,
+        disagreement_ms: solution.disagreement_ms,
+        worst_pair: solution.worst_pair,
+        tolerance_ms: OVERLAP_AGREEMENT_TOL_MS,
+        anchor_ms: solution.anchor_ms,
+        delta_ms: solution.delta_ms,
+        target_ms: solution.target_ms,
+        spread_ms: arrivals.spread_ms,
+        drift_ppm: arrivals.fit.drift_ppm(deps.timing.pattern_ms),
+        joint_error_ms: solution.joint_error_ms,
+        grid_epoch: epoch,
+        checks,
+        note: solution.note,
+    };
+    Ok(AcceptedStep { step, provisional: solution.provisional, observations })
+}
+
+/// Whether a refusal is about *this position's reading* — in which case the chain stays
+/// alive and the user can stand there and try again — or about the run itself, which
+/// ends it.
+///
+/// Losing a whole apartment's chain because one joint's overlaps disagreed would be the
+/// wrong trade: the positions already aligned are still good and still carry their
+/// provisional delays. Anything about the run's *bindings* (the session, the capture,
+/// the delay line, cancellation) is fatal, because retrying cannot help.
+fn chain_step_retryable(kind: RefusalKind) -> bool {
+    matches!(
+        kind,
+        RefusalKind::OverlapDisagreement
+            | RefusalKind::OverlapMissing
+            | RefusalKind::ChainOutOfOrder
+            | RefusalKind::Transitivity
+            | RefusalKind::Repeatability
+            | RefusalKind::AmbiguousSpread
+            | RefusalKind::Estimator
+            | RefusalKind::GateTimeout
+            | RefusalKind::Interference
+            | RefusalKind::MicReconnected
+    )
+}
+
+/// Push the chain's provisional delays to the relay and wait for the lines that changed
+/// to fill (plan §1.1.1).
+///
+/// The exact value stays in the chain's own arithmetic and only the *pushed* value is
+/// rounded to whole milliseconds, so a step's Δ cannot accumulate rounding. For an
+/// overlap that rounding is not even an assumption: the next position measures the
+/// overlap *through* the line, so what was applied is observed.
+async fn apply_provisional(
+    deps: &MeasureDeps,
+    inner: &Arc<Mutex<Inner>>,
+    cancel: &AtomicBool,
+    changed: &[(String, f64)],
+) -> Result<(), Refusal> {
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let mut waiting: Vec<String> = Vec::new();
+    for (name, delay_ms) in changed {
+        let applied = delay_ms.round().clamp(0.0, f64::from(u16::MAX)) as u16;
+        deps.relay.set_delay_ms(name, applied).map_err(|e| {
+            Refusal::for_member(
+                RefusalKind::ProvisionalRange,
+                name,
+                format!(
+                    "the provisional delay line refused {applied} ms on '{name}': {e}. A chain can only ever *add* delay, so its floor \
+                     ratchets upward across an apartment (plan §1.1) — and the renormalisation that takes it back out only happens once, \
+                     at the end. This chain has run past what the line can hold: align fewer positions per run, or align the loudest \
+                     room first so the ratchet starts from a smaller number.",
+                ),
+            )
+        })?;
+        {
+            let mut g = inner.lock_recover();
+            g.provisional.insert(name.clone(), *delay_ms);
+            if g.relay.is_none() {
+                g.relay = Some(deps.relay.clone());
+            }
+        }
+        if applied > 0 {
+            waiting.push(name.clone());
+        }
+    }
+    let deadline = Instant::now() + PROVISIONAL_PRIME_TIMEOUT;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Refusal::new(RefusalKind::Cancelled, "abandoned"));
+        }
+        waiting.retain(|name| !deps.relay.status(name).is_none_or(|s| s.primed));
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Refusal::for_member(
+                RefusalKind::ProvisionalRange,
+                &waiting[0],
+                format!(
+                    "the provisional delay line on '{}' never filled ({} s). A line fills from the audio flowing to that output, so this \
+                     says no audio is reaching it — and a position measured through a half-filled line reads as a dropout rather than as \
+                     a delay, which is why this refuses instead of measuring.",
+                    waiting[0],
+                    PROVISIONAL_PRIME_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        set_phase(inner, Phase::Measuring, format!("waiting for the provisional delay on {} speaker(s) to take effect", waiting.len()));
+        tokio::time::sleep(deps.timing.poll.min(deadline - now)).await;
+    }
+}
+
+/// Assemble what the UI reads about the chain. One place, so the aligned set, the
+/// provisional delays and the error statement cannot disagree with each other.
+#[allow(clippy::too_many_arguments)] // one snapshot's worth of state
+fn chain_progress(
+    next: ChainAction,
+    steps: &[ChainStep],
+    aligned: &[String],
+    remaining: &[String],
+    provisional: &HashMap<String, f64>,
+    measuring: Option<usize>,
+    restarts: u32,
+    prompt: String,
+    refusal: Option<Refusal>,
+) -> ChainProgress {
+    let mut lines: Vec<ProvisionalDelay> = provisional
+        .iter()
+        .map(|(node_name, delay_ms)| ProvisionalDelay {
+            node_name: node_name.clone(),
+            delay_ms: *delay_ms,
+            applied_ms: delay_ms.round().clamp(0.0, f64::from(u16::MAX)) as u16,
+        })
+        .collect();
+    lines.sort_by(|a, b| a.node_name.cmp(&b.node_name));
+    // The ratchet §1.1 warns about. Zero before anything is aligned, rather than an
+    // infinity a UI would render as a number.
+    let floor = provisional.values().copied().fold(f64::INFINITY, f64::min);
+    ChainProgress {
+        next,
+        steps: steps.to_vec(),
+        aligned: aligned.to_vec(),
+        remaining: remaining.to_vec(),
+        floor_ms: if floor.is_finite() { floor } else { 0.0 },
+        provisional: lines,
+        measuring,
+        restarts,
+        prompt,
+        error: chain_error(steps),
+        refusal,
+        scope_note: CHAIN_SCOPE_NOTE,
+    }
+}
+
+fn set_chain(inner: &Arc<Mutex<Inner>>, chain: ChainProgress) {
+    let mut g = inner.lock_recover();
+    g.chain = Some(chain);
+    g.bump();
+}
+
+/// The sentence the user reads while the chain waits for them to move.
+fn chain_prompt(next: ChainAction, remaining: &[String], done: usize) -> String {
+    match (next, done) {
+        (ChainAction::Finish, _) => "every speaker has been aligned at some position. POST /api/align/measure/finish to take the \
+             accumulated delay back out — a common shift, so nothing moves relative to anything else — and see the knobs that would be \
+             written. You can still post another position first: re-linking a region through more overlaps only makes the chain tighter."
+            .to_string(),
+        (_, 0) => format!(
+            "sit where you listen to the first set of speakers. Post the ones you can hear clearly from there to \
+             /api/align/measure/position — that set is aligned *for that spot*, and it becomes the reference the rest of the chain is \
+             built on. {} speaker(s) to align: {}.",
+            remaining.len(),
+            remaining.join(", ")
+        ),
+        _ => format!(
+            "move to the next listening position, then post the speakers you can hear from there **plus one or two you have already \
+             aligned and can still hear from here**. Two overlaps are what let this joint be checked against itself; one is accepted but \
+             cannot be checked, and the chain's total error stops being boundable. {} speaker(s) left: {}.",
+            remaining.len(),
+            remaining.join(", ")
+        ),
+    }
+}
+
 /// WRITING → SETTLING → VERIFYING → DONE.
 async fn run_apply(
     deps: &MeasureDeps,
     inner: &Arc<Mutex<Inner>>,
     cancel: &AtomicBool,
     proposal: &Proposal,
-    walk_rx: Option<tokio::sync::mpsc::UnboundedReceiver<WalkCommand>>,
+    cmd_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RunCommand>>,
 ) -> Result<Phase, Refusal> {
     let session = bind(deps, inner, cancel).await?;
     let pattern_ms = deps.timing.pattern_ms;
@@ -3520,6 +5099,17 @@ async fn run_apply(
             }
         }
     }
+    // The real knobs now carry what the delay lines were standing in for, so the lines
+    // have to go — otherwise every chained member would be delayed twice (plan §1.1.1:
+    // the provisional delay is a *stand-in* for the knob, not an addition to it). Done
+    // immediately after the write wave rather than before it, so nothing is briefly
+    // un-delayed while the writes are being issued; the reconnect-length gate below
+    // absorbs the transient either way.
+    let cleared = inner.lock_recover().clear_provisional();
+    if cleared > 0 {
+        tracing::info!("alignment chain: dropped {cleared} provisional delay line(s); the written knobs carry them now");
+    }
+
     if wrote == 0 {
         set_phase(inner, Phase::Verifying, "nothing to write — the group was already aligned; verifying");
     } else {
@@ -3528,11 +5118,23 @@ async fn run_apply(
     }
 
     set_phase(inner, Phase::Verifying, "verifying");
+    // A chain can only be checked where the phone is, which is the **last** position.
+    // Its own set — the position's speakers and its overlaps, which that step's Δ put in
+    // step with them — is the one set that is genuinely aligned here; every other
+    // position was aligned somewhere else, and measuring it from here would report a
+    // correct chain as broken for exactly the reason §10.4 gives for a walk.
+    let chain_scope: Option<(Vec<String>, usize)> = inner.lock_recover().chain.as_ref().and_then(|c| {
+        c.steps.last().map(|last| {
+            let mut set = last.members.clone();
+            set.extend(last.overlaps.iter().map(|o| o.node_name.clone()));
+            (set, c.steps.len())
+        })
+    });
     let observations = if deps.mode.is_walk() {
         // A near-field write can only be checked from where it was measured — at the
         // speakers. See [`WalkPurpose::Verify`]: a stationary residual would measure
         // the phone's distance to each speaker and fail every time.
-        let mut rx = walk_rx
+        let mut rx = cmd_rx
             .ok_or_else(|| Refusal::new(RefusalKind::Internal, "a near-field verification was started without a way to accept arrivals"))?;
         let (observations, closure) = run_walk(deps, inner, cancel, &mut rx, WalkPurpose::Verify, &session, rate).await?;
         if !closure.passed {
@@ -3552,6 +5154,9 @@ async fn run_apply(
         let mut observations = Vec::new();
         for pass in 0..VERIFY_PASSES {
             let mut order: Vec<&SessionMember> = session.members.iter().collect();
+            if let Some((set, _)) = chain_scope.as_ref() {
+                order.retain(|m| set.contains(&m.node_name));
+            }
             if pass % 2 == 1 {
                 order.reverse();
             }
@@ -3571,7 +5176,21 @@ async fn run_apply(
         observations
     };
 
-    let residual = residual(&observations, &proposal.reference, pattern_ms, RESIDUAL_TOL_MS);
+    // The reference has to be inside the set that was actually re-measured, so a chain
+    // measures its residual against whichever of the last position's speakers ended with
+    // the smallest knob — the same "everyone was moved towards this one" rule the
+    // single-position solve uses, restricted to what the phone can hear from here.
+    let reference = match chain_scope.as_ref() {
+        None => proposal.reference.clone(),
+        Some((set, _)) => proposal
+            .members
+            .iter()
+            .filter(|m| set.contains(&m.node_name))
+            .min_by(|a, b| a.new_delay_ms.cmp(&b.new_delay_ms).then_with(|| a.node_name.cmp(&b.node_name)))
+            .map(|m| m.node_name.clone())
+            .unwrap_or_else(|| proposal.reference.clone()),
+    };
+    let residual = residual(&observations, &reference, pattern_ms, RESIDUAL_TOL_MS);
     let trans = transitivity(&observations, &deps.timing, TRANSITIVITY_TOL_MS);
     let passed = residual.passed && trans.passed;
     let verification = Verification {
@@ -3580,6 +5199,16 @@ async fn run_apply(
         merged_peak: MergedPeakCheck::seam(),
         observations,
         passed,
+        scope_note: chain_scope.as_ref().map(|(set, positions)| {
+            format!(
+                "this checked the last of {positions} position(s) only — the {} speaker(s) that position aligned, measured against '{}' \
+                 from where the phone is now. The earlier positions were aligned at *their* spots, so a reading of them from here would \
+                 be their distance to this spot rather than the write, and it would fail however correct the chain is. Re-checking them \
+                 means walking the chain again.",
+                set.len(),
+                reference
+            )
+        }),
     };
     {
         let mut g = inner.lock_recover();
@@ -4110,11 +5739,12 @@ pub const EQUIV_STEPS: usize = 6;
 /// conclusion is that no audio is reaching that output at all.
 const EQUIV_PRIME_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The provisional delay line, as this experiment drives it (`relay_delay.rs`).
+/// The provisional delay line (`relay_delay.rs`), as this module drives it: the
+/// equivalence experiment's relay arm, and every step of a chain (plan §1.1.1).
 ///
-/// A trait for the same reason [`MicFeed`] and [`DelayWriter`] are: the relay-side arm
-/// has to be exercised without a PipeWire graph, and the line's own unit tests already
-/// cover the sample arithmetic.
+/// A trait for the same reason [`MicFeed`] and [`DelayWriter`] are: both callers have to
+/// be exercised without a PipeWire graph, and the line's own unit tests already cover the
+/// sample arithmetic.
 pub trait RelayControl: Send + Sync {
     /// Apply a provisional delay of `delay_ms` to `output` (`0` clears it).
     fn set_delay_ms(&self, output: &str, delay_ms: u16) -> Result<(), String>;
@@ -4124,9 +5754,9 @@ pub trait RelayControl: Send + Sync {
     fn clear(&self, output: &str);
 }
 
-/// The process-global delay line the three relays actually read.
-// Only the API handler that owns the route can construct this; see `measure_ws`.
-#[allow(dead_code)]
+/// The process-global delay line the three relays actually read. Constructed by the API
+/// handler that assembles [`MeasureDeps`], so a run and the equivalence experiment hold
+/// the same handle rather than two that could differ.
 pub struct LiveRelay;
 
 impl RelayControl for LiveRelay {
@@ -4149,10 +5779,11 @@ impl RelayControl for LiveRelay {
 /// experiment solos through the same session, measures through the same mic and gate,
 /// and writes through the same endpoint-backed [`DelayWriter`], so nothing about
 /// persistence, clamping, the per-device reconnect or its group-wide high-water
-/// exception is duplicated here (plan §9.3). `mode` and `link_to` are unused.
+/// exception is duplicated here (plan §9.3). It also carries the delay line the relay arm
+/// drives — one handle rather than two — so `mode`, `chained` and `link_to` are the only
+/// unused parts.
 pub struct EquivalenceDeps {
     pub base: MeasureDeps,
-    pub relay: Arc<dyn RelayControl>,
     /// Override the member the experiment runs on. `None` lets
     /// [`plan_equivalence`] choose, which is the intended path — the choice is a
     /// property of the *transport*, not a preference.
@@ -4770,8 +6401,8 @@ async fn restore_equivalence(deps: &EquivalenceDeps, st: &EquivState, applied: &
     let mut failures = Vec::new();
     // The line first: it is infallible and instant, and it is the one that would
     // otherwise keep shifting audio for as long as the daemon runs.
-    deps.relay.clear(&applied.member);
-    let relay_cleared = deps.relay.status(&applied.member).is_none_or(|s| s.delay_us == 0);
+    deps.base.relay.clear(&applied.member);
+    let relay_cleared = deps.base.relay.status(&applied.member).is_none_or(|s| s.delay_us == 0);
     if !relay_cleared {
         failures.push(format!("the provisional delay on '{}' is still applied", applied.member));
     }
@@ -4873,13 +6504,13 @@ async fn equivalence_body(
     st.set(EquivPhase::RelayArm, format!("relay arm: measuring '{}' with and without a {} ms delay line", plan.member, EQUIV_STEP_MS));
     let settle = GateConfig::mute_settle(&deps.base.timing);
     let r1 = equiv_read(deps, st, cancel, &member, level, settle, 0, rate, "relay baseline (no provisional delay)").await?;
-    deps.relay.set_delay_ms(&plan.member, EQUIV_STEP_MS).map_err(|e| {
+    deps.base.relay.set_delay_ms(&plan.member, EQUIV_STEP_MS).map_err(|e| {
         Refusal::for_member(RefusalKind::Internal, &plan.member, format!("the provisional delay line refused {EQUIV_STEP_MS} ms: {e}"))
     })?;
     applied.relay_set = true;
     let relay_applied_ms = equiv_wait_primed(deps, st, cancel, &plan.member).await?;
     let r2 = equiv_read(deps, st, cancel, &member, level, settle, 1, rate, "relay stepped (delay line applied)").await?;
-    deps.relay.clear(&plan.member);
+    deps.base.relay.clear(&plan.member);
     applied.relay_set = false;
     let r3 = equiv_read(deps, st, cancel, &member, level, settle, 2, rate, "relay baseline again (the drift bracket)").await?;
     let relay = equiv_arm("relay", f64::from(EQUIV_STEP_MS), relay_applied_ms, &r1, &r2, &r3, pattern_ms, Vec::new());
@@ -4944,7 +6575,7 @@ async fn equiv_wait_primed(deps: &EquivalenceDeps, st: &EquivState, cancel: &Ato
         if cancel.load(Ordering::Relaxed) {
             return Err(Refusal::new(RefusalKind::Cancelled, "abandoned"));
         }
-        let Some(status) = deps.relay.status(output) else {
+        let Some(status) = deps.base.relay.status(output) else {
             return Err(Refusal::for_member(
                 RefusalKind::Internal,
                 output,
@@ -6127,11 +7758,11 @@ mod tests {
         shift: Arc<dyn ArrivalShift>,
     }
 
-    /// How something the daemon does moves a member's arrival — the seam the
-    /// relay-vs-device experiment injects its physics through (a provisional delay of
-    /// *d* moves this speaker by *g·d*; a knob of *k* moves it by *h·k*; a reconnect
-    /// adds ε). Everything else uses [`NoShift`], so the existing tests measure exactly
-    /// what they measured before.
+    /// How something the daemon does moves a member's arrival — the seam a test injects
+    /// physics through. Two implementations: [`RelayShift`], where a provisional delay
+    /// simply delays that speaker (the chain's premise, plan §1.1), and [`EquivPhysics`],
+    /// where the delay line's gain, the knob's *sign* and a reconnect's ε are all
+    /// injectable, because whether those match is exactly what W21 measures.
     trait ArrivalShift: Send + Sync {
         fn shift_ms(&self, member: &str) -> f64;
 
@@ -6139,14 +7770,6 @@ mod tests {
         /// (plan §2.3.2), and the only honest way to make a gate genuinely time out.
         fn silent(&self, _member: &str) -> bool {
             false
-        }
-    }
-
-    struct NoShift;
-
-    impl ArrivalShift for NoShift {
-        fn shift_ms(&self, _member: &str) -> f64 {
-            0.0
         }
     }
 
@@ -6407,18 +8030,44 @@ mod tests {
         /// The fake capture, so a test can read its frame clock to schedule the above.
         mic: Arc<FakeMic>,
         levels: Arc<Mutex<HashMap<String, u8>>>,
+        /// The provisional delay line the chain applies through (plan §1.1.1), and the
+        /// thing that makes an overlap's *next* reading include the delay it is carrying.
+        relay: Arc<FakeRelay>,
+    }
+
+    /// A provisional delay moves the speaker it is applied to — the physics the whole
+    /// chain rests on, since a later position measures each overlap *through* the line it
+    /// is carrying (plan §1.1).
+    ///
+    /// Deliberately nothing else: the line's own sample arithmetic and its cap are
+    /// `relay_delay`'s tests, and the relay-vs-device *equivalence* is W21's.
+    struct RelayShift {
+        relay: Arc<FakeRelay>,
+    }
+
+    impl ArrivalShift for RelayShift {
+        fn shift_ms(&self, member: &str) -> f64 {
+            self.relay.applied_ms(member)
+        }
     }
 
     impl Rig {
         fn new(arrivals: &[(&str, f64)], mode: Mode, drift_ms_per_s: f64) -> Self {
+            Self::of_kinds(&arrivals.iter().map(|(n, a)| (*n, MemberKind::Sendspin, *a)).collect::<Vec<_>>(), mode, drift_ms_per_s)
+        }
+
+        /// The same rig with an explicit kind per member, for the mixed-polarity cases
+        /// §2.4.2 is about.
+        fn of_kinds(arrivals: &[(&str, MemberKind, f64)], mode: Mode, drift_ms_per_s: f64) -> Self {
             let timing = Timing::real();
-            let members: Vec<SessionMember> = arrivals.iter().map(|(n, _)| member(n)).collect();
+            let members: Vec<SessionMember> =
+                arrivals.iter().map(|(n, k, _)| SessionMember { node_name: (*n).to_string(), kind: *k }).collect();
             let soloed = Arc::new(Mutex::new(None));
             let active = Arc::new(AtomicBool::new(true));
             let connected = Arc::new(AtomicBool::new(true));
             let levels = Arc::new(Mutex::new(HashMap::new()));
             let arrivals: Arc<Mutex<HashMap<String, f64>>> =
-                Arc::new(Mutex::new(arrivals.iter().map(|(n, a)| ((*n).to_string(), *a)).collect()));
+                Arc::new(Mutex::new(arrivals.iter().map(|(n, _, a)| ((*n).to_string(), *a)).collect()));
             let reconnect_at = Arc::new(AtomicU64::new(0));
             let session = Arc::new(FakeSession {
                 members,
@@ -6427,6 +8076,9 @@ mod tests {
                 interference: Arc::new(Mutex::new(Vec::new())),
                 levels: levels.clone(),
             });
+            // Every rig carries a line, and an unused one applies nothing — so the tests
+            // that predate W12 measure exactly what they measured before.
+            let relay = Arc::new(FakeRelay::new());
             let mic = Arc::new(FakeMic {
                 rate: 48_000,
                 pattern_ms: timing.pattern_ms,
@@ -6437,20 +8089,22 @@ mod tests {
                 connected: connected.clone(),
                 drift_ms_per_s,
                 reconnect_at: reconnect_at.clone(),
-                shift: Arc::new(NoShift),
+                shift: Arc::new(RelayShift { relay: relay.clone() }),
             });
             let writer = Arc::new(FakeWriter::default());
             let deps = MeasureDeps {
                 mode,
+                chained: false,
                 link_to: Vec::new(),
                 session,
                 mic: mic.clone(),
                 writer: writer.clone(),
+                relay: relay.clone(),
                 current_delays: HashMap::new(),
                 send_ahead: SendAheadContext::default(),
                 timing,
             };
-            Rig { deps, writer, active, connected, arrivals, reconnect_at, levels, mic }
+            Rig { deps, writer, active, connected, arrivals, reconnect_at, levels, mic, relay }
         }
     }
 
@@ -6587,8 +8241,10 @@ mod tests {
             Phase::Learning,
             // Parked waiting for the user is *not* terminal: the run is alive and
             // holding the group, so a second `start` must refuse rather than quietly
-            // abandoning a walk in progress.
+            // abandoning a walk in progress — or, for a chain, stranding an apartment's
+            // worth of provisional delays with nothing left that knows about them.
             Phase::Walking,
+            Phase::Positioning,
             Phase::Measuring,
             Phase::Solving,
             Phase::Writing,
@@ -7075,6 +8731,642 @@ mod tests {
         assert_eq!(m.status().phase, Phase::Idle, "a refused start must leave no run behind");
     }
 
+    // ------------------------------------ multi-position chaining (W12), end to end
+
+    /// A chained run over synthetic audio, with the provisional delay line wired to the
+    /// physics ([`RelayShift`]): a delay the chain applies really does move that speaker,
+    /// which is what makes an overlap's *next* reading include it (plan §1.1).
+    fn chain_rig(members: &[&str]) -> Rig {
+        let mut rig = Rig::new(&members.iter().map(|n| (*n, 0.0)).collect::<Vec<_>>(), Mode::SweetSpot, 0.0);
+        rig.deps.chained = true;
+        rig
+    }
+
+    fn chain_rig_of(members: &[(&str, MemberKind)]) -> Rig {
+        let mut rig = Rig::of_kinds(&members.iter().map(|(n, k)| (*n, *k, 0.0)).collect::<Vec<_>>(), Mode::SweetSpot, 0.0);
+        rig.deps.chained = true;
+        rig
+    }
+
+    async fn wait_chain(m: &MeasureManager) -> MeasureStatus {
+        wait_for(m, "the chain to be waiting for a position", |s| {
+            s.chain.as_ref().is_some_and(|c| matches!(c.next, ChainAction::Position | ChainAction::Finish))
+        })
+        .await
+    }
+
+    fn chain_of(s: &MeasureStatus) -> ChainProgress {
+        s.chain.clone().unwrap_or_else(|| panic!("a chain; phase {:?}, message {}", s.phase, s.message))
+    }
+
+    fn applied(s: &MeasureStatus, node: &str) -> u16 {
+        chain_of(s).provisional.iter().find(|p| p.node_name == node).map(|p| p.applied_ms).unwrap_or_else(|| {
+            panic!(
+                "'{node}' has no provisional delay; lines are {:?}",
+                chain_of(s).provisional.iter().map(|p| &p.node_name).collect::<Vec<_>>()
+            )
+        })
+    }
+
+    /// Stand at a listening position: tell the fake capture what is audible from there —
+    /// wire delay **plus that spot's path** per speaker, exactly as a mic in one place
+    /// hears it (plan §1) — and then post the position.
+    ///
+    /// The provisional delays are *not* part of these numbers: the rig's [`RelayShift`]
+    /// adds whatever the line is carrying, which is the whole point.
+    async fn at_position(
+        m: &MeasureManager,
+        arrivals: &Arc<Mutex<HashMap<String, f64>>>,
+        heard: &[(&str, f64)],
+        members: &[&str],
+        overlaps: &[&str],
+    ) {
+        wait_chain(m).await;
+        *arrivals.lock_recover() = heard.iter().map(|(n, a)| ((*n).to_string(), *a)).collect();
+        m.position(members.iter().map(|s| (*s).to_string()).collect(), overlaps.iter().map(|s| (*s).to_string()).collect())
+            .unwrap_or_else(|r| panic!("position {members:?} through {overlaps:?} refused: {}", r.message));
+    }
+
+    /// The headline case: two rooms, one microphone, and a result that is right in *both*
+    /// places — recovered from arrivals injected separately per position.
+    #[tokio::test(start_paused = true)]
+    async fn a_two_step_chain_recovers_the_arrivals_injected_at_both_positions() {
+        let rig = chain_rig(&["a", "b", "c", "d"]);
+        let (writer, relay, arrivals) = (rig.writer.clone(), rig.relay.clone(), rig.arrivals.clone());
+        let m = manager();
+        m.start(rig.deps).await.expect("a chained run must start");
+
+        // Position 1, in the living room: 'b' arrives 5 ms after 'a', so 'a' is delayed to
+        // meet it — the latest arrival is the target (plan §1.1).
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0)], &["a", "b"], &[]).await;
+        let s = wait_chain(&m).await;
+        assert_eq!(applied(&s, "a"), 5, "the earlier speaker is delayed to the later one");
+        assert_eq!(applied(&s, "b"), 0);
+        assert_eq!(chain_of(&s).steps[0].confidence, OverlapConfidence::Origin);
+        assert_eq!(chain_of(&s).remaining, vec!["c".to_string(), "d".to_string()]);
+
+        // Position 2, in the kitchen: 'a' and 'b' are still audible and are the overlaps.
+        // With the 5 ms 'a' is carrying they arrive together here at 25 ms, and the new
+        // speakers arrive earlier, so nothing already aligned has to move.
+        at_position(&m, &arrivals, &[("a", 20.0), ("b", 25.0), ("c", 10.0), ("d", 13.0)], &["c", "d"], &["a", "b"]).await;
+        let s = wait_chain(&m).await;
+        let chain = chain_of(&s);
+        assert_eq!(chain.next, ChainAction::Finish, "every speaker is aligned somewhere: {}", chain.prompt);
+        assert_eq!(chain.steps.len(), 2);
+        let two = &chain.steps[1];
+        assert_eq!(two.confidence, OverlapConfidence::Checked);
+        assert!(two.disagreement_ms.is_some_and(|d| d < 1.0), "the two overlaps agree here: {two:?}");
+        assert!(two.delta_ms.abs() < 0.6, "nothing new arrives later than the aligned set, so Δ is 0: {}", two.delta_ms);
+        assert_eq!(applied(&s, "c"), 15);
+        assert_eq!(applied(&s, "d"), 12);
+        assert_eq!(applied(&s, "a"), 5, "an aligned member only moves when Δ says so");
+        assert_eq!(chain.floor_ms, 0.0, "the floor has not ratcheted yet — 'b' is still at zero");
+
+        // Finishing renormalises globally and proposes the one write.
+        m.finish().expect("finish accepted");
+        let s = wait_terminal(&m).await;
+        assert_eq!(s.phase, Phase::Proposed, "{}", s.message);
+        assert!(writer.writes.lock_recover().is_empty(), "a chain writes nothing until `apply` (plan §1.1.1)");
+        assert!(relay.applied_ms("c") > 0.0, "the proposal the user is listening to is the delay line");
+
+        // Both positions' geometry is reproduced by the knobs: an advance of `x` plays
+        // that much earlier, so a member that needed 5 ms *more* delay than another ends
+        // with 5 ms *less* advance.
+        assert_eq!(proposed(&s, "a").new_delay_ms, 10);
+        assert_eq!(proposed(&s, "b").new_delay_ms, 15);
+        assert_eq!(proposed(&s, "c").new_delay_ms, 0);
+        assert_eq!(proposed(&s, "d").new_delay_ms, 3);
+        let p = s.proposal.clone().expect("a proposal");
+        assert_eq!(p.reference, "c", "the member that needed the most delay ends at knob zero (§2.4.2)");
+        assert!(p.members.iter().all(|x| x.polarity == KnobPolarity::Advance));
+        assert!(p.blocked.is_none(), "{:?}", p.blocked);
+        assert!(s.can_apply);
+        // Position 1's 5 ms between 'a' and 'b' survives, and so does position 2's 3 ms.
+        assert_eq!(proposed(&s, "b").new_delay_ms - proposed(&s, "a").new_delay_ms, 5);
+        assert_eq!(proposed(&s, "d").new_delay_ms - proposed(&s, "c").new_delay_ms, 3);
+
+        // What it does *not* promise is stated, on every chained run.
+        let scope = s.warnings.iter().find(|w| w.kind == WarningKind::ChainScope).expect("the doorway caveat is not optional");
+        assert!(scope.message.contains("doorway"), "{}", scope.message);
+        assert!(scope.message.contains("indirectly"), "{}", scope.message);
+        assert!(chain_of(&s).error.bounded, "both joints were checked by two overlaps");
+    }
+
+    /// **The trick the whole feature rests on** (plan §1.1): when a new speaker arrives
+    /// later than the already-aligned set, the set gains Δ — and Δ goes to *every* member
+    /// of it, not just to the overlap that was measured, because a common delay preserves
+    /// that set's internal alignment.
+    #[tokio::test(start_paused = true)]
+    async fn a_delta_moves_the_whole_aligned_set_and_not_just_the_overlap() {
+        // 'e' is aligned at position 1 and is **not** audible at position 2, so it is
+        // never measured there: it can only move if Δ was propagated to the whole set.
+        let rig = chain_rig(&["a", "b", "e", "c", "d"]);
+        let arrivals = rig.arrivals.clone();
+        let m = manager();
+        m.start(rig.deps).await.expect("started");
+
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0), ("e", 2.0)], &["a", "b", "e"], &[]).await;
+        let s = wait_chain(&m).await;
+        assert_eq!((applied(&s, "a"), applied(&s, "b"), applied(&s, "e")), (5, 0, 3));
+
+        // At position 2 the overlaps arrive together at 15 ms while the new speakers
+        // arrive at 30 and 25: the target is 30, so the aligned set is 15 ms early.
+        at_position(&m, &arrivals, &[("a", 10.0), ("b", 15.0), ("c", 30.0), ("d", 25.0)], &["c", "d"], &["a", "b"]).await;
+        let s = wait_chain(&m).await;
+        let two = &chain_of(&s).steps[1];
+        assert!((two.delta_ms - 15.0).abs() < 0.6, "Δ should be 15 ms: {}", two.delta_ms);
+        assert_eq!(applied(&s, "a"), 20, "the measured overlap gained Δ");
+        assert_eq!(applied(&s, "b"), 15, "so did the other overlap");
+        assert_eq!(applied(&s, "e"), 18, "and so did the member that was not even audible here — that is the trick");
+        assert_eq!(applied(&s, "c"), 0);
+        assert_eq!(applied(&s, "d"), 5);
+        // Position 1's internal alignment is untouched by the common shift.
+        assert_eq!(applied(&s, "a") - applied(&s, "b"), 5);
+        assert_eq!(applied(&s, "e") - applied(&s, "b"), 3);
+        assert!((chain_of(&s).floor_ms - 0.0).abs() < 1e-9, "'c' is the new floor at 0 ms");
+        assert!(two.note.contains("common delay"), "{}", two.note);
+
+        // And the floor that ratcheted is taken back out by the global renormalisation, so
+        // nothing is left carrying delay for nothing (plan §1.1).
+        m.finish().expect("finish accepted");
+        let s = wait_terminal(&m).await;
+        assert_eq!(s.phase, Phase::Proposed, "{}", s.message);
+        let p = s.proposal.clone().expect("a proposal");
+        assert_eq!(p.members.iter().map(|x| x.new_delay_ms).min(), Some(0), "the renormalisation puts the smallest knob back at zero");
+        assert_eq!(proposed(&s, "a").new_delay_ms, 0);
+        assert_eq!(proposed(&s, "b").new_delay_ms, 5);
+        assert_eq!(proposed(&s, "e").new_delay_ms, 2);
+        assert_eq!(proposed(&s, "c").new_delay_ms, 20);
+        assert_eq!(proposed(&s, "d").new_delay_ms, 15);
+        assert!((p.spread_ms - 20.0).abs() < 0.6, "the ratchet the renormalisation removed: {} ms", p.spread_ms);
+    }
+
+    /// Two overlaps that disagree by more than plausible geometry **refuse the step**
+    /// (plan §1.1) — and the chain survives it, because the positions already aligned are
+    /// still good and still carry their delays.
+    #[tokio::test(start_paused = true)]
+    async fn overlaps_that_disagree_refuse_the_step_and_leave_the_chain_alive() {
+        let rig = chain_rig(&["a", "b", "c"]);
+        let arrivals = rig.arrivals.clone();
+        let m = manager();
+        m.start(rig.deps).await.expect("started");
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0)], &["a", "b"], &[]).await;
+        wait_chain(&m).await;
+
+        // 'a' carries 5 ms, so the overlaps read 15 and 25 here: 10 ms apart, which is
+        // more than one room's geometry explains.
+        at_position(&m, &arrivals, &[("a", 10.0), ("b", 25.0), ("c", 8.0)], &["c"], &["a", "b"]).await;
+        let s = wait_for(&m, "the step to be refused", |s| s.chain.as_ref().is_some_and(|c| c.refusal.is_some())).await;
+        let chain = chain_of(&s);
+        let r = chain.refusal.clone().expect("a step refusal");
+        assert_eq!(r.kind, RefusalKind::OverlapDisagreement);
+        // The refusal has to set the expectation, not just report a number: two overlaps
+        // are *not* expected to agree exactly, and the tolerance is a plausibility check.
+        assert!(r.message.contains("not* expected to read identically"), "{}", r.message);
+        assert!(r.message.contains("a few ms is normal"), "{}", r.message);
+        assert!(r.message.contains("every* speaker aligned so far"), "the stake has to be in the sentence: {}", r.message);
+        assert_eq!(chain.steps.len(), 1, "the bad position was not recorded");
+        assert!(!chain.aligned.contains(&"c".to_string()));
+        assert_eq!(applied(&s, "a"), 5, "position 1 is untouched");
+        assert_eq!(s.phase, Phase::Positioning, "the chain is still waiting, not refused");
+        assert!(s.refusal.is_none(), "a step refusal is not the run's refusal");
+
+        // Standing somewhere the two overlaps *are* plausible, the same position works.
+        at_position(&m, &arrivals, &[("a", 15.0), ("b", 20.0), ("c", 8.0)], &["c"], &["a", "b"]).await;
+        let s = wait_chain(&m).await;
+        assert_eq!(chain_of(&s).steps.len(), 2, "{}", chain_of(&s).prompt);
+        assert!(chain_of(&s).refusal.is_none(), "an accepted position clears the last refusal");
+        assert_eq!(applied(&s, "c"), 12, "the overlaps read 20 ms here, so 'c' at 8 ms is delayed by 12");
+    }
+
+    /// One overlap is **possible** — a user may genuinely have only one shared speaker —
+    /// and it is reported as what it is: a joint nothing checks, and a chain whose total
+    /// error cannot be bounded (plan §1.1).
+    #[tokio::test(start_paused = true)]
+    async fn a_single_overlap_step_is_accepted_and_reported_as_reduced_confidence() {
+        let rig = chain_rig(&["a", "b", "c"]);
+        let arrivals = rig.arrivals.clone();
+        let m = manager();
+        m.start(rig.deps).await.expect("started");
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0)], &["a", "b"], &[]).await;
+        wait_chain(&m).await;
+        at_position(&m, &arrivals, &[("a", 20.0), ("c", 10.0)], &["c"], &["a"]).await;
+        let s = wait_chain(&m).await;
+
+        let chain = chain_of(&s);
+        let two = &chain.steps[1];
+        assert_eq!(two.confidence, OverlapConfidence::Single);
+        assert_eq!(two.disagreement_ms, None, "one overlap has nothing to disagree with");
+        assert_eq!(two.joint_error_ms, None, "and therefore no error estimate at all");
+        assert!(two.note.contains("weakest"), "{}", two.note);
+        assert_eq!(applied(&s, "c"), 15, "'a' reads 25 ms here with its 5 ms, so 'c' at 10 is delayed by 15");
+
+        // The honest answer about the total is *no* total, not a partial one.
+        assert!(!chain.error.bounded);
+        assert_eq!(chain.error.joint_ms, None);
+        assert!(chain.error.message.contains("cannot be bounded"), "{}", chain.error.message);
+        assert!(chain.error.message.contains("single overlap"), "{}", chain.error.message);
+        let warn = s.warnings.iter().find(|w| w.kind == WarningKind::OneOverlap).expect("the user has to be told which step was weaker");
+        assert!(warn.message.contains("nothing to check it against"), "{}", warn.message);
+
+        m.finish().expect("finish accepted");
+        let s = wait_terminal(&m).await;
+        assert_eq!(s.phase, Phase::Proposed, "{}", s.message);
+        // …and it is still on the proposal, where the user decides whether to write.
+        assert!(s.proposal.as_ref().expect("a proposal").warnings.iter().any(|w| w.kind == WarningKind::OneOverlap));
+        assert!(!chain_of(&s).error.bounded);
+    }
+
+    /// Plan §1.1.1: the real knobs are written **once**, after the last position. A
+    /// per-position write would spend the run's wall clock waiting for speakers to come
+    /// back (§2.3: tens of seconds each).
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_step_chain_writes_exactly_one_wave_and_drops_the_delay_lines() {
+        let rig = chain_rig(&["a", "b", "c"]);
+        let (relay, arrivals) = (rig.relay.clone(), rig.arrivals.clone());
+        let m = manager();
+        m.start(rig.deps).await.expect("started");
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0)], &["a", "b"], &[]).await;
+        wait_chain(&m).await;
+        at_position(&m, &arrivals, &[("a", 20.0), ("b", 25.0), ("c", 10.0)], &["c"], &["a", "b"]).await;
+        wait_chain(&m).await;
+        m.finish().expect("finish accepted");
+        let s = wait_terminal(&m).await;
+        assert_eq!(s.phase, Phase::Proposed, "{}", s.message);
+        assert!(relay.applied_ms("a") > 0.0, "the alignment is in the line until `apply`");
+
+        // Post-write the whole set arrives together — the knobs now carry what the lines
+        // were standing in for, so the fake capture is told to render them level.
+        let after = chain_rig(&["a", "b", "c"]);
+        *after.arrivals.lock_recover() = [("a", 0.0), ("b", 0.0), ("c", 0.0)].iter().map(|(n, v)| ((*n).to_string(), *v)).collect();
+        let writer = after.writer.clone();
+        m.apply(after.deps).await.expect("apply accepted");
+        let s = wait_terminal(&m).await;
+        assert_eq!(s.phase, Phase::Done, "{}", s.message);
+
+        // One wave: every knob written at most once, and only the ones that changed.
+        let writes = writer.writes.lock_recover().clone();
+        for (name, _) in &writes {
+            assert_eq!(writer.count(name), 1, "'{name}' was written more than once: {writes:?}");
+        }
+        assert!(writes.len() <= 3, "a three-speaker chain cannot need more than three writes: {writes:?}");
+        // 'c' needed the most provisional delay, so the renormalisation leaves it at
+        // advance 0 — which is where it already was, and writing it would reconnect a
+        // speaker for nothing (plan §2.3).
+        assert_eq!(proposed(&s, "c").new_delay_ms, 0);
+        assert_eq!(writer.count("c"), 0, "an unchanged knob is not written: {writes:?}");
+        assert_eq!(writer.last("a"), Some(10));
+        assert_eq!(writer.last("b"), Some(15));
+        // And the provisional lines are gone, or every chained member would be delayed
+        // twice (plan §1.1.1: the line is a stand-in for the knob, not an addition).
+        assert_eq!(relay.applied_ms("a"), 0.0);
+        assert!(chain_of(&s).provisional.is_empty());
+
+        // The verification says what it covered: the *last* position only (§10.4's rule,
+        // applied to a chain).
+        let v = s.verification.clone().expect("a verification");
+        assert!(v.passed, "residual {} ms", v.residual.worst_ms);
+        let note = v.scope_note.clone().expect("a chain must not imply it re-checked every position");
+        assert!(note.contains("last of 2 position(s)"), "{note}");
+        assert!(note.contains("walking the chain again"), "{note}");
+    }
+
+    /// Plan §1.2: a *position* is one continuous capture. A reconnect inside one discards
+    /// that position's readings — nothing is ever solved across the seam — while the
+    /// positions already aligned survive, because what carries a chain from one position
+    /// to the next is the delay each speaker holds, and the next position re-measures its
+    /// overlaps in the new frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_mic_reconnect_voids_the_position_in_flight_without_mixing_frames() {
+        let rig = chain_rig(&["a", "b", "c"]);
+        let (reconnect_at, mic, arrivals) = (rig.reconnect_at.clone(), rig.mic.clone(), rig.arrivals.clone());
+        let m = manager();
+        m.start(rig.deps).await.expect("started");
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0)], &["a", "b"], &[]).await;
+        let s = wait_chain(&m).await;
+        let before = s.observations.len();
+        assert_eq!(before, 4, "two members, two passes");
+
+        // 5 s from now: past the 3 s mute guard, so it lands inside the next reading —
+        // the only place a reconnect is detectable.
+        reconnect_at.store(mic.frames_now() + u64::from(mic.rate) * 5, Ordering::Relaxed);
+        at_position(&m, &arrivals, &[("a", 20.0), ("b", 25.0), ("c", 10.0)], &["c"], &["a", "b"]).await;
+
+        let s = wait_for(&m, "the position to restart", |s| s.chain.as_ref().is_some_and(|c| c.restarts >= 1)).await;
+        let warn = s.warnings.iter().find(|w| w.kind == WarningKind::MicReconnected).expect("the user has to be told");
+        assert!(warn.message.contains("discarded"), "{}", warn.message);
+        assert!(warn.message.contains("earlier positions are not affected"), "{}", warn.message);
+        assert!(warn.message.contains("re-measures its overlaps"), "the reason they survive has to be in the sentence: {}", warn.message);
+
+        let s = wait_chain(&m).await;
+        let chain = chain_of(&s);
+        assert_eq!(chain.steps.len(), 2, "the position was retaken, not lost: {}", chain.prompt);
+        assert_eq!(applied(&s, "a"), 5, "position 1 came through untouched");
+        assert_eq!(applied(&s, "c"), 15);
+        // Nothing from the discarded attempt survived into the readings the step solved.
+        assert_eq!(s.observations.len(), before + 6, "3 members × 2 passes for position 2, and nothing left over");
+        // The two positions are in **different** frames, and that is fine precisely
+        // because no arrival is ever compared across them.
+        assert_eq!(chain.steps[0].grid_epoch, 0);
+        assert_eq!(chain.steps[1].grid_epoch, 1, "the post-reconnect epoch");
+        // Every reading a step solved shares that step's epoch — the seam the epoch check
+        // in `arrivals_of` refuses is never reached.
+        for step in &chain.steps {
+            let names: Vec<&String> = step.members.iter().chain(step.overlaps.iter().map(|o| &o.node_name)).collect();
+            let mine: Vec<&MemberObservation> =
+                s.observations.iter().filter(|o| names.contains(&&o.node_name) && o.grid_epoch == step.grid_epoch).collect();
+            assert_eq!(mine.len(), names.len() * MEASURE_PASSES, "step {} is missing readings in its own epoch", step.index);
+        }
+    }
+
+    /// §2.4.2, through the chain: a sendspin-only run is aligned to the member that needed
+    /// the **most** delay — its earliest arrival — which takes advance 0 while everyone
+    /// else is advanced to meet it. The renormalisation is the interval solver, not a
+    /// subtraction, and this is the case most likely to regress.
+    #[test]
+    fn a_sendspin_only_chain_aligns_to_its_earliest_member_after_renormalising() {
+        let members = [member("a"), member("b"), member("c")];
+        // A floor that has ratcheted a long way up, which is exactly what §1.1 warns
+        // about: every step could only add.
+        let provisional: HashMap<String, f64> =
+            [("a".to_string(), 100.0), ("b".to_string(), 105.0), ("c".to_string(), 120.0)].into_iter().collect();
+        let p = solve_chain(&ChainSolveInput {
+            timing: Timing::real(),
+            members: &members,
+            provisional: &provisional,
+            current_delays: &HashMap::new(),
+            send_ahead: &SendAheadContext::default(),
+            steps: &[],
+            observations: &[],
+        })
+        .expect("accepted");
+        let by = |n: &str| p.members.iter().find(|m| m.node_name == n).unwrap().clone();
+        // 'c' needed the most delay, i.e. it arrived earliest: advance 0, and the others
+        // are advanced to meet it.
+        assert_eq!(by("c").new_delay_ms, 0);
+        assert_eq!(by("b").new_delay_ms, 15);
+        assert_eq!(by("a").new_delay_ms, 20);
+        assert_eq!(p.reference, "c");
+        assert!(p.members.iter().all(|m| m.polarity == KnobPolarity::Advance));
+        // The point of the renormalisation: nobody carries the 100 ms floor the chain
+        // accumulated, and the relative geometry is untouched.
+        assert_eq!(p.largest_knob_ms, 20);
+        assert_eq!(p.members.iter().map(|m| m.new_delay_ms).min(), Some(0));
+        assert!((p.spread_ms - 20.0).abs() < 1e-9, "the ratchet that was removed: {}", p.spread_ms);
+        assert_eq!(by("a").new_delay_ms - by("b").new_delay_ms, 5, "'a' needed 5 ms less delay than 'b', so it ends 5 ms less advanced");
+    }
+
+    /// The renormalisation cannot be "subtract the minimum" once the polarities are mixed
+    /// (plan §2.4.2), so it is the interval solver — and the solver's answer is a common
+    /// shift chosen inside the intersection, which lands both knobs at the same value here.
+    #[test]
+    fn a_mixed_polarity_chain_is_renormalised_by_the_interval_solver() {
+        let members = [member("spk"), SessionMember { node_name: "ap2-dev-x".into(), kind: MemberKind::Airplay2 }];
+        let provisional: HashMap<String, f64> = [("spk".to_string(), 20.0), ("ap2-dev-x".to_string(), 0.0)].into_iter().collect();
+        // The sendspin member needs headroom to be moved *later*: reducing an advance is
+        // the only way to do it, so it has to have one to give up.
+        let current: HashMap<String, u16> = [("spk".to_string(), 30u16)].into_iter().collect();
+        let p = solve_chain(&ChainSolveInput {
+            timing: Timing::real(),
+            members: &members,
+            provisional: &provisional,
+            current_delays: &current,
+            send_ahead: &SendAheadContext::default(),
+            steps: &[],
+            observations: &[],
+        })
+        .expect("accepted");
+        let by = |n: &str| p.members.iter().find(|m| m.node_name == n).unwrap().clone();
+        assert_eq!(by("spk").new_delay_ms, 5, "the advance is reduced by 25, which delays it by 25");
+        assert_eq!(by("ap2-dev-x").new_delay_ms, 5, "and the AP2 member is delayed by 5 — the difference is the 20 ms asked for");
+        assert_eq!(p.largest_knob_ms, 5, "the target chosen is the one that keeps the largest knob smallest (§9.2)");
+
+        // Without that headroom the chain is measurable but **not writable**, and the
+        // refusal names both members rather than writing a best effort (§2.4.2).
+        let r = solve_chain(&ChainSolveInput {
+            timing: Timing::real(),
+            members: &members,
+            provisional: &provisional,
+            current_delays: &HashMap::new(),
+            send_ahead: &SendAheadContext::default(),
+            steps: &[],
+            observations: &[],
+        })
+        .expect_err("an advance-only member cannot be pushed later");
+        assert_eq!(r.kind, RefusalKind::KnobRange);
+        assert!(r.message.contains("spk") && r.message.contains("ap2-dev-x"), "{}", r.message);
+    }
+
+    /// §1.1's algebra on its own, with no capture, no relay and no runtime — including the
+    /// two cases the orchestration cannot express as cleanly: three overlaps, and an
+    /// aligned set that is already the latest thing at the new position.
+    #[test]
+    fn the_chain_step_algebra_takes_the_latest_arrival_as_the_target() {
+        let aligned: HashMap<String, f64> = [("x".to_string(), 4.0), ("y".to_string(), 0.0), ("z".to_string(), 7.0)].into_iter().collect();
+        // The aligned set reads 10 and 12 here (mean 11); the new member arrives at 30.
+        let arrivals = [("new".to_string(), 30.0), ("x".to_string(), 10.0), ("y".to_string(), 12.0)];
+        let overlaps = ["x".to_string(), "y".to_string()];
+        let s = chain_step(&ChainStepInput { aligned: &aligned, arrivals: &arrivals, overlaps: &overlaps, tolerance_ms: 8.0 })
+            .expect("2 ms apart is plausible");
+        assert_eq!(s.target_ms, 30.0);
+        assert_eq!(s.anchor_ms, Some(11.0));
+        assert_eq!(s.delta_ms, 19.0);
+        assert_eq!(s.provisional.get("new"), Some(&0.0), "the latest arrival needs no delay");
+        assert_eq!(s.provisional.get("x"), Some(&23.0), "4 + Δ");
+        assert_eq!(s.provisional.get("y"), Some(&19.0), "0 + Δ");
+        assert_eq!(s.provisional.get("z"), Some(&26.0), "7 + Δ — never measured here, moved anyway");
+        assert_eq!(s.disagreement_ms, Some(2.0));
+        assert_eq!(s.joint_error_ms, Some(1.0), "the anchor is the mean, so it can be out by half the disagreement");
+        assert_eq!(s.confidence, OverlapConfidence::Checked);
+
+        // The other direction: the aligned set is already the latest thing here, so it
+        // does not move at all and the new members are delayed to it.
+        let arrivals = [("new".to_string(), 5.0), ("x".to_string(), 20.0), ("y".to_string(), 20.0)];
+        let s = chain_step(&ChainStepInput { aligned: &aligned, arrivals: &arrivals, overlaps: &overlaps, tolerance_ms: 8.0 })
+            .expect("accepted");
+        assert_eq!(s.delta_ms, 0.0);
+        assert_eq!(s.provisional.get("new"), Some(&15.0));
+        assert_eq!(s.provisional.get("z"), None, "with no Δ the aligned set is not touched at all");
+
+        // A later position with no overlap has nothing tying it to anything.
+        let arrivals = [("new".to_string(), 5.0)];
+        let r = chain_step(&ChainStepInput { aligned: &aligned, arrivals: &arrivals, overlaps: &[], tolerance_ms: 8.0 })
+            .expect_err("must refuse");
+        assert_eq!(r.kind, RefusalKind::OverlapMissing);
+        assert!(r.message.contains("mutually meaningless"), "{}", r.message);
+    }
+
+    /// The chain's error statement, which is the whole honesty budget of the feature.
+    #[test]
+    fn the_accumulated_error_is_the_joints_and_is_withheld_when_a_joint_is_unmeasurable() {
+        let step = |index: usize, confidence: OverlapConfidence, joint: Option<f64>| ChainStep {
+            index,
+            members: vec![format!("m{index}")],
+            overlaps: match confidence {
+                OverlapConfidence::Origin => Vec::new(),
+                _ => vec![ChainOverlap { node_name: "ov".into(), arrival_ms: 0.0, applied_ms: 0.0 }],
+            },
+            confidence,
+            disagreement_ms: joint.map(|j| j * 2.0),
+            worst_pair: None,
+            tolerance_ms: OVERLAP_AGREEMENT_TOL_MS,
+            anchor_ms: None,
+            delta_ms: 0.0,
+            target_ms: 0.0,
+            spread_ms: 0.0,
+            drift_ppm: 0.0,
+            joint_error_ms: joint,
+            grid_epoch: 0,
+            checks: Checks {
+                transitivity: transitivity(&[], &Timing::real(), TRANSITIVITY_TOL_MS),
+                repeatability: None,
+                merged_peak: MergedPeakCheck::seam(),
+                closure: None,
+            },
+            note: String::new(),
+        };
+        // One position is not a chain: no joints, so nothing accumulates.
+        let one = chain_error(&[step(1, OverlapConfidence::Origin, None)]);
+        assert!(one.bounded && one.joint_ms == Some(0.0));
+        assert!(one.message.contains("no joints"), "{}", one.message);
+
+        // Two checked joints compose additively — the shifts are applied one on top of
+        // the other, so the worst case is the sum.
+        let checked = chain_error(&[
+            step(1, OverlapConfidence::Origin, None),
+            step(2, OverlapConfidence::Checked, Some(1.5)),
+            step(3, OverlapConfidence::Checked, Some(2.0)),
+        ]);
+        assert!(checked.bounded);
+        assert_eq!(checked.joint_ms, Some(3.5));
+        assert!(checked.message.contains("3.5 ms"), "{}", checked.message);
+        // …and it still says what it is *not* measuring.
+        assert!(checked.message.contains("§5.6"), "{}", checked.message);
+        assert!(checked.message.contains("between* regions"), "{}", checked.message);
+
+        // One unchecked joint anywhere and there is no total, rather than a total with a
+        // hole in it.
+        let single = chain_error(&[
+            step(1, OverlapConfidence::Origin, None),
+            step(2, OverlapConfidence::Checked, Some(1.5)),
+            step(3, OverlapConfidence::Single, None),
+        ]);
+        assert!(!single.bounded);
+        assert_eq!(single.joint_ms, None);
+        assert!(single.message.contains("position 3"), "{}", single.message);
+        assert!(single.message.contains("would be worse than none"), "{}", single.message);
+    }
+
+    /// The out-of-order cases, all of which are states the user can act on — so they are
+    /// refusals with a sentence, never a 500 and never silence (plan §11).
+    #[tokio::test(start_paused = true)]
+    async fn the_chain_refuses_calls_that_do_not_match_where_it_is() {
+        let m = manager();
+        let r = m.position(vec!["a".into()], Vec::new()).expect_err("idle refuses");
+        assert_eq!(r.kind, RefusalKind::ChainOutOfOrder);
+
+        let rig = chain_rig(&["a", "b", "c"]);
+        let (arrivals, relay, writer) = (rig.arrivals.clone(), rig.relay.clone(), rig.writer.clone());
+        m.start(rig.deps).await.expect("started");
+        wait_chain(&m).await;
+
+        // A speaker the run is not holding.
+        let r = m.position(vec!["ghost".into(), "a".into()], Vec::new()).expect_err("must refuse");
+        assert_eq!(r.member.as_deref(), Some("ghost"));
+        // An overlap at the first position, where nothing is aligned yet.
+        let r = m.position(vec!["a".into(), "b".into()], vec!["c".into()]).expect_err("must refuse");
+        assert!(r.message.contains("first position"), "{}", r.message);
+        // One speaker on its own has nothing to be aligned *to*.
+        let r = m.position(vec!["a".into()], Vec::new()).expect_err("must refuse");
+        assert!(r.message.contains("at least two speakers"), "{}", r.message);
+        // Finishing with speakers still unaligned.
+        let r = m.finish().expect_err("must refuse");
+        assert!(r.message.contains("not been aligned"), "{}", r.message);
+        // A near-field call on a chained run points at the right endpoint.
+        let r = m.arrival("a".into(), None).expect_err("must refuse");
+        assert!(r.message.contains("/api/align/measure/position"), "{}", r.message);
+
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0)], &["a", "b"], &[]).await;
+        // A second tap while the position is being measured.
+        let r = m.position(vec!["c".into()], vec!["a".into()]).expect_err("must refuse");
+        assert!(r.message.contains("busy"), "{}", r.message);
+        wait_chain(&m).await;
+
+        // Re-aligning a speaker that is already aligned, and using one that is not as an
+        // overlap: the two halves of the same mistake, each named correctly.
+        let r = m.position(vec!["a".into(), "c".into()], vec!["b".into()]).expect_err("must refuse");
+        assert_eq!(r.member.as_deref(), Some("a"));
+        assert!(r.message.contains("Offer it as an *overlap*"), "{}", r.message);
+        let r = m.position(vec!["c".into()], vec!["c".into()]).expect_err("must refuse");
+        assert!(r.message.contains("named twice"), "{}", r.message);
+
+        // Abandoning mid-chain gives the provisional delays back and writes nothing.
+        assert!(relay.applied_ms("a") > 0.0);
+        let after = m.abandon();
+        assert_eq!(after.phase, Phase::Idle);
+        assert!(after.chain.is_none(), "abandoning clears the chain with the run");
+        assert_eq!(relay.applied_ms("a"), 0.0, "a closed tab must not leave a delay line applied (plan §1.1.1)");
+        assert!(after.message.contains("provisional"), "{}", after.message);
+        assert!(writer.writes.lock_recover().is_empty());
+    }
+
+    /// A run that is not chained takes no positions, and says why rather than accepting
+    /// one and doing nothing with it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unchained_run_is_not_a_chain_and_says_so() {
+        let rig = Rig::new(&[("a", 0.0), ("b", 6.0)], Mode::SweetSpot, 0.0);
+        let m = manager();
+        m.start(rig.deps).await.expect("started");
+        let r = m.position(vec!["a".into(), "b".into()], Vec::new()).expect_err("must refuse");
+        assert_eq!(r.kind, RefusalKind::ChainOutOfOrder);
+        assert!(r.message.contains("`chain: true`"), "{}", r.message);
+        let s = wait_terminal(&m).await;
+        assert_eq!(s.phase, Phase::Proposed, "the ordinary path is untouched: {}", s.message);
+        assert!(s.chain.is_none(), "an unchained run has no chain state");
+
+        // And a near-field walk is refused for its own reason: it needs no overlaps at all.
+        let walk = Rig::new(&[("a", 0.0), ("b", 6.0)], Mode::NearField, 0.0);
+        m.abandon();
+        m.start(walk.deps).await.expect("started");
+        let r = m.position(vec!["a".into(), "b".into()], Vec::new()).expect_err("must refuse");
+        assert!(r.message.contains("one continuous capture"), "{}", r.message);
+    }
+
+    /// A chain over a pw-sink member: the mode admits every member kind, and the floor
+    /// that cannot be written below is the solver's problem rather than the chain's
+    /// (plan §1.1.2 item 4).
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_can_include_a_pw_sink_member() {
+        let rig = chain_rig_of(&[("a", MemberKind::Sendspin), ("b", MemberKind::Sendspin), ("pwsink-dev-host", MemberKind::PwSink)]);
+        let arrivals = rig.arrivals.clone();
+        let m = manager();
+        m.start(rig.deps).await.expect("started");
+        at_position(&m, &arrivals, &[("a", 0.0), ("b", 5.0)], &["a", "b"], &[]).await;
+        wait_chain(&m).await;
+        at_position(&m, &arrivals, &[("a", 20.0), ("b", 25.0), ("pwsink-dev-host", 10.0)], &["pwsink-dev-host"], &["a", "b"]).await;
+        wait_chain(&m).await;
+        m.finish().expect("finish accepted");
+        let s = wait_terminal(&m).await;
+
+        // The pw-sink member's playout delay cannot go below three packet times, and that
+        // floor is what pins the whole group's target — a refusal or a shifted target, but
+        // never a value nobody can write.
+        match s.phase {
+            Phase::Proposed => {
+                let p = s.proposal.clone().expect("a proposal");
+                let sink = proposed(&s, "pwsink-dev-host");
+                assert_eq!(sink.polarity, KnobPolarity::Delay);
+                assert!(sink.new_delay_ms >= crate::sync_settings::PWSINK_JITTER_MIN_MS, "{sink:?}");
+                assert!(p.blocked.is_none(), "{:?}", p.blocked);
+            }
+            Phase::Refused => {
+                let r = s.refusal.clone().expect("a refusal");
+                assert_eq!(r.kind, RefusalKind::KnobRange, "{}", r.message);
+            }
+            other => panic!("unexpected phase {other:?}: {}", s.message),
+        }
+    }
+
     // ------------------------------------------------------- closure unit tests
 
     fn walk_obs(name: &str, centre: f64, phase_a: f64) -> MemberObservation {
@@ -7372,15 +9664,16 @@ mod tests {
         let deps = EquivalenceDeps {
             base: MeasureDeps {
                 mode: Mode::SweetSpot,
+                chained: false,
                 link_to: Vec::new(),
                 session,
                 mic,
                 writer: writer.clone(),
+                relay: relay.clone(),
                 current_delays,
                 send_ahead: SendAheadContext::default(),
                 timing,
             },
-            relay: relay.clone(),
             member: None,
         };
         EquivRig { deps, relay, writer }
