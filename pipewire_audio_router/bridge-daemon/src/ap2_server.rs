@@ -386,7 +386,16 @@ pub fn start(
             // (announce.rs), so music and overlay are the same rate here — the mix is
             // pure sample addition. `mix_buf` is reused across chunks AND devices.
             let mixer = crate::overlay_mixer::OverlayMixer::global();
+            // Provisional per-device alignment delay (relay_delay.rs), applied AFTER the
+            // overlay so it shifts everything this receiver renders — as the AP2 render-
+            // delay knob it stands in for does. It emits exactly what it is fed, one
+            // block per block, so the feed cadence and the receiver's buffering are
+            // unchanged; only the content is older. `delay_buf` is reused like `mix_buf`,
+            // and with no alignment running the call is one relaxed atomic load.
+            let delayer = crate::relay_delay::RelayDelay::global();
+            let delay_fmt = crate::relay_delay::PcmFormat::new(rate, crate::sendspin_capture::CHANNELS);
             let mut mix_buf: Vec<u8> = Vec::new();
+            let mut delay_buf: Vec<u8> = Vec::new();
             while let Some(pcm) = pcm_rx.blocking_recv() {
                 let list = senders_relay.lock().unwrap();
                 // Fan out with ZERO steady-state allocation on this RT relay thread:
@@ -397,7 +406,8 @@ pub fn start(
                 // side, so the whole capture→feed path is allocation-free once warm.)
                 for (name, s) in list.iter() {
                     let mut buf = s.take_buffer();
-                    let src: &[u8] = if mixer.mix_into(name, &pcm, &mut mix_buf) { &mix_buf } else { &pcm };
+                    let mixed: &[u8] = if mixer.mix_into(name, &pcm, &mut mix_buf) { &mix_buf } else { &pcm };
+                    let src: &[u8] = if delayer.delay_into(name, delay_fmt, mixed, &mut delay_buf) { &delay_buf } else { mixed };
                     buf.extend(src.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
                     let _ = s.try_send(LivePcmFrame { samples: buf, channels: crate::sendspin_capture::CHANNELS as u8, sample_rate: rate });
                 }

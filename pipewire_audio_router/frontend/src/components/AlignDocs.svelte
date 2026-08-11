@@ -37,8 +37,10 @@
     <p class="card-sub">
       Speakers that play the same stream should be sample-locked, but each one adds its own delay on the way to the
       cone — a different decoder, a different amplifier, a DSP stage, a slower Wi-Fi link. A few milliseconds is
-      inaudible; ten or twenty smears the stereo image, and a hundred sounds like an echo between rooms. Alignment adds
-      a compensating delay to the speakers that are <em>early</em>, until they all land together.
+      inaudible; ten or twenty smears the stereo image, and a hundred sounds like an echo between rooms. Alignment
+      turns each speaker's own timing knob until they all land together — and the two kinds of knob work in
+      <em>opposite</em> directions: a <strong>Sendspin</strong> speaker's knob makes it play <em>earlier</em>, an
+      <strong>AirPlay 2</strong> receiver's or <strong>PipeWire host</strong>'s makes it play <em>later</em>.
     </p>
 
     <section>
@@ -70,9 +72,13 @@
       <h3>How to run it</h3>
       <ul>
         <li>
-          <strong>Pick the reference.</strong> Offsets only ever <em>add</em> delay, so the reference must be the
-          physically <em>latest</em> speaker — the one that already lags the most. Everything else is delayed up to
-          meet it. If you pick a fast speaker, the slow ones have nothing left to give.
+          <strong>Pick the reference — which one depends on the kinds.</strong> Each speaker's knob only moves it one
+          way, so the reference has to be the speaker the others can actually reach. Among <em>Sendspin</em> speakers
+          the knob is an <em>advance</em>, so leave the <em>earliest</em> one at zero and bring the late ones forward to
+          meet it. Among <em>AirPlay 2</em> receivers and <em>PipeWire hosts</em> the knob is a delay, so it is the
+          other way round: reference the <em>latest</em> one. A mixed group meets somewhere in between, and if the early
+          speaker is a delay-only one while the late speaker is advance-only, no setting brings them together at all —
+          then move a speaker, or drop one from the group.
         </li>
         <li>
           <strong>Only two speakers are audible</strong> at a time: the reference and the one being tuned. The rest are
@@ -98,20 +104,22 @@
     <section>
       <h3>What the offset actually changes</h3>
       <p>
-        For a <strong>Sendspin</strong> speaker it's that device's static delay: it renders each chunk that much later
-        than the timeline says. Current ESPHome firmware doesn't apply a delay change to a running stream, so each
+        For a <strong>Sendspin</strong> speaker it is that device's <em>static delay</em> setting, and despite the name
+        the device <em>subtracts</em> it from the moment it was told to play: raising it makes that speaker play
+        <em>earlier</em>, not later. Current ESPHome firmware doesn't apply the change to a running stream, so each
         change reconnects that one speaker — expect tens of seconds of silence from it before the click returns, while
         its group-mates keep playing. (If your firmware does apply it live, turn on
         <em>Sendspin delay applies live</em> under <strong>Settings</strong> and the slider becomes continuous.)
       </p>
       <p>
-        For an <strong>AirPlay 2</strong> receiver it's the render delay we ask it to use. Those are committed when you
-        release the slider rather than while dragging.
+        For an <strong>AirPlay 2</strong> receiver it is the render delay we ask it to use, and for a
+        <strong>PipeWire host</strong> the receiver's playout buffer: both make that speaker play <em>later</em>. Those
+        are committed when you release the slider rather than while dragging.
       </p>
       <p class="hint">
-        Because the delay is added on our side, aligning also raises how far ahead the group must be sent. A large
-        offset therefore increases that group's overall latency — see <em>Group sync</em> under
-        <strong>Settings</strong>.
+        Either direction costs latency for the whole group: a delay is added on our side, and an advance means every
+        speaker has to be sent that much further ahead. So a large offset increases that group's overall latency — see
+        <em>Group sync</em> under <strong>Settings</strong>.
       </p>
     </section>
 

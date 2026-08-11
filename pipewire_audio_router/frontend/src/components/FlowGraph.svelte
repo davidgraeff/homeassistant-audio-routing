@@ -38,7 +38,15 @@
   // Virtual outputs (sendspin + AirPlay-2) carry volume/mute in-band; both are
   // driven entirely by the routing matrix over the WebSocket (no polling). RAOP
   // (AirPlay 1) is being retired and no longer exposes volume in this UI.
-  const isVirtual = (name: string) => name.startsWith(SENDSPIN_DEV_PREFIX) || name.startsWith(AP2_DEV_PREFIX);
+  /** Does the daemon have a level it can drive for this node?
+   *
+   *  `volume`/`muted` are reported exactly when it can — sendspin and AP2 in-band,
+   *  pw-sink through the receiver agent — and null when it cannot (no agent, or a sink
+   *  with no volume lever). Sources report neither, so this also excludes them without
+   *  naming prefixes, which is what the old `isVirtual` name-prefix test was really for.
+   *  Kind-agnostic on purpose: enumerating prefixes here is what hid the control from
+   *  every pw-sink host the daemon could already drive. */
+  const hasLevel = (n: RoutingNode) => n.volume != null || n.muted != null;
 
   /** Expert view: bypass groups and wire individual speakers. */
   let showSpeakers = $state(false);
@@ -130,7 +138,9 @@
     return np.state === 'paused' ? `${label} (paused)` : label;
   }
 
-  const memberH = (n: RoutingNode) => (n.present && isVirtual(n.node_name) ? MEM_VOL_H : MEM_H);
+  // Must agree with the render gate below, or a row is sized for a control it does
+  // not draw (or vice versa).
+  const memberH = (n: RoutingNode) => (n.present && hasLevel(n) ? MEM_VOL_H : MEM_H);
   function targetH(t: Target): number {
     const rows = t.members.length ? t.members.map(memberH) : [MEM_H];
     const body = rows.reduce((a, b) => a + b, 0) + (rows.length - 1) * MEM_GAP;
@@ -570,7 +580,7 @@
       let mNext = muted;
       let mChanged = false;
       for (const o of outs) {
-        if (!isVirtual(o.node_name)) continue;
+        if (!hasLevel(o)) continue;
         if (typeof o.muted === 'boolean' && mNext[o.node_name] !== o.muted) {
           if (!mChanged) mNext = { ...muted };
           mNext[o.node_name] = o.muted;
@@ -817,7 +827,10 @@
                           >
                         {/if}
                       </span>
-                      {#if m.present && isVirtual(m.node_name)}
+                      <!-- Capability, not kind: `volume`/`muted` are populated exactly
+                           when the daemon can drive that output, so this also excludes
+                           sources (which report neither) without naming prefixes. -->
+                      {#if m.present && hasLevel(m)}
                         <VolumeControl
                           percent={m.volume == null ? null : Math.round(m.volume * 100)}
                           muted={muted[m.node_name] ?? false}

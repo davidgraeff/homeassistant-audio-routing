@@ -771,12 +771,20 @@ pub async fn start_server_per_device(
             .spawn(move || {
                 set_relay_realtime_priority();
                 let mixer = crate::overlay_mixer::OverlayMixer::global();
+                // Provisional per-device alignment delay (relay_delay.rs). Costs one
+                // relaxed atomic load per device per block while no alignment run is
+                // active, which is always unless one is in progress.
+                let delayer = crate::relay_delay::RelayDelay::global();
+                let delay_fmt = crate::relay_delay::PcmFormat::new(crate::sendspin_capture::SAMPLE_RATE, crate::sendspin_capture::CHANNELS);
                 // Reused across chunks AND across devices within a chunk so the
                 // per-device overlay mix allocates at most once (only relevant
                 // while an announcement is overlaying; the plain-music path never
                 // touches it). push_at copies into its own wire frame
                 // synchronously, so one buffer is safe to reuse for every device.
                 let mut mix_buf: Vec<u8> = Vec::new();
+                // Same deal for the delay line's output; a separate buffer because it
+                // reads from `mix_buf` (delay AFTER overlay — see relay_delay's docs).
+                let mut delay_buf: Vec<u8> = Vec::new();
                 // Wire codec (sendspin_codec.rs). PCM is a passthrough; a compressed
                 // codec needs fixed-size blocks, so captured quanta are re-cut here —
                 // once for the whole group, since one stream carries one format, which
@@ -821,8 +829,18 @@ pub async fn start_server_per_device(
                         let groups = groups.lock_recover();
                         let c2n = client_to_node.lock().unwrap();
                         for (client_id, group) in groups.iter() {
-                            let overlaid = c2n.get(client_id).is_some_and(|node| mixer.mix_into(node, block, &mut mix_buf));
-                            let src: &[u8] = if overlaid { &mix_buf } else { block };
+                            let dev_node = c2n.get(client_id);
+                            let overlaid = dev_node.is_some_and(|node| mixer.mix_into(node, block, &mut mix_buf));
+                            let mixed: &[u8] = if overlaid { &mix_buf } else { block };
+                            // Provisional alignment delay, applied AFTER the overlay so
+                            // it shifts everything this device renders — which is what
+                            // the device-side delay knob it stands in for does. Same
+                            // length in as out, so `ts` above and the send-ahead lead
+                            // are untouched (relay_delay.rs §RT-safety).
+                            let src: &[u8] = match dev_node {
+                                Some(node) if delayer.delay_into(node, delay_fmt, mixed, &mut delay_buf) => &delay_buf,
+                                _ => mixed,
+                            };
                             let encoder = encoders.entry(client_id.clone()).or_insert_with(|| {
                                 crate::sendspin_codec::Encoder::new(&relay_codec).unwrap_or(crate::sendspin_codec::Encoder::Pcm)
                             });

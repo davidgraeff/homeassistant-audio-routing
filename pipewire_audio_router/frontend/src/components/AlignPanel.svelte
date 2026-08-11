@@ -5,8 +5,10 @@
   // session for them or, while one is running, the by-ear tuning controls.
   //
   // Session state is global (one at a time, server-owned): see lib/align.svelte.
-  import { align, sliderMax } from '../lib/align.svelte';
+  import { align, knobNoun, memberKindLabel, sliderMax, sliderMin } from '../lib/align.svelte';
+  import { measure } from '../lib/measure.svelte';
   import { routing } from '../lib/routing';
+  import AlignWizard from './AlignWizard.svelte';
 
   interface Props {
     /** The source's stable routing node name (SourceView.node_name). */
@@ -18,6 +20,22 @@
   const active = $derived(!!group && align.isActive(group));
   const blocked = $derived(!!group && align.isBlocked(group));
   const members = $derived(group?.members ?? []);
+
+  /** The microphone-assisted wizard, open on this card. Local, because only one
+   *  session can run at a time and the wizard is a slice of one. */
+  let wizardOpen = $state(false);
+
+  // The measurement run's status, polled by the store. Wanted here and not only
+  // inside the wizard: a run that wrote delays stays revertable after the wizard is
+  // closed and the session finished (plan §9.4), and the offer to revert has to be
+  // somewhere the user can find it.
+  $effect(() => measure.attach());
+  // Overlap, not an exact set match: a wizard run is scoped to a *selection of
+  // speakers* (plan §12.3.1), so its `revert_scope` will rarely equal any one source
+  // group's set — but a delay written to a speaker this source plays through is
+  // still this card's business, and the undo has to be reachable from where the user
+  // notices the problem.
+  const revertable = $derived(measure.canRevert && measure.revertTouches(members.map((m) => m.node_name)));
 
   // Friendly names from the routing matrix (falls back to the raw node name).
   function label(nodeName: string): string {
@@ -63,9 +81,23 @@
       >
         {members.length < 2 ? 'Align (needs 2+ speakers)' : 'Align speakers'}
       </button>
+      {#if !wizardOpen}
+        <!-- Not gated on this source's speaker count: the wizard picks its own set of
+             speakers (plan §12.1), so a source playing to one speaker can still be the
+             place the user starts from — the others are chosen in there. -->
+        <button
+          class="ghost"
+          disabled={blocked}
+          title={blocked
+            ? 'An alignment session is running for another source — finish it first'
+            : 'Hold a phone where you listen and let the add-on measure the delays instead of judging them by ear'}
+          onclick={() => (wizardOpen = true)}
+        >
+          Measure with a microphone
+        </button>
+      {/if}
     </div>
   {:else}
-    {@const session = align.session}
     <div class="sync-row">
       <span class="sync-label on">Aligning</span>
       <span class="spk-list">
@@ -73,13 +105,33 @@
           <span class="spk">{label(m.node_name)}</span>
         {/each}
       </span>
+      {#if !wizardOpen}
+        <button class="ghost" onclick={() => (wizardOpen = true)} title="Measure the delays with a phone instead of judging them by ear">
+          Measure with a microphone
+        </button>
+      {/if}
       <button class="danger" onclick={() => align.stop()} disabled={align.busy}>Finish</button>
     </div>
+  {/if}
 
+  <!-- One instance, outside the branches above. Starting or finishing the session
+       flips which branch draws the header row, and a wizard rendered *inside* a
+       branch would be torn down and rebuilt by that flip — which restarts the
+       microphone capture (losing the timing reference every reading shares) and
+       throws the user back to page one. -->
+  {#if wizardOpen}
+    <AlignWizard {group} {label} onClose={() => (wizardOpen = false)} />
+  {/if}
+
+  {#if active}
+    {@const session = align.session}
     <p class="explain">
       The <strong>reference</strong> and the speaker you're <strong>tuning</strong> play together; everything else is
       muted. Nudge the tuned speaker until its clicks sit exactly on the reference's, then move to the next speaker.
-      Because you can only add delay, make the physically latest speaker the reference.
+      Each knob only moves its speaker one way, and the two kinds go opposite ways: a <strong>Sendspin</strong> knob is
+      an <em>advance</em> (higher = plays earlier), an <strong>AirPlay 2</strong> or <strong>PipeWire host</strong> knob
+      is a delay (higher = plays later). So reference the earliest speaker in a Sendspin group and the latest one in an
+      AirPlay group.
     </p>
 
     <div class="field level">
@@ -99,7 +151,7 @@
 
     <table>
       <thead>
-        <tr><th>Speaker</th><th>Role</th><th>Offset</th><th></th></tr>
+        <tr><th>Speaker</th><th>Role</th><th>Advance / delay</th><th></th></tr>
       </thead>
       <tbody>
         {#each session?.members ?? [] as m (m.node_name)}
@@ -108,7 +160,7 @@
           <tr class:audible={isRef || isTarget}>
             <td>
               {label(m.node_name)}
-              <span class="badge">{m.kind === 'sendspin' ? 'Sendspin' : 'AirPlay 2'}</span>
+              <span class="badge">{memberKindLabel(m.kind)}</span>
             </td>
             <td>
               <label class="role">
@@ -120,7 +172,7 @@
               <div class="offset">
                 <input
                   type="range"
-                  min="0"
+                  min={sliderMin(m)}
                   max={sliderMax(m)}
                   step={m.kind === 'sendspin' ? 5 : 10}
                   value={align.offsets[m.node_name] ?? 0}
@@ -128,7 +180,10 @@
                   oninput={(e) => align.liveOffset(m, Number((e.currentTarget as HTMLInputElement).value))}
                   onchange={(e) => align.applyOffset(m, Number((e.currentTarget as HTMLInputElement).value))}
                 />
-                <span class="ms">{align.offsets[m.node_name] ?? 0} ms</span>
+                <!-- The number is meaningless without the noun: the same 40 ms is
+                     "plays 40 ms earlier" on a Sendspin speaker and "40 ms later" on
+                     an AirPlay 2 one. -->
+                <span class="ms">{align.offsets[m.node_name] ?? 0} ms {knobNoun(m.kind)}</span>
               </div>
               {#if isTarget}
                 <div class="nudge">
@@ -154,6 +209,28 @@
         {/each}
       </tbody>
     </table>
+  {/if}
+
+  <!-- Plan §9.4: the write is destructive to a previously-tuned setup, so one
+       click has to undo it — and it has to still be here after the wizard is closed
+       and the session finished, which is exactly when the user decides they
+       preferred it the way it was. -->
+  {#if revertable}
+    <div class="revert">
+      <!-- Names the *whole* scope, not just this card's speakers: a wizard run is
+           scoped to a selection, and Revert restores the entire snapshot it took — so
+           it can put back speakers this source never plays to. Saying "these
+           speakers" while doing more than that is the kind of small lie that makes an
+           undo untrustworthy. -->
+      <span>A measurement wrote delays to {measure.revertScope.map(label).join(', ')}.</span>
+      <button class="ghost" disabled={measure.busy} onclick={() => void measure.revert()}>
+        Revert to the delays from before
+      </button>
+      <span class="hint">
+        Every one of them goes back to the delay it had before that run, and each speaker whose delay changes reconnects —
+        so expect another quiet gap.
+      </span>
+    </div>
   {/if}
 </div>
 
@@ -262,5 +339,25 @@
     margin-top: 4px;
     font-size: 0.78rem;
     color: var(--secondary-text-color);
+  }
+  .revert {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--warning-color, #ffa600) 55%, transparent);
+    background: color-mix(in srgb, var(--warning-color, #ffa600) 10%, transparent);
+    font-size: 0.82rem;
+  }
+  .revert button {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+  }
+  .revert .hint {
+    display: inline;
+    margin: 0;
   }
 </style>

@@ -78,6 +78,15 @@ impl Inner {
         for (id, _reason) in effects.dropped {
             self.clips.remove(&id);
         }
+        // A barge-in outranked an alignment hold (plan §12.3). The reservation is not
+        // what stops it — this report is what stops the holder from trusting audio it
+        // no longer controls, so the affected member's measurement is discarded with a
+        // reason naming the doorbell instead of the user's hand.
+        for hit in effects.reservations_hit {
+            for output in hit.outputs {
+                crate::align_group::registry().note(&output, crate::align_group::InterferenceCause::BargeIn { announcement: hit.by });
+            }
+        }
     }
 }
 
@@ -141,6 +150,22 @@ impl AnnounceCoordinator {
             inner.clips.remove(&id);
         }
         admission
+    }
+
+    /// Claim `outputs` for a non-announcement holder — today an alignment session's
+    /// temporary exclusive group (align_group.rs). While held, ordinary announcements
+    /// to those outputs queue (or are rejected per `OnBusy`); a `barge_in` still
+    /// plays and is reported back through [`crate::align_group::registry`].
+    pub fn reserve_outputs(&self, id: crate::announce_arbiter::ReservationId, outputs: Vec<String>) {
+        self.inner.lock().unwrap().sched.reserve(id, outputs);
+    }
+
+    /// Drop a reservation and let anything that queued behind it play.
+    pub fn release_reservation(&self, id: crate::announce_arbiter::ReservationId) {
+        let now = now_ms();
+        let mut inner = self.inner.lock().unwrap();
+        let eff = inner.sched.release_reservation(id, now);
+        inner.apply(eff);
     }
 
     /// Outputs with an announcement playing or queued — see

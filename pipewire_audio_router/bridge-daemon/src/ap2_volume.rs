@@ -181,6 +181,47 @@ impl Ap2Control {
         false
     }
 
+    /// Like [`Self::set_volume`], but **without claiming user intent** — for a level
+    /// the *daemon* is imposing temporarily rather than one the user chose.
+    ///
+    /// The alignment session drives every audible member's level for its duration
+    /// (docs/mic-alignment-plan.md §12.2) and puts the original back at teardown. Going
+    /// through `set_volume` for that would leave a mark teardown cannot erase: it adds
+    /// the node to `user_set`, and `register` re-applies a `user_set` level on every
+    /// later reconnect — so a calibration level of 20 % would come back as if the user
+    /// had asked for it, on an amplifier, forever. `desired_volume` is still set,
+    /// because `set_muted(false)` re-sends it and the calibration level has to survive
+    /// an unmute *within* the session.
+    ///
+    /// Pair it with [`Self::forget_volume`] when the pre-session level was unknown.
+    pub async fn set_volume_transient(&mut self, node_name: &str, volume: f32) -> bool {
+        let volume = volume.clamp(0.0, 1.0);
+        let changed = self.desired_volume.insert(node_name.to_string(), volume) != Some(volume);
+        if changed {
+            self.notify_changed();
+        }
+        let muted = self.desired_muted.get(node_name).copied().unwrap_or(false);
+        if !muted && self.senders.contains_key(node_name) {
+            self.send(node_name, volume).await;
+            return true;
+        }
+        false
+    }
+
+    /// Forget any desired level for a device, and any claim that the user chose it.
+    ///
+    /// The restore counterpart for a member whose level was **unknown** before a
+    /// session drove it: there is no value to put back, and writing an invented one is
+    /// the one thing that must not happen (AP2 level is device-authoritative). Dropping
+    /// the entry returns the receiver to "we do not know and will not impose", which is
+    /// the state it was in. Sends nothing — the receiver keeps whatever it is playing at.
+    pub fn forget_volume(&mut self, node_name: &str) {
+        let had = self.desired_volume.remove(node_name).is_some() | self.user_set.remove(node_name);
+        if had {
+            self.notify_changed();
+        }
+    }
+
     /// Set a device's desired mute. Sends volume `0.0` (mute) or the stored
     /// desired volume (unmute). Returns true if a command reached a live task.
     pub async fn set_muted(&mut self, node_name: &str, muted: bool) -> bool {
@@ -228,6 +269,36 @@ impl Ap2Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The alignment session drives a level and then puts it back. Going through
+    /// `set_volume` would leave the node in `user_set`, so a later reconnect would
+    /// re-impose the calibration level on an amplifier as if the user had chosen it —
+    /// a side effect no teardown can reach. The transient path must not do that.
+    #[tokio::test]
+    async fn a_transient_level_does_not_claim_user_intent() {
+        let mut c = Ap2Control::default();
+        c.set_volume_transient("ap2-dev-yamaha", 0.2).await;
+        // Still the desired level, because `set_muted(false)` re-sends it mid-session.
+        assert_eq!(c.volumes().get("ap2-dev-yamaha").copied(), Some(0.2));
+        assert!(!c.user_set.contains("ap2-dev-yamaha"), "a daemon-imposed level is not user intent");
+
+        // Whereas an explicit user set does claim it, and must keep doing so.
+        c.set_volume("ap2-dev-pioneer", 0.4).await;
+        assert!(c.user_set.contains("ap2-dev-pioneer"));
+    }
+
+    /// The restore path for a member whose level was unknown before the session: there
+    /// is nothing to put back, and inventing one is what must not happen.
+    #[tokio::test]
+    async fn forgetting_a_level_returns_the_receiver_to_unknown() {
+        let mut c = Ap2Control::default();
+        c.set_volume_transient("ap2-dev-yamaha", 0.2).await;
+        c.forget_volume("ap2-dev-yamaha");
+        assert_eq!(c.volumes().get("ap2-dev-yamaha"), None, "unknown again, not 0.0");
+        assert!(!c.user_set.contains("ap2-dev-yamaha"));
+        // Idempotent: teardown runs on paths that may already have cleaned up.
+        c.forget_volume("ap2-dev-yamaha");
+    }
 
     #[tokio::test]
     async fn volume_persists_without_a_live_task() {

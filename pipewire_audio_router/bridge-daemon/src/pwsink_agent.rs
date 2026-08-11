@@ -908,6 +908,74 @@ async fn pump_until_closed(stream: &mut futures_util::stream::SplitStream<WebSoc
     }
 }
 
+/// Silences **and levels** a receiver host for the alignment session, over the agent's
+/// control lane (`calibrate::OutOfBandMute`).
+///
+/// This is the *preferred* way to silence a pw-sink member during a solo, and it is
+/// better than the relay fallback where it works: only the receiver's own sink volume
+/// changes, so the stream keeps flowing and its jitter buffer never re-anchors —
+/// unmuting therefore cannot introduce the discontinuity the estimator would read as a
+/// real offset (plan §12.3.2).
+///
+/// Either getter answering `None` is the capability query *and* the snapshot in one: a
+/// host with no live agent, or one whose sink has neither a device route nor node volume
+/// (the agent's own diagnostic calls that "lever: none"), reports nothing — and the
+/// session then falls back to the relay mute rather than assuming a speaker is silent
+/// when it is not, and treats the member as un-levellable rather than pretending it drove
+/// a level.
+///
+/// ## Mute and level are asked separately because they really are separate
+///
+/// [`HostState`] carries them as two independent `Option`s, and the agent fills them from
+/// one probe that can genuinely answer one and not the other: `pw_thread::master_props`
+/// falls back to the sink **node**'s `Props` when the sink has no device route (a virtual
+/// sink), and that path reports `channel_volumes` with `mute: None`. Such a host is
+/// levellable out of band while its *mute* still needs the relay. Both answers are also
+/// `None` whenever the host is not receiving our stream at all, since the lever is found
+/// through the receive stream's target sink.
+///
+/// ## Why no "transient" write and no "forget", unlike `ap2_volume`
+///
+/// `ap2_volume` needed [`set_volume_transient`](crate::ap2_volume::Ap2Control::set_volume_transient)
+/// and [`forget_volume`](crate::ap2_volume::Ap2Control::forget_volume) because it *stores*
+/// a desired level and re-applies a user-set one on every reconnect — so a calibration
+/// level written through the ordinary path outlived the session. [`Agents`] stores
+/// nothing: `set_volume` queues one `SetVolume` for the host and returns, `HostState` is
+/// what the host *reports back*, and no level is ever re-applied on a reconnect. A write
+/// therefore leaves no daemon-side mark for a teardown to erase, and "leave an unknown
+/// level alone" is implemented by simply not writing.
+pub struct AgentSilencer(pub SharedAgents);
+
+/// Spelled out rather than borrowed from `calibrate`: its alias is private, and this
+/// must stay structurally identical to the trait's signature.
+type OobFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+impl crate::calibrate::OutOfBandMute for AgentSilencer {
+    fn muted<'a>(&'a self, output: &'a str) -> OobFut<'a, Option<bool>> {
+        Box::pin(async move { self.0.lock().await.state(output).and_then(|s| s.muted) })
+    }
+
+    fn set_muted<'a>(&'a self, output: &'a str, muted: bool) -> OobFut<'a, bool> {
+        // `set_mute` returns false when the host is not connected. Propagating that
+        // rather than swallowing it is what lets the caller keep the member
+        // relay-muted instead of leaving it audible.
+        Box::pin(async move { self.0.lock().await.set_mute(output, muted) })
+    }
+
+    fn level<'a>(&'a self, output: &'a str) -> OobFut<'a, Option<f32>> {
+        // The host's own cubic 0.0–1.0 master level, exactly as `/api/outputs` reports it
+        // — the snapshot is kept on the host's scale so that putting it back is exact.
+        Box::pin(async move { self.0.lock().await.state(output).and_then(|s| s.volume) })
+    }
+
+    fn set_level<'a>(&'a self, output: &'a str, level: f32) -> OobFut<'a, bool> {
+        // Same honesty as `set_muted`: false = the command did not reach the host, and the
+        // level has *no* fallback (the relay has a mute, not a gain), so the caller has to
+        // report the member as un-levellable rather than assume the write landed.
+        Box::pin(async move { self.0.lock().await.set_volume(output, level) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,6 +1188,53 @@ mod tests {
         agents.hello(claim("m1", "dave", Some(&paired.token)), tx);
         agents.update_state(&paired.node_name, HostState { volume: Some(0.4), ..Default::default() });
         assert_eq!(agents.state(&paired.node_name).and_then(|s| s.volume), Some(0.4));
+    }
+
+    /// The alignment seam (W17 for the mute, W20 for the level), through the real
+    /// registry: both getters answer `None` — "cannot" — until a host is actually
+    /// connected *and* has reported the lever, and both setters say whether the command
+    /// reached the host. That honesty is the whole contract: `None`/`false` is what makes
+    /// the session fall back to the relay mute and report the member as un-levellable
+    /// instead of believing it silenced or levelled a speaker it did not.
+    #[tokio::test]
+    async fn the_alignment_seam_answers_cannot_until_a_host_reports_a_lever() {
+        use crate::calibrate::OutOfBandMute as _;
+
+        let mut agents = registry();
+        agents.hello(claim("m1", "dave", None), channel());
+        let paired = agents.approve("m1:dave").unwrap();
+        let node = paired.node_name.clone();
+        let shared: SharedAgents = Arc::new(Mutex::new(agents));
+        let seam = AgentSilencer(shared.clone());
+
+        // Paired but not connected: no capability either way, and no write lands.
+        assert_eq!(seam.muted(&node).await, None);
+        assert_eq!(seam.level(&node).await, None);
+        assert!(!seam.set_muted(&node, true).await);
+        assert!(!seam.set_level(&node, 0.2).await);
+
+        // Connected, but nothing reported yet — still "cannot", because a state we have
+        // not read is not a snapshot we can put back.
+        let (tx, mut rx) = mpsc::channel(AGENT_MSG_DEPTH);
+        shared.lock().await.hello(claim("m1", "dave", Some(&paired.token)), tx);
+        assert_eq!(seam.level(&node).await, None);
+
+        // A sink with a level but no mute lever is a real case, not a hypothetical: the
+        // agent's node-`Props` fallback reports `channel_volumes` with `mute: None`. Such a
+        // member is levellable out of band while its mute still needs the relay.
+        shared.lock().await.update_state(&node, HostState { volume: Some(0.7), muted: None, receiving: true, ..Default::default() });
+        assert_eq!(seam.level(&node).await, Some(0.7), "the host's own cubic scale, kept exact for the restore");
+        assert_eq!(seam.muted(&node).await, None, "no mute lever ⇒ the relay has to hold this one down");
+
+        // And a write now reaches the host, on its own scale.
+        assert!(seam.set_level(&node, 0.2).await);
+        assert!(seam.set_muted(&node, true).await);
+        let mut sent = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            sent.push(msg);
+        }
+        assert!(sent.contains(&DaemonMsg::SetVolume { volume: 0.2 }), "{sent:?}");
+        assert!(sent.contains(&DaemonMsg::SetMute { muted: true }), "{sent:?}");
     }
 
     #[test]

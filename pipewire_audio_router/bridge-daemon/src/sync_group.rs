@@ -273,6 +273,15 @@ pub struct GroupReconciler {
     /// On-demand announce sessions for unrouted AP2 receivers / pw-sink targets,
     /// keyed by output node name (`ap2-dev-*` / `pwsink-dev-*`).
     announce_sessions: HashMap<String, AnnounceSession>,
+    /// An **alignment hold** (align_group.rs): outputs taken exclusively for a
+    /// calibration session. While set, [`Self::effective_intent`] rewrites routing
+    /// intent so these outputs belong to one synthetic group and nothing else, which
+    /// is how a temporary group is formed around an arbitrary selection.
+    ///
+    /// In memory only, and deliberately: the user's routing store is never touched,
+    /// so teardown is "stop overriding" rather than a replay that could half-fail —
+    /// and a daemon restart mid-session reads the unmodified store.
+    align_hold: Option<(u64, BTreeSet<String>)>,
     /// Something this pass wanted to do didn't take (a sender failed to start, an
     /// anchor didn't appear, a device had no resolved URL yet) and only a *retry*
     /// will fix it. The reconcile task is change-driven with no periodic tick, so
@@ -623,6 +632,12 @@ impl GroupReconciler {
         // is precisely the "which speaker is this?" test-tone case).
         let adopted = crate::outputs_store::adopted_snapshot(deps.outputs);
         let intent: Vec<RoutingLink> = routing_store::snapshot(deps.routing).into_iter().filter(|l| adopted.contains(&l.output)).collect();
+        // Read through the alignment hold too: an output taken for a calibration IS
+        // routed (into the temporary group), so opening a *second* on-demand session
+        // to it would collide with the group's own sender — an AP2 receiver accepts
+        // one session at a time. Without this, a barge-in aimed at a held receiver
+        // that happened to be unrouted before the session would do exactly that.
+        let intent = self.effective_intent(intent);
         if !routing::source_set_of(&intent, output).is_empty() {
             return AnnounceTransport::Unavailable(if output.starts_with(AP2_DEV_PREFIX) {
                 "routed, but its AirPlay-2 sender isn't streaming (receiver unreachable, or still connecting)".into()
@@ -891,6 +906,62 @@ impl GroupReconciler {
         }
     }
 
+    /// Take `outputs` exclusively for alignment hold `id` (align_group.rs). The
+    /// caller must nudge a reconcile afterwards (ChangeNotifier).
+    ///
+    /// Replaces any previous hold: one alignment session exists at a time, and a
+    /// stale hold would keep displacing routing nothing is aligning.
+    pub fn set_align_hold(&mut self, id: u64, outputs: BTreeSet<String>) {
+        if outputs.is_empty() {
+            self.align_hold = None;
+        } else {
+            self.align_hold = Some((id, outputs));
+        }
+    }
+
+    /// Drop hold `id`, restoring the displaced routing on the next reconcile.
+    /// Id-guarded so a late teardown can't clear a newer session's hold, and
+    /// idempotent so every teardown path may call it.
+    pub fn clear_align_hold(&mut self, id: u64) {
+        if self.align_hold.as_ref().is_some_and(|(held, _)| *held == id) {
+            self.align_hold = None;
+        }
+    }
+
+    /// The outputs currently held for alignment (empty when none).
+    pub fn align_hold_outputs(&self) -> BTreeSet<String> {
+        self.align_hold.as_ref().map(|(_, o)| o.clone()).unwrap_or_default()
+    }
+
+    /// Routing intent as this pass must see it: the stored intent, with any
+    /// alignment hold applied.
+    ///
+    /// The hold does two things at once, which is what makes a temporary group both
+    /// *exclusive* and *independent of current routing*:
+    ///
+    /// - every link into a held output is **dropped**, so no music source reaches it;
+    /// - one synthetic link [`crate::align_group::ALIGN_HOLD_SOURCE`] → each held
+    ///   output is **injected**, so all held outputs share a source set nothing else
+    ///   has and the reconciler materialises exactly one group for them, with an
+    ///   anchor the calibration player can write into. That source is not a real
+    ///   node, so nothing is linked into the anchor and it stays silent otherwise.
+    ///
+    /// Identity when no hold is set, so the ordinary path is byte-for-byte unchanged.
+    ///
+    /// Note the hold is applied *after* the adoption filter and is not itself
+    /// filtered by it: adoption is checked once, when the hold is formed
+    /// (`align_group::validate_selection`), and from then on the session owns those
+    /// outputs until it ends — removing an output on the Outputs page mid-session
+    /// does not silently drop it out of a running measurement.
+    fn effective_intent(&self, intent: Vec<RoutingLink>) -> Vec<RoutingLink> {
+        let Some((_, held)) = &self.align_hold else { return intent };
+        let mut out: Vec<RoutingLink> = intent.into_iter().filter(|l| !held.contains(&l.output)).collect();
+        for output in held {
+            out.push(RoutingLink { source: crate::align_group::ALIGN_HOLD_SOURCE.to_string(), output: output.clone() });
+        }
+        out
+    }
+
     /// Snapshot every running group (anchor + members) for the alignment API.
     pub fn snapshot(&self) -> Vec<GroupSnapshot> {
         self.running
@@ -1053,6 +1124,9 @@ impl GroupReconciler {
         // a merely discovered device.
         let adopted_set = crate::outputs_store::adopted_snapshot(adopted);
         let intent: Vec<RoutingLink> = routing_store::snapshot(routing).into_iter().filter(|l| adopted_set.contains(&l.output)).collect();
+        // An alignment session's temporary exclusive group (align_group.rs) is an
+        // override on this intent, not an edit of the store — see `effective_intent`.
+        let intent = self.effective_intent(intent);
         let devices_map = devices.lock_recover().clone();
         let ap2_map = ap2_devices.lock_recover().clone();
         let ap2_latencies = sync_settings.lock_recover().ap2_latencies();
@@ -1812,6 +1886,124 @@ mod tests {
         // (There is no third case any more: a static-delay edit used to force a
         // whole-group restart from here, and now scopes itself to the one device —
         // see `a_static_delay_change_within_the_running_lead_touches_only_that_device`.)
+    }
+
+    // --- the alignment hold (align_group.rs, plan §12.1) ---
+
+    fn link(source: &str, output: &str) -> RoutingLink {
+        RoutingLink { source: source.to_string(), output: output.to_string() }
+    }
+
+    fn held(outputs: &[&str]) -> BTreeSet<String> {
+        outputs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// No hold ⇒ the reconciler sees exactly the stored intent. This is the property
+    /// that makes the whole mechanism low-risk: the ordinary path is untouched.
+    #[test]
+    fn without_a_hold_the_intent_passes_through_unchanged() {
+        let r = GroupReconciler::new();
+        let intent = vec![link("airplay-in", "sendspin-dev-kitchen"), link("bt-rtp", "ap2-dev-dusche")];
+        assert_eq!(r.effective_intent(intent.clone()), intent);
+        assert!(r.align_hold_outputs().is_empty());
+    }
+
+    /// A hold forms a group around an arbitrary selection: the held outputs are cut
+    /// out of whatever was feeding them and given one source set of their own.
+    #[test]
+    fn a_hold_displaces_the_held_outputs_and_gives_them_one_group() {
+        let mut r = GroupReconciler::new();
+        let intent = vec![
+            link("airplay-in", "sendspin-dev-kitchen"),
+            link("airplay-in", "sendspin-dev-bath"), // same group as kitchen today
+            link("bt-rtp", "ap2-dev-dusche"),        // a different group
+            link("bt-rtp", "sendspin-dev-office"),   // not selected: must be untouched
+        ];
+        // A selection spanning two existing groups and leaving members behind — the
+        // case an existing source set could never express.
+        r.set_align_hold(1, held(&["sendspin-dev-kitchen", "ap2-dev-dusche"]));
+        let eff = r.effective_intent(intent.clone());
+
+        // Nothing feeds a held output but the synthetic source...
+        for output in ["sendspin-dev-kitchen", "ap2-dev-dusche"] {
+            let sources = routing::source_set_of(&eff, output);
+            assert_eq!(sources.into_iter().collect::<Vec<_>>(), vec![crate::align_group::ALIGN_HOLD_SOURCE], "{output}");
+        }
+        // ...and the outputs left behind keep exactly the routing they had.
+        assert_eq!(routing::source_set_of(&eff, "sendspin-dev-bath"), routing::source_set_of(&intent, "sendspin-dev-bath"));
+        assert_eq!(routing::source_set_of(&eff, "sendspin-dev-office"), routing::source_set_of(&intent, "sendspin-dev-office"));
+
+        // And that source set materialises as ONE group holding exactly the selection.
+        let devices: BTreeMap<String, SendspinDevice> = [(
+            "sendspin-dev-kitchen".to_string(),
+            SendspinDevice {
+                fullname: "kitchen._sendspin._tcp.local.".into(),
+                display_name: "Kitchen".into(),
+                addr: None,
+                present: true,
+                url: Some("ws://k".into()),
+                supported_codecs: Vec::new(),
+                min_buffer_ms: None,
+                required_lead_time_ms: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let ap2: BTreeMap<String, crate::ap2_discovery::Ap2Device> = [(
+            "ap2-dev-dusche".to_string(),
+            crate::ap2_discovery::Ap2Device {
+                fullname: "Dusche._airplay._tcp.local.".into(),
+                display_name: "Dusche".into(),
+                model: None,
+                features: None,
+                addr: Some("10.0.0.5:7000".parse().unwrap()),
+                present: true,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let desired = compute_desired(&eff, &devices, &ap2, &BTreeMap::new(), &PwsinkHosts::new());
+        let align = desired.get(crate::align_group::ALIGN_HOLD_SOURCE).expect("the held group exists");
+        assert_eq!(align.sendspin_node_names, vec!["sendspin-dev-kitchen".to_string()]);
+        assert_eq!(align.ap2_members.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(), vec!["ap2-dev-dusche"]);
+        // The kitchen speaker is in NO other group, which is what "exclusive" means
+        // for music: its old group can't reach it.
+        for (key, g) in &desired {
+            if key != crate::align_group::ALIGN_HOLD_SOURCE {
+                assert!(!g.sendspin_node_names.contains(&"sendspin-dev-kitchen".to_string()), "still in group {key}");
+            }
+        }
+    }
+
+    /// Restore is "stop overriding", so it has to be *exactly* the identity again —
+    /// the stored intent was never edited, so there is nothing to replay.
+    #[test]
+    fn clearing_the_hold_restores_the_intent_exactly() {
+        let mut r = GroupReconciler::new();
+        let intent = vec![link("airplay-in", "sendspin-dev-kitchen"), link("bt-rtp", "ap2-dev-dusche")];
+        r.set_align_hold(1, held(&["sendspin-dev-kitchen"]));
+        assert_ne!(r.effective_intent(intent.clone()), intent);
+        r.clear_align_hold(1);
+        assert_eq!(r.effective_intent(intent.clone()), intent);
+        assert!(r.align_hold_outputs().is_empty());
+        // Idempotent: every teardown path may call it, including twice.
+        r.clear_align_hold(1);
+        assert_eq!(r.effective_intent(intent.clone()), intent);
+    }
+
+    #[test]
+    fn clearing_is_id_guarded_and_an_empty_set_is_no_hold() {
+        let mut r = GroupReconciler::new();
+        r.set_align_hold(1, held(&["sendspin-dev-kitchen"]));
+        r.set_align_hold(2, held(&["ap2-dev-dusche"]));
+        // The first session's safety timeout firing late must not free the second's
+        // speakers while it is still measuring them.
+        r.clear_align_hold(1);
+        assert_eq!(r.align_hold_outputs(), held(&["ap2-dev-dusche"]));
+        r.clear_align_hold(2);
+        assert!(r.align_hold_outputs().is_empty());
+        r.set_align_hold(3, BTreeSet::new());
+        assert!(r.align_hold_outputs().is_empty(), "holding nothing is not a hold");
     }
 
     #[test]

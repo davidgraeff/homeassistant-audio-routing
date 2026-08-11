@@ -1,3 +1,8 @@
+mod align_estimator;
+mod align_group;
+mod align_levels;
+mod align_measure;
+mod align_mic;
 mod airplay_clients;
 mod airplay_source;
 mod announce;
@@ -36,6 +41,7 @@ mod pw_thread;
 mod pwsink_agent;
 mod pwsink_server;
 mod raop_migration;
+mod relay_delay;
 mod resample;
 mod routing;
 mod routing_store;
@@ -365,6 +371,15 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // layout, plays a click into a group's anchor, and mutes non-audible
         // members while the user tunes offsets by ear.
         let align = calibrate::AlignManager::new(sendspin_control.clone(), ap2_control.clone(), groups.clone());
+        // How a *pw-sink* member is silenced during a solo. Alignment resolves the
+        // mechanism per output rather than per kind (calibrate.rs `SilenceChannel`):
+        // sendspin and AP2 have in-band mutes, and a receiver host is silenced over its
+        // agent's control lane — preferred, because only the remote sink's volume moves,
+        // so the stream keeps flowing and unmuting cannot introduce a discontinuity the
+        // estimator would measure as a real offset. Without this the session falls back
+        // to zero-filling in the relay, which also works; with it, the better mechanism
+        // is used wherever an agent is actually there.
+        align.set_out_of_band_mute(std::sync::Arc::new(pwsink_agent::AgentSilencer(agents.clone())));
         {
             let pw = pw_state.clone();
             let cmd = pw_cmd.clone();

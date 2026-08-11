@@ -247,6 +247,12 @@ fn build_matrix(
     sendspin_mutes: &std::collections::HashMap<String, bool>,
     ap2_volumes: &std::collections::HashMap<String, f32>,
     ap2_mutes: &std::collections::HashMap<String, bool>,
+    // Per-receiver-host volume/mute as the pwrouter-agent reports it (`HostState`).
+    // Absent = we have no live agent for that host, or its sink has no volume lever at
+    // all (the agent's own diagnostic calls that "lever: none") — either way the level
+    // is genuinely unknown, which is the one thing the UI must not fabricate.
+    pwsink_volumes: &std::collections::HashMap<String, f32>,
+    pwsink_mutes: &std::collections::HashMap<String, bool>,
     // `ap2_connected`: AP2 outputs whose sender has a live command channel
     // (`Ap2Control::connected`) — half of the `streaming` verdict below; the
     // pw-sink half is a process-global, so it needs no parameter.
@@ -339,6 +345,12 @@ fn build_matrix(
                     // haven't read it from the receiver and the user hasn't set it —
                     // the UI then shows no level rather than a fabricated 100 %.
                     ap2_volumes.get(&name).copied()
+                } else if name.starts_with(PWSINK_DEV_PREFIX) {
+                    // Same contract as the two above, via the agent's control lane
+                    // (`pwsink_agent::DaemonMsg::SetVolume`, already used by
+                    // `PUT /api/pwsink/volume`). Only the *read* side was missing, which
+                    // is why the UI showed no control for a host it could already drive.
+                    pwsink_volumes.get(&name).copied()
                 } else {
                     None
                 },
@@ -346,6 +358,11 @@ fn build_matrix(
                     Some(sendspin_mutes.get(&name).copied().unwrap_or(false))
                 } else if name.starts_with(AP2_DEV_PREFIX) {
                     Some(ap2_mutes.get(&name).copied().unwrap_or(false))
+                } else if name.starts_with(PWSINK_DEV_PREFIX) {
+                    // `None` — not `Some(false)` — when the host reports no mute state:
+                    // a missing agent must not read as "unmuted", or the UI would offer
+                    // a mute button that silently does nothing.
+                    pwsink_mutes.get(&name).copied()
                 } else {
                     None
                 },
@@ -421,7 +438,25 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
     let output_labels = crate::outputs_store::names_snapshot(&state.outputs);
     let devices = state.sendspin_devices.lock_recover().clone();
     let ap2_devices = state.ap2_devices.lock_recover().clone();
-    let pwsink_hosts = state.agents.lock().await.connected_targets();
+    // One guard for the hosts *and* their reported levels, so the matrix cannot show a
+    // host as present while sourcing its volume from a different instant.
+    let (pwsink_hosts, pwsink_volumes, pwsink_mutes) = {
+        let a = state.agents.lock().await;
+        let hosts = a.connected_targets();
+        let mut vols = std::collections::HashMap::new();
+        let mut mutes = std::collections::HashMap::new();
+        for name in hosts.keys() {
+            if let Some(st) = a.state(name) {
+                if let Some(v) = st.volume {
+                    vols.insert(name.clone(), v);
+                }
+                if let Some(m) = st.muted {
+                    mutes.insert(name.clone(), m);
+                }
+            }
+        }
+        (hosts, vols, mutes)
+    };
     let (lat, source_labels) = {
         use crate::sources_store::SourceConfig;
         let sources = state.sources.lock_recover();
@@ -466,6 +501,8 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         &sendspin_mutes,
         &ap2_volumes,
         &ap2_mutes,
+        &pwsink_volumes,
+        &pwsink_mutes,
         &ap2_connected,
         &lat,
         &xruns,
@@ -1207,6 +1244,9 @@ mod tests {
             intent,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            // pwsink volumes / mutes
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &ap2_connected,

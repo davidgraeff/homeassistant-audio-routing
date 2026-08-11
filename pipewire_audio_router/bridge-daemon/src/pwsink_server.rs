@@ -205,7 +205,15 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
         .spawn(move || {
             set_relay_realtime_priority();
             let mixer = crate::overlay_mixer::OverlayMixer::global();
+            // Provisional per-device alignment delay (relay_delay.rs), applied AFTER the
+            // overlay so it shifts everything this target renders — as the playout-delay
+            // knob it stands in for does. One block out per block in, so the sender's
+            // packet cadence, RTP timestamps and backlog are untouched. With no alignment
+            // running this is one relaxed atomic load per target per chunk.
+            let delayer = crate::relay_delay::RelayDelay::global();
+            let delay_fmt = crate::relay_delay::PcmFormat::new(format.rate, format.channels);
             let mut mix_buf: Vec<u8> = Vec::new();
+            let mut delay_buf: Vec<u8> = Vec::new();
             // Per-target dropped-chunk counters + one shared report cadence: a
             // blocked sender drops many chunks in a row, and one line per burst is
             // the diagnostic (mirrors the sendspin relay's backlog-full report).
@@ -217,7 +225,8 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
                     // music path (no work); when a device is being announced to it
                     // returns duck(music)+overlay in `mix_buf`. Both are S16LE at
                     // 48 kHz here, so the mix is a plain sample add.
-                    let src: &[u8] = if mixer.mix_into(name, &pcm, &mut mix_buf) { &mix_buf } else { &pcm };
+                    let mixed: &[u8] = if mixer.mix_into(name, &pcm, &mut mix_buf) { &mix_buf } else { &pcm };
+                    let src: &[u8] = if delayer.delay_into(name, delay_fmt, mixed, &mut delay_buf) { &delay_buf } else { mixed };
                     // S16LE bytes → native i16 (applemidi_sender byte-swaps to L16
                     // big-endian on the wire).
                     let samples: PcmChunk = src.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();

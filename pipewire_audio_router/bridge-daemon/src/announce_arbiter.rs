@@ -23,6 +23,16 @@
 //     announcement waits until *all* its targets are free, then plays on all.
 //   * **Ducking** is reference-counted by occupancy: an output ducks its music
 //     while an announcement occupies it, and un-ducks when none does.
+//   * **Reservations (plan §12.3):** something that is *not* an announcement can
+//     claim outputs exclusively — today an alignment session's temporary group
+//     (align_group.rs). A reservation counts as occupancy for admission, so an
+//     ordinary announcement queues (or is rejected per `OnBusy`) instead of
+//     playing over a calibration tone. It deliberately does **not** stop a
+//     `barge_in`: nobody wants a fire alarm suppressed by a calibration, so the
+//     admission order stays `if !overlaps { start } else if barge_in { preempt }
+//     else { on_busy }` and the reservation *holder is told* instead
+//     ([`ReservationHit`]), which is what lets it discard the affected member's
+//     measurement with a reason naming the cause.
 //
 // The scheduler is pure and time is injected (`now_ms`) so it's deterministic in
 // tests; the daemon passes real milliseconds. Wiring the emitted [`Action`]s to
@@ -39,6 +49,11 @@ pub type AnnouncementId = u64;
 
 /// An output's stable node name (e.g. `ap2-dev-dusche`, `sendspin-dev-…`).
 pub type Output = String;
+
+/// Identifies one **reservation**: an exclusive claim on a set of outputs held by
+/// something that is not an announcement (today an alignment session's temporary
+/// group — see `align_group.rs`).
+pub type ReservationId = u64;
 
 /// What to do when the requested outputs are busy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +122,21 @@ pub enum DropReason {
     Stale,
 }
 
+/// A barge-in announcement that took over outputs someone had **reserved**.
+///
+/// The load-bearing half of the reservation feature (plan §12.3): the reservation
+/// is not what stops the announcement — the *report* is what stops the holder from
+/// trusting audio it no longer controls. Without it an alignment run sees the
+/// doorbell as unstable amplitude and tells the user to hold the phone still.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationHit {
+    pub reservation: ReservationId,
+    /// The reserved outputs the announcement is taking over (sorted, unique).
+    pub outputs: Vec<Output>,
+    /// The announcement that won.
+    pub by: AnnouncementId,
+}
+
 /// Side effects plus any drops, from an operation.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Effects {
@@ -114,6 +144,18 @@ pub struct Effects {
     pub actions: Vec<Action>,
     /// Announcements removed without playing/finishing (e.g. TTL), for logging.
     pub dropped: Vec<(AnnouncementId, DropReason)>,
+    /// Reservations a barge-in just played over — the holder must be told (the
+    /// caller forwards these; see `announce.rs`).
+    pub reservations_hit: Vec<ReservationHit>,
+}
+
+/// An exclusive claim on outputs by a non-announcement holder (see
+/// [`ReservationId`]). Counts as occupancy for admission, emits no actions of its
+/// own — the holder is already producing whatever those outputs play.
+#[derive(Debug, Clone)]
+struct Reservation {
+    id: ReservationId,
+    outputs: BTreeSet<Output>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +173,11 @@ struct Entry {
 pub struct AnnounceScheduler {
     active: Vec<Entry>,
     queue: Vec<Entry>,
+    /// Non-announcement exclusive claims (plan §12.3). Kept separate from
+    /// `active` so no action-diffing path can mistake one for a clip: a
+    /// reservation has no id in [`occupancy`](Self::occupancy), so it never emits
+    /// duck/start/stop.
+    reservations: Vec<Reservation>,
     max_queue: usize,
     next_seq: u64,
 }
@@ -147,13 +194,55 @@ impl AnnounceScheduler {
     }
 
     pub fn with_max_queue(max_queue: usize) -> Self {
-        Self { active: Vec::new(), queue: Vec::new(), max_queue, next_seq: 0 }
+        Self { active: Vec::new(), queue: Vec::new(), reservations: Vec::new(), max_queue, next_seq: 0 }
+    }
+
+    /// Claim `outputs` exclusively for `id` (plan §12.3). Replaces any previous
+    /// claim under the same id, so re-reserving is how a holder changes its set.
+    /// An empty set releases it.
+    ///
+    /// Emits nothing: a reservation is not a clip, so there is no duck to start —
+    /// the holder is already producing what those outputs play. What it changes is
+    /// *admission*: while held, an ordinary announcement to one of these outputs
+    /// queues (or is rejected per `OnBusy`), and a queued one cannot start.
+    pub fn reserve(&mut self, id: ReservationId, outputs: impl IntoIterator<Item = Output>) {
+        let outputs: BTreeSet<Output> = outputs.into_iter().collect();
+        self.reservations.retain(|r| r.id != id);
+        if !outputs.is_empty() {
+            self.reservations.push(Reservation { id, outputs });
+        }
+    }
+
+    /// Drop `id`'s claim and let anything that was waiting on those outputs start.
+    /// Idempotent — releasing an unknown id just settles.
+    pub fn release_reservation(&mut self, id: ReservationId, now_ms: u64) -> Effects {
+        let before = self.occupancy();
+        let mut dropped = Vec::new();
+        self.reservations.retain(|r| r.id != id);
+        self.settle(now_ms, &mut dropped);
+        let after = self.occupancy();
+        Effects { actions: diff_actions(&before, &after), dropped, reservations_hit: Vec::new() }
+    }
+
+    /// Every currently reserved output (sorted).
+    pub fn reserved_outputs(&self) -> BTreeSet<Output> {
+        self.reservations.iter().flat_map(|r| r.outputs.iter().cloned()).collect()
+    }
+
+    /// Is `output` claimed by any reservation?
+    pub fn is_reserved(&self, output: &str) -> bool {
+        self.reservations.iter().any(|r| r.outputs.contains(output))
     }
 
     /// Every output an announcement is currently playing on **or waiting for**.
     /// The audio path keeps a transport it opened on demand alive for these: a
     /// queued clip has no overlay slot yet, so the mixer alone can't tell that the
     /// output still has something coming.
+    ///
+    /// Reservations are deliberately **not** included: a reservation is not a clip
+    /// waiting for a transport — its holder owns the output's audio path already
+    /// (an alignment hold is routed into its own group), so listing it here would
+    /// keep an on-demand announce session leased for nothing.
     pub fn outputs_in_flight(&self) -> BTreeSet<Output> {
         self.active.iter().chain(self.queue.iter()).flat_map(|e| e.req.targets.iter().cloned()).collect()
     }
@@ -180,8 +269,11 @@ impl AnnounceScheduler {
         let mut dropped = Vec::new();
         let req_id = req.id;
 
-        let busy: BTreeSet<&Output> = before.keys().collect();
-        let overlaps = req.targets.iter().any(|t| busy.contains(t));
+        // "Busy" is announcement occupancy **plus** reservations (plan §12.3) — an
+        // aligning output used to be invisible here, which is exactly why an
+        // announcement took the immediate-start path straight over a calibration.
+        let overlaps = req.targets.iter().any(|t| before.contains_key(t) || self.is_reserved(t));
+        let mut reservations_hit = Vec::new();
 
         enum Path {
             Started,
@@ -194,6 +286,9 @@ impl AnnounceScheduler {
             self.push_active(req, now_ms);
             Path::Started
         } else if req.barge_in {
+            // A barge-in wins over a reservation too — it just has to say so, so the
+            // holder can throw away whatever it was measuring on those outputs.
+            reservations_hit = self.hits_for(&req);
             // Preempt every announcement overlapping our targets; re-queue each
             // whole (if still within TTL) so it replays from the start later.
             let victims: Vec<AnnouncementId> =
@@ -242,7 +337,7 @@ impl AnnounceScheduler {
             }
         };
 
-        (admission, Effects { actions, dropped })
+        (admission, Effects { actions, dropped, reservations_hit })
     }
 
     /// A playing announcement finished (its clip ended) or was cancelled.
@@ -252,7 +347,7 @@ impl AnnounceScheduler {
         self.remove_active(id);
         self.settle(now_ms, &mut dropped);
         let after = self.occupancy();
-        Effects { actions: diff_actions(&before, &after), dropped }
+        Effects { actions: diff_actions(&before, &after), dropped, reservations_hit: Vec::new() }
     }
 
     /// Advance time: drop stale queued announcements and start any now-eligible
@@ -262,7 +357,7 @@ impl AnnounceScheduler {
         let mut dropped = Vec::new();
         self.settle(now_ms, &mut dropped);
         let after = self.occupancy();
-        Effects { actions: diff_actions(&before, &after), dropped }
+        Effects { actions: diff_actions(&before, &after), dropped, reservations_hit: Vec::new() }
     }
 
     /// Outputs currently ducked (an announcement occupies them).
@@ -278,6 +373,17 @@ impl AnnounceScheduler {
     }
 
     // --- internals (mutate active/queue only; never emit actions) ---
+
+    /// Which reservations `req`'s targets overlap, as the report the holder gets.
+    fn hits_for(&self, req: &Request) -> Vec<ReservationHit> {
+        self.reservations
+            .iter()
+            .filter_map(|r| {
+                let outputs: BTreeSet<Output> = req.targets.iter().filter(|t| r.outputs.contains(*t)).cloned().collect();
+                (!outputs.is_empty()).then(|| ReservationHit { reservation: r.id, outputs: outputs.into_iter().collect(), by: req.id })
+            })
+            .collect()
+    }
 
     fn take_seq(&mut self) -> u64 {
         let s = self.next_seq;
@@ -330,9 +436,14 @@ impl AnnounceScheduler {
 
         // Start eligible entries in priority/arrival order. Occupancy only grows
         // as we start clips, so a single ordered sweep with rechecks suffices.
+        // Reservations are constant across the sweep, so they're read once — and a
+        // reserved output blocks a queued start exactly like a playing clip does,
+        // which is what makes "queue, don't play over the calibration" hold for a
+        // clip admitted *before* the reservation existed.
+        let reserved = self.reserved_outputs();
         loop {
             let occ = self.occupancy();
-            let pick = self.queue.iter().position(|e| e.req.targets.iter().all(|o| !occ.contains_key(o)));
+            let pick = self.queue.iter().position(|e| e.req.targets.iter().all(|o| !occ.contains_key(o) && !reserved.contains(o)));
             match pick {
                 Some(i) => {
                     let entry = self.queue.remove(i);
@@ -509,6 +620,103 @@ mod tests {
             vec![DuckMusic(o("bed")), StartAnnouncement(o("bed"), 2), StopAnnouncement(o("k"), 1), StartAnnouncement(o("k"), 2),]
         );
         assert!(s.is_active(2));
+    }
+
+    // --- reservations (plan §12.3: an alignment hold) ---
+
+    /// The bug §12.3 records: occupancy came only from in-flight announcements, so
+    /// an aligning output was invisible and `begin` took the immediate-start path.
+    #[test]
+    fn a_reservation_makes_an_ordinary_announcement_queue() {
+        let mut s = AnnounceScheduler::new();
+        s.reserve(7, [o("k")]);
+        assert!(s.is_reserved("k"));
+        let (adm, eff) = s.begin(req(1, 0, &["k"]), 0);
+        assert_eq!(adm, Admission::Queued { position: 0 });
+        assert!(eff.actions.is_empty(), "nothing may play over the calibration tone");
+        assert!(eff.reservations_hit.is_empty(), "a queued clip did not touch the reservation");
+        // A tick while the hold stands must not let it slip through.
+        assert!(s.tick(10).actions.is_empty());
+        assert!(!s.is_active(1));
+        // Releasing the hold is what starts it.
+        let eff = s.release_reservation(7, 20);
+        assert_eq!(eff.actions, vec![DuckMusic(o("k")), StartAnnouncement(o("k"), 1)]);
+        assert!(s.is_active(1));
+    }
+
+    #[test]
+    fn a_reservation_rejects_when_the_producer_asked_for_reject() {
+        let mut s = AnnounceScheduler::new();
+        s.reserve(7, [o("k")]);
+        let mut r = req(1, 0, &["k"]);
+        r.on_busy = OnBusy::Reject;
+        assert_eq!(s.begin(r, 0).0, Admission::Rejected(RejectReason::Busy));
+        // ...and play-now-or-drop is stale, not queued, exactly as for a busy output.
+        let mut r = req(2, 0, &["k"]);
+        r.ttl_ms = Some(0);
+        assert_eq!(s.begin(r, 0).0, Admission::Rejected(RejectReason::Stale));
+    }
+
+    #[test]
+    fn a_reservation_leaves_other_outputs_alone() {
+        let mut s = AnnounceScheduler::new();
+        s.reserve(7, [o("k")]);
+        let (adm, eff) = s.begin(req(1, 0, &["bed"]), 0);
+        assert_eq!(adm, Admission::Playing, "an unreserved output is untouched by the hold");
+        assert_eq!(eff.actions, vec![DuckMusic(o("bed")), StartAnnouncement(o("bed"), 1)]);
+        // A multi-output clip that includes a reserved output waits for ALL of them
+        // (the existing all-or-nothing rule), so it must not start on the free one.
+        assert_eq!(s.begin(req(2, 0, &["k", "bed2"]), 1).0, Admission::Queued { position: 0 });
+        assert!(!s.is_active(2));
+    }
+
+    /// The fire-alarm case: barge-in still wins, and the holder is told which of its
+    /// members were touched and by what.
+    #[test]
+    fn barge_in_beats_a_reservation_and_reports_the_hit() {
+        let mut s = AnnounceScheduler::new();
+        s.reserve(7, [o("k"), o("hall")]);
+        let mut alarm = req(9, 100, &["k"]);
+        alarm.barge_in = true;
+        let (adm, eff) = s.begin(alarm, 5);
+        assert_eq!(adm, Admission::Playing, "an alarm is never suppressed by a calibration");
+        assert_eq!(eff.actions, vec![DuckMusic(o("k")), StartAnnouncement(o("k"), 9)]);
+        assert_eq!(eff.reservations_hit, vec![ReservationHit { reservation: 7, outputs: vec![o("k")], by: 9 }]);
+        // The hold is NOT dissolved by the hit — only the affected member's
+        // measurement is; the other member is still exclusive.
+        assert!(s.is_reserved("k") && s.is_reserved("hall"));
+        assert_eq!(s.begin(req(1, 0, &["hall"]), 6).0, Admission::Queued { position: 0 });
+    }
+
+    #[test]
+    fn a_hit_names_every_reserved_output_the_barge_in_covers() {
+        let mut s = AnnounceScheduler::new();
+        s.reserve(7, [o("k"), o("hall")]);
+        s.reserve(8, [o("bath")]);
+        let mut alarm = req(9, 100, &["hall", "k", "bath", "bed"]);
+        alarm.barge_in = true;
+        let eff = s.begin(alarm, 0).1;
+        assert_eq!(
+            eff.reservations_hit,
+            vec![
+                ReservationHit { reservation: 7, outputs: vec![o("hall"), o("k")], by: 9 },
+                ReservationHit { reservation: 8, outputs: vec![o("bath")], by: 9 },
+            ],
+            "one entry per reservation, its own outputs only, sorted"
+        );
+    }
+
+    #[test]
+    fn reserving_again_replaces_the_set_and_an_empty_set_releases() {
+        let mut s = AnnounceScheduler::new();
+        s.reserve(7, [o("k"), o("hall")]);
+        s.reserve(7, [o("hall")]); // the wizard narrowed its selection
+        assert!(!s.is_reserved("k") && s.is_reserved("hall"));
+        assert_eq!(s.reserved_outputs().into_iter().collect::<Vec<_>>(), vec![o("hall")]);
+        s.reserve(7, []);
+        assert!(s.reserved_outputs().is_empty());
+        // Releasing an id that never existed is a no-op, not a panic.
+        assert!(s.release_reservation(999, 0).actions.is_empty());
     }
 
     #[test]

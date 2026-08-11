@@ -13,11 +13,96 @@
 
 import { api } from './api';
 import { run } from './toast';
-import type { AlignGroup, AlignMember, AlignState } from './types';
+import { mic } from './mic.svelte';
+import type {
+  AlignGroup,
+  AlignMember,
+  AlignMemberKind,
+  AlignSessionMode,
+  AlignState,
+  MeasureMode,
+  OutputInfo,
+  SignalCheck,
+} from './types';
+
+/** The level a measured run sets speakers to while their levels are being checked
+ *  (plan §12.2): 20 %, not the by-ear panel's old 50 %.
+ *
+ *  Real in-room readings came out roughly 40 dB above what the estimator needs, so
+ *  50 % is needlessly loud for something done standing in a living room. The daemon's
+ *  `DEFAULT_ALIGN_LEVEL` is the same 20, so this agrees with it rather than fighting
+ *  it — it is stated here because the *slider* needs a starting position too. */
+export const DEFAULT_MEASURE_LEVEL = 20;
+
+const KIND_LABELS: Record<AlignMemberKind, string> = {
+  sendspin: 'Sendspin',
+  airplay2: 'AirPlay 2',
+  pwsink: 'PipeWire host',
+};
+
+/** One member kind, in the user's words. Centralised because "not sendspin ⇒
+ *  AirPlay 2" stopped being true when pw-sink became an alignable kind. */
+export function memberKindLabel(kind: AlignMemberKind): string {
+  return KIND_LABELS[kind] ?? kind;
+}
+
+/** Who owns a member's playback level during a session — i.e. whether the wizard's
+ *  level slider can do anything at all for it.
+ *
+ *  Three different answers, checked against `calibrate::apply_audibility` rather than
+ *  assumed, because a slider that silently does nothing is the worst of the three:
+ *
+ *  * `session` (sendspin) — the calibration level is pushed per device and restored on
+ *    teardown. The slider is real.
+ *  * `receiver` (AirPlay 2) — the session mutes and unmutes, but deliberately does
+ *    **not** impose a volume: an AP2 receiver's level is device-authoritative, and the
+ *    session snapshots only its mute, so a level written here could not be put back.
+ *    So the level is set on the receiver, and this page's job is to *judge* it.
+ *  * `none` (pw-sink) — no level and no in-band mute at all. It cannot be tuned or
+ *    silenced from here, so it keeps playing through every other member's turn and
+ *    constrains what their levels have to be (plan §7, §12.3.2). */
+export type LevelControl = 'session' | 'receiver' | 'none';
+
+export function levelControl(kind: AlignMemberKind): LevelControl {
+  if (kind === 'sendspin') return 'session';
+  return kind === 'airplay2' ? 'receiver' : 'none';
+}
+
+/** Which way raising this kind's knob moves the speaker (plan §2.4.1).
+ *
+ *  Mirrors the daemon's kind → polarity mapping (`align_measure::KnobPolarity`) for
+ *  the places that have only a member kind to go on — the by-ear panel and the run's
+ *  per-member progress. Where the daemon *sends* a polarity or an `effect` sentence
+ *  (`ProposedDelay`), that is authoritative and this must not be used instead.
+ *
+ *  Not a cosmetic label: a sendspin device subtracts its `static_delay_ms` from the
+ *  playback instant, so a UI that calls that knob a delay tells the user the exact
+ *  opposite of what the slider will do. */
+export function knobNoun(kind: AlignMemberKind): 'advance' | 'delay' {
+  return kind === 'sendspin' ? 'advance' : 'delay';
+}
+
+/** Lowest offset the delay slider may offer (ms).
+ *
+ *  A PipeWire receiver's playout delay is its jitter buffer, and it cannot go below
+ *  three packet times (`sync_settings::PWSINK_JITTER_MIN_MS` = 3 × 5 ms), so a
+ *  slider that starts at zero would promise a placement the receiver refuses. */
+export function sliderMin(m: { kind: AlignMemberKind }): number {
+  return m.kind === 'pwsink' ? 15 : 0;
+}
 
 /** Highest offset the slider offers, per member kind (ms). */
-export function sliderMax(m: AlignMember): number {
-  return m.kind === 'sendspin' ? 2000 : 5000;
+export function sliderMax(m: { kind: AlignMemberKind }): number {
+  if (m.kind === 'sendspin') return 2000;
+  return m.kind === 'pwsink' ? 2000 : 5000;
+}
+
+/** The session promise (`AlignMode`) a measurement mode makes. Two enums, one
+ *  meaning: `sweet_spot` and `multi_position` are the same promise under the two
+ *  names the daemon uses (`MeasureMode` vs `AlignMode`), so the mapping is written
+ *  once here instead of guessed at each call site. */
+export function sessionModeFor(mode: MeasureMode): AlignSessionMode {
+  return mode === 'near_field' ? 'near_field' : 'multi_position';
 }
 
 const sameSet = (a: string[], b: string[]) =>
@@ -36,6 +121,30 @@ function createAlign() {
   // false, a change reconnects that one speaker, so we don't stream during drag.
   let sendspinDelayLive = $state(false);
 
+  // ---- The wizard's speaker selection (plan §12.1, §12.2, §12.3.1) ----------
+  //
+  // This lives beside the session rather than in the page component because the
+  // page is unmounted every time the user steps back to the mode picker, and losing
+  // the scope (and the levels checked so far) to a navigation would be absurd.
+
+  /** The adopted outputs the picker offers. */
+  let outputs = $state<OutputInfo[]>([]);
+  let outputsLoaded = $state(false);
+  /** The run's **entire scope** — every speaker the one hold will cover, not the
+   *  first position's subset (plan §12.3.1). */
+  let selection = $state<string[]>([]);
+  /** Per-speaker playback level for level-setting, remembered while the wizard is
+   *  open so re-soloing a speaker returns to the level it was left at. The daemon
+   *  keeps one session level, applied to whoever is audible, so this side is what
+   *  makes it read as per-speaker. */
+  let levels = $state<Record<string, number>>({});
+  /** The speaker this browser last asked to hear. Not the whole truth — see the
+   *  `soloed` getter, which reconciles it with what the daemon says is audible. */
+  let soloIntent = $state<string | null>(null);
+  /** The last level verdict seen for each speaker while it was soloed — the
+   *  checklist of "which of my scope has been confirmed audible". */
+  let verdicts = $state<Record<string, SignalCheck['verdict']>>({});
+
   async function seedOffsets() {
     const next: Record<string, number> = {};
     try {
@@ -51,6 +160,16 @@ function createAlign() {
       /* leave defaults */
     }
     offsets = next;
+  }
+
+  /** The speaker actually playing the tone: this browser's own last instruction while
+   *  the daemon still agrees it is audible, else the daemon's single audible member.
+   *  One definition, used by the getter and by the level controls, so they can never
+   *  disagree about which speaker a level belongs to. */
+  function currentSolo(): string | null {
+    const audible = session?.audible ?? [];
+    if (soloIntent && (audible.length === 0 || audible.includes(soloIntent))) return soloIntent;
+    return audible.length === 1 ? audible[0] : null;
   }
 
   /** Full load: session state, the alignable groups, and the delay-live setting. */
@@ -79,6 +198,23 @@ function createAlign() {
   async function refreshGroups() {
     try {
       groups = await api.alignGroups();
+    } catch {
+      /* keep last-known */
+    }
+  }
+
+  /** Session state only — no groups, no offsets, no settings.
+   *
+   *  Wanted because parts of `AlignState` change *without* the UI doing anything:
+   *  `interference` records a doorbell or a voice-assistant turn that outranked the
+   *  session's exclusive hold, and that has to be visible while it is still relevant
+   *  rather than the next time something else happens to refresh. */
+  async function refreshStatus() {
+    try {
+      // Deliberately does not adopt `volume`: this runs on a timer, and a poll
+      // landing mid-drag would snap the slider back under the user's finger. The
+      // level the *daemon* used per member is reported by the measurement status.
+      session = await api.alignStatus();
     } catch {
       /* keep last-known */
     }
@@ -113,8 +249,69 @@ function createAlign() {
       return sendspinDelayLive;
     },
 
+    /** Is a session holding speakers right now (however it was started)? */
+    get sessionActive() {
+      return !!session?.active;
+    },
+    /** The adopted outputs the wizard's picker offers. */
+    get outputs() {
+      return outputs;
+    },
+    get outputsLoaded() {
+      return outputsLoaded;
+    },
+    /** The run's whole scope, as picked. */
+    get selection() {
+      return selection;
+    },
+    get levels() {
+      return levels;
+    },
+    /** The speaker whose tone is playing, or null when the group is silent.
+     *
+     *  Our own last instruction while the daemon still agrees it is audible (so the
+     *  highlight and the slider do not flicker on a status poll that was already in
+     *  flight), and otherwise whatever the daemon reports as its single audible
+     *  member — a measurement run moves the solo itself, and after one has been
+     *  abandoned this page must show what is *actually* playing rather than what this
+     *  browser last asked for. */
+    get soloed(): string | null {
+      return currentSolo();
+    },
+    get verdicts() {
+      return verdicts;
+    },
+    /** The level a speaker plays at. This browser's choice if it made one; otherwise
+     *  the *session's* level for whichever speaker is actually audible — that is the
+     *  level really being applied, and showing the default instead would misreport it
+     *  after a reload or a run that set its own. */
+    levelOf(nodeName: string): number {
+      const own = levels[nodeName];
+      if (own !== undefined) return own;
+      return currentSolo() === nodeName ? (session?.volume ?? DEFAULT_MEASURE_LEVEL) : DEFAULT_MEASURE_LEVEL;
+    },
+    /** The kind of a selected output, for the knobs it does and does not have. */
+    kindOf(nodeName: string): AlignMemberKind | null {
+      const m = session?.members.find((x) => x.node_name === nodeName);
+      if (m) return m.kind;
+      const o = outputs.find((x) => x.node_name === nodeName);
+      return o ? o.kind : null;
+    },
+
+    /** Things that outranked the session's exclusive hold (plan §12.3), newest
+     *  last. Never empty-checked away: an interfering doorbell is the explanation
+     *  for a reading the gate would otherwise blame on the user's hand. */
+    get interference() {
+      return session?.interference ?? [];
+    },
+    /** Routing the session is displacing while it holds these speakers. */
+    get displaced() {
+      return session?.displaced ?? [];
+    },
+
     refresh,
     refreshGroups,
+    refreshStatus,
 
     /** Mount hook: load, keep the group list fresh, and never leave a session
      *  running behind a page the user navigated away from. */
@@ -141,6 +338,117 @@ function createAlign() {
       return !!session?.active && !sameSet(session.sources, g.sources);
     },
 
+    /** Load the adopted outputs the picker offers. Cheap and idempotent; the picker
+     *  calls it on mount and after adopting something elsewhere. */
+    async loadOutputs() {
+      try {
+        outputs = await api.outputs();
+      } catch {
+        /* keep last-known; the picker says when it has nothing */
+      }
+      outputsLoaded = true;
+    },
+
+    /** Add or drop one speaker from the run's scope. Refused once a hold exists:
+     *  the scope *is* the hold, and changing it means paying the reconnect wave
+     *  twice more (plan §12.3.1), so that is a deliberate stop-and-restart rather
+     *  than a click. */
+    toggleSelected(nodeName: string) {
+      if (session?.active) return;
+      selection = selection.includes(nodeName) ? selection.filter((n) => n !== nodeName) : [...selection, nodeName];
+    },
+    /** Seed the scope, e.g. from the speakers a source is already playing to. */
+    setSelection(nodeNames: string[]) {
+      if (session?.active) return;
+      selection = [...new Set(nodeNames)];
+    },
+    clearSelection() {
+      if (session?.active) return;
+      selection = [];
+    },
+
+    /** Form the temporary exclusive group over the **whole** selection and go quiet.
+     *
+     *  Silence is deliberate: forming a group leaves the daemon's first two members
+     *  audible, and the level phase is one speaker at a time (plan §12.2). Starting
+     *  with two speakers playing would both mis-set levels and contradict what the
+     *  page says it is doing. */
+    async startSelection(mode: MeasureMode): Promise<boolean> {
+      if (selection.length < 2) return false;
+      busy = true;
+      try {
+        session = await api.alignStartOutputs(selection, sessionModeFor(mode));
+        level = session.volume;
+        soloIntent = null;
+        await seedOffsets();
+        session = await api.alignAudible([], level);
+        busy = false;
+        return true;
+      } catch (e) {
+        busy = false;
+        await run(() => Promise.reject(e));
+        return false;
+      }
+    },
+
+    /** Play the tone on exactly one speaker (plan §12.2's solo), at that speaker's
+     *  own level. Clicking the same speaker again, or `stopTone()`, silences it. */
+    async solo(nodeName: string) {
+      const next = levels[nodeName] ?? DEFAULT_MEASURE_LEVEL;
+      levels = { ...levels, [nodeName]: next };
+      soloIntent = nodeName;
+      level = next;
+      // The trailing signal window still holds the previous speaker's sound.
+      mic.disturbSignal();
+      try {
+        session = await api.alignAudible([nodeName], next);
+      } catch (e) {
+        soloIntent = null;
+        await run(() => Promise.reject(e));
+      }
+    },
+
+    /** Silence every member, leaving the session and the hold in place. */
+    async stopTone() {
+      if (!session?.active) return;
+      soloIntent = null;
+      mic.disturbSignal();
+      try {
+        session = await api.alignAudible([], level);
+      } catch {
+        /* nothing to say: the session may already be gone, which is also silence */
+      }
+    },
+
+    /** Drag feedback for the soloed speaker's level — readout only. */
+    previewSoloLevel(v: number) {
+      const node = currentSolo();
+      if (!node) return;
+      levels = { ...levels, [node]: v };
+      level = v;
+    },
+
+    /** Commit the soloed speaker's level (on release). */
+    async setSoloLevel(v: number) {
+      const node = currentSolo();
+      if (!node) return;
+      levels = { ...levels, [node]: v };
+      level = v;
+      mic.disturbSignal();
+      try {
+        session = await api.alignAudible([node], v);
+      } catch (e) {
+        await run(() => Promise.reject(e));
+      }
+    },
+
+    /** Remember the verdict just seen for the speaker being tuned, so the page can
+     *  show which of the scope has been confirmed rather than only the current one. */
+    recordVerdict(nodeName: string, verdict: SignalCheck['verdict']) {
+      if (verdicts[nodeName] === verdict) return;
+      verdicts = { ...verdicts, [nodeName]: verdict };
+    },
+
     async start(g: AlignGroup) {
       busy = true;
       try {
@@ -155,8 +463,28 @@ function createAlign() {
 
     async stop() {
       busy = true;
+      soloIntent = null;
+      // The verdicts described *this* hold's levels; carrying them into the next one
+      // would show a confirmation that nothing has re-checked. Levels are kept —
+      // they are the user's choice, not a measurement.
+      verdicts = {};
       if (await run(() => api.alignStop(), 'Alignment finished — volumes restored')) {
-        session = { active: false, sources: [], reference: null, target: null, members: [], volume: level };
+        session = {
+          active: false,
+          sources: [],
+          reference: null,
+          target: null,
+          members: [],
+          volume: level,
+          // Optimistic inactive state: the daemon's own `inactive()` reports an empty
+          // map, and no member has a session-applied level once the session is gone.
+          levels: {},
+          mode: 'manual',
+          outputs: [],
+          audible: [],
+          interference: [],
+          displaced: [],
+        };
       }
       busy = false;
     },
@@ -194,7 +522,7 @@ function createAlign() {
 
     /** Commit a member's offset (the persisted per-device delay knob). */
     async applyOffset(m: AlignMember, ms: number) {
-      const clamped = Math.max(0, Math.min(sliderMax(m), Math.round(ms)));
+      const clamped = Math.max(sliderMin(m), Math.min(sliderMax(m), Math.round(ms)));
       offsets = { ...offsets, [m.node_name]: clamped };
       try {
         if (m.kind === 'sendspin') await api.setSendspinDelay(m.node_name, clamped);

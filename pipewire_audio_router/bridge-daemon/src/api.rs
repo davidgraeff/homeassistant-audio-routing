@@ -265,7 +265,37 @@ pub fn router(
         .route("/api/align", get(align_status).delete(align_stop))
         .route("/api/align/start", post(align_start))
         .route("/api/align/select", post(align_select))
+        // Plan §12.2's solo: "these members are audible" — one for level-setting and
+        // for the sequential measurement, all of them for §7's all-play round.
+        .route("/api/align/audible", post(align_audible))
         .route("/api/align/volume", post(align_volume))
+        // Microphone-assisted alignment (align_mic.rs): the phone's capture socket
+        // and the status the UI's level meter reads.
+        .route("/api/align/mic/ws", get(crate::align_mic::mic_ws))
+        .route("/api/align/mic", get(crate::align_mic::mic_status))
+        // Whether the level is good enough to measure — the meter cannot say.
+        .route("/api/align/mic/signal", get(mic_signal))
+        // Measurement orchestration (align_measure.rs, plan §11). `apply` is a
+        // separate, explicit step: the user sees the proposed deltas and the
+        // confidence before a single delay is written.
+        .route("/api/align/measure", get(measure_status).delete(measure_abandon))
+        // Pushed run status (plan §11): one full `MeasureStatus` on connect, then one
+        // per change. The polling `GET` above stays, and the UI falls back to it —
+        // a run that looks frozen because a socket dropped is worse than a poll.
+        .route("/api/align/measure/ws", get(crate::align_measure::measure_ws))
+        // The relay-vs-device equivalence experiment (plan §1.1.1). Separate from a
+        // measurement run — and it refuses while one is live, since both drive the same
+        // session.
+        .route("/api/align/equivalence", get(equivalence_status).post(equivalence_start).delete(equivalence_abandon))
+        .route("/api/align/equivalence/ws", get(crate::align_measure::equivalence_ws))
+        .route("/api/align/measure/start", post(measure_start))
+        // Near field only (plan §1, W8a). The daemon cannot see where the phone is, so
+        // the walk is driven by the user: one `arrival` per speaker while standing at
+        // it, then `close` back at the first one for the drift measurement.
+        .route("/api/align/measure/arrival", post(measure_arrival))
+        .route("/api/align/measure/close", post(measure_close))
+        .route("/api/align/measure/apply", post(measure_apply))
+        .route("/api/align/measure/revert", post(measure_revert))
         .route("/api/routing", get(routing::get_routing))
         .route("/api/routing/link", post(routing::link))
         .route("/api/routing/unlink", post(routing::unlink))
@@ -870,9 +900,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             // AirPlay 2 always uses HomeKit transient pairing + encryption.
             encryption: Some("HomeKit".to_string()),
             latency_ms: ap2_latencies.get(&node_name).copied(),
-            latency_effective_ms: Some(
-                ap2_latencies.get(&node_name).copied().unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16),
-            ),
+            latency_effective_ms: Some(ap2_latencies.get(&node_name).copied().unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16)),
             ptp_locked,
             ptp_lock_age_s: ptp_age.map(|a| a.as_secs()),
             ptp_supported,
@@ -941,9 +969,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             port: None,
             encryption: Some("None".to_string()), // L16 RTP is unencrypted
             latency_ms: pwsink_jitters.get(&node_name).copied(),
-            latency_effective_ms: Some(
-                pwsink_jitters.get(&node_name).copied().unwrap_or(crate::sync_settings::DEFAULT_PWSINK_JITTER_MS),
-            ),
+            latency_effective_ms: Some(pwsink_jitters.get(&node_name).copied().unwrap_or(crate::sync_settings::DEFAULT_PWSINK_JITTER_MS)),
             ptp_locked: None,
             ptp_lock_age_s: None,
             ptp_supported: None,
@@ -2094,7 +2120,10 @@ async fn set_sync_settings(State(state): State<AppState>, Json(req): Json<SetSyn
         }
         if let Some(ms) = req.opus_floor_ms {
             if let Err(e) = ss.set_opus_floor_ms(ms) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
+                );
             }
         }
     }
@@ -2756,6 +2785,16 @@ async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>)
     for target in &targets {
         crate::announce::sync_agent_duck(target);
     }
+    // A duck hold outranks an alignment hold (plan §12.3) — the session gets a
+    // structured report through `align_group`, and it is worth a log line at the point
+    // of cause too, so "why was my measurement discarded?" is answerable from the log.
+    let aligning: Vec<&str> = targets.iter().filter(|t| crate::align_group::registry().is_reserved(t)).map(String::as_str).collect();
+    if !aligning.is_empty() {
+        tracing::warn!(
+            "duck hold {id} lands on speaker(s) currently being aligned [{}] — their measurements will be discarded",
+            aligning.join(", ")
+        );
+    }
     // One line per call, like announce: "why is the kitchen quiet?" is answerable
     // from the log alone.
     tracing::info!(
@@ -3046,17 +3085,100 @@ async fn align_status(State(state): State<AppState>) -> Json<crate::calibrate::A
     Json(state.align.status().await)
 }
 
-#[derive(Deserialize)]
-struct AlignStartRequest {
-    /// Source node names identifying the group to align (its stable identity).
-    sources: Vec<String>,
+/// The shared handles an alignment session needs to form and hold its temporary
+/// exclusive group (align_group.rs). Assembled here so `AlignManager` — which
+/// main.rs builds with three handles — needs no new constructor arguments.
+fn hold_deps(state: &AppState) -> crate::align_group::HoldDeps<'_> {
+    crate::align_group::HoldDeps { groups: &state.groups, changes: &state.changes, routing: &state.routing, outputs: &state.outputs }
 }
 
+#[derive(Deserialize)]
+struct AlignStartRequest {
+    /// **Either**: source node names identifying an existing group to align (the
+    /// by-ear entry point from a source card — its present members are what gets
+    /// held).
+    #[serde(default)]
+    sources: Vec<String>,
+    /// **Or**: the speakers to align, picked on the Outputs page (plan §12.1). A
+    /// temporary exclusive group is formed around exactly these, independent of how
+    /// they are routed now.
+    ///
+    /// **This is the run's whole scope, not one position's** (plan §12.3.1). It reads
+    /// counter-intuitively next to a wizard that then works on a subset, so:
+    ///
+    /// - send every speaker the run will touch — the floor, the apartment — because
+    ///   forming the group reconnects each of them (tens of seconds each, plan §2.3)
+    ///   and releasing it does so again. Paying that once is the point;
+    /// - then scope each position with `POST /api/align/audible`, which only moves
+    ///   mutes and is free;
+    /// - a `start` naming the same speakers, or **any subset** of them, does **not**
+    ///   re-form anything: the hold keeps its id, its anchor and its senders, nothing
+    ///   reconnects, and only audibility changes. `hold_id` in the response is
+    ///   unchanged, `hold_reused` is `true`;
+    /// - only a selection needing a speaker the current hold does not cover tears the
+    ///   session down and forms a new group. `hold_cost` says which of the two
+    ///   happened, in words.
+    #[serde(default)]
+    outputs: Vec<String>,
+    /// Which acoustic promise the run makes (plan §1). Only meaningful with
+    /// `outputs`; a `sources` start is by-ear by construction. Changing it on a
+    /// reusing `start` is free — the mode describes the run, not the group.
+    #[serde(default)]
+    mode: crate::align_group::AlignMode,
+}
+
+/// `POST /api/align/start` — hold a set of speakers exclusively for an alignment run.
+///
+/// Responds with the whole `AlignState`, including what this call **cost**:
+/// `hold_id` (unchanged ⇒ nothing re-formed), `hold_reused`, `hold_cost` (a sentence),
+/// and `level_note` when a member has no level knob (a pw-sink host, plan §7).
 async fn align_start(
     State(state): State<AppState>,
     Json(req): Json<AlignStartRequest>,
 ) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
-    state.align.start(req.sources).await.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+    let deps = hold_deps(&state);
+    let result = match (req.outputs.is_empty(), req.sources.is_empty()) {
+        (false, _) => {
+            tracing::info!("USER ACTION: start alignment ({:?}) on {} selected output(s)", req.mode, req.outputs.len());
+            state.align.start_outputs(&deps, req.outputs, req.mode).await
+        }
+        (true, false) => state.align.start(&deps, req.sources).await,
+        (true, true) => Err("give either `outputs` (the speakers to align) or `sources` (an existing group)".to_string()),
+    };
+    result.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+}
+
+#[derive(Deserialize)]
+struct AlignAudibleRequest {
+    /// The members to make audible — one for level-setting/measurement (plan §12.2),
+    /// all of them for §7's all-play headroom round.
+    audible: Vec<String>,
+    /// Playback level 0–100; omitted keeps the session's current level.
+    #[serde(default)]
+    level: Option<u8>,
+}
+
+/// `POST /api/align/audible` — plan §12.2's solo, generalised: make exactly these
+/// members audible and mute the rest.
+///
+/// **This is how a position is scoped** (plan §12.3.1): mutes are live and cost
+/// nothing, whereas re-selecting speakers by starting a *different* union re-forms the
+/// group and reconnects every member. A multi-position walk should call `start` once
+/// with the whole scope and then only come here.
+async fn align_audible(
+    State(state): State<AppState>,
+    Json(req): Json<AlignAudibleRequest>,
+) -> Result<Json<crate::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+    let level = match req.level {
+        Some(l) => l,
+        None => state.align.status().await.volume,
+    };
+    state
+        .align
+        .set_audible(req.audible, level)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
 }
 
 #[derive(Deserialize)]
@@ -3097,9 +3219,279 @@ async fn align_volume(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
 }
 
-/// Stop the session, restoring every member's volume.
+/// Stop the session: click off, every member's level/mute restored, the temporary
+/// exclusive group released so the displaced music comes back.
 async fn align_stop(State(state): State<AppState>) -> Json<crate::calibrate::AlignState> {
     Json(state.align.stop().await)
+}
+
+// ---- Microphone-assisted alignment (align_measure.rs, plan §11) ----------
+//
+// The measurement rides *beside* the by-ear session rather than replacing it: it
+// needs that session running (the click track has to be playing on every member
+// off one clock) and it drives the same live-mute machinery to solo one member at
+// a time. `apply` is deliberately a separate step — the user sees the proposed
+// deltas and their confidence before anything is written.
+
+use crate::align_measure::{DelayWriter, MeasureDeps, MeasureStatus, Mode, Refusal, RefusalKind, SendAheadContext, Timing};
+
+/// Writes one member's delay knob **through the existing endpoint handlers**.
+///
+/// Not through `sync_settings`: those handlers own the persist-then-push order,
+/// the per-kind clamping, and — the part that must not be duplicated — the scoped
+/// `force_device_reconnect` plus its group-wide send-ahead exception (plan §9.3).
+/// A second copy of that reasoning is exactly how a calibration write would end up
+/// blacking out a whole room.
+struct ApiDelayWriter {
+    state: AppState,
+}
+
+impl DelayWriter for ApiDelayWriter {
+    fn write(
+        &self,
+        node_name: String,
+        kind: crate::calibrate::MemberKind,
+        delay_ms: u16,
+    ) -> crate::align_measure::Fut<'_, Result<String, String>> {
+        Box::pin(async move {
+            let (status, Json(resp)) = match kind {
+                crate::calibrate::MemberKind::Sendspin => {
+                    set_sendspin_delay_handler(State(self.state.clone()), Json(SetSendspinDelayRequest { node_name, delay_ms })).await
+                }
+                // pw-sink shares AP2's per-output latency endpoint (its playout
+                // delay); the handler clamps to `PWSINK_JITTER_MIN_MS`.
+                crate::calibrate::MemberKind::Airplay2 | crate::calibrate::MemberKind::PwSink => {
+                    set_output_latency(
+                        State(self.state.clone()),
+                        Path(node_name),
+                        Json(SetOutputLatencyRequest { latency_ms: Some(delay_ms) }),
+                    )
+                    .await
+                }
+            };
+            if status.is_success() && resp.ok {
+                Ok(resp.message)
+            } else {
+                Err(resp.message)
+            }
+        })
+    }
+}
+
+/// Assemble what a run needs from `AppState`, so `align_measure` never sees it.
+fn measure_deps(state: &AppState, mode: Mode, link_to: Vec<String>) -> MeasureDeps {
+    // Every knob the two member kinds have, as persisted — the value a revert
+    // restores and the value the solve adds to.
+    // Snapshotted before the sync-settings lock is taken: two locks in one expression
+    // is how a lock-order inversion gets written.
+    let adopted = crate::outputs_store::adopted_snapshot(&state.outputs);
+    let (current_delays, send_ahead) = {
+        let ss = state.sync_settings.lock_recover();
+        let mut delays: HashMap<String, u16> = ss.sendspin_delays().into_iter().collect();
+        delays.extend(ss.ap2_latencies());
+        // pw-sink members (alignable since W15) render at their stored playout delay
+        // **or the default** — never at 0. So the *effective* value is reported for
+        // every adopted pw-sink output, not just the overridden ones: absent would read
+        // as "currently 0 ms", and the solve would compute its delta from a delay the
+        // host is not using (it cannot even be set below `PWSINK_JITTER_MIN_MS`, plan
+        // §1.1.2).
+        for name in adopted.iter().filter(|n| n.starts_with(PWSINK_DEV_PREFIX)) {
+            delays.insert(name.clone(), ss.pwsink_jitter_effective(name));
+        }
+        // Inputs for the plan §9.2 high-water warning. `floor_ms` is deliberately
+        // just the configured group lead: the codec's own decode floor is per-group
+        // and per-device here, and over-reporting the floor can only *suppress* a
+        // warning about a mark that would not have moved — never invent one.
+        let min_buffer_ms =
+            state.sendspin_devices.lock_recover().iter().map(|(node_name, d)| (node_name.clone(), d.min_buffer_ms)).collect();
+        let ctx = SendAheadContext { floor_ms: ss.group_lead_ms(), unreported_floor_ms: ss.opus_floor_ms(), min_buffer_ms };
+        (delays, ctx)
+    };
+    MeasureDeps {
+        mode,
+        link_to,
+        session: std::sync::Arc::new(state.align.clone()),
+        mic: std::sync::Arc::new(crate::align_measure::LiveMic),
+        writer: std::sync::Arc::new(ApiDelayWriter { state: state.clone() }),
+        current_delays,
+        send_ahead,
+        timing: Timing::real(),
+    }
+}
+
+/// A refusal is never a 500: every one of them is a state the user can act on.
+fn refusal_status(kind: RefusalKind) -> StatusCode {
+    match kind {
+        // "you have to do something first" / "something is already running".
+        // `WalkOutOfOrder` belongs here for the same reason: the request is
+        // well-formed, the run is simply not at that step (plan §11 — a refusal is a
+        // state the user can act on, never a 500 and never a malformed-input error).
+        RefusalKind::NoSession | RefusalKind::MicMissing | RefusalKind::Internal | RefusalKind::WalkOutOfOrder => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn refused(r: Refusal) -> (StatusCode, Json<Refusal>) {
+    tracing::info!("alignment measurement refused: {:?} — {}", r.kind, r.message);
+    (refusal_status(r.kind), Json(r))
+}
+
+#[derive(Deserialize)]
+struct MeasureStartRequest {
+    /// `"sweet_spot"` or `"near_field"`. The two make different promises about *where*
+    /// the group is aligned, so it is explicit and never inferred:
+    ///
+    /// - `sweet_spot`: the phone stays put and the daemon measures every member
+    ///   itself, twice. Aligns the position it was measured from.
+    /// - `near_field`: the daemon parks and waits for the user to walk. One
+    ///   `POST /api/align/measure/arrival` per speaker while standing at it, then
+    ///   `POST /api/align/measure/close` back at the first one. Aligns the wiring, so
+    ///   it holds everywhere.
+    #[serde(default = "default_measure_mode")]
+    mode: Mode,
+    /// Speakers aligned in an **earlier** run that this one should be made coherent
+    /// with (plan §12.1's "link, or keep independent?"). Not implemented — send it and
+    /// the run is refused with `mode_unsupported`, which is deliberate: a run that
+    /// claimed to link and did not would be worse than one that refuses.
+    #[serde(default)]
+    link_to: Vec<String>,
+}
+
+fn default_measure_mode() -> Mode {
+    Mode::SweetSpot
+}
+
+/// `POST /api/align/equivalence` — the relay-vs-device equivalence experiment (W21).
+///
+/// The deferred-write scheme (plan §1.1.1) assumes a relay-side delay of *d* and a
+/// device-side knob of *d* produce the same shift. This measures it: one speaker, six
+/// bracketed readings, three real writes. It reports the **scale** and the **sign** with
+/// an explicit resolution bound and applies no correction of its own — a discrepancy is
+/// a finding for a human, not something to silently absorb.
+#[derive(Deserialize)]
+struct EquivalenceStartRequest {
+    /// Override the member. Omit — the choice is a property of the transport, and
+    /// `plan_equivalence` picks the one where the sign can actually be confirmed.
+    #[serde(default)]
+    node_name: Option<String>,
+}
+
+async fn equivalence_start(
+    State(state): State<AppState>,
+    Json(req): Json<EquivalenceStartRequest>,
+) -> Result<Json<crate::align_measure::EquivalenceStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: start the relay-vs-device equivalence experiment ({:?})", req.node_name);
+    let deps = crate::align_measure::EquivalenceDeps {
+        // The same deps a measurement run uses; `mode`/`link_to` are unused here.
+        base: measure_deps(&state, Mode::SweetSpot, Vec::new()),
+        relay: std::sync::Arc::new(crate::align_measure::LiveRelay),
+        member: req.node_name,
+    };
+    crate::align_measure::equivalence().start(deps).await.map(Json).map_err(refused)
+}
+
+/// `GET /api/align/equivalence` — the experiment's state, including both arms' numbers,
+/// the resolution bound and what it cannot tell you.
+async fn equivalence_status() -> Json<crate::align_measure::EquivalenceStatus> {
+    Json(crate::align_measure::equivalence().status())
+}
+
+/// `DELETE /api/align/equivalence` — abandon. Restore still runs.
+async fn equivalence_abandon() -> Json<crate::align_measure::EquivalenceStatus> {
+    Json(crate::align_measure::equivalence().abandon())
+}
+
+/// `POST /api/align/measure/start` — begin the run.
+async fn measure_start(
+    State(state): State<AppState>,
+    Json(req): Json<MeasureStartRequest>,
+) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: start microphone-assisted alignment measurement ({:?})", req.mode);
+    crate::align_measure::shared().start(measure_deps(&state, req.mode, req.link_to)).await.map(Json).map_err(refused)
+}
+
+#[derive(Deserialize)]
+struct MeasureArrivalRequest {
+    /// The speaker the user is standing at, by node name.
+    node_name: String,
+    /// Playback level (0–100) to measure it at. Omit to use the level the session last
+    /// applied to this speaker — i.e. whatever the user settled on with
+    /// `POST /api/align/audible` while standing there (plan §12.2).
+    #[serde(default)]
+    level: Option<u8>,
+}
+
+/// `POST /api/align/measure/arrival` — near field's "I am at this speaker now".
+///
+/// The one call that makes near field work, and the reason it exists rather than the
+/// daemon working it out: nothing in a mixed capture says *which* speaker the phone is
+/// closest to, and per-speaker excitation (which could) is a separate work package. So
+/// the user points, and the run solos, levels, gates and measures that member.
+///
+/// Refused — never 500 — when the run is not a walk, is busy, has already measured
+/// this speaker, or has never heard of it.
+async fn measure_arrival(Json(req): Json<MeasureArrivalRequest>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: near-field arrival at '{}'", req.node_name);
+    crate::align_measure::shared().arrival(req.node_name, req.level).map(Json).map_err(refused)
+}
+
+/// `POST /api/align/measure/close` — near field's closure reading.
+///
+/// "I have walked back to the speaker I started at." The difference between its two
+/// readings is the mic-vs-audio clock drift accumulated over the whole walk, which is
+/// the only thing that makes a one-pass walk trustworthy (plan §5.3). Refused until
+/// every member has been visited.
+async fn measure_close() -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: close the near-field walk");
+    crate::align_measure::shared().close().map(Json).map_err(refused)
+}
+
+/// `GET /api/align/measure` — phase, per-member state, SNR, uncertainties and
+/// refusal reasons. Poll-only for now; pushing it belongs on the alignment
+/// panel's existing subscription (plan §11), which is W6's frontend work.
+async fn measure_status() -> Json<MeasureStatus> {
+    Json(crate::align_measure::shared().status())
+}
+
+/// `GET /api/align/mic/signal` — plan §12's per-channel SNR readout: is the level
+/// good enough to measure?
+///
+/// Separate from `/api/align/mic` on purpose. That endpoint's `peak` is a decaying
+/// *broadband* peak, and against an 8 ms burst once per second it is only a
+/// "the mic is alive" indicator — it cannot say whether a measurement would
+/// succeed. This runs the estimator over the recent capture and grades the weaker
+/// tone, which is what actually decides it. Session-independent and side-effect
+/// free, so it can be polled while the user is still turning a volume knob.
+async fn mic_signal() -> Json<crate::align_measure::SignalCheck> {
+    Json(crate::align_measure::signal_check(crate::align_estimator::PATTERN_SECS * 1000.0))
+}
+
+/// `POST /api/align/measure/apply` — write the solved delays, then settle and
+/// verify. Never automatic: a blocked proposal is refused here with the reason.
+///
+/// The mode is read off the **run** rather than taken from the request, because how
+/// the arrivals were acquired decides how the write can be checked: a near-field
+/// proposal is verified by walking again (a residual measured from one spot would be
+/// each speaker's distance to that spot, not the write). `apply` asserts this itself,
+/// so the two cannot disagree — this just keeps the log honest.
+async fn measure_apply(State(state): State<AppState>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    let mode = crate::align_measure::shared().status().mode;
+    tracing::info!("USER ACTION: apply measured alignment delays ({mode:?})");
+    crate::align_measure::shared().apply(measure_deps(&state, mode, Vec::new())).await.map(Json).map_err(refused)
+}
+
+/// `POST /api/align/measure/revert` — restore the start-of-session delay
+/// snapshot (plan §9.4).
+async fn measure_revert(State(state): State<AppState>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: revert alignment delays to the pre-measurement snapshot");
+    let writer = ApiDelayWriter { state };
+    crate::align_measure::shared().revert(&writer).await.map(Json).map_err(refused)
+}
+
+/// `DELETE /api/align/measure` — abandon, leaving delays untouched.
+async fn measure_abandon() -> Json<MeasureStatus> {
+    tracing::info!("USER ACTION: abandon the alignment measurement");
+    Json(crate::align_measure::shared().abandon())
 }
 
 #[derive(Deserialize)]

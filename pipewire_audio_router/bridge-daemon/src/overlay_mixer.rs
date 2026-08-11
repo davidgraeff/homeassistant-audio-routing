@@ -176,6 +176,15 @@ impl OverlayMixer {
     /// A hold on an output with nothing playing is inaudible and harmless — that
     /// is deliberate, so the caller need not know which speakers are live, and
     /// music that *starts* mid-turn comes up already ducked.
+    ///
+    /// A hold on an output held for **alignment** is reported to the holder
+    /// (`align_group`), because it is the interferer nothing else can see: a duck
+    /// hold has no clip and no occupancy, so the announce arbiter's reservation
+    /// never hears about it, and an assistant turn would otherwise attenuate a
+    /// calibration tone and be diagnosed as an unstable hand (plan §12.3, §2.3.2).
+    /// Reporting here rather than at the API handler is deliberate: this is the one
+    /// place a hold can be born, so the report cannot be forgotten by a future
+    /// caller.
     pub fn start_duck(&self, targets: &[String], level: f32, ttl: Duration) -> DuckHoldId {
         let id = {
             let mut next = self.next_duck_id.lock().unwrap();
@@ -184,9 +193,17 @@ impl OverlayMixer {
         };
         let expires = Instant::now() + ttl;
         let level = level.clamp(0.0, 1.0);
-        let mut ducks = self.ducks.lock().unwrap();
+        {
+            let mut ducks = self.ducks.lock().unwrap();
+            for output in targets {
+                ducks.entry(output.clone()).or_default().push(DuckHold { id, level, expires });
+            }
+        }
+        // Outside the `ducks` lock: the registry takes its own, and no lock order
+        // between the two is worth establishing for a report.
+        let holds = crate::align_group::registry();
         for output in targets {
-            ducks.entry(output.clone()).or_default().push(DuckHold { id, level, expires });
+            holds.note(output, crate::align_group::InterferenceCause::DuckHold { hold: id });
         }
         id
     }
@@ -419,7 +436,7 @@ mod tests {
         samples.iter().flat_map(|s| s.to_le_bytes()).collect()
     }
     fn to_i16(bytes: &[u8]) -> Vec<i16> {
-        bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+        bytes.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect()
     }
 
     #[test]

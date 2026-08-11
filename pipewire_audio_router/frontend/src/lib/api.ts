@@ -9,6 +9,7 @@ import type {
   AgentInfo,
   AirplayClient,
   AlignGroup,
+  AlignSessionMode,
   AlignState,
   AnnounceRequest,
   AnnounceResponse,
@@ -17,6 +18,11 @@ import type {
   AppSettings,
   AppSettingsUpdate,
   DuckHold,
+  MeasureMode,
+  MeasureStatus,
+  MicStatus,
+  Refusal,
+  SignalCheck,
   MusicGroup,
   NodesResponse,
   OpResponse,
@@ -44,6 +50,12 @@ export function wsUrl(path: string): string {
   return u.toString();
 }
 
+/** Push channel for the measurement run (plan §11: "progress should be pushed, not
+ *  polled"). Sends one whole `MeasureStatus` on connect and one on every change.
+ *  Kept here beside the REST client so both halves of the same endpoint are in one
+ *  place; resolve it with `wsUrl()`, which handles HA ingress. */
+export const MEASURE_WS_PATH = 'api/align/measure/ws';
+
 /** Shortest name an output may be renamed to, mirroring the daemon's rule
  *  (outputs_store.rs `MIN_NAME_CHARS`) so the UI can refuse before the round trip
  *  instead of surfacing a 400. */
@@ -53,6 +65,12 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public status: number,
+    /** The parsed error body, when the endpoint sent a structured one. Kept
+     *  because some endpoints say considerably more than a sentence: an alignment
+     *  measurement answers with a whole `Refusal` (kind, the member to blame, the
+     *  estimator's own verdict), and reducing that to `message` would throw away
+     *  exactly the part that tells the user what to do — see `refusalOf`. */
+    public body?: unknown,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -72,9 +90,24 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       data && typeof data === 'object' && 'message' in data && (data as { message?: unknown }).message
         ? String((data as { message: unknown }).message)
         : `HTTP ${resp.status} ${resp.statusText}`;
-    throw new ApiError(message, resp.status);
+    throw new ApiError(message, resp.status, data);
   }
   return data as T;
+}
+
+/** The `Refusal` an alignment-measurement call was rejected with, or `null` if the
+ *  failure was something else (a network error, a 500, a non-JSON body).
+ *
+ *  Every `/api/align/measure*` rejection is a `Refusal` with a 400 or 409 — the
+ *  daemon deliberately never 500s on one, because each is a state the user can act
+ *  on (api.rs `refusal_status`). This is how the UI keeps the *kind* and the
+ *  blamed member instead of collapsing everything into one sentence. */
+export function refusalOf(e: unknown): Refusal | null {
+  if (!(e instanceof ApiError)) return null;
+  const b = e.body;
+  if (!b || typeof b !== 'object') return null;
+  const r = b as Partial<Refusal>;
+  return typeof r.kind === 'string' && typeof r.message === 'string' ? (b as Refusal) : null;
 }
 
 export const api = {
@@ -237,10 +270,68 @@ export const api = {
   alignGroups: () => request<AlignGroup[]>('GET', 'api/align/groups'),
   alignStatus: () => request<AlignState>('GET', 'api/align'),
   alignStart: (sources: string[]) => request<AlignState>('POST', 'api/align/start', { sources }),
+  /** Start a session on an arbitrary **selection of speakers** (plan §12.1): a
+   *  temporary exclusive group is formed around exactly these, whatever they are
+   *  routed to now. This is the wizard's entry point, and the mode travels with it
+   *  so the session's promise is the one picked on the wizard's first page.
+   *
+   *  Costs a reconnect wave in both directions (§12.3.1), which is why the whole run
+   *  forms **one** hold over its entire scope and then scopes each position by
+   *  audibility — see `alignAudible`. */
+  alignStartOutputs: (outputs: string[], mode: AlignSessionMode) =>
+    request<AlignState>('POST', 'api/align/start', { outputs, mode }),
+  /** Make exactly these members audible at `level`, muting the rest — plan §12.2's
+   *  solo, generalised to a set. Live mutes, so this is free: it is how a run scopes
+   *  a position without re-forming the hold. An empty set silences every member. */
+  alignAudible: (audible: string[], level?: number) =>
+    request<AlignState>('POST', 'api/align/audible', { audible, ...(level == null ? {} : { level }) }),
   alignSelect: (reference: string, target: string) =>
     request<AlignState>('POST', 'api/align/select', { reference, target }),
   alignVolume: (volume: number) => request<AlignState>('POST', 'api/align/volume', { volume }),
   alignStop: () => request<AlignState>('DELETE', 'api/align'),
+  /** Microphone-ingest status (align_mic.rs). Polled only while capturing — it
+   *  feeds the level meter, and a meter fed from the *daemon* is what proves the
+   *  whole path works rather than just the browser's microphone. The capture
+   *  socket itself is `wsUrl('api/align/mic/ws')`, driven by lib/mic.svelte.ts. */
+  micStatus: () => request<MicStatus>('GET', 'api/align/mic'),
+
+  /** Is the level good enough to measure? Grades the weaker of the click track's
+   *  two tones by peak SNR — the meter above cannot answer this (see SignalCheck).
+   *  Session-independent and side-effect free, so it is safe to poll while the
+   *  user is still adjusting speaker volume. */
+  micSignal: () => request<SignalCheck>('GET', 'api/align/mic/signal'),
+
+  // Microphone-assisted alignment measurement (align_measure.rs, plan §11). One
+  // run at a time, process-wide, riding beside the by-ear session above: it needs
+  // that session playing the click track on every member off one clock.
+  //
+  // All five reject with a `Refusal` rather than a bare error string — use
+  // `refusalOf(e)` on the thrown ApiError to keep the kind, the blamed member and
+  // the estimator's own verdict.
+  /** The whole run: phase, per-member progress, gate, observations, proposal,
+   *  verification, refusal.
+   *
+   *  The push channel is `wsUrl(MEASURE_WS_PATH)` — one full status on connect and
+   *  one per change. This stays the fallback rather than a legacy path: a wizard that
+   *  shows nothing because the socket did not open is worse than one that polls, so
+   *  `lib/measure.svelte.ts` polls until the socket has actually delivered something
+   *  and goes back to polling if it drops. */
+  measureStatus: () => request<MeasureStatus>('GET', 'api/align/measure'),
+  /** Begin learning + measuring. Returns the run's first status (phase `arming`);
+   *  everything after that arrives by polling `measureStatus`. `near_field` is
+   *  refused with `mode_unsupported` by design — it is W8. */
+  measureStart: (mode: MeasureMode) => request<MeasureStatus>('POST', 'api/align/measure/start', { mode }),
+  /** Write the solved delays, then settle and verify. Never automatic (plan §11):
+   *  the user has seen the deltas and their confidence first. Refused with the
+   *  blocking check's own refusal when the proposal is blocked. */
+  measureApply: () => request<MeasureStatus>('POST', 'api/align/measure/apply'),
+  /** Restore the start-of-session delay snapshot (plan §9.4). The write phase is
+   *  destructive to a previously-tuned setup, so this stays available afterwards —
+   *  including after the run was abandoned. */
+  measureRevert: () => request<MeasureStatus>('POST', 'api/align/measure/revert'),
+  /** Abandon the run, leaving delays untouched. Any delays already written stay
+   *  written (and revertable) — abandoning is not an undo. */
+  measureAbandon: () => request<MeasureStatus>('DELETE', 'api/align/measure'),
 
   // Dynamic input sources — collection CRUD (multi-source refactor). Supersedes
   // the singular /api/source/{airplay,rtp} endpoints above. The backend routes

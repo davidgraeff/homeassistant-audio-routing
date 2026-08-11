@@ -104,3 +104,12 @@ futures-util = { version = "0.3.33", default-features = false, features = ["sink
 # AirPlay-2 gPTP grandmaster — into the daemon for the AP2 sender's PTP.
 [build-dependencies]
 cc = "1"
+
+# `test-util` gives tokio's paused-clock test runtime (`Builder::start_paused`),
+# which is what makes align_measure.rs's timing testable: its settling waits are
+# tens of seconds long (a sendspin device reconnect — docs/mic-alignment-plan.md
+# §2.3), and real sleeps in a unit test would be intolerable. Kept a
+# dev-dependency on purpose: with resolver v2 the feature is enabled for the test
+# build only, so the shipped binary does not carry the paused-clock machinery.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

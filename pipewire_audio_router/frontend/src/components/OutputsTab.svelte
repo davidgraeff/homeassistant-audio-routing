@@ -46,6 +46,20 @@
     new Map($routing.matrix.outputs.map((o) => [o.node_name, o.volume == null ? null : Math.round(o.volume * 100)])),
   );
 
+  /** Does the daemon have a level it can drive for this output?
+   *
+   *  `volume`/`muted` are reported exactly when it can (sendspin and AP2 in-band,
+   *  pw-sink through the receiver agent) and are null when it cannot — an agent-less
+   *  host, or a sink with neither a device route nor node volume. Either is enough:
+   *  a member whose level was never reported can still be *set*, which is why
+   *  <VolumeControl> keeps the slider live and only changes its tooltip. Deliberately
+   *  kind-agnostic, so the next output kind gets its control the moment the daemon
+   *  reports state instead of needing this file edited. */
+  const levelControl = $derived(
+    new Set($routing.matrix.outputs.filter((o) => o.volume != null || o.muted != null).map((o) => o.node_name)),
+  );
+  const hasLevelControl = (nodeName: string) => levelControl.has(nodeName);
+
   // Mute is mirrored into local state rather than read straight through, so the
   // toggle can be optimistic (the matrix confirms a frame later). `untrack` keeps
   // this effect from depending on its own writes.
@@ -842,10 +856,15 @@
             <span class="badge">{kindLabel(o)}</span>
           </div>
           <!-- The volume column is kept even for an output that has no volume to
-               control (pw-sink, or anything offline), so the badges beside it line
-               up with every other row's instead of sliding right. -->
+               control (an agent-less pw-sink host, or anything offline), so the badges
+               beside it line up with every other row's instead of sliding right.
+               Gated on *capability*, not on kind: the daemon reports `volume`/`muted`
+               exactly when it can drive that output (sendspin and AP2 in-band, pw-sink
+               through the receiver agent), and null when it genuinely cannot. Listing
+               kinds here is what previously hid the control from every pw-sink host the
+               daemon could already drive. -->
           <div class="out-vol">
-            {#if o.present && (o.kind === 'airplay2' || o.kind === 'sendspin')}
+            {#if o.present && hasLevelControl(o.node_name)}
               <VolumeControl
                 percent={liveVol.get(o.node_name) ?? null}
                 muted={muted[o.node_name] ?? false}

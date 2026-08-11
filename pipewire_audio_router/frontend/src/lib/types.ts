@@ -48,13 +48,23 @@ export interface RoutingNode {
   /** Recent peak level 0.0–1.0 for the meter (sources, while the matrix is
    * open); 0 for outputs/unmetered. */
   peak: number;
-  /** Current volume 0.0–1.0 for outputs whose volume the daemon tracks
-   * out-of-band (sendspin devices) — pushed live over the routing WS so the
-   * slider syncs, including physical changes the device reports. Absent for
-   * sources. */
+  /** Current volume 0.0–1.0, pushed live over the routing WS so the slider syncs
+   * (including physical changes a device reports).
+   *
+   * **This field is the capability contract the UI gates on.** It is populated
+   * exactly when the daemon can drive that output's level — sendspin and AirPlay 2
+   * in-band, a pw-sink host through the receiver agent — and `null`/absent when it
+   * genuinely cannot: an agent-less host, a sink with neither a device route nor node
+   * volume, or a source. So render a volume control iff `volume != null || muted !=
+   * null`; do **not** test the output kind. Enumerating kinds is what previously hid
+   * the control from every pw-sink host the daemon could already drive.
+   *
+   * `null` on an output that *does* have a control means "level not reported yet, but
+   * settable" — <VolumeControl> keeps the slider live and only changes its tooltip. */
   volume?: number | null;
-  /** Current mute state for outputs whose mute the daemon tracks out-of-band
-   * (sendspin devices), pushed live over the routing WS. Absent otherwise. */
+  /** Current mute state, same capability contract as `volume` above. Deliberately
+   * `null` rather than `false` when unknown: a missing agent reading as "unmuted"
+   * would put a mute button on screen that silently does nothing. */
   muted?: boolean | null;
   /** Outputs only: the diagnosed reason this output can't carry audio right now;
    * absent when nothing is known to be wrong. Turns "not connected" from a state
@@ -334,7 +344,14 @@ export interface StatusInfo {
 
 // ---- Latency alignment (calibrate.rs) -----------------------------------
 
-export type AlignMemberKind = 'sendspin' | 'airplay2';
+/** What kind of speaker an alignment member is (`calibrate::MemberKind`).
+ *
+ *  `pwsink` — a remote PipeWire host — is not a third flavour of the same thing:
+ *  it has **no level knob and no mute** in this path, so it can neither be tuned
+ *  nor silenced while another speaker is soloed, and its delay knob has a hard
+ *  floor (plan §7, §12.3.2). Every UI that offers a level control has to branch on
+ *  this rather than assume "not sendspin ⇒ AirPlay 2". */
+export type AlignMemberKind = 'sendspin' | 'airplay2' | 'pwsink';
 
 export interface AlignMember {
   node_name: string;
@@ -349,17 +366,432 @@ export interface AlignGroup {
   members: AlignMember[];
 }
 
+/** Which acoustic promise a *session* is making (align_group.rs `AlignMode`).
+ *
+ *  Not the same enum as `MeasureMode` below, and deliberately so: this is the
+ *  session's promise (including `manual`, which runs no measurement at all), while
+ *  `MeasureMode` is what the measurement state machine implements. `multi_position`
+ *  and `sweet_spot` are the same promise under the two names. */
+export type AlignSessionMode = 'multi_position' | 'near_field' | 'manual';
+
+/** Why one member's reading has to be thrown away: something legitimately
+ *  outranked the alignment's exclusive hold (plan §12.3).
+ *
+ *  Exclusivity is deliberately not absolute — a barge-in announcement and a voice
+ *  duck both win, because nobody wants a fire alarm suppressed by a calibration.
+ *  The report is the load-bearing part: without it the gate catches the same event
+ *  as unstable amplitude and blames the user's hand for what a doorbell did. */
+export type InterferenceCause =
+  | { kind: 'barge_in'; announcement: number }
+  | { kind: 'duck_hold'; hold: number };
+
+export interface Interference {
+  /** The held output it happened on. */
+  member: string;
+  cause: InterferenceCause;
+  /** Milliseconds since the hold was formed. */
+  at_ms: number;
+  /** The sentence to show, pre-rendered by the daemon so every consumer quotes the
+   *  same one. Show it verbatim. */
+  reason: string;
+}
+
 /** Current calibration session state (`/api/align`). */
 export interface AlignState {
   active: boolean;
+  /** The session's identity as the UI compares it: the source set for a session
+   *  started from a source card, the selected output set for one started from a
+   *  selection. Either way, the thing the user picked. */
   sources: string[];
   /** The fixed member everything is aligned against. */
   reference: string | null;
   /** The member currently being tuned (audible alongside the reference). */
   target: string | null;
   members: AlignMember[];
-  /** Playback level (0–100) of the audible members. */
+  /** Playback level (0–100) last applied — the fallback for a member the session has
+   *  not given a level to yet. */
   volume: number;
+  /** Per-member calibration level (0–100), keyed by node name.
+   *
+   *  Session-owned so it survives a page reload; a member the session has never applied
+   *  a level to is **absent** (not 0, not null), so read `levels[node] ?? volume`.
+   *  Deliberately not persisted across sessions: the right level depends on where the
+   *  phone is standing, so a stored value would be a good seed and a bad promise. */
+  levels: Record<string, number>;
+  /** Which acoustic promise this session is making. */
+  mode: AlignSessionMode;
+  /** The outputs held exclusively for the session — its temporary group. */
+  outputs: string[];
+  /** The members audible right now: one while a level is being set or a member
+   *  measured, two for the by-ear comparison. */
+  audible: string[];
+  /** Exclusivity violations recorded so far, newest last. A *peek* — reading this
+   *  does not clear it. */
+  interference: Interference[];
+  /** The routing this session is displacing while it holds these speakers: what
+   *  the UI shows as "these speakers will stop playing what they play now". */
+  displaced: RoutingLink[];
+}
+
+/** Microphone-ingest status (`/api/align/mic`, align_mic.rs) — what the level
+ *  meter and the capture pre-flight read. Counters cover the *current* capture;
+ *  a reconnect starts them over. */
+/** Whether the *level* is good enough to measure — which the meter cannot say,
+ *  because `MicStatus.peak` is a decaying broadband peak read against an 8 ms
+ *  burst once per second. `GET api/align/mic/signal`. */
+export interface SignalCheck {
+  verdict: 'good' | 'marginal' | 'too_quiet' | 'unusable';
+  /** One sentence naming the problem and the action. Show it verbatim. */
+  message: string;
+  sample_rate: number;
+  periods: number;
+  gap: boolean;
+  clipped: boolean;
+  /** The channel that decides the verdict; null when nothing was analysed. */
+  worst_peak_snr_db: number | null;
+  channels: SignalChannel[];
+}
+
+export interface SignalChannel {
+  label: string;
+  center_hz: number;
+  peak_snr_db: number;
+  second_peak_ratio: number;
+  /** Meaningless in isolation — shown only so instability is visible. */
+  phase_ms: number;
+  periods_used: number;
+}
+
+export interface MicStatus {
+  connected: boolean;
+  /** Rate the capture declared; 0 before the first one. */
+  sample_rate: number;
+  frames_received: number;
+  blocks_received: number;
+  /** Sequence discontinuities: any window spanning one is unusable. */
+  gap_count: number;
+  /** Decaying peak level, 0.0–1.0. */
+  peak: number;
+  /** Sticky: a measurement is refused on a capture that clipped at all. */
+  clipped: boolean;
+  clip_count: number;
+  buffered_frames: number;
+  capacity_frames: number;
+}
+
+// ---- Microphone-assisted alignment measurement (align_measure.rs) --------
+// The measurement run rides *beside* the by-ear session of `AlignState` above:
+// it needs that session playing the click track, and it solos one member at a
+// time through the same live-mute machinery. Everything here mirrors
+// bridge-daemon/src/align_measure.rs field-for-field; the plan is
+// docs/mic-alignment-plan.md §§5, 8-11.
+
+/** Which acoustic promise a run makes (plan §1). `near_field` is accepted by the
+ *  type but refused by the daemon with `mode_unsupported` (it is W8), which is
+ *  deliberate: the two modes align *different* things, so silently substituting
+ *  one for the other would lie to the user. */
+export type MeasureMode = 'sweet_spot' | 'near_field';
+
+/** Plan §8's state machine. `proposed` is the state that parks the run waiting
+ *  for the user, which is what makes `apply` an explicit step (§11). */
+export type MeasurePhase =
+  | 'idle'
+  | 'arming'
+  | 'learning'
+  | 'measuring'
+  | 'solving'
+  | 'proposed'
+  | 'writing'
+  | 'settling'
+  | 'verifying'
+  | 'done'
+  | 'refused';
+
+/** Machine-readable half of a refusal. Every one of these reaches the UI with a
+ *  sentence in `Refusal.message` — plan §5.5: "it didn't work" is not an
+ *  acceptable thing to show. */
+export type RefusalKind =
+  | 'no_session'
+  | 'session_lost'
+  | 'session_changed'
+  | 'mic_missing'
+  | 'mic_lost'
+  | 'mic_reconnected'
+  | 'mode_unsupported'
+  | 'estimator'
+  | 'gate_timeout'
+  /** Exclusivity was violated on a member and its reading could not be retaken: a
+   *  barge-in announcement or a voice-duck hold outranked the alignment hold (plan
+   *  §12.3). A legitimate loss rather than a bug — and it must be reported *as
+   *  itself*, never softened into a timeout. */
+  | 'interference'
+  | 'ambiguous_spread'
+  | 'transitivity'
+  | 'repeatability'
+  | 'knob_range'
+  | 'residual_too_large'
+  | 'write_failed'
+  | 'cancelled'
+  | 'internal';
+
+/** The estimator's own verdict, when a refusal came from it
+ *  (align_estimator.rs `RejectReason`). */
+export type EstimatorReason =
+  | 'low_snr'
+  | 'ambiguous_peak'
+  | 'unstable_phase'
+  | 'clipped'
+  | 'sequence_gap'
+  | 'too_few_periods';
+
+/** A refusal, in both machine and human form. `message` is written for the user
+ *  and must be shown verbatim; `member` names the speaker when one is to blame. */
+export interface Refusal {
+  kind: RefusalKind;
+  message: string;
+  member?: string;
+  estimator_reason?: EstimatorReason;
+}
+
+export type WarningKind =
+  | 'send_ahead_high_water'
+  | 'aec_suspected'
+  | 'level_learning_skipped'
+  | 'mic_reconnected'
+  | 'no_drift_fit'
+  /** Exclusivity was violated during the run, even though the affected window was
+   *  retaken — it explains why the run took longer than it should have. */
+  | 'interference';
+
+export interface Warning {
+  kind: WarningKind;
+  message: string;
+}
+
+/** One member's estimate for a single pass. Both bursts are measured (plan §2.2),
+ *  which is what gives §10.2's cross-band check a second, independent axis. */
+export interface MemberMeasurement {
+  /** Arrival of the 3 kHz "A" burst, ms on the estimator's shared grid. */
+  phase_a_ms: number;
+  /** Arrival of the 1.5 kHz "B" burst, ms on the same grid. */
+  phase_b_ms: number;
+  /** Spread across pattern repeats — the sharpest discriminator the estimator
+   *  has (plan §5.4.1), so it is shown wherever a delta is shown. */
+  std_error_ms: number;
+  peak_snr_db: number;
+  second_peak_ratio: number;
+  drift_ppm: number;
+  periods_used: number;
+}
+
+/** One accepted measurement of one member in one pass. */
+export interface MemberObservation extends MemberMeasurement {
+  node_name: string;
+  pass: number;
+  /** Which capture the phases belong to. Observations from different epochs are
+   *  never comparable (plan §1.2), so a changing epoch explains a restart. */
+  grid_epoch: number;
+  period_centre: number;
+}
+
+export interface MemberProgress {
+  node_name: string;
+  kind: AlignMemberKind;
+  /** Calibration level this member was soloed at (0-100). */
+  level: number;
+  /** The value its knob had when the run started — i.e. what a revert restores.
+   *  Whether that knob is an advance or a delay follows from `kind` (sendspin
+   *  advances, AirPlay 2 and pw-sink delay), so never label it "delay" unconditionally. */
+  current_delay_ms: number;
+  passes_done: number;
+  last: MemberMeasurement | null;
+  /** What the gate is waiting for, or why the last attempt failed. */
+  note: string | null;
+}
+
+/** Which way raising a member's knob moves its arrival (plan §2.4.1).
+ *
+ *  This is the correction W14 landed, and it inverts what the UI used to claim: a
+ *  sendspin device *subtracts* `static_delay_ms` from the playback instant, so
+ *  raising that knob makes the speaker play **earlier**. An AirPlay-2 render delay
+ *  and a pw-sink playout delay both make it play **later**. A user shown the word
+ *  "delay" for an advance has been told the opposite of the truth, which is why
+ *  every number in the UI is paired with its polarity or with `effect`. */
+export type KnobPolarity = 'advance' | 'delay';
+
+/** One member's proposed write. */
+export interface ProposedDelay {
+  node_name: string;
+  kind: AlignMemberKind;
+  /** Measured arrival relative to the earliest member, ms (>= 0): the acoustic
+   *  answer, before any knob arithmetic. */
+  arrival_ms: number;
+  /** Knob values, not necessarily delays — see `polarity`. */
+  current_delay_ms: number;
+  new_delay_ms: number;
+  /** `new - current`. Its sign is how the **knob** moves, not how the sound moves:
+   *  raising a sendspin advance makes that speaker play *earlier*. Never render
+   *  this on its own — pair it with `polarity`, or use `effect`. */
+  added_ms: number;
+  std_error_ms: number;
+  /** The member whose knob lands at the smallest value. An **outcome** of the
+   *  interval intersection (plan §2.4.2), not a reference anyone chose — so it must
+   *  not be presented as "the speaker the others were aligned to by decision". */
+  is_reference: boolean;
+  polarity: KnobPolarity;
+  knob_min_ms: number;
+  knob_max_ms: number;
+  /** The arrivals this member can reach, on `arrival_ms`'s scale — the interval the
+   *  common target had to fall inside. */
+  achievable_lo_ms: number;
+  achievable_hi_ms: number;
+  /** The daemon's own sentence for what this write does, e.g. `"advance 12 ms (was
+   *  0 ms) — plays 12 ms earlier"`. **Prefer this verbatim** over composing wording
+   *  from the numbers: it is the one place the direction is guaranteed right. */
+  effect: string;
+}
+
+/** Plan §10.2's cross-band check. `caveat` states what it cannot see; it is shown
+ *  whether the check passes or fails, because a pass is *not* proof (plan §5.6). */
+export interface TransitivityCheck {
+  worst_pair: [string, string] | null;
+  worst_ms: number;
+  tolerance_ms: number;
+  passed: boolean;
+  caveat: string;
+}
+
+export interface RepeatabilityCheck {
+  worst_member: string | null;
+  worst_ms: number;
+  tolerance_ms: number;
+  passed: boolean;
+}
+
+/** Plan §10.3 — a documented seam, not an implementation. `state` is
+ *  `"not_implemented"` today and `reason` says why. */
+export interface MergedPeakCheck {
+  state: string;
+  reason: string;
+}
+
+export interface ResidualCheck {
+  worst_member: string | null;
+  worst_ms: number;
+  tolerance_ms: number;
+  passed: boolean;
+}
+
+/** The checks available *before* the write. Residual only exists afterwards
+ *  (see `Verification`), because it re-measures what was written. */
+export interface Checks {
+  transitivity: TransitivityCheck;
+  /** Null when only one pass was usable — then there is nothing to compare. */
+  repeatability: RepeatabilityCheck | null;
+  merged_peak: MergedPeakCheck;
+}
+
+/** What `apply` would write, and the confidence behind it. */
+export interface Proposal {
+  /** The member whose knob ends up smallest — everyone else moves towards it. An
+   *  outcome of the solve, not an input (see `ProposedDelay.is_reference`). */
+  reference: string;
+  pattern_ms: number;
+  /** Arrival spread across the group, ms. */
+  spread_ms: number;
+  /** Fitted mic-vs-audio clock drift, ppm. */
+  drift_ppm: number;
+  /** The common arrival the group is being moved to, on `arrival_ms`'s scale (0 = the
+   *  earliest member as measured). Can be **negative**: a sendspin group is aligned
+   *  earlier than anything currently arrives whenever a member already has an
+   *  advance. */
+  target_ms: number;
+  /** The intersection of every member's achievable arrivals — the window `target_ms`
+   *  was picked from. An empty intersection is what a `knob_range` refusal is. */
+  feasible_lo_ms: number;
+  feasible_hi_ms: number;
+  /** The largest knob value this proposal writes. This is the quantity the solver
+   *  minimised: both polarities cost latency (an AP2 delay directly, a sendspin
+   *  advance through the group's send-ahead), so plan §9.2's "keep the delay small"
+   *  generalises to "keep the biggest knob small". */
+  largest_knob_ms: number;
+  members: ProposedDelay[];
+  checks: Checks;
+  warnings: Warning[];
+  /** Set when a check blocks the write. The numbers stay visible on purpose: a
+   *  green residual with a failed transitivity check is the interesting failure
+   *  and must not be hidden (plan §10). */
+  blocked: Refusal | null;
+}
+
+/** Post-write verification (plan §10). */
+export interface Verification {
+  residual: ResidualCheck;
+  transitivity: TransitivityCheck;
+  merged_peak: MergedPeakCheck;
+  observations: MemberObservation[];
+  passed: boolean;
+}
+
+/** Why the loop-phase gate is not accepting a window yet (plan §8). */
+export type GateReason =
+  | 'mic_disconnected'
+  | 'mic_reconnected'
+  | 'sequence_gap'
+  | 'clipped'
+  | 'silent'
+  /** A barge-in announcement or a duck hold hit this member. Exists so the failure
+   *  names the doorbell: without it the level change an announcement causes is caught
+   *  as unstable amplitude and reported as "hold the phone still". */
+  | 'interference'
+  | 'intermittent'
+  | 'unstable_amplitude'
+  | 'aec_suspected'
+  | 'acquiring'
+  | 'estimator';
+
+/** What the gate is doing right now. This is what stops a slow run looking hung:
+ *  mute settling, a reconnect that costs tens of seconds, or the phone moving all
+ *  land here rather than as silence. */
+export interface GateProgress {
+  locked: boolean;
+  periods: number;
+  needed: number;
+  waiting_for?: GateReason;
+  message: string;
+  restarts: number;
+  member?: string;
+}
+
+/** `GET /api/align/measure` — the whole run, in one object. */
+export interface MeasureStatus {
+  phase: MeasurePhase;
+  mode: MeasureMode;
+  /** The source set identifying the group being measured. */
+  sources: string[];
+  sample_rate: number;
+  /** One sentence describing what the run is doing, or why it stopped. */
+  message: string;
+  members: MemberProgress[];
+  observations: MemberObservation[];
+  proposal: Proposal | null;
+  verification: Verification | null;
+  refusal: Refusal | null;
+  warnings: Warning[];
+  gate?: GateProgress;
+  /** `POST measure/apply` will be accepted (i.e. parked in `proposed`, unblocked). */
+  can_apply: boolean;
+  /** `POST measure/revert` has a snapshot to restore (plan §9.4). */
+  can_revert: boolean;
+  /** The speakers a *pending revert* belongs to; null when there is nothing to
+   *  revert. Non-null exactly while `can_revert` is true.
+   *
+   *  Retained across `abandon()`, which is the whole point: abandoning clears
+   *  `sources` but keeps what was written revertable (§9.4), so without this the
+   *  status alone could not say which group's panel should offer the undo — and a
+   *  client-side memory of it would die with the page. */
+  revert_scope: string[] | null;
+  elapsed_s: number;
 }
 
 /** One live PipeWire node (`/api/nodes`). */
