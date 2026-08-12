@@ -7,7 +7,7 @@
   import type { OpResponse, OutputInfo, SendspinCodec } from '../../lib/types';
   import { delaySpec, hasDelayKnob } from '../../lib/outputs/delay';
   import { setOutputMute, setOutputVolume } from '../../lib/outputs/level';
-  import { canTest, kindLabel, ptpBadge, statusBadge, testHint } from '../../lib/outputs/labels';
+  import { canTest, kindLabel, ptpBadge, statusBadge, syncBadge, testHint } from '../../lib/outputs/labels';
   import GroupTitle from '../groups/GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
@@ -307,19 +307,33 @@
   const playTone = (o: OutputInfo) => playClip(o, 'tone');
   const playAnnouncement = (o: OutputInfo) => playClip(o, 'announce');
 
-  // Resync: ask a sendspin device to drop its buffered audio and re-anchor
-  // (`stream/clear`). For the failure mode where a device is demonstrably being
-  // *sent* audio and plays none — measured on 2026-08-03, when three of four went
-  // silent while the daemon, the graph and the clock sync were all healthy. Before
-  // this the only lever was restarting the add-on, which interrupted every other
-  // output. Only offered for a connected sendspin device: there is nothing to clear
-  // otherwise, and the daemon says so rather than pretending.
+  // Resync: the same button for the same symptom on two transports — an output that is
+  // demonstrably being *sent* audio and plays none. What it costs differs, so what it
+  // sends does too:
+  //
+  // * **sendspin** — `stream/clear`: drop the buffered audio and re-anchor. One frame,
+  //   no reconnect. Measured on 2026-08-03, when three of four devices went silent while
+  //   the daemon, the graph and the clock sync were all healthy.
+  // * **AirPlay 2** — release the RTSP session and build a fresh one, re-arming the
+  //   receiver's PTP peer on the way. Heavier (a few seconds of silence on that
+  //   receiver), and the only thing that recovers a receiver which has lost its clock
+  //   lock — the Pioneer's failure mode, where the alternatives were restarting the
+  //   add-on or power-cycling the AVR. The daemon also does this by itself when it can
+  //   see the lock go (its watchdog); the button is for when it cannot, and for not
+  //   waiting.
+  //
+  // Both are offered only for a present device: with nothing connected there is nothing
+  // to resync, and the daemon says so rather than pretending.
   let clearing = $state<Record<string, boolean>>({});
-  const canClear = (o: OutputInfo) => o.kind === 'sendspin' && o.present;
+  const canClear = (o: OutputInfo) => (o.kind === 'sendspin' || o.kind === 'airplay2') && o.present;
+  const resyncHint = (o: OutputInfo) =>
+    o.kind === 'airplay2'
+      ? 'Release this receiver’s AirPlay session and build a fresh one, re-arming its PTP clock. Try this if it is connected but silent — its groupmates keep playing.'
+      : 'Discard this speaker’s buffered audio and re-anchor it (stream/clear). Try this if it is connected but silent — it does not disturb the other speakers in its group.';
   async function resync(o: OutputInfo) {
     clearing = { ...clearing, [o.node_name]: true };
     try {
-      const res = await api.sendspinClear(o.node_name);
+      const res = o.kind === 'airplay2' ? await api.ap2Resync(o.node_name) : await api.sendspinClear(o.node_name);
       toast(res.ok ? 'success' : 'error', res.message);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
@@ -537,7 +551,7 @@
     <button
       class="ghost out-resync"
       disabled={clearing[o.node_name]}
-      title="Discard this speaker's buffered audio and re-anchor it (stream/clear). Try this if it is connected but silent — it does not disturb the other speakers in its group."
+      title={resyncHint(o)}
       onclick={() => resync(o)}
     >{clearing[o.node_name] ? 'Resyncing…' : 'Resync'}</button>
   {/if}
@@ -712,6 +726,13 @@
             {#if ptpBadge(o)}
               {@const ptp = ptpBadge(o)!}
               <span class={ptp.cls} title={ptp.title}>{ptp.text}</span>
+            {/if}
+            <!-- The speaker's own verdict on whether it is rendering in step (sendspin
+                 only, and only when it has something to report). The counterpart of the
+                 PTP badge for the other transport. -->
+            {#if syncBadge(o)}
+              {@const sync = syncBadge(o)!}
+              <span class={sync.cls} title={sync.title}>{sync.text}</span>
             {/if}
             <span class={st.cls} title={st.title}>{st.text}</span>
             <span class="badge">{kindLabel(o)}</span>

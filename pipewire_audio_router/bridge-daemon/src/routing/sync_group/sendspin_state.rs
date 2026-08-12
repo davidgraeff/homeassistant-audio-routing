@@ -87,3 +87,18 @@ pub(crate) fn sendspin_server_action(s: SendspinServerState) -> ServerAction {
 pub(crate) fn sendspin_config_changed(prev_codec: &str, prev_lead_us: i64, want_codec: &str, want_lead_us: i64) -> bool {
     want_codec != prev_codec || want_lead_us > prev_lead_us
 }
+
+/// Does an explicit re-arm ([`crate::routing::sync_group::GroupReconciler::rearm_lead`])
+/// restart *this* group?
+///
+/// The counterpart to the send-ahead half of [`sendspin_config_changed`], and the only
+/// path that lowers a running lead. Separate because the rule is the opposite one: there
+/// it is "a raise only", here it is "any difference, because the user asked".
+///
+/// Still gated on a *difference*: a re-arm must not reconnect a group that is already
+/// running at the value being asked for. That matters more than it looks — the API
+/// re-arms on any sync-settings write, including one that only changes the Opus floor for
+/// a group whose lead is set by a member's reported buffer instead.
+pub(crate) fn sendspin_lead_rearm(rearm_requested: bool, prev_lead_us: i64, want_lead_us: i64) -> bool {
+    rearm_requested && want_lead_us != prev_lead_us
+}

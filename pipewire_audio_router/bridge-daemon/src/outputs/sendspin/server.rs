@@ -488,6 +488,77 @@ fn record_timing_request(
     true
 }
 
+/// Record a device's reported operational state, returning whether the *rendering*
+/// verdict changed (so the caller can push a UI frame without doing it per message —
+/// `client/state` repeats on every volume tick).
+///
+/// ## Why an `error` deserves this much machinery
+///
+/// It is the only thing a player ever says about whether it is actually rendering.
+/// `sendspin-cpp` ≥ 0.7.0 sends it on a hard sync outside startup/seek alignment — in
+/// practice a buffer underrun — once per episode, followed by `synchronized` when it is
+/// back in step. Everything the daemon can see on its own (blocks sent, timestamps,
+/// bytes on the wire, clock-sync exchanges) looks *perfect* during exactly that fault:
+/// that is what made the 2026-08-12 stutter need a packet capture and then an ear
+/// (docs/sendspin-open-items.md items 4 and 6b).
+///
+/// **Deliberately does not act.** The obvious reflex — `stream/clear`, or raise the lead —
+/// would be a feedback loop against a device that cannot keep up at the configured lead:
+/// each recovery attempt costs audio, so a device underrunning every few seconds would be
+/// kept permanently broken by its own recovery. The lead is a *site* decision (see
+/// [`crate::routing::sync_settings::DEFAULT_GROUP_LEAD_MS`]), so this reports and counts,
+/// and the log line names the number to change.
+fn record_sync_state(
+    node_name: &str,
+    state: Option<ClientSyncState>,
+    send_ahead_us: i64,
+    devices: &crate::outputs::sendspin::discovery::SharedSendspinDevices,
+) -> bool {
+    let out_of_sync = matches!(state, Some(ClientSyncState::Error));
+    let (changed, episodes) = {
+        let mut devs = devices.lock_recover();
+        match devs.get_mut(node_name) {
+            Some(dev) => {
+                let changed = dev.out_of_sync != out_of_sync;
+                if changed {
+                    dev.out_of_sync = out_of_sync;
+                    if out_of_sync {
+                        dev.sync_error_count = dev.sync_error_count.saturating_add(1);
+                    }
+                }
+                (changed, dev.sync_error_count)
+            }
+            // Not in the registry yet (its mDNS resolve hasn't landed): it will report
+            // again, and `client/state` repeats.
+            None => return false,
+        }
+    };
+    if !changed {
+        return false;
+    }
+    if out_of_sync {
+        tracing::warn!(
+            "sendspin '{node_name}': the device reports it LOST SYNC (episode #{episodes}) — it is being sent audio \
+             but is not rendering it in step, which is what a buffer underrun sounds like. Our send-ahead is {} ms; \
+             if this repeats, raise the group lead (Settings → Group sync) until it stops.",
+            send_ahead_us / 1000
+        );
+    } else {
+        tracing::info!("sendspin '{node_name}': back in sync (after {episodes} episode(s))");
+    }
+    true
+}
+
+/// Forget a device's out-of-sync claim, keeping the episode count (which is a history,
+/// not a state). For the disconnect paths: a device we are no longer connected to cannot
+/// be "not rendering in step", and leaving the flag set would show a fault on top of the
+/// disconnection the UI already reports.
+fn clear_sync_state(node_name: &str, devices: &crate::outputs::sendspin::discovery::SharedSendspinDevices) {
+    if let Some(dev) = devices.lock_recover().get_mut(node_name) {
+        dev.out_of_sync = false;
+    }
+}
+
 /// The send-ahead a sendspin stream must use: the user's configured lead, raised to
 /// the largest per-member requirement.
 ///
@@ -706,16 +777,29 @@ pub async fn start_server_per_device(
                         }
                         if let Some(sync_state) = reported_client_state(&message) {
                             let dev_node = client_to_node.lock().unwrap().get(&client_id).cloned();
-                            let node = dev_node.unwrap_or_else(|| client_id.clone());
+                            let node = dev_node.clone().unwrap_or_else(|| client_id.clone());
                             if ready_conn.lock_recover().insert(client_id.clone()) {
                                 tracing::info!(
                                     "sendspin '{node}': reported client/state ({}) — it may now be streamed to",
                                     match sync_state {
                                         Some(ClientSyncState::Synchronized) => "synchronized",
                                         Some(ClientSyncState::ExternalSource) => "external source — its output is in use elsewhere",
+                                        // An `error` as the FIRST state is possible on a
+                                        // re-dial into a running stream: the device is a
+                                        // member either way, and the fault is reported below.
+                                        Some(ClientSyncState::Error) => "error — it is not rendering in step",
+                                        Some(ClientSyncState::Unknown) => "a state this version does not know",
                                         None => "no operational state given",
                                     }
                                 );
+                            }
+                            // The rendering verdict — the only receiver-side signal there is.
+                            if let Some(dev_node) = dev_node {
+                                if record_sync_state(&dev_node, sync_state, send_ahead_us, &devices) {
+                                    // Push a matrix/outputs frame so the UI's badge follows
+                                    // the device rather than the next poll.
+                                    control.lock().await.notify_reconcile();
+                                }
                             }
                         }
                         if let Some((min_buffer_ms, required_lead_ms)) = reported_timing(&message) {
@@ -739,6 +823,7 @@ pub async fn start_server_per_device(
                             tracing::info!(
                                 "sendspin per-device: '{dev_node_name}' disconnected (client {client_id}) — awaiting ClientManager re-dial"
                             );
+                            clear_sync_state(dev_node_name, &devices);
                             control.lock().await.unregister(dev_node_name);
                         } else {
                             tracing::info!("sendspin per-device: client {client_id} disconnected (unmapped)");
@@ -1232,8 +1317,15 @@ async fn drain_messages_per_device(
         if let Some((volume, muted)) = reported_player_state(&message) {
             apply_reported_state(&control, &node_name, volume, muted).await;
         }
-        if reported_client_state(&message).is_some() && ready_members.lock_recover().insert(client_id.clone()) {
-            tracing::info!("sendspin '{node_name}': reported client/state — it may now be streamed to");
+        if let Some(sync_state) = reported_client_state(&message) {
+            if ready_members.lock_recover().insert(client_id.clone()) {
+                tracing::info!("sendspin '{node_name}': reported client/state — it may now be streamed to");
+            }
+            // Same rendering verdict as the dial-out path: an inbound connection can be
+            // mid-announcement, and an announcement nobody hears is the case this catches.
+            if record_sync_state(&node_name, sync_state, send_ahead_us, &devices_drain) {
+                control.lock().await.notify_reconcile();
+            }
         }
         if let Some((min_buffer_ms, required_lead_ms)) = reported_timing(&message) {
             if record_timing_request(&node_name, min_buffer_ms, required_lead_ms, send_ahead_us, &devices_drain) {
@@ -1241,6 +1333,10 @@ async fn drain_messages_per_device(
             }
         }
     }
+    // The connection is gone, so "not rendering in step" is no longer a claim we can make
+    // about it — a stale flag would leave the UI showing a fault for a device that is
+    // simply disconnected (which its own status already says).
+    clear_sync_state(&node_name, &devices_drain);
     control.lock().await.unregister(&node_name);
     client_to_node.lock().unwrap().remove(&client_id);
     groups.lock_recover().remove(&client_id);
@@ -1334,9 +1430,67 @@ mod tests {
                 supported_codecs: Vec::new(),
                 min_buffer_ms: None,
                 required_lead_time_ms: None,
+                out_of_sync: false,
+                sync_error_count: 0,
             },
         );
         Arc::new(Mutex::new(map))
+    }
+
+    /// The one signal a player gives about its own rendering. Two properties matter: a
+    /// repeat must not re-log or re-count (`client/state` arrives with every volume tick,
+    /// and the device sends `error` once per episode but keeps reporting state), and the
+    /// recovery must be visible — otherwise a device that underran an hour ago looks
+    /// broken forever.
+    #[test]
+    fn an_out_of_sync_report_is_recorded_once_per_episode_and_cleared_on_recovery() {
+        let devices = registry("sendspin-dev-kitchen", "Kitchen");
+        let lead = 180_000;
+        let read = || {
+            let d = devices.lock_recover();
+            let dev = d.get("sendspin-dev-kitchen").expect("present");
+            (dev.out_of_sync, dev.sync_error_count)
+        };
+
+        // Healthy: nothing to report, and nothing to notify the UI about.
+        assert!(!record_sync_state("sendspin-dev-kitchen", Some(ClientSyncState::Synchronized), lead, &devices));
+        assert_eq!(read(), (false, 0));
+
+        // The fault: recorded, counted, and worth a UI push.
+        assert!(record_sync_state("sendspin-dev-kitchen", Some(ClientSyncState::Error), lead, &devices));
+        assert_eq!(read(), (true, 1));
+        // Repeats of the same episode are absorbed — this must never become per-message
+        // log spam or inflate the count.
+        assert!(!record_sync_state("sendspin-dev-kitchen", Some(ClientSyncState::Error), lead, &devices));
+        assert_eq!(read(), (true, 1));
+
+        // Recovery clears the flag but keeps the history: the count is what says whether
+        // this is chronic (and so whether the group lead is too short).
+        assert!(record_sync_state("sendspin-dev-kitchen", Some(ClientSyncState::Synchronized), lead, &devices));
+        assert_eq!(read(), (false, 1));
+        // A second episode counts separately.
+        assert!(record_sync_state("sendspin-dev-kitchen", Some(ClientSyncState::Error), lead, &devices));
+        assert_eq!(read(), (true, 2));
+
+        // A disconnect withdraws the claim without erasing the history.
+        clear_sync_state("sendspin-dev-kitchen", &devices);
+        assert_eq!(read(), (false, 2));
+    }
+
+    /// Neither of the two states that are *not* faults may set the flag — `external_source`
+    /// is a device doing something else on purpose, and `Unknown` is a state from a newer
+    /// firmware that we must not guess about. Nor may a report for a device the registry
+    /// has never heard of create anything.
+    #[test]
+    fn only_an_error_state_counts_as_out_of_sync() {
+        let devices = registry("sendspin-dev-kitchen", "Kitchen");
+        for state in [Some(ClientSyncState::ExternalSource), Some(ClientSyncState::Unknown), None] {
+            assert!(!record_sync_state("sendspin-dev-kitchen", state, 180_000, &devices), "{state:?} is not a rendering fault");
+            assert!(!devices.lock_recover()["sendspin-dev-kitchen"].out_of_sync);
+        }
+        // Unknown device: reported before its mDNS resolve landed. It will report again.
+        assert!(!record_sync_state("sendspin-dev-nowhere", Some(ClientSyncState::Error), 180_000, &devices));
+        assert_eq!(devices.lock_recover().len(), 1, "nothing is invented for an unknown node");
     }
 
     #[test]

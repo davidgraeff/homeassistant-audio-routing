@@ -24,6 +24,7 @@ use airplay_core::features::Features;
 use airplay_core::stream::{PtpMode, StreamConfig, TimingProtocol};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::outputs::ap2::ptp::SharedAp2Ptp;
 use crate::outputs::ap2::volume::{Ap2Command, SharedAp2Control, AP2_CMD_DEPTH};
 use crate::routing::sync_settings::SharedSyncSettings;
 use crate::util::locks::LockRecover;
@@ -380,13 +381,15 @@ async fn abandon(conn: &mut Connection, node_name: &str) {
     }
 }
 
-/// Apply one control command to whichever of this group's connections it names.
+/// Apply one control command to whichever of this group's connections it names,
+/// returning `Some((node_name, reason))` when the command asks for a **reconnect** —
+/// which the caller performs, because it owns the connect path and its retries.
 ///
 /// Shared by the two places that drain the command channel — the connect loop and the
 /// steady-state loop — because the channel MUST be drained in both. A command for a
 /// member that isn't connected (yet, or at all) is silently ignored: `Ap2Control`
 /// keeps the desired state and `register` re-applies it on the next connect.
-async fn apply_command(conns: &mut [(String, Connection)], cmd: Ap2Command) {
+async fn apply_command(conns: &mut [(String, Connection)], cmd: Ap2Command) -> Option<(String, String)> {
     match cmd {
         Ap2Command::SetVolume { node_name, volume } => {
             if let Some((_, conn)) = conns.iter_mut().find(|(n, _)| *n == node_name) {
@@ -403,6 +406,195 @@ async fn apply_command(conns: &mut [(String, Connection)], cmd: Ap2Command) {
                 tracing::info!("AP2: '{node_name}' render delay set live to {ms}ms");
             }
         }
+        // Handled by the caller, not here: rebuilding a session needs the connect
+        // path, the member's address and the PTP service, and it must be able to
+        // *replace* an entry in `conns` rather than borrow one out of it.
+        Ap2Command::Reconnect { node_name, reason } => return Some((node_name, reason)),
+    }
+    None
+}
+
+/// What a running group task needs in order to (re)build one member's session on its
+/// own — i.e. everything the initial connect loop had in scope.
+///
+/// Bundled into a struct because it is threaded through three functions and the
+/// alternative is a nine-argument signature repeated three times.
+struct MemberCtx {
+    /// The group's members as `start` was given them: node name, receiver IP, and its
+    /// per-output render delay. A reconnect looks its target up here, so a receiver
+    /// that isn't a member of this group cannot be dialed by it.
+    members: Vec<(String, IpAddr, Option<u16>)>,
+    rate: u32,
+    clock_id: u64,
+    senders: Arc<Mutex<Vec<(String, LiveFrameSender)>>>,
+    control: SharedAp2Control,
+    /// The host-global grandmaster, so a reconnect can re-arm the receiver's PTP peer
+    /// (see [`reconnect_member`]).
+    ptp: SharedAp2Ptp,
+    /// Handed to `Ap2Control::register` for each attached member.
+    cmd_tx: mpsc::Sender<Ap2Command>,
+}
+
+impl MemberCtx {
+    /// One member's `(receiver IP, render delay in ms)`, or `None` when this group has no
+    /// such member — which is how a request naming an output that belongs to a *different*
+    /// group is refused rather than dialed.
+    fn member(&self, name: &str) -> Option<(IpAddr, u32)> {
+        self.members
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, ip, delay)| (*ip, u32::from(delay.unwrap_or(AP2_RENDER_DELAY_MS as u16))))
+    }
+}
+
+/// Take a freshly-connected receiver into the group: clear its fault note, publish its
+/// capture rate for announcement overlays, register its command channel, read back the
+/// level it is actually playing at, and start its volume forwarder.
+///
+/// Shared by the initial connect loop and [`reconnect_member`] so a *reconnected*
+/// receiver ends up in exactly the state a first connect leaves it in — the thing that
+/// is easy to get wrong when a second code path grows next to the first.
+async fn attach_member(
+    ctx: &MemberCtx,
+    name: &str,
+    mut conn: Connection,
+    mut volume_rx: mpsc::Receiver<f32>,
+    conns: &mut Vec<(String, Connection)>,
+    fwd_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
+) {
+    match ctx.member(name) {
+        Some((ip, render_delay_ms)) => {
+            tracing::info!("AP2: streaming to '{name}' ({ip}) @ {}Hz render_delay={render_delay_ms}ms", ctx.rate)
+        }
+        None => tracing::info!("AP2: streaming to '{name}' @ {}Hz", ctx.rate),
+    }
+    // It works — drop any stale "why isn't this playing" note the UI is still showing
+    // from an earlier failure.
+    crate::outputs::ap2::health::Ap2Health::global().clear(name);
+    // Publish this output's capture rate so announcement overlays are rate-matched to
+    // it (overlay_mixer resamples the 48 kHz clip).
+    crate::outputs::overlay_mixer::OverlayMixer::global().set_output_rate(name, ctx.rate);
+    // Register the command channel (does NOT push a volume unless the user set one —
+    // the device's own volume is authoritative).
+    ctx.control.lock().await.register(name.to_string(), ctx.cmd_tx.clone());
+    // READ the receiver's current volume so the UI reflects the real level (what the
+    // user set on the device) rather than a made-up one. If the receiver doesn't answer
+    // GET_PARAMETER, leave it unknown (the UI shows no/zero level — honest).
+    //
+    // **Bounded**, because this sits between `register` (the device is now in
+    // `Ap2Control::senders`) and the loop that drains its command channel. An unbounded
+    // wait here is the worst possible place for one: the device looks live to every
+    // writer while nothing consumes what they write. A wedged receiver — TCP
+    // established, RTSP silent — parked this indefinitely and took the daemon's whole UI
+    // down with it (see docs/live-instance-debugging.md). A receiver that cannot answer
+    // a volume read in this long simply has an unknown level.
+    match tokio::time::timeout(AP2_VOLUME_READ_TIMEOUT, conn.get_volume()).await.unwrap_or(None) {
+        Some(v) => {
+            tracing::info!("AP2: '{name}' reported volume {:.0}%", v * 100.0);
+            ctx.control.lock().await.note_reported_volume(name, v);
+        }
+        None => tracing::debug!("AP2: '{name}' did not report a volume (GET_PARAMETER unsupported); UI shows it as unknown"),
+    }
+    // Forward this receiver's reported volume into the control so the UI reflects a
+    // change made on the device itself.
+    let control_fwd = ctx.control.clone();
+    let name_fwd = name.to_string();
+    fwd_tasks.push((
+        name.to_string(),
+        tokio::spawn(async move {
+            while let Some(vol) = volume_rx.recv().await {
+                control_fwd.lock().await.note_reported_volume(&name_fwd, vol);
+            }
+        }),
+    ));
+    conns.push((name.to_string(), conn));
+}
+
+/// Release one member's session and stop feeding it, leaving the rest of the group
+/// alone. The inverse of [`attach_member`], and the first half of a reconnect.
+///
+/// Order matters: the audio feed goes **first** so the RT relay stops handing PCM to a
+/// connection that is about to be torn down, then the RTSP release, then the control
+/// registration (so nothing can queue a command for a connection that no longer
+/// exists). The release is bounded for the same reason [`teardown`] bounds it — an
+/// unresponsive receiver must not hold the group task hostage.
+async fn detach_member(
+    ctx: &MemberCtx,
+    name: &str,
+    conns: &mut Vec<(String, Connection)>,
+    fwd_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
+) {
+    ctx.senders.lock().unwrap().retain(|(n, _)| n != name);
+    for (_, t) in fwd_tasks.iter().filter(|(n, _)| n == name) {
+        t.abort();
+    }
+    fwd_tasks.retain(|(n, _)| n != name);
+    if let Some(pos) = conns.iter().position(|(n, _)| n == name) {
+        let (_, mut c) = conns.remove(pos);
+        let released = tokio::time::timeout(AP2_RELEASE_TIMEOUT, async {
+            let _ = c.stop().await; // FLUSH: audio stops, session stays
+            let _ = c.disconnect().await; // TEARDOWN: the receiver frees its one session
+        })
+        .await;
+        if released.is_err() {
+            tracing::warn!(
+                "AP2: '{name}' did not complete TEARDOWN within {:?} while being reconnected; \
+                 closing its socket anyway (its session may stay busy until the receiver times it out)",
+                AP2_RELEASE_TIMEOUT
+            );
+        }
+        // `c` drops here either way — closing the socket and joining its sender threads.
+    }
+    ctx.control.lock().await.unregister(name);
+    crate::outputs::overlay_mixer::OverlayMixer::global().clear_output_rate(name);
+}
+
+/// Rebuild one member's session in place: release it, re-arm its PTP peer, connect
+/// again. Its groupmates are never touched — same anchor, same relay, same clock — so
+/// the blast radius is one speaker instead of the whole group (let alone the add-on).
+///
+/// **Why the PTP peer is removed and re-added.** The receiver slaves to our host-global
+/// grandmaster, and the failure this recovers from is precisely that it stopped
+/// following it. `airptp_peer_remove` + `airptp_peer_add` restarts the
+/// Announce/Sync/Follow_Up sequence toward that address from scratch, which is the only
+/// lever the sender has on the receiver's clock; a fresh RTSP session alone would hand
+/// the same unlocked clock a new set of PT=87 anchors to ignore.
+///
+/// Returns whether the receiver is streaming again. On failure the fault is published
+/// to [`crate::outputs::ap2::health`], so the UI says why, and the caller's watchdog can
+/// try again after its cooldown.
+async fn reconnect_member(
+    ctx: &MemberCtx,
+    name: &str,
+    reason: &str,
+    conns: &mut Vec<(String, Connection)>,
+    fwd_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
+) -> bool {
+    let Some((ip, render_delay_ms)) = ctx.member(name) else {
+        tracing::warn!("AP2: asked to reconnect '{name}', which is not a member of this group — ignoring");
+        return false;
+    };
+    tracing::info!("AP2: rebuilding '{name}' ({ip})'s session — {reason}. Its groupmates keep streaming.");
+    detach_member(ctx, name, conns, fwd_tasks).await;
+    let addr = ip.to_string();
+    ctx.ptp.remove_peer(&addr);
+    if let Err(e) = ctx.ptp.add_peer(&addr) {
+        // Not fatal: the grandmaster is still running and the receiver may re-lock from
+        // the Announce it hears anyway. Worth a line, because a peer that cannot be
+        // re-added means the recovery is only half done.
+        tracing::warn!("AP2: could not re-arm the PTP peer for '{name}' ({addr}): {e}");
+    }
+    match connect_one(name, ip, ctx.clock_id, render_delay_ms, ctx.rate, &ctx.senders).await {
+        Ok((conn, volume_rx)) => {
+            attach_member(ctx, name, conn, volume_rx, conns, fwd_tasks).await;
+            true
+        }
+        Err(fail) => {
+            tracing::warn!("AP2: could not rebuild '{name}' ({ip}) @ {}Hz: {}", ctx.rate, fail.msg);
+            crate::outputs::ap2::health::Ap2Health::global()
+                .set(name, format!("Reconnect failed ({reason}): {}", fail.msg));
+            false
+        }
     }
 }
 
@@ -418,8 +610,8 @@ async fn apply_command(conns: &mut [(String, Connection)], cmd: Ap2Command) {
 /// minutes old had three `ap2-producer` threads and five `rt-sender` threads for one
 /// receiver actually streaming, two of the producers still burning ~1.4 % CPU each with
 /// nothing to feed.
-async fn teardown(conns: Vec<(String, Connection)>, fwd_tasks: Vec<tokio::task::JoinHandle<()>>, control: &SharedAp2Control) {
-    for t in fwd_tasks {
+async fn teardown(conns: Vec<(String, Connection)>, fwd_tasks: Vec<(String, tokio::task::JoinHandle<()>)>, control: &SharedAp2Control) {
+    for (_, t) in fwd_tasks {
         t.abort();
     }
     for (name, mut c) in conns {
@@ -481,6 +673,7 @@ fn set_relay_realtime_priority() {
 /// receiver with PT=87 anchored to the grandmaster `clock_id`. Non-blocking:
 /// connects the receivers inside the spawned task so a slow/absent receiver never
 /// stalls the reconciler.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     members: Vec<(String, IpAddr, Option<u16>)>,
     sink_node_id: u32,
@@ -488,6 +681,10 @@ pub fn start(
     control: SharedAp2Control,
     rate: u32,
     sync_settings: SharedSyncSettings,
+    // The host-global grandmaster, so a per-member reconnect can re-arm that
+    // receiver's PTP peer (see `reconnect_member`). Not used for the initial
+    // connects — the receivers were registered as peers at discovery.
+    ptp: SharedAp2Ptp,
 ) -> anyhow::Result<Ap2ServerHandle> {
     // Capture at the group's negotiated rate: PipeWire resamples the 48 kHz anchor
     // to `rate` in-graph (its own RT thread), so no Rust-side SRC — a 48 kHz group
@@ -553,14 +750,33 @@ pub fn start(
     // it applies them by node name. Each connected device registers this sender.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Ap2Command>(AP2_CMD_DEPTH);
     let control_task = control.clone();
+    // Everything a mid-run per-member reconnect needs (`Ap2Command::Reconnect`), so the
+    // task can rebuild one receiver's session without the reconciler restarting the
+    // group. Owns its own clone of `members` — the connect loop below iterates the
+    // original.
+    let ctx = MemberCtx {
+        members: members.clone(),
+        rate,
+        clock_id,
+        senders: Arc::clone(&senders),
+        control: control.clone(),
+        ptp,
+        cmd_tx: cmd_tx.clone(),
+    };
 
     let task = tokio::spawn(async move {
         // Connect every receiver (sequential; each is ~1-3s of pairing/SETUP).
         // connect_one registers its feed (driven by the relay) before starting.
         let mut conns: Vec<(String, Connection)> = Vec::new();
         // Per-device forwarders: receiver-reported volume (event channel) →
-        // Ap2Control (device→UI). Aborted on teardown.
-        let mut fwd_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // Ap2Control (device→UI). Keyed by node name so one member's reconnect can
+        // abort just its own; all aborted on teardown.
+        let mut fwd_tasks: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+        // Reconnect requests that arrived while the connect loop was still running.
+        // Deferred rather than served inline: a reconnect *is* a connect, and running one
+        // inside another member's connect would have two sessions dialing at once out of
+        // a task that can only await one at a time.
+        let mut deferred_reconnects: Vec<(String, String)> = Vec::new();
         // Set when a 48 kHz SETUP was rejected: cache the receiver as 44.1k-only and
         // nudge the reconciler so the group restarts at 44.1 kHz (auto-negotiation).
         let mut downgraded = false;
@@ -596,53 +812,16 @@ pub fn start(
                     result = &mut connect => break result,
                     // Guarded so the oneshot is never polled after it completes.
                     _ = &mut shutdown_rx, if !shutting_down => shutting_down = true,
-                    Some(cmd) = cmd_rx.recv() => apply_command(&mut conns, cmd).await,
+                    Some(cmd) = cmd_rx.recv() => {
+                        if let Some(req) = apply_command(&mut conns, cmd).await {
+                            deferred_reconnects.push(req);
+                        }
+                    }
                 }
             };
             match outcome {
-                Ok((mut c, mut volume_rx)) => {
-                    tracing::info!("AP2: streaming to '{}' ({}) @ {}Hz render_delay={}ms", name, ip, rate, render_delay_ms);
-                    // It works — drop any stale "why isn't this playing" note the UI
-                    // is still showing from an earlier failure.
-                    crate::outputs::ap2::health::Ap2Health::global().clear(name);
-                    // Publish this output's capture rate so announcement overlays are
-                    // rate-matched to it (overlay_mixer resamples the 48 kHz clip).
-                    crate::outputs::overlay_mixer::OverlayMixer::global().set_output_rate(name, rate);
-                    // Register the command channel (does NOT push a volume unless the
-                    // user set one — the device's own volume is authoritative).
-                    control_task.lock().await.register(name.clone(), cmd_tx.clone());
-                    // READ the receiver's current volume so the UI reflects the real
-                    // level (what the user set on the device) rather than a made-up
-                    // one. If the receiver doesn't answer GET_PARAMETER, leave it
-                    // unknown (the UI shows no/zero level — honest).
-                    //
-                    // **Bounded**, because this sits between `register` (the device is
-                    // now in `Ap2Control::senders`) and the loop that drains its command
-                    // channel. An unbounded wait here is the worst possible place for
-                    // one: the device looks live to every writer while nothing consumes
-                    // what they write. A wedged receiver — TCP established, RTSP silent —
-                    // parked this indefinitely and took the daemon's whole UI down with
-                    // it (see docs/live-instance-debugging.md). A receiver that cannot
-                    // answer a volume read in this long simply has an unknown level.
-                    match tokio::time::timeout(AP2_VOLUME_READ_TIMEOUT, c.get_volume()).await.unwrap_or(None) {
-                        Some(v) => {
-                            tracing::info!("AP2: '{name}' reported volume {:.0}%", v * 100.0);
-                            control_task.lock().await.note_reported_volume(name, v);
-                        }
-                        None => {
-                            tracing::debug!("AP2: '{name}' did not report a volume (GET_PARAMETER unsupported); UI shows it as unknown")
-                        }
-                    }
-                    // Forward this receiver's reported volume into the control so
-                    // the UI reflects a change made on the device itself.
-                    let control_fwd = control_task.clone();
-                    let name_fwd = name.clone();
-                    fwd_tasks.push(tokio::spawn(async move {
-                        while let Some(vol) = volume_rx.recv().await {
-                            control_fwd.lock().await.note_reported_volume(&name_fwd, vol);
-                        }
-                    }));
-                    conns.push((name.clone(), c));
+                Ok((c, volume_rx)) => {
+                    attach_member(&ctx, name, c, volume_rx, &mut conns, &mut fwd_tasks).await;
                 }
                 Err(fail) => {
                     tracing::warn!("AP2: could not start '{}' ({}) @ {}Hz: {}", name, ip, rate, fail.msg);
@@ -675,6 +854,14 @@ pub fn start(
         if conns.is_empty() {
             tracing::warn!("AP2 group: no receivers connected");
         }
+        // Serve any reconnect that arrived mid-connect, now that no other session is
+        // being dialed. Skipped when shutting down: the teardown below is what that
+        // member needs, not a fresh session.
+        if !shutting_down {
+            for (name, reason) in std::mem::take(&mut deferred_reconnects) {
+                reconnect_member(&ctx, &name, &reason, &mut conns, &mut fwd_tasks).await;
+            }
+        }
 
         // Run until the handle is dropped (shutdown), applying control commands
         // meanwhile. Skipped entirely if the stop already arrived during the connect
@@ -686,7 +873,17 @@ pub fn start(
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
-                    Some(cmd) = cmd_rx.recv() => apply_command(&mut conns, cmd).await,
+                    Some(cmd) = cmd_rx.recv() => {
+                        // A reconnect is served inline: it is the one command that has to
+                        // happen *here*, since only this task owns the connections. It
+                        // stops draining `cmd_rx` for the length of one connect
+                        // (bounded by AP2_CONNECT_TIMEOUT × attempts), which `try_queue`
+                        // already makes lossy-not-fatal for whatever writes meanwhile —
+                        // the same trade the connect loop above makes.
+                        if let Some((name, reason)) = apply_command(&mut conns, cmd).await {
+                            reconnect_member(&ctx, &name, &reason, &mut conns, &mut fwd_tasks).await;
+                        }
+                    }
                 }
             }
         }
@@ -694,4 +891,42 @@ pub fn start(
     });
 
     Ok(Ap2ServerHandle { shutdown: Some(shutdown_tx), task: Some(task), capture: Some(capture), _relay: relay })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reconnect must come back out of `apply_command` rather than being carried out
+    /// inside it: only the group task can replace an entry in `conns`, and only it owns
+    /// the connect path. The other commands stay handled in place.
+    ///
+    /// The empty-`conns` case is the one worth pinning, because it is what a request for a
+    /// receiver whose session already died looks like — the caller still has to hear about
+    /// it, since rebuilding is exactly what that receiver needs.
+    #[tokio::test]
+    async fn a_reconnect_command_is_handed_back_to_the_task() {
+        let mut conns: Vec<(String, Connection)> = Vec::new();
+        let req = apply_command(
+            &mut conns,
+            Ap2Command::Reconnect { node_name: "ap2-dev-pioneer".into(), reason: "its PTP clock lock was lost".into() },
+        )
+        .await;
+        assert_eq!(req, Some(("ap2-dev-pioneer".to_string(), "its PTP clock lock was lost".to_string())));
+
+        // Volume/mute/delay for a member that isn't connected are absorbed here, not
+        // handed back: `Ap2Control` keeps the desired state and re-applies it on connect.
+        assert_eq!(apply_command(&mut conns, Ap2Command::SetVolume { node_name: "ap2-dev-dusche".into(), volume: 0.4 }).await, None);
+        assert_eq!(apply_command(&mut conns, Ap2Command::SetRenderDelay { node_name: "ap2-dev-dusche".into(), ms: 250 }).await, None);
+    }
+
+    /// The ALAC cookie's trailing four bytes are the sample rate, and the SETUP
+    /// `audioFormat` bit has to agree with them — a mismatch is a receiver that accepts
+    /// the session and plays noise.
+    #[test]
+    fn the_alac_cookie_carries_the_rate_it_was_asked_for() {
+        assert_eq!(alac_cookie(44_100)[20..24], 44_100u32.to_be_bytes());
+        assert_eq!(alac_cookie(48_000)[20..24], 48_000u32.to_be_bytes());
+        assert_eq!(alac_cookie(44_100), ALAC_MAGIC_COOKIE, "44.1 kHz is the base cookie");
+    }
 }

@@ -138,6 +138,45 @@ pub(crate) struct SetAp2MuteRequest {
     pub(crate) muted: bool,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ResyncAp2Request {
+    /// AP2 output node name, e.g. `ap2-dev-pioneer_vsx_934_f11b89`.
+    pub(crate) node_name: String,
+}
+
+/// Rebuild one AirPlay-2 receiver's session, leaving its groupmates streaming — the AP2
+/// counterpart of `POST /api/sendspin/clear`.
+///
+/// The recovery for a receiver that is reachable, holds a session, is being sent
+/// audio and plays nothing. On this hardware that is what losing the PTP clock lock
+/// looks like from the outside (a Pioneer VSX-934, repeatedly): our PT=87 anchors are
+/// timestamps in the grandmaster's timeline, and a receiver that has drifted off it
+/// cannot place them. Until this existed the levers were restarting the add-on — which
+/// interrupts every other output — or power-cycling the receiver.
+///
+/// The daemon also does this by itself when it can *see* the lock go (the watchdog in
+/// `outputs/ap2/liveness.rs`); this endpoint is for the cases it cannot see, and for not
+/// having to wait for it.
+///
+/// A receiver with no live sender is reported honestly rather than treated as success:
+/// there is no session to rebuild, and the reconciler is what gives it one.
+pub(crate) async fn resync_ap2_receiver(
+    State(state): State<AppState>,
+    Json(req): Json<ResyncAp2Request>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    let queued = state.ap2_control.lock().await.reconnect(&req.node_name, "you asked for a resync");
+    let display = output_label(&state, &req.node_name);
+    if queued {
+        tracing::info!("USER ACTION: ap2 resync -> '{}' (releasing its session and building a fresh one)", req.node_name);
+    }
+    let message = if queued {
+        format!("rebuilding '{display}''s session — it should be back in a few seconds")
+    } else {
+        format!("'{display}' has no live AirPlay session, so there is nothing to rebuild")
+    };
+    (StatusCode::OK, Json(OutputOpResponse { ok: queued, message }))
+}
+
 pub(crate) async fn set_ap2_mute(
     State(state): State<AppState>,
     Json(req): Json<SetAp2MuteRequest>,

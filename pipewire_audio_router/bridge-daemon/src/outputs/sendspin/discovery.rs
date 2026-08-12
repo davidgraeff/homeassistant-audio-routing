@@ -80,6 +80,22 @@ pub struct SendspinDevice {
     /// only "when doing so adds no latency, i.e. for buffered sources but not live
     /// streams" — ours is live, so it's surfaced for diagnostics and not enforced.
     pub required_lead_time_ms: Option<u32>,
+    /// Is the device **currently** telling us it lost sync? Set while its last
+    /// `client/state` was `error`, cleared when it reports `synchronized` again.
+    ///
+    /// This is the one thing a player says about its own rendering, and the daemon had no
+    /// way to know it before: "being sent audio" and "playing that audio" were
+    /// indistinguishable from here, which is why a group-wide stutter needed a packet
+    /// capture and then an ear to diagnose (docs/sendspin-open-items.md items 4 and 6b).
+    /// `sendspin-cpp` ≥ 0.7.0 reports it on a hard sync outside startup/seek alignment —
+    /// i.e. a buffer underrun — so on that firmware a lead that is too short becomes
+    /// *visible* instead of merely audible.
+    pub out_of_sync: bool,
+    /// How many distinct out-of-sync episodes this device has reported since the daemon
+    /// started. Kept alongside the flag because the flag alone cannot tell "one blip an
+    /// hour ago" from "underrunning every few seconds" — and only the second is a reason
+    /// to raise the group lead.
+    pub sync_error_count: u32,
 }
 
 /// Live discovered devices, keyed by their virtual output node name
@@ -177,6 +193,8 @@ pub fn spawn(daemon: &ServiceDaemon, devices: SharedSendspinDevices, changes: Ch
                                     supported_codecs: Vec::new(),
                                     min_buffer_ms: None,
                                     required_lead_time_ms: None,
+                                    out_of_sync: false,
+                                    sync_error_count: 0,
                                 },
                             );
                             tracing::info!("discovered sendspin device '{display_name}' ({node_name})");

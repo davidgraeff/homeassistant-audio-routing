@@ -46,14 +46,35 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Default sendspin group lead: **0** — no headroom beyond what the hardware asks for.
+/// Default sendspin group lead: **180 ms** — the smallest value measured to play cleanly
+/// on ESP32 speakers over 2.4 GHz WiFi.
 ///
-/// This is a floor, not the value used: `required_send_ahead_us` raises every group's
-/// send-ahead to the largest per-member requirement (a device's reported
-/// `min_buffer_ms` + its static delay, or the wire codec's decode floor). 0 therefore
-/// means "exactly what the members need". Raise it to buy headroom they did not ask
-/// for.
-pub const DEFAULT_GROUP_LEAD_MS: u32 = 0;
+/// This is a floor, not necessarily the value used: `required_send_ahead_us` raises a
+/// group's send-ahead further if a member asks for more (its reported `min_buffer_ms` +
+/// its static delay, or the wire codec's decode floor).
+///
+/// ## Why it is not 0, which is what "no added latency" would suggest
+///
+/// It **was** 0, on the reasoning that the per-member floor already covers what the
+/// hardware needs. That reasoning is only sound for hardware that *states* what it needs,
+/// and the ESPHome firmware pinned here reports neither `min_buffer_ms` nor
+/// `required_lead_time_ms` — so a group of four Voice PE / Satellite1 speakers fell back
+/// to the Opus block floor ([`crate::outputs::sendspin::codec::DEFAULT_OPUS_FLOOR_MS`],
+/// 40 ms) and stuttered on every cold start until someone forced the lead up by hand.
+///
+/// **Bisected on hardware, 2026-08-13** (four speakers, Opus, 2.4 GHz, medium household
+/// WiFi load): 180 ms plays clean, below it stutters. The sender is not the constraint —
+/// its own numbers are flat at 130 ms and at 930 ms alike (exact 20 ms timestamp gaps, no
+/// dropped writes) — so this budget is entirely the receiver's: WiFi retransmit chains and
+/// airtime contention, DTIM/beacon wakeups, the MCU's Opus decode and its scheduling, and
+/// on ESPHome before 2026.7.0 an off-channel roam scan while playing (esphome#17133).
+///
+/// 802.11 guarantees none of that — it is CSMA/CA best-effort, so this is a *site*
+/// measurement, not a constant of nature. It is exposed as a knob for exactly that reason,
+/// and the UI reports what a group is really streaming at
+/// ([`crate::routing::sync_group::GroupReconciler::running_sendspin_leads`]) so the number can be
+/// re-bisected when the radio environment changes.
+pub const DEFAULT_GROUP_LEAD_MS: u32 = 180;
 
 fn default_group_lead_ms() -> u32 {
     DEFAULT_GROUP_LEAD_MS
@@ -528,9 +549,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut s = SyncSettings::load(&path).unwrap();
         assert_eq!(s.group_lead_ms(), DEFAULT_GROUP_LEAD_MS);
-        // The shipped default adds no headroom of its own; the per-member floor
-        // (required_send_ahead_us) is what raises a real group's send-ahead.
-        assert_eq!(s.group_lead_us(), 0);
+        // The shipped default is the bisected 180 ms, not 0: firmware that reports no
+        // buffer requirement would otherwise get only the codec's block floor and stutter
+        // (see DEFAULT_GROUP_LEAD_MS). `required_send_ahead_us` raises it further for a
+        // member that does ask for more.
+        assert_eq!(s.group_lead_us(), 180_000);
         s.set_group_lead_ms(600).unwrap();
         s.set_sendspin_delay("sendspin-dev-kitchen", 40).unwrap();
         s.set_ap2_latency("ap2-dev-dusche", Some(800)).unwrap();

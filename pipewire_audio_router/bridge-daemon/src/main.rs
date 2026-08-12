@@ -300,7 +300,10 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Same contract for AP2 receivers: mDNS (ap2_discovery) only adds; this
         // task TCP-probes each and demotes/removes a powered-off receiver so its
         // sender is torn down (and its PTP peer released).
-        outputs::ap2::liveness::spawn(ap2_devices.clone(), ap2_ptp.clone(), changes.clone());
+        // It also owns the PTP-lock watchdog: a receiver that stops following the
+        // grandmaster answers every probe and renders nothing, so it needs its session
+        // rebuilt (via ap2_control) rather than to be marked offline.
+        outputs::ap2::liveness::spawn(ap2_devices.clone(), ap2_ptp.clone(), ap2_control.clone(), changes.clone());
         // And for pw-sink targets, which have nothing to probe (the receiver dials
         // us): presence follows the advert, debounced, with an established session
         // as proof of life. Without this a target seen once stayed "online" forever.

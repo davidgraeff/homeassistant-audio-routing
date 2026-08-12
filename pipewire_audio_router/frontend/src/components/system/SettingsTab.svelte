@@ -23,6 +23,12 @@
   let leadFloorMs = $state(0);
   let leadEffectiveMs = $state(0);
   let leadFloorSources = $state<LeadFloorSource[]>([]);
+  // What the running groups are streaming at, which is NOT the same thing as the
+  // effective value above: a running send-ahead only ratchets up on its own, so a group
+  // can sit on an old, larger figure indefinitely. Shown whenever the two differ —
+  // without it this page claimed 130 ms while 900 ms was playing (2026-08-12), which is
+  // how tuning for low latency turned into guesswork.
+  let leadRunningMs = $state<number | null>(null);
   // Whether sendspin delay changes apply to the running stream (future firmware)
   // or need a stream restart (current ESPHome firmware).
   let sendspinDelayLive = $state(false);
@@ -52,6 +58,7 @@
         groupLeadMs = sync.group_lead_ms;
         leadFloorMs = sync.group_lead_floor_ms;
         leadEffectiveMs = sync.group_lead_effective_ms;
+        leadRunningMs = sync.group_lead_running_ms ?? null;
         leadFloorSources = sync.group_lead_floor_sources;
       }
     } catch {
@@ -166,10 +173,12 @@
     <h2>Group sync</h2>
     <p class="card-sub">
       When several outputs are routed from the same source they form a sync group off one clock. The
-      <strong>group lead</strong> is how far ahead audio is scheduled. It is <em>extra</em> headroom: the daemon already
-      raises every group to what its speakers ask for, so the default of 0 means "exactly what the hardware needs and no
-      more". Raise it only if a member still can't keep up. Fine-tune an individual speaker with its per-output value on
-      the Outputs tab.
+      <strong>group lead</strong> is how far ahead audio is scheduled — the buffer every speaker in the group plays out
+      of, and the latency you pay for it. The default of <strong>180 ms</strong> is measured, not theoretical: it is the
+      smallest lead ESP32 speakers played cleanly at over 2.4 GHz WiFi here, and it exists because that firmware never
+      says how much buffer it needs. Your radio environment is not this one, so treat it as a starting point: lower it
+      until you hear stutter, then go back one step. Fine-tune an individual speaker with its per-output value on the
+      Outputs tab.
     </p>
     <div class="row">
       <div class="field" style="flex:0 0 160px">
@@ -183,7 +192,7 @@
           max="5000"
           step="10"
           bind:value={groupLeadMs}
-          placeholder="0"
+          placeholder="180"
           title={leadFloorMs > 0
             ? `At least ${leadFloorMs} ms — that is what your speakers ask for with their current codec`
             : 'How far ahead audio is scheduled'}
@@ -209,7 +218,7 @@
         highAbove={80}
         risk="a block has under half its own length of slack to cross the network and be decoded — expect stutter"
         good="Head start for the WiFi hop and the speaker's Opus decode"
-        origin={opusFloorApplied === 40 ? 'the measured default' : 'your value'}
+        origin={opusFloorApplied === 40 ? 'the shipped default' : 'your value'}
         deferredHint=" — on release"
         oncommit={saveOpusFloor}
       />
@@ -217,10 +226,11 @@
     <p class="muted" style="font-size:0.8rem; margin:6px 0 0">
       <strong>Opus headroom</strong> is the part of the lead that is neither your choice nor a speaker's request: an Opus
       block has to arrive, be decoded on the speaker's MCU and be scheduled before its play time, so every Opus group
-      gets at least this much however low the group lead is set. The default of 40 ms — two Opus blocks — plays cleanly
-      on this hardware. Raise it if a congested band spends more of the budget on retransmissions; the floor is
-      {opusFloorMinMs} ms, one block, since nothing is sent before a whole block exists. PCM and FLAC ignore it, and a
-      speaker that states its own buffer requirement overrides it.
+      gets at least this much however low the group lead is set. The floor is {opusFloorMinMs} ms — one block, since
+      nothing is sent before a whole block exists — but low values are where ESP32 speakers stutter: a WiFi retransmit
+      or a roam scan eats tens of milliseconds, and this is the only budget it has to come out of. If speakers stutter,
+      raise this (or the group lead) until they stop, then come back down to the smallest value that still plays clean.
+      PCM and FLAC ignore it, and a speaker that states its own buffer requirement overrides it.
     </p>
     {#if leadFloorMs > 0}
       <p class="muted" style="font-size:0.8rem; margin:6px 0 0">
@@ -243,6 +253,19 @@
         {/if}
         A speaker can need more with a compressed codec than with PCM, so this floor moves when you change a codec on
         the Outputs tab.
+      </p>
+    {/if}
+    <!-- The value in force, whenever it is not the value computed above. These diverge
+         by design — a running send-ahead is fixed when the group's timeline is built and
+         only ever ratchets *up* on its own — and not showing it is what made this page
+         report 130 ms while 900 ms was playing. Applying now brings it down, at the price
+         of every speaker in the group reconnecting. -->
+    {#if leadRunningMs != null && leadRunningMs !== leadEffectiveMs}
+      <p class="lead-running" style="font-size:0.8rem; margin:6px 0 0">
+        Streaming right now at <strong>{leadRunningMs} ms</strong>, not {leadEffectiveMs} ms. A group's lead is fixed
+        when its stream starts and only rises by itself — something raised it (a speaker delay, a codec change, or a
+        higher setting) and it stayed. Press <strong>Apply</strong> to restart the group(s) at {leadEffectiveMs} ms; each
+        speaker reconnects, which costs it a few seconds of silence.
       </p>
     {/if}
 
@@ -275,3 +298,12 @@
     </p>
   </div>
 {/if}
+
+<style>
+  /* A number that contradicts the one the page just showed. Amber like `.badge.caution`
+     (app.css), for the same reason: a group streaming at a stale lead is not an error —
+     it plays fine — but it is not what the setting says, and that is worth noticing. */
+  .lead-running {
+    color: var(--warning-color, #b26a00);
+  }
+</style>

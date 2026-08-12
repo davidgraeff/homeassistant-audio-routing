@@ -72,6 +72,44 @@ export function ptpBadge(o: OutputInfo): { cls: string; text: string; title: str
   };
 }
 
+// Sync badge for a sendspin speaker — the one thing a speaker says about whether it is
+// actually *rendering* what we send it. `sendspin-cpp` >= 0.7.0 reports `client/state:
+// "error"` on an unexpected loss of sync (a buffer underrun), and `synchronized` again
+// when it recovers; the daemon counts the episodes.
+//
+// Worth a badge of its own because it is the only receiver-side signal in the system.
+// Everything the daemon can see by itself — blocks sent, exact timestamps, bytes on the
+// wire, clock-sync exchanges — reads perfect during exactly this fault, which is why a
+// group-wide stutter once needed a packet capture and then an ear to diagnose. Two
+// states, because they call for different things:
+//
+//   * out of sync NOW  → red: audio is being sent and not played in step.
+//   * recovered, but it has happened → amber with the count: not broken now, but the
+//     group lead may be too short for this speaker's WiFi.
+//
+// Returns null when there is nothing to say (not sendspin, offline, or a device on
+// firmware that never reports the state — which is indistinguishable from a healthy one,
+// and honest silence beats a green claim we cannot back).
+export function syncBadge(o: OutputInfo): { cls: string; text: string; title: string } | null {
+  if (o.kind !== 'sendspin' || !o.present) return null;
+  const episodes = o.sendspin_sync_errors ?? 0;
+  if (o.sendspin_out_of_sync) {
+    return {
+      cls: 'badge warn',
+      text: 'out of sync',
+      title: `This speaker reports it is not rendering in step — it is being sent audio but a buffer underrun means you are hearing gaps. If it keeps happening, raise the group lead (Settings → Group sync). Episodes since start: ${episodes}.`,
+    };
+  }
+  if (episodes > 0) {
+    return {
+      cls: 'badge caution',
+      text: `${episodes} dropout${episodes === 1 ? '' : 's'}`,
+      title: `In step now, but this speaker has reported losing sync ${episodes} time(s) since the add-on started — each one is an audible gap. A few after a reconnect are normal; a steady stream of them means the group lead is too short for its WiFi.`,
+    };
+  }
+  return null;
+}
+
 // Which outputs can be announced to individually via the per-device path
 // (/api/announce). Every output kind is a per-device sender wired into the
 // OverlayMixer: sendspin, AirPlay 2 (own overlay path), and pw-sink (the

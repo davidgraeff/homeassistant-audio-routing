@@ -1,6 +1,10 @@
 //! Tests for group layout: anchors, writers, identity and reconciliation.
 
 use super::*;
+// Named explicitly rather than picked up from `super::*`: the reconciler itself now
+// addresses these kinds through `OutputKind`, so its imports no longer re-export the
+// raw prefixes these assertions compare against.
+use crate::util::node_names::{PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 
 /// A running group with the given members and no live handles — enough to
 /// exercise the "is something streaming this output?" bookkeeping.
@@ -98,6 +102,8 @@ fn a_hold_displaces_the_held_outputs_and_gives_them_one_group() {
             supported_codecs: Vec::new(),
             min_buffer_ms: None,
             required_lead_time_ms: None,
+            out_of_sync: false,
+            sync_error_count: 0,
         },
     )]
     .into_iter()
@@ -230,6 +236,47 @@ fn a_static_delay_change_that_raises_the_group_lead_re_arms_every_member() {
     assert_eq!(raised, 350_000);
     assert!(sendspin_config_changed("opus", running_lead, "opus", raised));
     assert_eq!(sendspin_server_action(SendspinServerState { routed: true, have_server: true, config_changed: true }), ServerAction::Start);
+}
+
+/// The other half of that high-water rule, and the reason it needed one: with only
+/// "a raise restarts", the lead could never come **down** without restarting the
+/// add-on. On 2026-08-12 this instance ran at 930 ms — the leftover of one static-delay
+/// nudge — while the configured requirement was 130 ms, and lowering the knob did
+/// nothing at all. An explicit re-arm is what makes the knob two-way, and the
+/// difference-check is what keeps it from reconnecting a group that already runs at the
+/// value being asked for.
+#[test]
+fn a_lead_rearm_is_the_only_thing_that_lowers_a_running_send_ahead() {
+    let running = 930_000;
+    let wanted = 130_000;
+    // The ordinary rule ignores a drop, on purpose (§4.6/§4.9).
+    assert!(!sendspin_config_changed("opus", running, "opus", wanted));
+    // An explicit re-arm honours it.
+    assert!(sendspin_lead_rearm(true, running, wanted));
+    // Without one, nothing changes — the flag is what carries the user's intent.
+    assert!(!sendspin_lead_rearm(false, running, wanted));
+    // A re-arm whose value matches what is already streaming must NOT reconnect
+    // anyone: the API re-arms on every sync-settings write, including ones that don't
+    // move this group's requirement at all.
+    assert!(!sendspin_lead_rearm(true, running, running));
+    // It works upward too, which costs nothing extra — that case restarts anyway.
+    assert!(sendspin_lead_rearm(true, wanted, running));
+}
+
+/// `running_sendspin_leads` is the number the UI shows as "in force now", so it must
+/// report only groups that really have a server streaming. A group with no server has no
+/// lead in force, whatever its bookkeeping says.
+#[test]
+fn only_a_group_with_a_live_server_reports_a_running_lead() {
+    let mut r = GroupReconciler::new();
+    let mut g = running_group(&["sendspin-dev-kitchen"], &[], &[]);
+    g.server_send_ahead_us = 930_000; // what it *was* started with
+    r.running.insert("src".into(), g);
+    // `server: None` (this group's server is stopped) ⇒ nothing is in force.
+    assert!(r.running_sendspin_leads().is_empty());
+    // And a re-arm reports how many servers it would restart — none here, so the API
+    // can stay quiet about a cost nobody is paying.
+    assert_eq!(r.rearm_lead(), 0);
 }
 
 /// The request is addressed to one device in one group: a delay edit must not

@@ -223,6 +223,13 @@ export const api = {
    *  The recovery action for a device that is being sent audio and renders none. */
   sendspinClear: (nodeName: string) =>
     request<OpResponse>('POST', 'api/sendspin/clear', { node_name: nodeName }),
+  /** Rebuild one AirPlay-2 receiver's session (release + fresh RTSP/SETUP/RECORD),
+   *  leaving its groupmates streaming — the AP2 counterpart of `sendspinClear`.
+   *  For a receiver that is reachable and being sent audio yet plays nothing, which on
+   *  this hardware is what a lost PTP clock lock looks like. The daemon does this by
+   *  itself when it can see the lock go; this is for when it cannot. */
+  ap2Resync: (nodeName: string) =>
+    request<OpResponse>('POST', 'api/ap2/resync', { node_name: nodeName }),
 
   // AirPlay-2 per-device volume/mute (virtual outputs; volume is an in-band RTSP
   // SET_PARAMETER to the receiver). Volume is 0.0–1.0. No receiver→daemon

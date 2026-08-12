@@ -341,13 +341,38 @@ pub fn min_send_ahead_us(codec: &str, opus_floor_ms: u32) -> i64 {
 
 /// Shipped Opus send-ahead floor: **40 ms**, two [`OPUS_FRAME_FRAMES`] blocks.
 ///
-/// Measured on this project's hardware (Voice PE and satellite1 over 2.4 GHz WiFi):
-/// Opus plays cleanly at this lead. It covers one block of encoder output plus the
-/// WiFi hop, the MCU's decode and its scheduling.
+/// It covers one block of encoder output plus the WiFi hop, the MCU's decode and its
+/// scheduling — on paper. Tunable per install
+/// ([`crate::routing::sync_settings::SyncSettings::opus_floor_ms`]), since the network half of
+/// that budget belongs to the site rather than to the codec: a congested band spends
+/// more of it on retransmissions.
 ///
-/// Tunable per install ([`crate::routing::sync_settings::SyncSettings::opus_floor_ms`]), since
-/// the network half of that budget belongs to the site rather than to the codec: a
-/// congested band spends more of it on retransmissions.
+/// ## What is actually known, because this default has been wrong in both directions
+///
+/// It was **250 ms** (the sendspin protocol's own default) on the evidence that "a 100 ms
+/// lead stutters on these speakers while a much larger one audibly improves it", and was
+/// lowered to 40 ms with the note that Opus "plays cleanly at this lead". That claim does
+/// not survive contact with music:
+///
+/// * **2026-08-12, four ESPHome speakers (3× Voice PE + satellite1), Opus, 2.4 GHz.** A
+///   cold start computed an effective group lead of **130 ms** (70 ms floor as configured
+///   here, +60 ms for one speaker's static delay). Every speaker stuttered continuously.
+///   The daemon's own numbers were flawless throughout — 500 blocks / 10 s, `ts gap`
+///   exactly 20000 µs, `lead 97..121 ms`, no dropped writes — so nothing was starving on
+///   *this* side of the wire.
+/// * The same group at **930 ms** plays cleanly, with equally flat sender stats.
+///
+/// So the margin the receivers need is theirs, not ours: WiFi retransmits, DTIM wakeups
+/// and (on ESPHome before 2026.7.0) roam scanning while playing, plus MCU decode. The
+/// firmware pinned here reports neither `min_buffer_ms` nor `required_lead_time_ms`, so
+/// the daemon cannot ask — see docs/sendspin-open-items.md.
+///
+/// **Bisected 2026-08-13: 180 ms of total group lead plays clean, below it stutters.** So
+/// 40 ms is kept here — as the *codec's* share of the budget, which is all this constant
+/// is — and the receiver's share lives where it belongs, in
+/// [`crate::routing::sync_settings::DEFAULT_GROUP_LEAD_MS`]. Keeping the two separate matters: a
+/// PCM group pays nothing for decode headroom, and a device that starts reporting its own
+/// `min_buffer_ms` (a firmware upgrade) overrides this without touching the site's figure.
 pub const DEFAULT_OPUS_FLOOR_MS: u32 = 40;
 
 /// The lowest Opus floor that can mean anything, in ms — **the block size**.

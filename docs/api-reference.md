@@ -51,6 +51,7 @@ handler name, which is the authoritative place to check the exact body shape.
 | `PUT` | `/api/sendspin/delay` | set one sendspin delay |
 | `PUT` | `/api/ap2/volume` | set an AirPlay-2 receiver's volume |
 | `PUT` | `/api/ap2/mute` | mute an AirPlay-2 receiver |
+| `POST` | `/api/ap2/resync` | rebuild one AirPlay-2 receiver's session (lost PTP lock) |
 | `POST` | `/api/links` | low-level port link |
 | `GET` | `/api/routing` | routing matrix |
 | `POST` | `/api/routing/link` / `/api/routing/unlink` | edit the matrix |
@@ -147,7 +148,8 @@ adds its own:
     "ip": "192.168.178.52", "port": 8928, "encryption": "None", "latency_ms": null,
     "sendspin_codec": "opus", "sendspin_codec_active": "opus",
     "sendspin_codec_options": [ { "codec": "auto", "available": true } ],
-    "sendspin_send_ahead_ms": 250 },
+    "sendspin_send_ahead_ms": 250,
+    "sendspin_out_of_sync": false, "sendspin_sync_errors": 0 },
 
   { "node_name": "ap2-dev-pioneer_vsx_934_f11b89", "name": "Pioneer VSX-934 F11B89",
     "kind": "airplay2", "present": true, "configured": false, "state": "adopted",
@@ -167,6 +169,16 @@ adds its own:
 
 `ptp_locked` is **runtime** state, not a capability — a receiver can advertise PTP and
 sit unlocked without anything being wrong outside a multi-room group.
+
+`sendspin_out_of_sync` / `sendspin_sync_errors` are the *speaker's own* verdict on whether
+it is rendering what it was sent: `client/state: "error"`, which `sendspin-cpp` ≥ 0.7.0
+sends on an unexpected loss of sync (a buffer underrun), with `synchronized` on recovery.
+This is the only receiver-side signal in the system — everything the daemon can observe by
+itself (blocks sent, exact timestamps, bytes on the wire, clock-sync exchanges) reads
+perfect during exactly that fault. The flag is *now*; the count is the history, and it is
+the count that says whether the group lead is too short for that speaker's WiFi. Both stay
+`false`/`0` on firmware that never reports the state (ESPHome ≤ 2026.7.x pins 0.6.1, which
+has the value but never sets it), so absence is not proof of health.
 
 ### `GET /api/outputs/discovered`
 The same shape, for everything found but **not** adopted (`state` is `discovered` or
@@ -581,10 +593,15 @@ server — see [`/api/sync/settings`](#getput-apisyncsettings) for the group-wid
 The two group-wide sendspin timing knobs.
 
 ```json
-{ "group_lead_ms": 0, "opus_floor_ms": 40 }
+{ "group_lead_ms": 180, "opus_floor_ms": 40 }
 ```
 
-* **`group_lead_ms`** — extra head start for every group, over what its members need.
+* **`group_lead_ms`** — the head start every group gets, over what its members ask for.
+  Default **180 ms**, bisected on hardware (2026-08-13): the smallest lead four ESP32
+  speakers played cleanly at over 2.4 GHz WiFi. It is not 0 because the ESPHome firmware
+  pinned here reports no `min_buffer_ms`, so without it a group falls back to the Opus
+  block floor and stutters. A site measurement, not a constant — 802.11 guarantees no
+  latency at all.
 * **`opus_floor_ms`** — the head start an **Opus** stream gets whether or not a device
   asked for one: time for the network hop, the speaker's decode and its scheduling.
   Default 40 ms (two Opus blocks). PCM and FLAC impose nothing, and a device that
@@ -597,6 +614,28 @@ member's requirement is its reported `min_buffer_ms` (else its codec's floor) pl
 own static delay. `GET` therefore also reports what that resolves to, read-only:
 `group_lead_floor_ms`, `group_lead_effective_ms`, `group_lead_floor_sources` (which
 devices set the floor and why), and `opus_floor_min_ms`.
+
+#### The lead in force vs. the lead computed
+
+`GET` also reports **`group_lead_running_ms`** (and `group_lead_running`, the same per
+group with its anchor name): what the running sendspin servers are *actually* streaming
+at. This is not the same number as `group_lead_effective_ms`, and the difference is not a
+bug in either:
+
+* a group's send-ahead is fixed when its shared timeline is constructed, and
+* it is a **high-water mark** — a raise restarts the group's server, a drop deliberately
+  does not, because honouring every incidental drop would reconnect every speaker (tens of
+  seconds of silence each on real ESPHome firmware) to buy back a few tens of ms.
+
+So a group can sit indefinitely on a larger figure than the settings imply — measured on
+2026-08-12: `group_lead_effective_ms: 130` while the relay logged `lead 899..921 ms`, left
+over from one static-delay experiment. Reporting only the computed value made that
+invisible, and made tuning *downward* look like it had worked when nothing had changed.
+
+A `PUT` now also **re-arms** the lead: each group whose requirement differs from what its
+server is running restarts, so a *lower* value takes effect without restarting the add-on
+(the previous workaround was to raise one speaker's static delay and put it back, which
+forced a group restart as a side effect). The response says how many groups that costs.
 
 ## AirPlay-2 receiver volume
 
@@ -613,6 +652,34 @@ Mute or unmute one receiver (`set_ap2_mute`).
 > The daemon deliberately **does not impose** a volume on connect — an earlier version
 > force-sent maximum volume when a session opened, which made a receiver's real level
 > (e.g. −67 dB on a Pioneer) disagree with the UI slider after a restart.
+
+### `POST /api/ap2/resync`
+Release one receiver's AirPlay session and build a fresh one — re-arming its PTP peer on
+the way — while its groupmates keep streaming. The AP2 counterpart of
+[`POST /api/sendspin/clear`](#post-apisendspinclear), for the same symptom: an output that
+is reachable and being sent audio yet renders nothing.
+
+```json
+// Request
+{ "node_name": "ap2-dev-pioneer_vsx_934_f11b89" }
+// Response
+{ "ok": true, "message": "rebuilding 'Pioneer''s session — it should be back in a few seconds" }
+```
+
+`ok: false` means the receiver has no live sender, so there is no session to rebuild (the
+reconciler is what gives it one) — reported rather than treated as success.
+
+On this hardware the fault it recovers is a **lost PTP clock lock**: our PT=87 anchors are
+timestamps in the grandmaster's timeline, so a receiver whose slaved clock has drifted off
+it plays nothing at all. A Pioneer VSX-934 does this repeatedly, and until this existed
+the only fixes were restarting the add-on or power-cycling the AVR — both of which work
+only because both build a new session.
+
+The daemon also does this **by itself**: the AP2 liveness task watches each receiver's
+gPTP lock age and rebuilds the session of one that had a lock, is still being streamed to,
+and has gone quiet for 30 s (at most one attempt every two minutes, and never for a
+receiver that has *never* locked — a Yamaha WX-021 never sends a `Delay_Req` and plays
+perfectly). This endpoint is for the cases it cannot see, and for not waiting.
 
 ## Announcements
 

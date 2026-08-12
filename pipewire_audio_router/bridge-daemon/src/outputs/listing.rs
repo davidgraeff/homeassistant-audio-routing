@@ -158,6 +158,18 @@ pub(crate) struct OutputInfo {
     /// sources, and this is a live stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sendspin_required_lead_ms: Option<u32>,
+    /// sendspin only: the device says it is **not rendering in step** right now — its last
+    /// `client/state` was `error`, which `sendspin-cpp` ≥ 0.7.0 sends on an unexpected loss
+    /// of sync (a buffer underrun). The only receiver-side signal there is: everything the
+    /// daemon can observe by itself looks healthy during exactly this fault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sendspin_out_of_sync: Option<bool>,
+    /// sendspin only: how many out-of-sync episodes it has reported since the daemon
+    /// started. Present (possibly 0) for any known sendspin device. The count is what
+    /// separates one blip from chronic underrunning — only the latter argues for a longer
+    /// group lead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sendspin_sync_errors: Option<u32>,
     /// sendspin only: the send-ahead its stream actually uses (ms) — the configured
     /// group lead raised to the largest member requirement.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -333,6 +345,8 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_codec_options: Some(codec_options),
             sendspin_min_buffer_ms: min_buffer_ms,
             sendspin_required_lead_ms: required_lead_ms,
+            sendspin_out_of_sync: dev.map(|d| d.out_of_sync),
+            sendspin_sync_errors: dev.map(|d| d.sync_error_count),
             sendspin_send_ahead_ms: Some(send_ahead_ms),
             pwsink_paired: None,
             pwsink_pair_code: None,
@@ -439,6 +453,8 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_codec_active: None,
             sendspin_codec_options: None,
             sendspin_min_buffer_ms: None,
+            sendspin_out_of_sync: None,
+            sendspin_sync_errors: None,
             sendspin_required_lead_ms: None,
             sendspin_send_ahead_ms: None,
             pwsink_paired: None,
@@ -510,6 +526,8 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             sendspin_codec_active: None,
             sendspin_codec_options: None,
             sendspin_min_buffer_ms: None,
+            sendspin_out_of_sync: None,
+            sendspin_sync_errors: None,
             sendspin_required_lead_ms: None,
             sendspin_send_ahead_ms: None,
             pwsink_paired: Some(paired),

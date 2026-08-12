@@ -264,10 +264,21 @@ export interface SyncSettingsInfo {
    * to at least this, so configuring less has no effect. 0 = nothing reported yet.
    * Can change when a device's wire codec changes (decode warmup differs). */
   group_lead_floor_ms: number;
-  /** What the daemon actually uses: max(group_lead_ms, group_lead_floor_ms). */
+  /** What the daemon would start a group at now: max(group_lead_ms,
+   * group_lead_floor_ms). Not necessarily what is playing — see
+   * `group_lead_running_ms`. */
   group_lead_effective_ms: number;
   /** Which devices set the floor, largest first — for explaining the number. */
   group_lead_floor_sources: LeadFloorSource[];
+  /** sendspin only: the speaker says it is **not rendering in step** right now — its last
+   * `client/state` was `error`, which sendspin-cpp >= 0.7.0 sends on an unexpected loss of
+   * sync (a buffer underrun). The only receiver-side signal in the system: everything the
+   * daemon can observe by itself looks healthy during exactly this fault. */
+  sendspin_out_of_sync?: boolean;
+  /** sendspin only: out-of-sync episodes reported since the add-on started. The count is
+   * what separates one blip from chronic underrunning — only the latter argues for a
+   * longer group lead. */
+  sendspin_sync_errors?: number;
   /** Decode+network headroom every **Opus** stream gets, in ms — the term that keeps
    * an Opus group above `group_lead_ms` however low that is set. Tunable, because the
    * shipped 250 ms is a conservative guess rather than a measurement. */
@@ -292,6 +303,14 @@ export interface LeadFloorSource {
   static_delay_ms: number;
   /** Its effective per-speaker send-ahead: the larger of the two, plus the delay. */
   required_ms: number;
+  /** The largest send-ahead a running sendspin server is **actually** streaming at;
+   * absent when no group has a live server. Diverges from `group_lead_effective_ms`
+   * because a running send-ahead only ratchets up on its own — so this is the number to
+   * show as "in force now", and the reason the UI used to be able to claim a low value
+   * had applied when 900 ms was streaming. */
+  group_lead_running_ms?: number;
+  /** The same per group (each computes its own requirement from its own members). */
+  group_lead_running: RunningLead[];
   /** 'reported' or 'codec-minimum'. */
   reason: string;
 }
@@ -303,6 +322,13 @@ export interface AppSettings {
   /** Runtime mDNS discovery on/off. */
   discovery_enabled: boolean;
   /** Whether sendspin devices apply a static-delay change to the running stream.
+/** What one running group's sendspin server is streaming at right now. */
+export interface RunningLead {
+  /** The group's sync-anchor node name (`sync-grp-…`), as its log lines carry it. */
+  anchor: string;
+  lead_ms: number;
+}
+
    * Current ESPHome firmware does not, so a delay change restarts the group
    * stream; enable for future firmware that honors a live SetStaticDelay. */
   sendspin_delay_live: boolean;

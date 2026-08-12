@@ -78,6 +78,9 @@ pub struct GroupReconciler {
     /// without this a transient failure left a group silent until an unrelated
     /// event happened along — see [`Self::retry_wanted`].
     retry_wanted: bool,
+    /// One-shot: let the next pass apply a **lower** send-ahead, not just a higher one.
+    /// Set by [`Self::rearm_lead`]; see it for why this is opt-in rather than the rule.
+    lead_rearm: bool,
 }
 
 impl GroupReconciler {
@@ -114,6 +117,43 @@ impl GroupReconciler {
             }
         }
         false
+    }
+
+    /// The send-ahead each running sendspin server is **actually** streaming at, in ms,
+    /// by anchor node name.
+    ///
+    /// This is the number `GET /api/sync/settings` has to report alongside the computed
+    /// one, because the two diverge and the divergence cost a whole investigation a wrong
+    /// conclusion: the API said `effective 130 ms` while the relay logged `lead 899..921`
+    /// (2026-08-12), the leftover of an earlier experiment, because the send-ahead is a
+    /// high-water mark that only ever rose ([`sendspin_config_changed`]). A user reading
+    /// the UI had no way to see the value in force, so tuning the knob *down* looked like
+    /// it had applied when nothing had changed at all.
+    pub fn running_sendspin_leads(&self) -> BTreeMap<String, u32> {
+        self.running
+            .values()
+            .filter(|g| g.server.is_some())
+            .map(|g| (g.anchor_node_name.clone(), (g.server_send_ahead_us / 1000) as u32))
+            .collect()
+    }
+
+    /// Let the next reconcile pass apply a **lower** send-ahead too, restarting each
+    /// group whose requirement has dropped below what its server is running. Returns how
+    /// many running sendspin servers would be re-armed, so the caller can say what it is
+    /// about to cost. The caller must nudge a reconcile afterwards.
+    ///
+    /// **Why this is opt-in and not simply the rule.** The high-water behaviour exists to
+    /// protect against *incidental* drops: a member with a large requirement leaves, and
+    /// honouring the lower figure would reconnect every remaining speaker — tens of
+    /// seconds of silence each on real ESPHome firmware (§4.9) — to buy back a few tens
+    /// of milliseconds nobody asked for. That reasoning does not apply to a user who has
+    /// just typed a smaller number into the latency knob: there the reconnect is the
+    /// point, and refusing it is what left the only way *down* being a restart of the
+    /// add-on (or the delay-nudge dance: raise one speaker's static delay to force a
+    /// group restart, then put it back).
+    pub fn rearm_lead(&mut self) -> usize {
+        self.lead_rearm = true;
+        self.running.values().filter(|g| g.server.is_some()).count()
     }
 
     /// Gracefully tear down every sendspin server — group senders and idle senders
@@ -328,6 +368,7 @@ impl GroupReconciler {
             deps.ap2_control.clone(),
             rate,
             deps.sync_settings.clone(),
+            deps.ap2_ptp.clone(),
         ) {
             Ok(handle) => handle,
             Err(e) => {
@@ -916,10 +957,15 @@ impl GroupReconciler {
             //    A restart, when the config really did change, is still only the
             //    server — never the anchor — so AP2/RAOP outputs fed from the same
             //    anchor don't blip.
+            // A user-requested re-arm (`rearm_lead`) is the one case where a *lower*
+            // send-ahead is worth every member reconnecting: the user asked for less
+            // latency, so the reconnect is what they are paying for deliberately.
+            let lead_rearm = sendspin_lead_rearm(self.lead_rearm, prev_lead, d.sendspin_send_ahead_us);
             let action = sendspin_server_action(SendspinServerState {
                 routed: !d.sendspin_node_names.is_empty(),
                 have_server,
-                config_changed: sendspin_config_changed(prev_codec, prev_lead, d.sendspin_codec, d.sendspin_send_ahead_us),
+                config_changed: lead_rearm
+                    || sendspin_config_changed(prev_codec, prev_lead, d.sendspin_codec, d.sendspin_send_ahead_us),
             });
             let restart = action == ServerAction::Start;
             if matches!(action, ServerAction::Start | ServerAction::Stop) {
@@ -934,6 +980,14 @@ impl GroupReconciler {
                             "no sendspin devices routed here any more".to_string()
                         } else if d.sendspin_codec != prev_codec {
                             format!("wire codec {prev_codec} -> {}", d.sendspin_codec)
+                        } else if lead_rearm && d.sendspin_send_ahead_us < prev_lead {
+                            // The only path that lowers a running lead, and only because
+                            // someone asked for it (`rearm_lead`).
+                            format!(
+                                "re-arming at the send-ahead you asked for: {} ms, down from the running {} ms",
+                                d.sendspin_send_ahead_us / 1000,
+                                prev_lead / 1000
+                            )
                         } else {
                             // Since §4.10 this is the only way a static-delay edit
                             // reaches the whole group: the delay fed into the
@@ -1141,6 +1195,7 @@ impl GroupReconciler {
                             ap2_control.clone(),
                             d.ap2_rate,
                             sync_settings.clone(),
+                            ap2_ptp.clone(),
                         ) {
                             Ok(handle) => {
                                 tracing::info!(
@@ -1212,6 +1267,11 @@ impl GroupReconciler {
                 }
             }
         }
+
+        // Every group has now seen the re-arm, so it is spent. Cleared here rather than
+        // at the top of the pass so a group created *during* this pass (which starts at
+        // the current requirement anyway) doesn't miss it.
+        self.lead_rearm = false;
 
         // 3. Idle-sender creation (per-device mode): stand up a standalone sender
         //    for every ungrouped device that doesn't have one, so it's always

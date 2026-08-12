@@ -138,6 +138,7 @@ pub fn router(
         .route("/api/sendspin/clear", post(clear_sendspin_stream))
         .route("/api/ap2/volume", put(set_ap2_volume))
         .route("/api/ap2/mute", put(set_ap2_mute))
+        .route("/api/ap2/resync", post(resync_ap2_receiver))
         .route("/api/sendspin/delays", get(get_sendspin_delays))
         .route("/api/sendspin/delay", put(set_sendspin_delay_handler))
         .route("/api/sync/settings", get(get_sync_settings).put(set_sync_settings))

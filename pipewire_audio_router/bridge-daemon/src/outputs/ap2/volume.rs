@@ -67,6 +67,25 @@ pub enum Ap2Command {
         node_name: String,
         ms: u16,
     },
+    /// Release **this** receiver's RTSP session and build a fresh one, leaving its
+    /// groupmates streaming — the AP2 counterpart of sendspin's `stream/clear`
+    /// Resync, and the recovery for a receiver that has stopped rendering while the
+    /// daemon still thinks it is streaming.
+    ///
+    /// The case that made it necessary: a receiver that PTP-locks (the Pioneer
+    /// VSX-934) renders nothing at all once that lock is lost, because its slaved
+    /// clock no longer maps our PT=87 anchors onto anything. Nothing in the sender
+    /// noticed — the group task connects once and then only applies volume — so the
+    /// only recoveries were restarting the add-on or power-cycling the receiver. Both
+    /// work because both build a new session, which is exactly what this does at the
+    /// cost of one receiver's audio instead of everything.
+    Reconnect {
+        node_name: String,
+        /// Why, for the log line and the health note the UI shows ("you asked",
+        /// "its clock lock was lost"). Carried rather than derived so the automatic
+        /// and the manual path are distinguishable after the fact.
+        reason: String,
+    },
 }
 
 #[derive(Default)]
@@ -190,6 +209,19 @@ impl Ap2Control {
     /// caller (sync_settings) so a later reconnect uses it as the initial delay.
     pub fn set_render_delay(&self, node_name: &str, ms: u16) -> bool {
         self.try_queue(node_name, Ap2Command::SetRenderDelay { node_name: node_name.to_string(), ms })
+    }
+
+    /// Ask the group task to rebuild **this** receiver's session (see
+    /// [`Ap2Command::Reconnect`]). Returns false when the receiver has no live sender
+    /// to ask — there is no session to rebuild, and the caller reports that rather
+    /// than pretending, exactly like sendspin's `clear_stream` on a disconnected
+    /// device.
+    ///
+    /// Unlike volume/mute this stores **no desired state**: a reconnect is an action,
+    /// not a setting, so a receiver that isn't streaming has nothing to re-apply
+    /// later. The reconciler brings it back on its own when it becomes routable.
+    pub fn reconnect(&self, node_name: &str, reason: impl Into<String>) -> bool {
+        self.try_queue(node_name, Ap2Command::Reconnect { node_name: node_name.to_string(), reason: reason.into() })
     }
 
     /// Register a freshly-connected device's group-task command channel.
@@ -410,6 +442,33 @@ mod tests {
         // `register` re-applies a user-set level on the device's next connect.
         assert_eq!(c.volumes().get("ap2-dev-wedged").copied(), Some(0.9));
         assert_eq!(c.mutes().get("ap2-dev-wedged").copied(), Some(true));
+    }
+
+    /// A resync reaches the group task that owns the receiver, and — unlike volume and
+    /// mute — leaves nothing behind in the model. A reconnect is an action, not a desired
+    /// state: a receiver that isn't streaming has no session to rebuild, and re-applying
+    /// one later would reconnect it for a fault that has long since gone.
+    #[tokio::test]
+    async fn a_resync_is_queued_for_the_owning_task_and_stores_no_state() {
+        let mut c = Ap2Control::default();
+        // Nothing streaming ⇒ reported honestly, exactly like `clear_stream` on a
+        // disconnected sendspin device.
+        assert!(!c.reconnect("ap2-dev-pioneer", "you asked for a resync"));
+
+        let (tx, mut rx) = mpsc::channel(8);
+        c.register("ap2-dev-pioneer".to_string(), tx);
+        assert!(c.reconnect("ap2-dev-pioneer", "its PTP clock lock was lost"));
+        match rx.try_recv() {
+            Ok(Ap2Command::Reconnect { node_name, reason }) => {
+                assert_eq!(node_name, "ap2-dev-pioneer");
+                assert_eq!(reason, "its PTP clock lock was lost", "the reason travels, so the log says which path fired");
+            }
+            other => panic!("expected a Reconnect, got {other:?}"),
+        }
+        // No level, no mute, no user intent recorded.
+        assert!(c.volumes().is_empty());
+        assert!(c.mutes().is_empty());
+        assert!(c.user_set.is_empty());
     }
 
     /// A device whose task is gone reports honestly too — same contract as a full

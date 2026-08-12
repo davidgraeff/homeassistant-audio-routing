@@ -90,6 +90,37 @@ Small, all still open, all verified present in the tree as of 2026-08-12:
 - Fold the vendored `with_daemon` mDNS patches and the libairptp patches into the
   `pull_request_docs/` upstream mirrors, per the vendoring convention.
 
+### Lost PTP lock is recoverable per receiver ✅ (2026-08-12)
+
+A receiver that PTP-locks and then loses the lock renders **nothing**: our PT=87 anchors
+are timestamps in the grandmaster's timeline, and a clock that has drifted off it cannot
+place them. Nothing in the sender noticed — the group task connected once and then only
+applied volume — so the only recoveries were restarting the add-on or power-cycling the
+receiver. Both work for the same reason: they build a new session. Observed repeatedly on
+the Pioneer VSX-934; the Yamaha WX-021 never locks at all and plays fine, which is the
+whole reason the check has to be about runtime state rather than advertised capability.
+
+Three pieces, all per receiver — its groupmates keep streaming throughout:
+
+- **`Ap2Command::Reconnect`** and the group task's `reconnect_member`: drop that member's
+  feed, release its session (bounded FLUSH + TEARDOWN, then close), `remove_peer` +
+  `add_peer` on the libairptp grandmaster so its Announce/Sync sequence restarts, then a
+  fresh `connect_one` through the same retry path as an initial connect. `attach_member`
+  is shared with the connect loop, so a reconnected receiver lands in exactly the state a
+  first connect leaves it in.
+- **`POST /api/ap2/resync`** and a **Resync** button on each present AirPlay-2 output —
+  the same button the sendspin outputs have, for the same symptom, sending what that
+  transport needs.
+- **A watchdog in `outputs/ap2/liveness.rs`**, on the existing 12 s tick: a receiver that
+  *was* locked (`peer_lock_age ≤ 5 s` at some point this session), still has a live sender,
+  and has gone quiet for ≥ 30 s gets its session rebuilt — at most one attempt every two
+  minutes, with the reason published to `ap2_health` so the UI says what happened. A
+  receiver that never locked is never touched. Decision extracted as `ptp_recovery_due`
+  and unit-tested, since every clause exists to stop it firing on something healthy.
+
+Not yet validated on hardware: the automatic path needs a real lock loss to fire, which is
+not something we can provoke on demand. The manual button is the fallback if it does not.
+
 ### The one real defect: shutdown during a group's initial connect does not TEARDOWN
 
 `Ap2ServerHandle::shutdown` — the graceful-exit path

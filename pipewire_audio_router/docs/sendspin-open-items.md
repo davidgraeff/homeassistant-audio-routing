@@ -47,7 +47,7 @@ the sync group loses satellite1 until the new name is adopted.
 > on the next reflash or rename. See item 4 for why the phantom may have mattered for
 > more than tidiness.
 
-### 2. `ClientSyncState` silently discards a `client/state` of `"error"`
+### 2. `ClientSyncState` silently discarded a `client/state` of `"error"` ✅
 
 `submodules/sendspin/src/protocol/messages.rs:~324` defines only `Synchronized` and
 `ExternalSource`, with **no `Error` variant and no `#[serde(other)]`**. A `client/state`
@@ -61,6 +61,53 @@ that value, so the upgrade's headline observability win would be thrown away sil
 **Fix:** add `Error` plus `#[serde(other)] Unknown`. The codebase already has the idiom —
 `PlayerCommandType` in the same file carries `#[serde(other)] Unknown` commented
 "forward compatibility". Three lines, worth doing regardless of the upgrade.
+
+> **Upstream check, 2026-08-13 — this is now a dated fuse, and it is the missing signal
+> for item 6b.** Read from the sendspin-cpp sources at each tag:
+>
+> | version | `SendspinClientState::ERROR` | who ships it |
+> |---|---|---|
+> | v0.6.1 | enum + `to_cstr` → `"error"` exist, **never set** | ESPHome **2026.7.x** (current stable, 2026.7.4) |
+> | v0.7.0 – v0.7.2 | **set on unexpected loss of sync** (`sync_task.cpp`: `enqueue_state_update(SendspinClientState::ERROR)`) | ESPHome **dev**, pinning `sendspin-cpp 0.7.2` |
+>
+> The trigger is a *hard sync* outside an expected alignment: playback off by more than
+> `HARD_SYNC_THRESHOLD_US = 5000` (5 ms) when not priming or post-seek — "e.g. buffer
+> underrun". Reported once, then `SYNCHRONIZED` again when it re-aligns.
+>
+> **That is exactly the receiver-side stutter indicator item 6b had to bisect by ear**, and
+> today our parser would drop the whole message containing it — volume, mute and static
+> delay with it. So this is no longer "worth doing regardless": it is the thing that turns
+> the 180 ms guess into a measurement, and it lands the moment ESPHome cuts a release off
+> dev. Do it before the upgrade, not after.
+
+> **Done 2026-08-13 — and it is now a diagnosis, not just a parse.**
+>
+> * **Submodule** (`protocol/messages.rs`): `ClientSyncState` gains `Error` and
+>   `#[serde(other)] Unknown`. Two tests pin what the fallback is *for* — an `error` and an
+>   invented `"buffering"` both parse **and the message's volume / mute / static delay
+>   survive**, which is what was being thrown away.
+> * **Daemon** (`outputs/sendspin/server.rs`): `record_sync_state` records the verdict per
+>   device — `out_of_sync` plus a `sync_error_count` of distinct episodes — on both the
+>   dial-out and inbound paths, clearing the claim (not the history) on disconnect. A
+>   transition into error logs a `WARN` naming the running send-ahead **and the knob to
+>   change**; recovery logs the episode count. Repeats are absorbed: `client/state` arrives
+>   with every volume tick, so only a change logs, counts or pushes a UI frame.
+> * **API/UI**: `sendspin_out_of_sync` / `sendspin_sync_errors` on `GET /api/outputs`, and a
+>   badge on the Outputs page — red **out of sync** while it is happening, amber
+>   **"N dropouts"** once it has recovered. Silence when the device has never reported one,
+>   since on `0.6.x` firmware that is indistinguishable from healthy.
+>
+> **Deliberately no automatic recovery.** A `stream/clear` or an automatic lead bump in
+> response would be a feedback loop against a device that cannot keep up at the configured
+> lead: every attempt costs audio, so a speaker underrunning every few seconds would be held
+> broken by its own recovery. The lead is a site decision (item 6b); this reports, counts,
+> and names the number to change. Contrast the AP2 PTP watchdog, which *does* act — there
+> the fault is binary and a reconnect provably fixes it.
+>
+> **Inert until the firmware moves.** The speakers here run pre-`sendspin-cpp` firmware and
+> ESPHome stable pins 0.6.1, which never sets the state, so nothing will light up until the
+> ladder in item 9 is climbed. That is the point: the machinery is in place *before* the
+> upgrade, so the upgrade's one observability win isn't silently dropped on arrival.
 
 ### 3. PR #520 is applied to the Satellite1 config but not committed
 
@@ -225,7 +272,7 @@ was the only option.
 > This is the first thing to try next time item 4 recurs — and it leaves the evidence
 > intact, which an add-on restart did not.
 
-### 6. `group_lead_effective_ms` does not report the lead actually in use
+### 6. `group_lead_effective_ms` did not report the lead actually in use ✅
 
 `GET /api/sync/settings` reported `configured 0 / floor 320 / effective 320 ms` while the
 running relay logged `lead 870..892 ms` — the value left over from an earlier experiment
@@ -241,10 +288,93 @@ The design is defensible; **the reporting is not.** The API presents
 this investigation a wrong conclusion — item 4's original "the lead was returned to 320
 and audio kept playing" was built on it.
 
-Fix: report the running value alongside the computed one — e.g. `group_lead_running_ms`
-read from the live timeline — and have the UI show both when they differ, with the reason
-("a lower lead applies on the next group restart"). §4.10 already warns that the API's
-number is not a predictor of blast radius; this is the same gap seen from the other side.
+> **Done 2026-08-12.** It happened again — `effective 130 ms` reported while the relay
+> logged `lead 899..921 ms` — and this time it cost a *user* the tuning loop, not just an
+> investigation. Two fixes:
+>
+> * **`group_lead_running_ms`** (plus `group_lead_running`, per group with its anchor name)
+>   from `GroupReconciler::running_sendspin_leads`, and the Settings page says "streaming
+>   right now at X ms, not Y ms" whenever they differ, in amber.
+> * **The knob is two-way.** A `PUT /api/sync/settings` calls `rearm_lead`, so a group
+>   whose requirement differs from its running send-ahead restarts — which is the only way
+>   *down* other than restarting the add-on. The high-water rule still governs everything
+>   automatic (`sendspin_config_changed`); the re-arm is a separate, explicitly-requested
+>   decision (`sendspin_lead_rearm`), because "a member left, so the lead could drop" and
+>   "the user asked for less latency" deserve opposite answers. The response says how many
+>   groups will restart.
+
+### 6b. The smallest lead these speakers play at: **180 ms** ✅ (bisected 2026-08-13)
+
+> **Result.** `group_lead_ms` **180** + `opus_floor_ms` **40** plays clean on all four
+> speakers; below 180 ms of total lead there is audible stutter. Both are now the shipped
+> defaults ([`DEFAULT_GROUP_LEAD_MS`](../bridge-daemon/src/routing/sync_settings.rs),
+> [`DEFAULT_OPUS_FLOOR_MS`](../bridge-daemon/src/outputs/sendspin/codec.rs)), so a cold start
+> begins where the hardware works instead of where the codec's block size happens to land.
+>
+> **The split is deliberate.** 40 ms is the *codec's* share (decode headroom, waived for
+> PCM/FLAC, overridden by a device that reports its own `min_buffer_ms`); 140 ms is the
+> *site's* share, which is what the group lead is for. Rolling both into the Opus floor
+> would have charged a PCM group for a budget it does not spend.
+>
+> **What 180 ms buys, roughly** — none of it guaranteed, because 802.11 is CSMA/CA
+> best-effort and offers no latency bound at all:
+>
+> | term | typical | note |
+> |---|---|---|
+> | Opus block + capture quantum | ~20 + ~21 ms | fixed; nothing is sent before a whole block exists |
+> | network, median | 2–5 ms | a healthy 2.4 GHz link, medium load |
+> | retransmit chain + airtime contention | 20–100 ms | the dominant term, and the reason the tail matters more than the median |
+> | DTIM / power-save wakeup | 0–100 ms | interval × DTIM count, if the speaker sleeps between beacons |
+> | MCU decode + task scheduling | 5–20 ms | shared with whatever else the ESP32 is doing (voice, mic) |
+> | **off-channel roam scan** | **100–500 ms** | **not covered at 180 ms** — suppressed only from ESPHome 2026.7.0 (esphome#17133); this box runs 2026.4.5, see item 9 |
+>
+> So 180 ms covers the ordinary tail with little to spare and does *not* cover a scan —
+> consistent with "clean, but stutters if I go lower". Expect the figure to move with the
+> radio environment (a new neighbouring AP on the same channel, a microwave, a legacy
+> 1 Mbit device hogging airtime), and re-bisect against the running value the Settings page
+> now reports rather than against the configured one.
+>
+> **Still worth trying, and would lower it further if it works:** PCM on one speaker (no
+> codec floor, no MCU decode in the budget, ~1.5 Mbit/s per device). If PCM plays clean
+> markedly lower, the margin is decode-bound and the fix is item 9's firmware ladder rather
+> than more buffer.
+
+<details>
+<summary>The measurements this came from (kept: they say what the sender was doing, which is what ruled it out)</summary>
+
+Opened by item 6's fix, because the honest answer is now visible instead of hidden. The
+send-ahead default has been wrong in **both** directions: 250 ms → 40 ms (2026-08-10,
+commit 9f56025, on the note that Opus "plays cleanly at this lead"), and 40 ms is not
+enough.
+
+**What was measured on 2026-08-12** (four ESPHome speakers — 3× Voice PE + satellite1 —
+Opus over 2.4 GHz, `airplay-in` as the source, `opus_floor_ms` set to 70 on this install):
+
+| running lead | with music | the daemon's own numbers |
+|---|---|---|
+| **130 ms** (70 floor + satellite1's 60 ms static delay) | every speaker stutters continuously | 500 blocks/10 s, `ts gap 20000..20000 µs`, `lead 97..121 ms`, zero dropped writes |
+| **930 ms** (after one static-delay nudge raised the high-water mark) | clean | identical: 500 blocks/10 s, exact gaps, `lead 899..921 ms` |
+
+The sender is therefore **not** the starving party in either state. Both windows are flat,
+continuous and on time; the difference is entirely how much margin the *receiver* has for
+WiFi retransmits, DTIM wakeups and MCU decode. (Note ESPHome 2026.7.0's "suppress WiFi
+roam scanning while playing", esphome#17133 — the box runs 2026.4.5, so these speakers
+still roam-scan mid-playback. That is a credible chunk of the margin, and it is in item 9's
+version ladder.)
+
+**How the 180 ms above was then found:** by ear, since nothing about a stuttering receiver
+is visible from the daemon (blind spot #1 in item 4). Two things made that loop tolerable —
+the UI reports the running lead, and the knob goes down as well as up — so the procedure is
+worth keeping for the next re-bisect: play music to the whole group, set the lead well
+above the last known-good value, Apply, listen, and step down until stutter returns.
+
+A caution for whoever does it: `largest packet 3 B` in the relay log means the Opus encoder
+is emitting **silence** frames, i.e. nothing is playing into the anchor. Two 22-minute
+windows of that were nearly mistaken for "the stutter reproduced with no music" — the real
+music window (`largest packet ~600 B`) started at 21:08:56 and is the only part of that log
+which says anything about audio.
+
+</details>
 
 ---
 
@@ -263,6 +393,30 @@ all are currently inert — correctness debt, not live bugs. Full detail in the 
 | F5 | we add a client to `ready` for *any* `client/state`, so an `external_source` device is streamed to anyway and never sent `stream/end` (spec: MUST NOT) | a device is taken over by a local source |
 | F7 | `buffer_capacity` is parsed and never read; our `MAX_QUEUED_AUDIO_FRAMES = 32` is a local invention where the spec supplies a negotiated number | a device advertises a smaller capacity than we assume |
 | F8 | `required_lead_time_ms` excluded from the send-ahead — correct against spec HEAD, a violation against the era spec | the firmware starts reporting it (i.e. on upgrade) |
+
+> **F7/F8 upstream check, 2026-08-13 — the firmware never reports either timing field, at
+> any version.** `min_buffer_ms` and `required_lead_time_ms` do not appear **anywhere** in
+> sendspin-cpp v0.6.1 or v0.7.2 (0 hits across the whole tree), nor in ESPHome's `sendspin`
+> component on `dev`. `PlayerRole::Impl::build_state_fields` emits exactly `volume`,
+> `muted`, `static_delay_ms` and `supported_commands` — and the spec marks both fields
+> **"REQUIRED for players"** (`roles/player/v1.md`), so this is an upstream client gap, not
+> a version we can wait for. **F8 therefore stays inert indefinitely**, and the group lead
+> stays a site measurement (item 6b) rather than something a speaker can tell us. Filing it
+> upstream is the only route to a reported value.
+>
+> **F7 is bounded and harmless.** The hello *does* carry `buffer_capacity`: ESPHome's
+> `buffer_size` defaults to 1,000,000 bytes and the library advertises 80 % of it
+> (800 kB) — ≈33 s of Opus, ≈4.2 s of PCM at 48 kHz/16/2. Our `MAX_QUEUED_AUDIO_FRAMES = 32`
+> (640 ms of Opus) is far inside that, so the local invention is safe at any lead we would
+> plausibly use. Note the spec's own caveat: `buffer_capacity` is a **byte** cap and can cut
+> the effective queued *duration* below a requested `min_buffer_ms` — which matters for PCM
+> long before it matters for Opus.
+>
+> Two device-side terms worth knowing for the latency budget, both new since the pinned
+> firmware: `extra_startup_silence_ms` (default **50 ms**, silence inserted at stream start
+> so the decode pipeline stays ahead of the sink) and ESPHome's `fixed_delay` — the Voice PE
+> config sets **480 µs** for its AIC3204 DAC. Neither is an ongoing buffer, so neither
+> substitutes for the group lead.
 
 ### 8. The device's API log subscription delivers nothing
 
@@ -289,6 +443,17 @@ sendspin-cpp 0.7.0.
 `is_time_synced()` gate — verified against sources. It does **not** address what turned
 out to be the root cause, and in one respect it is worse (`update()` runs only at burst
 completion, so worst case is 8 × 10 s).
+
+> **Re-checked 2026-08-13, and there is now one concrete reason to climb the ladder.**
+> Current stable ESPHome is **2026.7.4**, still pinning `sendspin-cpp 0.6.1`; `dev` pins
+> **0.7.2** (released 2026-08-12), so the version numbers in this item have moved but the
+> ladder has not. What changed is the payoff: **0.7.x reports `client/state: "error"` on an
+> unexpected loss of sync** (item 2), which is the only receiver-side stutter signal that
+> exists — the thing item 6b had to bisect by ear. Still absent at every version:
+> `min_buffer_ms` / `required_lead_time_ms` (item 7), so the upgrade buys *detection*, never
+> *negotiation*. The other reason remains esphome#17133 (no roam scanning while playing),
+> already in 2026.7.0 — one release *below* the 0.7.x pin, so a partial move gets the
+> single biggest term in the 180 ms budget without the full ladder.
 
 The real cost is the version ladder: the component shipped in ESPHome **2026.5.0**,
 **2026.7.0 pins sendspin-cpp 0.6.1**, and **0.7.0 is only on `dev`** (≥2026.8). The box
