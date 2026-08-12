@@ -805,6 +805,19 @@
                         {#if (xrunsOf($routing, m.node_name) ?? 0) > 0}
                           <span class="xrun" class:hot={xrunHot[m.node_name]} title="Dropped audio cycles (PipeWire xruns) since this node started — pw-top's ERR. Red = climbing now.">⚠ {xrunsOf($routing, m.node_name)}</span>
                         {/if}
+                        <!-- Taken over by an alignment run. It belongs here as much as
+                             on the Outputs page: this view draws the wire from the
+                             source (the routing intent survives a hold, only the audio
+                             is displaced), so without it the graph shows a speaker fed
+                             by a live source and playing nothing. Same word and same
+                             sentence as the Outputs badge, deliberately. -->
+                        {#if m.held}
+                          <span
+                            class="tag held"
+                            title="A speaker-timing measurement has taken this output over. Nothing else plays on it until that finishes, and whatever was routed here comes back afterwards."
+                            >held</span
+                          >
+                        {/if}
                         <!-- A diagnosed fault outranks the generic states below: when
                              the daemon knows *why* nothing is playing, showing
                              "offline"/"not connected" alone is what sent people to the
@@ -1252,6 +1265,14 @@
     color: var(--warning-color, #b26a00);
     text-transform: none;
     white-space: nowrap;
+  }
+  /* Held by an alignment run: amber like `wait`, since the speaker is fine and simply
+     isn't carrying what the wire suggests. Its own class so it reads as a state rather
+     than a warning, and `cursor: help` because the sentence is in the tooltip. */
+  .tag.held {
+    background: color-mix(in srgb, var(--warning-color, #f9a825) 18%, transparent);
+    color: var(--warning-color, #b26a00);
+    cursor: help;
   }
   /* A named, diagnosed fault — red rather than the amber of "not up yet", because
      this one will not fix itself by waiting. Hover carries the sentence. */

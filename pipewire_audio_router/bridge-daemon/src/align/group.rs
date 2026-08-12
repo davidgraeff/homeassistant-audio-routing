@@ -316,10 +316,12 @@ impl HoldRegistry {
         self.inner.lock().unwrap().as_ref().is_some_and(|h| h.held.contains_key(output))
     }
 
-    /// Every held output (empty when nothing is aligning). Observation seam: the
-    /// same set is available to the API through the session's own status, so nothing
-    /// in the daemon reads this one yet.
-    #[allow(dead_code)]
+    /// Every held output (empty when nothing is aligning).
+    ///
+    /// Read once per routing-matrix frame (`routing::held_for_alignment`) to fill
+    /// `RoutingNode::held` — one lock take and a consistent answer for
+    /// the whole frame, where a per-output [`Self::is_reserved`] could see a release
+    /// land mid-build and emit a frame in which only some of the held rows say so.
     pub fn reserved(&self) -> BTreeSet<String> {
         self.inner.lock().unwrap().as_ref().map(|h| h.held.keys().cloned().collect()).unwrap_or_default()
     }
@@ -647,6 +649,12 @@ impl ExclusiveHold {
     /// once music can reach these speakers again), then the user's routing comes back,
     /// then the announcement queue is opened, then the registry entry goes. Nothing here
     /// can fail in a way that leaves the house half-restored — each step is a removal.
+    ///
+    /// The `changes` notification comes **last**, after the registry entry is gone: it is
+    /// what pushes the routing matrix, and the matrix reports the hold per output
+    /// (`RoutingNode::held`). Notifying before the close would push a
+    /// frame that still claims the hold — with nothing scheduled to correct it, so the
+    /// "held" badge would outlive the hold until something unrelated changed the graph.
     pub async fn release(&mut self) {
         if self.released {
             return;
@@ -654,9 +662,9 @@ impl ExclusiveHold {
         self.released = true;
         self.unmute_relay();
         self.groups.lock().await.clear_align_hold(self.id);
-        let _ = self.changes.send(());
         crate::announce::AnnounceCoordinator::global().release_reservation(self.id);
         registry().close(self.id);
+        let _ = self.changes.send(());
         tracing::info!("alignment hold {}: released; displaced routing restored", self.id);
     }
 

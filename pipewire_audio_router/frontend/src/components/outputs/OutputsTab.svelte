@@ -64,6 +64,15 @@
   );
   const hasLevelControl = (nodeName: string) => levelControl.has(nodeName);
 
+  // Outputs a speaker-timing measurement holds right now (`RoutingNode.held`), from
+  // the same live matrix as the levels above. That hold is *exclusive*: while it is up
+  // those speakers play nothing, and this page is where someone stands when they
+  // wonder why a room is quiet. Read off the pushed matrix rather than from the
+  // alignment API, so it appears — and vanishes — with the hold itself; the notice
+  // this replaced polled a session and could go on claiming a hold that had already
+  // been released.
+  const heldNow = $derived(new Set($routing.matrix.outputs.filter((o) => o.held).map((o) => o.node_name)));
+
   // Mute is mirrored into local state rather than read straight through, so the
   // toggle can be optimistic (the matrix confirms a frame later). `untrack` keeps
   // this effect from depending on its own writes.
@@ -240,6 +249,21 @@
         `Music on this output is playing at ${pct}% while a voice assistant in its room is talking. ` +
         'Held by the Home Assistant integration and released when the turn ends; if that holder goes ' +
         'away, the add-on un-ducks by itself when the lease expires.',
+    };
+  }
+
+  // "Held" badge: an alignment run has this output for the duration, and the hold is
+  // exclusive — so anything routed here is silent until it ends. The sentence names the
+  // cause and stops there: no link, no invitation, nothing about where the feature
+  // lives. Same register as "fault" and "not connected" — this row is reporting a
+  // state, not advertising a page.
+  function heldBadge(o: OutputInfo): { text: string; title: string } | null {
+    if (!heldNow.has(o.node_name)) return null;
+    return {
+      text: 'held',
+      title:
+        'A speaker-timing measurement has taken this output over. Nothing else plays on it until that finishes, ' +
+        'and whatever was routed here comes back afterwards.',
     };
   }
 
@@ -662,6 +686,14 @@
             {#if duckBadge(o)}
               {@const duck = duckBadge(o)!}
               <span class="badge duck" title={duck.title}>{duck.text}</span>
+            {/if}
+            <!-- Taken over by an alignment run: it sits between "ducked" and "fault"
+                 because it lasts a whole run rather than a voice turn, and amber
+                 (`caution`) because the output is not faulty — it just isn't carrying
+                 what you routed to it. -->
+            {#if heldBadge(o)}
+              {@const held = heldBadge(o)!}
+              <span class="badge caution" title={held.title}>{held.text}</span>
             {/if}
             <!-- A fault the daemon has diagnosed (see `last_error`). The badge is
                  only the marker — the sentence itself is printed below the header,

@@ -143,6 +143,19 @@ pub struct RoutingNode {
     /// only so far.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    /// Outputs only: an alignment run has taken this output over right now, so
+    /// **nothing routed to it is playing** (`align/group.rs`, plan §12.3 — the hold is
+    /// exclusive). Absent (rather than `false`) when nothing is aligning, like the two
+    /// fields above: this is the rare state, and an absent key is one less thing in
+    /// every ordinary frame.
+    ///
+    /// It rides the matrix rather than a status socket of its own because this is the
+    /// per-output state channel the UI already consumes, and because it must **clear**
+    /// the moment the hold does — a badge that outlives the hold is worse than no badge.
+    /// That is why [`ExclusiveHold::release`](crate::align::group::ExclusiveHold::release)
+    /// clears the registry entry *before* it notifies `changes`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    held: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -273,6 +286,11 @@ fn build_matrix(
     ap2_connected: &std::collections::HashSet<String>,
     lat: &LatencyConfig,
     xruns: &std::collections::HashMap<String, u32>,
+    // Outputs an alignment run holds exclusively right now ([`held_for_alignment`]) —
+    // one snapshot per frame rather than a registry question per output, so a hold that
+    // releases while the matrix is being built cannot produce a frame where half the
+    // rows claim it.
+    held: &std::collections::BTreeSet<String>,
 ) -> RoutingMatrix {
     use std::collections::BTreeSet;
 
@@ -383,6 +401,7 @@ fn build_matrix(
                 latency_ms: node_latency_ms(&name, lat),
                 xruns: xruns.get(&name).copied(),
                 last_error: crate::outputs::ap2::health::Ap2Health::global().get(&name),
+                held: held.contains(&name),
                 node_name: name,
                 peak: 0.0, // outputs aren't metered
             }
@@ -413,8 +432,10 @@ fn build_matrix(
                 muted: None,
                 latency_ms,
                 xruns: node_xruns,
-                // Outputs-only: a source has no receiver to refuse us.
+                // Outputs-only: a source has no receiver to refuse us, and an alignment
+                // hold takes speakers, never inputs.
                 last_error: None,
+                held: false,
             }
         })
         .collect();
@@ -428,6 +449,17 @@ fn build_matrix(
     links.sort();
 
     RoutingMatrix { sources, outputs, links }
+}
+
+/// The outputs an alignment run holds exclusively right now — what
+/// [`RoutingNode::held`] is built from.
+///
+/// The hold registry is the single source of truth (`align/group.rs`); this only names
+/// the seam, so a test can assert on the matrix's *input* where the hold is formed and
+/// released, and on the mapping from that input to the field where the matrix is built.
+/// Empty — and allocation-free — whenever nothing is aligning, which is almost always.
+pub(crate) fn held_for_alignment() -> std::collections::BTreeSet<String> {
+    crate::align::group::registry().reserved()
 }
 
 /// Snapshot the matrix from shared state (locks registry + routing intent).
@@ -500,6 +532,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         (lat, source_labels)
     };
     let xruns = state.xruns.lock_recover().clone();
+    let held = held_for_alignment();
     let reg = state.pw.lock_recover();
     build_matrix(
         &reg,
@@ -520,6 +553,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         &ap2_connected,
         &lat,
         &xruns,
+        &held,
     )
 }
 
@@ -1244,6 +1278,18 @@ mod tests {
         ap2_connected: &[&str],
         output_labels: &BTreeMap<String, String>,
     ) -> RoutingMatrix {
+        matrix_of_held(adopted, intent, ap2_connected, output_labels, &std::collections::BTreeSet::new())
+    }
+
+    /// As [`matrix_of`], with `held` naming the outputs an alignment run holds
+    /// exclusively (what `held_for_alignment()` returns in production).
+    fn matrix_of_held(
+        adopted: &[&str],
+        intent: &[RoutingLink],
+        ap2_connected: &[&str],
+        output_labels: &BTreeMap<String, String>,
+        held: &std::collections::BTreeSet<String>,
+    ) -> RoutingMatrix {
         let empty_names: std::collections::BTreeSet<String> = adopted.iter().map(|s| s.to_string()).collect();
         let ap2_connected: std::collections::HashSet<String> = ap2_connected.iter().map(|s| s.to_string()).collect();
         build_matrix(
@@ -1274,6 +1320,7 @@ mod tests {
                 pwsink_default_ms: 0,
             },
             &std::collections::HashMap::new(),
+            held,
         )
     }
 
@@ -1324,6 +1371,35 @@ mod tests {
         // No sender ever published a status for this target (pw_sink_liveness) — the
         // receiver-initiated handshake hasn't happened, so nothing is carried.
         assert_eq!(by_name("pwsink-dev-david_local").streaming, Some(false));
+    }
+
+    /// An alignment hold is exclusive (plan §12.3): the held speakers play nothing
+    /// while it runs, so each held row has to say so — and, more importantly, each
+    /// row that is *not* held must not. The field is a plain mirror of the hold
+    /// registry's snapshot, which is what makes "it clears on release" true by
+    /// construction: an empty snapshot cannot produce a held row.
+    #[test]
+    fn a_held_output_reports_it_and_the_others_do_not() {
+        let held: std::collections::BTreeSet<String> = ["ap2-dev-dusche".to_string()].into_iter().collect();
+        let adopted = ["ap2-dev-dusche", "sendspin-dev-kitchen"];
+        let intent = vec![link(AIRPLAY_NODE_NAME, "ap2-dev-dusche")];
+        let m = matrix_of_held(&adopted, &intent, &[], &BTreeMap::new(), &held);
+        let by_name = |m: &RoutingMatrix, n: &str| m.outputs.iter().find(|o| o.node_name == n).expect("output listed").held;
+        assert!(by_name(&m, "ap2-dev-dusche"), "a held speaker must say why it is silent");
+        assert!(!by_name(&m, "sendspin-dev-kitchen"), "an output nobody is aligning is untouched");
+        // The hold takes speakers, never inputs — a source is never held even when its
+        // name somehow appears in the set.
+        assert!(m.sources.iter().all(|s| !s.held));
+
+        // Released (the registry snapshot is empty again): no row claims a hold, and the
+        // key is gone from the frame entirely — the badge is driven by its presence, so a
+        // stale `held: false` would be indistinguishable but bigger.
+        let after = matrix_of_held(&adopted, &intent, &[], &BTreeMap::new(), &std::collections::BTreeSet::new());
+        assert!(after.outputs.iter().all(|o| !o.held), "the hold released, so nothing is held");
+        let json = serde_json::to_value(&after).unwrap();
+        assert!(json["outputs"][0].get("held").is_none(), "an unheld row carries no `held` key: {json}");
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["outputs"][0]["held"], true, "a held row does: {json}");
     }
 
     /// A source has no session to be up — `streaming` must stay absent rather than

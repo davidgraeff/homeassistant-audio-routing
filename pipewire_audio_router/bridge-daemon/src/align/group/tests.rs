@@ -213,6 +213,10 @@ async fn a_hold_takes_exclusivity_reports_violations_and_gives_everything_back()
     assert_eq!(hold.displaced(), displaced.as_slice());
     assert_eq!(hold.mode(), AlignMode::MultiPosition);
     assert!(registry().is_reserved(&a));
+    // ...and the routing matrix's input says so, so both speakers' rows can explain
+    // why they are silent (`RoutingNode::held`).
+    let held_now = crate::routing::held_for_alignment();
+    assert!(held_now.contains(&a) && held_now.contains(&b), "{held_now:?}");
 
     // 2. An ordinary announcement to a held speaker queues instead of playing.
     let announce = crate::announce::AnnounceCoordinator::global();
@@ -244,6 +248,12 @@ async fn a_hold_takes_exclusivity_reports_violations_and_gives_everything_back()
     hold.release().await;
     assert!(groups.lock().await.align_hold_outputs().is_empty(), "routing override cleared");
     assert!(!registry().is_reserved(&a) && registry().holder().is_none());
+    // The matrix input is clear too — the "held" badge on those rows is driven by this
+    // set, so a hold that released while the page was open must not keep claiming them
+    // (the notice this replaced had exactly that bug: it went on naming speakers the
+    // idle timeout had already given back).
+    let held_now = crate::routing::held_for_alignment();
+    assert!(!held_now.contains(&a) && !held_now.contains(&b), "{held_now:?}");
     hold.release().await; // no panic, no double-release
                           // With the reservation gone, an announcement to those speakers plays again.
     let adm = announce.announce(vec![b.clone()], vec![0u8; 8], 0.3, 0, OnBusy::Queue, false, None, Duration::from_secs(1));

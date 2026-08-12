@@ -70,6 +70,15 @@ export interface RoutingNode {
    * absent when nothing is known to be wrong. Turns "not connected" from a state
    * you have to guess about into one with a stated cause. AirPlay 2 only so far. */
   last_error?: string | null;
+  /** Outputs only: a speaker-timing measurement holds this output right now, so
+   * nothing routed to it is playing (the hold is exclusive). Absent — not `false` —
+   * when nothing is aligning, so a badge keyed on its presence needs no extra test.
+   *
+   * It arrives on the matrix rather than from the alignment API on purpose: this is
+   * the channel the daemon already pushes on every change, so the state appears and
+   * **disappears** with the hold. A page that polled the session for it once claimed
+   * a hold the idle timeout had already released. */
+  held?: boolean | null;
   /** Estimated buffering (ms) this node adds to the path — the configured
    * jitter/playout buffer, not a measured value. Sources: ingest jitter buffer
    * (RTP / AirPlay). Outputs: playout lead (sendspin group send-ahead + static
