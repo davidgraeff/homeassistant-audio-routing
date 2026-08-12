@@ -19,7 +19,7 @@
 use crate::receiver;
 use anyhow::anyhow;
 use pipewire as pw;
-use pw::spa::param::ParamType;
+use pw::spa::param::{ParamInfoFlags, ParamType};
 use pw::spa::pod::Pod;
 use pw_control::module::LoadedModule;
 use pw_control::pods;
@@ -368,12 +368,25 @@ impl State {
     }
 
     /// The sink that plays our audio.
+    ///
+    /// The first link out of the receive stream is **not** good enough: anything that
+    /// *monitors* the stream links to it too — a volume applet's level meter, a peak
+    /// meter, a recorder — and on a desktop with `pavucontrol` open that link is often
+    /// the first one there is. Taking it made the agent report `volume: None` (a meter
+    /// has no master level and is not even in `nodes`, so `master_props` found nothing)
+    /// and made every write fail with "sink N vanished" the moment the meter went away —
+    /// which reads, from the add-on, as a slider that does nothing (found live
+    /// 2026-08-12, §7.4).
+    ///
+    /// So the answer is the link whose input is a **tracked `Audio/Sink`**: the only
+    /// kind of node the master lever means anything for.
     fn target_sink(&self) -> Option<u32> {
         let stream = self.receive_stream()?;
         self.links
             .values()
-            .find(|(out, _)| *out == stream)
+            .filter(|(out, _)| *out == stream)
             .map(|(_, inp)| *inp)
+            .find(|inp| self.nodes.get(inp).map(|n| n.media_class.as_deref() == Some("Audio/Sink")).unwrap_or(false))
     }
 
     /// Master volume/mute of the target sink, read from whichever lever applies.
@@ -520,7 +533,14 @@ impl State {
         let state = self.master();
         if self.last_published.as_ref() != Some(&state) {
             self.last_published = Some(state.clone());
-            let _ = self.events.try_send(Event::Master(state));
+            // Logged because the failure this hides is invisible from both ends: the
+            // add-on shows a level, the host shows another, and nothing says which side
+            // stopped talking. A `try_send` that fails means the control plane is not
+            // draining and the two will now disagree indefinitely (§9.4).
+            tracing::debug!("publishing host state: {state:?}");
+            if self.events.try_send(Event::Master(state)).is_err() {
+                tracing::warn!("dropped a host-state update: the control plane is not draining it");
+            }
         }
         let sinks = self.sinks();
         if self.last_sinks.as_ref() != Some(&sinks) {
@@ -806,6 +826,11 @@ fn on_global(
                         let Some(props) = pod.and_then(pods::parse_props) else {
                             return;
                         };
+                        tracing::debug!(
+                            "node {id} Props: channelVolumes={:?} mute={:?}",
+                            props.channel_volumes,
+                            props.mute
+                        );
                         let mut st = state.borrow_mut();
                         if let Some(entry) = st.nodes.get_mut(&id) {
                             if !props.channel_volumes.is_empty() {
@@ -857,6 +882,40 @@ fn on_global(
             let id = global.id;
             let listener = device
                 .add_listener_local()
+                // **A device does not push its `Route` param; it only invalidates it.**
+                // `subscribe_params` delivers one `Route` per route at bind time and then
+                // nothing ever again — measured 2026-08-12 with a debug build: turning the
+                // volume knob produced node `Props` events and *no* device `Route` event,
+                // so the master level the agent reported froze at whatever it was when the
+                // agent started, and stayed frozen for hours. That is the whole "the tray
+                // and the add-on disagree and never converge" bug (§9.4 was never actually
+                // working), including the add-on's own writes appearing to revert.
+                //
+                // The signal is the `info` event's `params` list — a device bumps the
+                // param's flags/serial there when its value changes — so re-enumerate on
+                // every one. This is what WirePlumber does, and it is why `wpctl` sees
+                // changes we did not. Cheap: a device emits `info` only when something
+                // about it actually changed, and `enum_params` costs one round trip whose
+                // replies arrive as the same `param` events handled below.
+                .info({
+                    let state = state.clone();
+                    move |info| {
+                        let readable_route = info
+                            .params()
+                            .iter()
+                            .any(|p| p.id() == ParamType::Route && p.flags().contains(ParamInfoFlags::READ));
+                        if !readable_route {
+                            return;
+                        }
+                        // Read through the state's own handle: the proxy is owned by
+                        // `DeviceState`. An `info` that arrives before the insert below
+                        // finds nothing and needs nothing — `subscribe_params` delivers
+                        // the first value anyway.
+                        if let Some(dev) = state.borrow().devices.get(&id) {
+                            dev.proxy.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
+                        }
+                    }
+                })
                 .param({
                     let state = state.clone();
                     move |_seq, param_type, _index, _next, pod| {
@@ -864,11 +923,25 @@ fn on_global(
                             return;
                         }
                         let Some(entry) = pod.and_then(pods::parse_route) else {
+                            tracing::debug!("device {id} Route param that did not parse");
                             return;
                         };
+                        tracing::debug!(
+                            "device {id} Route: index={} device={} channelVolumes={:?} mute={:?}",
+                            entry.index,
+                            entry.device,
+                            entry.props.channel_volumes,
+                            entry.props.mute
+                        );
                         let mut st = state.borrow_mut();
                         if let Some(dev) = st.devices.get_mut(&id) {
-                            match dev.routes.iter_mut().find(|r| r.device == entry.device) {
+                            // Keyed by (index, device), not by `device` alone: one card
+                            // device can appear in more than one route (a headphone jack
+                            // and a line-out are separate route indices over the same
+                            // ALSA device), and collapsing them made two routes clobber
+                            // each other — so which value the agent held depended on
+                            // which param arrived last.
+                            match dev.routes.iter_mut().find(|r| r.index == entry.index && r.device == entry.device) {
                                 Some(existing) => *existing = entry,
                                 None => dev.routes.push(entry),
                             }

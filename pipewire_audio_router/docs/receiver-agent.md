@@ -190,11 +190,24 @@ multi-sink host they will. Follow the graph from the node the agent itself creat
 
 1. the receive stream node — identified by `rtp.session` (§7.1), not by name;
 2. the `Link` global whose `link.output.node` is that id;
-3. its `link.input.node` is the sink our audio actually lands in — authoritative
-   by construction, and it tracks the user moving our stream elsewhere.
+3. its `link.input.node`, **when that node is an `Audio/Sink`**, is the sink our audio
+   actually lands in — authoritative by construction, and it tracks the user moving our
+   stream elsewhere.
 
 Verified end to end on a live host (`pwsink-in` id 122 →
 `alsa_output.pci-…analog-stereo` id 90).
+
+The media-class condition in step 3 is not decoration. **Anything that *monitors* our
+stream links to it too** — a volume applet's level meter, a peak meter, a recorder — and
+on a desktop with `pavucontrol` open one of those is frequently the *first* link in the
+list. Taking the first one (which both the service path and the diagnostic `Graph` did)
+resolved the "sink" to a meter: it is not in the agent's node table, so `master_props`
+found no lever and the agent reported `volume: None`, and every write failed with
+`sink 209 vanished` the moment the meter closed. From the add-on that reads as a slider
+that does nothing — and it is why alignment resolved this host to
+`level_channel: none` and its level slider was inert (§7.4's sibling failure, found the
+same night). Reporting *no* sink when only a meter is attached is deliberate: the caller
+then says "un-levellable" instead of writing where no ear is.
 
 ### 6.1 Node `Props` is the wrong lever for a device sink
 
@@ -220,6 +233,29 @@ setting 0.250 made `wpctl get-volume @DEFAULT_AUDIO_SINK@` read 0.25, and
 restoring 0.370 read back 0.37. Node `Props` keeps exactly one job: **per-stream
 duck of foreign playback streams**, where it is the correct and appropriately
 invisible lever.
+
+### 6.2 A device does not *push* its `Route`; it only invalidates it
+
+`subscribe_params([Route])` on a Device delivers one `param` event per route **at bind
+time and never again**. Measured 2026-08-12 with a debug build of the agent: turning the
+host's volume knob produced node `Props` events every time and *zero* device `Route`
+events, so the master level the agent reported froze at whatever it happened to be when
+the agent started — for hours. A device signals a changed param through its **`info`
+event's `params` list** (flags/serial bumped) and expects the client to re-read; that is
+what WirePlumber does, and it is why `wpctl` saw changes the agent did not.
+
+So the Device listener now also handles `info`: when `Route` is listed as readable, it
+calls `enum_params(Route)`, whose replies arrive as the same `param` events. Route
+entries are also keyed by **(index, device)** rather than `device` alone — one card
+device can appear in more than one route (a headphone jack and a line-out over the same
+ALSA device), and collapsing them made two routes clobber each other, so which value the
+agent held depended on which param happened to arrive last.
+
+This is the bug behind *"the tray and the add-on show different volumes and never
+converge"*, in **both** directions: the add-on's own writes are echoed back from the
+route it just wrote, so with a frozen cache a write also looked like it reverted — the
+web UI showed the stale value again a frame later. §9.4 ("never fight the user") was
+never actually working until this; nothing had exercised a *local* change end to end.
 
 Cubic↔linear (`V³`, matching wpctl and HA's `volume_level`) is shared with the
 daemon through the **`pw-control`** crate (§12). It lives *outside*
@@ -555,10 +591,18 @@ separate decision (§13.3).
 
 ### 9.4 Never fight the user
 
-Volume changes made *locally* (pavucontrol, volume keys) are pushed as `state`
-events, so HA follows the host rather than overwriting it — the agent is not the
-owner of the value, just a controller of it. This is why §6.1 matters: an agent
-writing a lever the user's own UI cannot see would silently diverge from it.
+Volume changes made *locally* (pavucontrol, volume keys, the tray's own slider) are
+pushed as `state` events, so HA follows the host rather than overwriting it — the agent
+is not the owner of the value, just a controller of it. This is why §6.1 matters: an
+agent writing a lever the user's own UI cannot see would silently diverge from it.
+
+**This did not actually work until 2026-08-12**, and the two reasons are worth knowing
+because neither is visible from either end — the add-on shows one number, the host shows
+another, and nothing says which side stopped talking: a device only *invalidates* its
+`Route` param (§6.2), and the "sink" the agent followed could be a level meter (§6). Both
+are now fixed and both were proven live in both directions; the `publish` path also logs
+the state it sends, and warns when the control plane is too slow to drain it, so a
+recurrence says so in the journal instead of looking like a UI bug.
 
 ## 10. Packaging
 

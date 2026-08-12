@@ -215,11 +215,17 @@ impl Graph {
 
     /// The node our stream's output is linked into — the sink that actually plays
     /// it, and therefore the "master out" the agent controls.
+    ///
+    /// It has to be an `Audio/Sink`, not merely the first thing linked to us: a volume
+    /// applet's level meter, a peak meter or a recorder links to the stream as well, and
+    /// on a desktop with `pavucontrol` open one of those is often first. Answering with
+    /// a meter cost the service path its whole level report (see `pw_thread::target_sink`).
     pub fn linked_sink(&self, stream_id: u32) -> Option<u32> {
         self.links
             .iter()
-            .find(|(out, _)| *out == stream_id)
+            .filter(|(out, _)| *out == stream_id)
             .map(|(_, inp)| *inp)
+            .find(|inp| self.node(*inp).map(|n| n.media_class.as_deref() == Some("Audio/Sink")).unwrap_or(false))
     }
 
     pub fn node(&self, id: u32) -> Option<&NodeInfo> {
@@ -463,21 +469,53 @@ mod tests {
         }
     }
 
+    /// A playback sink, which is the only thing `linked_sink` may answer with.
+    fn sink(id: u32, name: &str) -> NodeInfo {
+        NodeInfo {
+            id,
+            name: name.into(),
+            media_class: Some("Audio/Sink".into()),
+            session: None,
+        }
+    }
+
     #[test]
     fn prefers_the_linked_twin_of_a_same_named_stream_pair() {
         // module-rtp-session publishes a send and a receive stream with the same
         // node.name; only the receive one is linked to a sink.
         let graph = Graph {
-            nodes: vec![
-                node(40, "pwsink-in", None),
-                node(41, "pwsink-in", None),
-                node(50, "alsa-sink", None),
-            ],
+            nodes: vec![node(40, "pwsink-in", None), node(41, "pwsink-in", None), sink(50, "alsa-sink")],
             links: vec![(41, 50)],
         };
         assert_eq!(graph.find_receive_stream("pwsink-in", None).unwrap().id, 41);
         assert_eq!(graph.linked_sink(41), Some(50));
         assert_eq!(graph.node(50).unwrap().name, "alsa-sink");
+    }
+
+    #[test]
+    fn a_level_meter_on_our_stream_is_not_the_sink() {
+        // What a desktop with `pavucontrol` (or any peak meter) open looks like: it links
+        // itself to our stream, often *before* the sink in link order. Answering with it
+        // left the agent reporting no level at all and every write failing on a node that
+        // had since vanished — the live 2026-08-12 sync failure.
+        let mut meter = node(60, "PulseAudio Volume Control", None);
+        meter.media_class = Some("Stream/Input/Audio".into());
+        let graph = Graph {
+            nodes: vec![node(41, "pwsink-in", None), meter, sink(50, "alsa-sink")],
+            links: vec![(41, 60), (41, 50)],
+        };
+        assert_eq!(graph.linked_sink(41), Some(50));
+    }
+
+    #[test]
+    fn a_stream_linked_only_to_a_meter_has_no_sink() {
+        // Better to report "no lever" than to drive a meter: the caller reports an
+        // un-levellable output (which alignment surfaces), instead of writing somewhere
+        // that changes nothing an ear can hear.
+        let mut meter = node(60, "peak-meter", None);
+        meter.media_class = Some("Stream/Input/Audio".into());
+        let graph = Graph { nodes: vec![node(41, "pwsink-in", None), meter], links: vec![(41, 60)] };
+        assert_eq!(graph.linked_sink(41), None);
     }
 
     #[test]
