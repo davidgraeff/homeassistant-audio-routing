@@ -1,15 +1,15 @@
 <script lang="ts">
   import { routing } from './lib/routing';
-  import ThemeToggle from './components/ThemeToggle.svelte';
-  import Toasts from './components/Toasts.svelte';
-  import ConfirmDialog from './components/ConfirmDialog.svelte';
-  import OutputsTab from './components/OutputsTab.svelte';
-  import AlignmentTab from './components/AlignmentTab.svelte';
-  import MusicGroupsTab from './components/MusicGroupsTab.svelte';
-  import AnnouncementsTab from './components/AnnouncementsTab.svelte';
-  import SourcesTab from './components/SourcesTab.svelte';
-  import SettingsTab from './components/SettingsTab.svelte';
-  import DiagnosticsTab from './components/DiagnosticsTab.svelte';
+  import ThemeToggle from './components/ui/ThemeToggle.svelte';
+  import Toasts from './components/ui/Toasts.svelte';
+  import ConfirmDialog from './components/ui/ConfirmDialog.svelte';
+  import OutputsTab from './components/outputs/OutputsTab.svelte';
+  import AlignmentTab from './components/align/AlignmentTab.svelte';
+  import MusicGroupsTab from './components/groups/MusicGroupsTab.svelte';
+  import AnnouncementsTab from './components/groups/AnnouncementsTab.svelte';
+  import SourcesTab from './components/sources/SourcesTab.svelte';
+  import SettingsTab from './components/system/SettingsTab.svelte';
+  import DiagnosticsTab from './components/system/DiagnosticsTab.svelte';
 
   // Music groups is the primary surface: who plays together, and what they play
   // (with the low-level routing graph on the same page). Announcements is the
