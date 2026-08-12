@@ -35,7 +35,7 @@
   // Audibility here is the user's own: `onHear` solos the speaker being stood at so its
   // level can be set. The daemon solos it again itself while taking the reading.
   import AlignSignalVerdict from './AlignSignalVerdict.svelte';
-  import { DEFAULT_MEASURE_LEVEL, align, levelControl, memberKindLabel } from '../../lib/align.svelte';
+  import { DEFAULT_MEASURE_LEVEL, align, memberKindLabel } from '../../lib/align.svelte';
   import {
     WALK_CLOSURE_WHY,
     WALK_FEWER_CHECKS,
@@ -168,6 +168,7 @@
       {#each walk.remaining as n (n)}
         {@const on = soloed === n}
         {@const kind = kindOf(n)}
+        {@const lvl = align.levelControlOf(n)}
         <li class:on>
           <div class="row">
             <button class="tap" class:on disabled={busy} onclick={() => tap(n)}>
@@ -175,10 +176,11 @@
             </button>
             <span class="name">{label(n)}</span>
             {#if kind}<span class="kind">{memberKindLabel(kind)}</span>{/if}
-            {#if kind && levelControl(kind) === 'receiver'}
-              <span class="note">level is set on the receiver</span>
-            {:else if kind && levelControl(kind) === 'none'}
-              <span class="note">no level or mute control from here</span>
+            <!-- Only where there is something to say, and only from the daemon's resolved
+                 answer — never from the kind, which is not what decides it (see
+                 `levelControl`). A working slider needs no label. -->
+            {#if lvl === 'none'}
+              <span class="note">no level control here</span>
             {/if}
             <span class="spacer"></span>
             <button
@@ -191,7 +193,12 @@
             </button>
           </div>
 
-          {#if kind && levelControl(kind) === 'session'}
+          <!-- Every member whose level the daemon can reach gets the slider, including the
+               ones whose level is borrowed from the device for the run (AP2 receivers, and
+               PipeWire hosts through their agent). Keying this off the *kind* denied the
+               slider to both — and near field is where the level matters most, because at
+               arm's length the danger is clipping. -->
+          {#if lvl === 'live' || lvl === 'borrowed'}
             <div class="knob" class:dim={!on}>
               <input
                 type="range"
@@ -205,6 +212,11 @@
               />
               <span class="pct">{align.levelOf(n)}%</span>
             </div>
+          {:else if on && lvl === 'none'}
+            <p class="hint caution">
+              This one's level can only be set on the machine that plays it — no receiver is answering for it, or its
+              sink has no volume control. Hold the phone a little further away if the check says it is clipping.
+            </p>
           {/if}
 
           {#if on}

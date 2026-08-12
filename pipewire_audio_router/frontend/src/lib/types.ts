@@ -355,11 +355,14 @@ export interface StatusInfo {
 
 /** What kind of speaker an alignment member is (`align::calibrate::MemberKind`).
  *
- *  `pwsink` — a remote PipeWire host — is not a third flavour of the same thing:
- *  it has **no level knob and no mute** in this path, so it can neither be tuned
- *  nor silenced while another speaker is soloed, and its delay knob has a hard
- *  floor (plan §7, §12.3.2). Every UI that offers a level control has to branch on
- *  this rather than assume "not sendspin ⇒ AirPlay 2". */
+ *  Useful for naming a member and for its **delay** knob — a sendspin device's knob is an
+ *  advance and has a different range, a pw-sink playout delay has a hard floor. It is
+ *  **not** what decides whether a member can be levelled or silenced: that is a per-output
+ *  capability the daemon resolves per position and publishes as
+ *  `AlignState.level_channels` (plan §7, §12.3.2). This doc used to claim pw-sink had
+ *  neither a level nor a mute; a host's agent supplies the level (W20) and the relay
+ *  supplies a universal mute (W17), so both halves were wrong and any UI branching on the
+ *  kind for those two questions is wrong with them. */
 export type AlignMemberKind = 'sendspin' | 'airplay2' | 'pwsink';
 
 export interface AlignMember {
@@ -462,7 +465,47 @@ export interface AlignState {
    *  daemon's watchdog is a poller. This is the size of the word "about": a UI must not
    *  count a user down to a precise second it does not have. */
   timeout_slack_s: number;
+  /** How each member's level is reached **at this position**, keyed by node name —
+   *  the daemon's own resolved answer (`align::calibrate::LevelChannel`).
+   *
+   *  Read this; never re-derive it from `AlignMember.kind`. It is a **per-output**
+   *  capability, not a property of the transport (plan §7, §12.3.2): a pw-sink host with
+   *  a live receiver agent is levellable and the same host without one is not, so two
+   *  members of one kind differ and one member's answer changes when its agent drops
+   *  mid-walk. A UI that guesses from the kind gets it wrong in both directions — it
+   *  hides a slider that works, and offers one that writes into nothing.
+   *
+   *  Absent (or a node not in the map) means **not resolved yet**: no session, or a member
+   *  that has not been through an audibility pass. That is "unknown", never "none". */
+  level_channels: Record<string, LevelChannel>;
+  /** Members with no level knob this daemon can reach — the `none` entries above, as a
+   *  list. They constrain the others' levels instead of being tuned. */
+  unlevellable: string[];
+  /** One sentence saying what that costs, written by the daemon so every consumer says
+   *  the same thing; null when every member has a level knob. The part users do not
+   *  guess: such a member sets the clip ceiling, so turning the *others* down cannot
+   *  rescue a measurement it is spoiling. */
+  level_note: string | null;
 }
+
+/** How one member's playback level is reached while the session runs — the daemon's
+ *  resolved per-output answer (`align::calibrate::LevelChannel`).
+ *
+ *  There is deliberately no `relay` variant as there is for the *mute*: the relay hook has
+ *  a mute and no gain, so `none` is a real outcome rather than a degraded one. The mute has
+ *  a universal fallback and therefore needs no reporting — every member can be silenced. */
+export type LevelChannel =
+  /** sendspin's live per-device level. */
+  | 'sendspin_live'
+  /** The AP2 receiver's own volume, imposed for the session's duration and given back at
+   *  teardown. */
+  | 'ap2_snapshot'
+  /** The host's sink level over its receiver agent — same borrow-and-restore shape as
+   *  `ap2_snapshot`, and only restorable because the host reports it. */
+  | 'out_of_band'
+  /** Nothing this daemon can reach: no agent answering, a sink with no volume lever, or a
+   *  future output kind. */
+  | 'none';
 
 /** Microphone-ingest status (`/api/align/mic`, align/mic.rs) — what the level
  *  meter and the capture pre-flight read. Counters cover the *current* capture;

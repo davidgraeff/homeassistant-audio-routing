@@ -35,14 +35,7 @@
   // each speaker, and the risk there inverts from too-quiet to clipping, so the level is
   // folded into each arrival on the walk page instead of being set from here.
   import AlignSignalVerdict from './AlignSignalVerdict.svelte';
-  import {
-    DEFAULT_MEASURE_LEVEL,
-    align,
-    isMeasured,
-    levelControl,
-    memberKindLabel,
-    type WizardMode,
-  } from '../../lib/align.svelte';
+  import { DEFAULT_MEASURE_LEVEL, align, isMeasured, memberKindLabel, type WizardMode } from '../../lib/align.svelte';
   import { askConfirm } from '../../lib/confirm.svelte';
   import { measure } from '../../lib/measure.svelte';
   import { mic } from '../../lib/mic.svelte';
@@ -271,13 +264,12 @@
         <span class="body">
           <span class="name">{label(o.node_name)}</span>
           <span class="kind">{memberKindLabel(o.kind)}</span>
-          {#if levelControl(o.kind) === 'receiver'}
-            <!-- Honest at the point of choosing, not discovered at the point of
-                 turning: this one's level is set on the device. -->
-            <span class="note">level is set on the receiver</span>
-          {:else if levelControl(o.kind) === 'none'}
-            <span class="note">no level or mute control from here</span>
-          {/if}
+          <!-- No level note while choosing. Whether a speaker's level can be set is a
+               *per-output* answer the daemon resolves once it holds the group (plan §7,
+               §12.3.2) — a note here could only be guessed from the kind, and guessing is
+               what previously told AirPlay 2 owners their slider was dead and PipeWire
+               hosts that they had no mute. The answer appears on the level rows below,
+               where it is true. -->
         </span>
       </label>
     {/each}
@@ -299,12 +291,18 @@
   {/if}
 
   {#if pwsinkChosen.length}
+    <!-- What is true *before* the group is held: a PipeWire host's level is reached through
+         its receiver agent, and whether that agent answers is not knowable from here. It
+         used to say the add-on had no level and no mute over these at all — wrong on both
+         counts since the agent gained a volume (W20) and the relay gained a universal mute
+         (W17). Silencing them is never in doubt; only the level is. -->
     <p class="hint caution">
       {pwsinkChosen.map((o) => label(o.node_name)).join(', ')}
-      {pwsinkChosen.length === 1 ? 'is a PipeWire host' : 'are PipeWire hosts'}: the add-on has no level or mute control
-      over {pwsinkChosen.length === 1 ? 'it' : 'them'}, so {pwsinkChosen.length === 1 ? 'it keeps' : 'they keep'} playing
-      the click while other speakers are being measured, and the others have to be audible over
-      {pwsinkChosen.length === 1 ? 'it' : 'them'}. Set the volume on that machine before starting.
+      {pwsinkChosen.length === 1 ? 'is a PipeWire host' : 'are PipeWire hosts'}: {pwsinkChosen.length === 1
+        ? 'its'
+        : 'their'} level lives on that machine and is set through its receiver, so it is borrowed for the run and given
+      back afterwards. If the receiver is not answering when the run starts, the level cannot be set and you will be told
+      which {pwsinkChosen.length === 1 ? 'speaker' : 'speakers'} — silencing works either way.
     </p>
   {/if}
 
@@ -383,6 +381,7 @@
     {#each members as m (m.node_name)}
       {@const on = soloed === m.node_name}
       {@const v = align.verdicts[m.node_name]}
+      {@const lvl = align.levelControlOf(m.node_name)}
       <li class:on>
         <div class="row">
           <button class="tap" class:on onclick={() => void tap(m.node_name)} disabled={align.busy}>
@@ -391,11 +390,12 @@
           <span class="name">{label(m.node_name)}</span>
           <span class="kind">{memberKindLabel(m.kind)}</span>
           <!-- The short form on every row; the full explanation only on the row being
-               worked on, so five speakers do not produce five paragraphs of amber. -->
-          {#if levelControl(m.kind) === 'receiver'}
-            <span class="note">level on the receiver</span>
-          {:else if levelControl(m.kind) === 'none'}
-            <span class="note">no level or mute here</span>
+               worked on, so five speakers do not produce five paragraphs of amber. And
+               only where there is something to say: a working slider needs no label, so
+               `live` and `borrowed` are silent here and only "nothing to turn" is called
+               out. -->
+          {#if lvl === 'none'}
+            <span class="note">no level control here</span>
           {/if}
           <span class="spacer"></span>
           <span class="verdict-pill {verdictClass(v)}" title="What the daemon last said about this speaker's level">
@@ -403,7 +403,12 @@
           </span>
         </div>
 
-        {#if levelControl(m.kind) === 'session'}
+        <!-- A slider wherever the daemon says the level is reachable — including the two
+             kinds that borrow it (an AP2 receiver's own volume, a PipeWire host's through
+             its agent), which the session imposes for the run and gives back at teardown.
+             This branch used to key off the member's *kind* and so hid a slider that works
+             from every AirPlay 2 and PipeWire member. -->
+        {#if lvl === 'live' || lvl === 'borrowed'}
           <div class="knob" class:dim={!on}>
             <input
               type="range"
@@ -417,20 +422,23 @@
             />
             <span class="pct">{align.levelOf(m.node_name)}%</span>
           </div>
-        {:else if on}
-          <!-- No slider where there is no knob: a disabled one reads as "broken", and
-               a working-looking one that changes nothing is worse than either. -->
+          {#if on && lvl === 'borrowed'}
+            <p class="hint">
+              This speaker's own volume is borrowed for the run and put back when you stop, so what you set here is not
+              its normal level.
+            </p>
+          {/if}
+        {:else if on && lvl === 'none'}
+          <!-- No slider where there is no knob: a disabled one reads as "broken", and a
+               working-looking one that changes nothing is worse than either. The daemon
+               says the same thing in `AlignState.level_note`, which is not quoted here
+               because it is written for an API caller — but the part that is easy to drop
+               is kept: a speaker nobody can turn down sets the ceiling for all of them. -->
           <p class="hint caution">
-            {#if levelControl(m.kind) === 'receiver'}
-              The level is the receiver's own. Alignment mutes and unmutes AirPlay 2 speakers but never sets their volume
-              — it only snapshots the mute, so a level written from here could not be put back afterwards. Set it on the
-              receiver (or with its volume control on the Outputs page); the verdict below still tells you whether it is
-              loud enough.
-            {:else}
-              No level control from here — this is a PipeWire host and its volume belongs to that machine. It also cannot
-              be muted from here, so it keeps playing the click while the others are measured: the others have to be
-              loud enough to be heard over it.
-            {/if}
+            Nothing here can set this one's level right now — no receiver is answering for it, or its sink has no volume
+            control at all — so its volume can only be changed on the machine that plays it. It is still silenced while
+            another speaker is soloed, but since it cannot be turned <em>down</em> it sets the ceiling for the others: if
+            it clips, turning everything else down cannot rescue the measurement.
           </p>
         {/if}
 

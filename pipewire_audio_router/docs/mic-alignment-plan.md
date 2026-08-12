@@ -1516,6 +1516,30 @@ treats `percent == null` as genuinely unknown rather than fabricating full scale
 agent-less host correctly shows no control instead of a slider that silently does
 nothing.
 
+**A fifth place, found by using the wizard (2026-08-12): the wizard itself.**
+`lib/align.svelte.ts` answered "can this member's level be set?" from a kind → answer
+table of its own — the same wrong assumption as the four above, in the one component
+that had the resolved answer sitting in the state it was already polling. Both of its
+interesting rows were stale, and in opposite directions:
+
+- **pw-sink read "no level and no mute at all"**, so a host whose agent was levelling
+  it perfectly well got an amber "no level or mute control from here" and *no slider*;
+  and the mute half was never true after W17, since the relay can silence anything.
+- **AirPlay 2 read "the level is the receiver's own, we never write it"**, which W18
+  changed — the session imposes a transient level and gives the receiver's own back at
+  teardown. So an AP2 member also had its slider withheld, with a paragraph explaining
+  a restriction that no longer existed.
+
+The fix is the one this section keeps arriving at: **consume the resolved channel,
+never the kind.** `AlignState.level_channels` is now in `types.ts`, the store exposes
+`levelChannel(node)`/`levelControlOf(node)`, and `levelControl` maps a channel to what
+the UI needs to say — `live` (sendspin), `borrowed` (AP2 or a host's agent: the slider
+works, the level is given back), `none`, and **`unresolved`**, which is what a member
+with no answer yet gets. That last one is why the speaker *picker* now says nothing
+about levels at all: before a hold exists there is no resolved answer, and the only
+thing a picker could do is guess from the kind, which is how this started. The mute is
+never mentioned anywhere any more, because there is nothing to warn about.
+
 Two loose ends, both outside the alignment cluster:
 
 - `align_group::ExclusiveHold::unlevellable`/`level_constraint` still derive their

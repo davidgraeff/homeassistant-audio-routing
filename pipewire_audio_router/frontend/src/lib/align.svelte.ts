@@ -20,6 +20,7 @@ import type {
   AlignMemberKind,
   AlignSessionMode,
   AlignState,
+  LevelChannel,
   MeasureMode,
   OutputInfo,
   SignalCheck,
@@ -46,26 +47,41 @@ export function memberKindLabel(kind: AlignMemberKind): string {
   return KIND_LABELS[kind] ?? kind;
 }
 
-/** Who owns a member's playback level during a session — i.e. whether the wizard's
- *  level slider can do anything at all for it.
+/** Whether the wizard's level slider can do anything for a member — **derived from the
+ *  daemon's resolved `LevelChannel`, never from the member's kind.**
  *
- *  Three different answers, checked against `calibrate::apply_audibility` rather than
- *  assumed, because a slider that silently does nothing is the worst of the three:
+ *  This used to be a kind → answer table, and both of its interesting rows went stale
+ *  without anything failing:
  *
- *  * `session` (sendspin) — the calibration level is pushed per device and restored on
- *    teardown. The slider is real.
- *  * `receiver` (AirPlay 2) — the session mutes and unmutes, but deliberately does
- *    **not** impose a volume: an AP2 receiver's level is device-authoritative, and the
- *    session snapshots only its mute, so a level written here could not be put back.
- *    So the level is set on the receiver, and this page's job is to *judge* it.
- *  * `none` (pw-sink) — no level and no in-band mute at all. It cannot be tuned or
- *    silenced from here, so it keeps playing through every other member's turn and
- *    constrains what their levels have to be (plan §7, §12.3.2). */
-export type LevelControl = 'session' | 'receiver' | 'none';
+ *  * **AirPlay 2 was "the receiver's own, we never write it"**, which stopped being true
+ *    when the session started driving AP2 volume for its duration (W18, plan §7's
+ *    decision table). It writes a *transient* level and gives the receiver's own back at
+ *    teardown, so the slider is real — it just borrows the level rather than owning it.
+ *  * **pw-sink was "no level and no mute at all"**, which was never quite true and is now
+ *    plainly wrong (W20): a pw-sink host's level is its receiver agent's, and the daemon
+ *    asks the agent per position rather than assuming. And the *mute* has a universal
+ *    fallback — `relay_delay` can silence anything, cooperation or not (W17) — so nothing
+ *    is ever un-mutable and no UI should say so.
+ *
+ *  The lesson the daemon already documents (`AlignState::level_channels`): this is a
+ *  per-output capability, so two members of one kind differ and one member's answer
+ *  changes when its agent drops mid-walk. Hence four answers, one of which is "not
+ *  resolved yet" rather than a guess:
+ *
+ *  * `live` — set here, applied as you drag, restored at teardown (sendspin).
+ *  * `borrowed` — set here for the run and put back afterwards (an AP2 receiver, or a
+ *    PipeWire host through its agent). The slider works; the level is not the user's
+ *    stored one.
+ *  * `none` — nothing this daemon can reach. Not tunable, still silenceable, and it sets
+ *    the clip ceiling every other member has to fit under (plan §7).
+ *  * `unresolved` — no session yet, or a member that has not been through an audibility
+ *    pass. Say nothing rather than guessing; the answer arrives with the hold. */
+export type LevelControl = 'live' | 'borrowed' | 'none' | 'unresolved';
 
-export function levelControl(kind: AlignMemberKind): LevelControl {
-  if (kind === 'sendspin') return 'session';
-  return kind === 'airplay2' ? 'receiver' : 'none';
+export function levelControl(channel: LevelChannel | undefined): LevelControl {
+  if (channel === undefined) return 'unresolved';
+  if (channel === 'sendspin_live') return 'live';
+  return channel === 'none' ? 'none' : 'borrowed';
 }
 
 /** Which way raising this kind's knob moves the speaker (plan §2.4.1).
@@ -537,6 +553,26 @@ function createAlign() {
       const own = levels[nodeName];
       if (own !== undefined) return own;
       return currentSolo() === nodeName ? (session?.volume ?? DEFAULT_MEASURE_LEVEL) : DEFAULT_MEASURE_LEVEL;
+    },
+    /** How this member's level is reached right now, as the daemon resolved it — or
+     *  `undefined` before there is an answer (no session, or a member no audibility pass
+     *  has covered yet).
+     *
+     *  The one place the UI learns whether a level slider is real. Deliberately not
+     *  answerable from `kindOf`: see `levelControl`. */
+    levelChannel(nodeName: string): LevelChannel | undefined {
+      return session?.level_channels?.[nodeName];
+    },
+    /** The same answer as the wizard's three-way question. */
+    levelControlOf(nodeName: string): LevelControl {
+      return levelControl(session?.level_channels?.[nodeName]);
+    },
+    /** Held members with no level knob at all — the `none` channels above, as the daemon
+     *  lists them. Its `level_note` beside them is deliberately *not* surfaced: it is
+     *  written for an API caller (it quotes node labels and cites the plan), so the pages
+     *  say the same thing in their own words. */
+    get unlevellable(): string[] {
+      return session?.unlevellable ?? [];
     },
     /** The kind of a selected output, for the knobs it does and does not have. */
     kindOf(nodeName: string): AlignMemberKind | null {
