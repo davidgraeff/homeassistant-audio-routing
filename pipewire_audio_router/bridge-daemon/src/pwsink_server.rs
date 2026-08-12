@@ -239,12 +239,8 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
                     }
                 }
                 if dropped.iter().any(|&n| n > 0) && last_drop_log.elapsed() >= std::time::Duration::from_secs(5) {
-                    let detail: Vec<String> = feeds
-                        .iter()
-                        .zip(dropped.iter())
-                        .filter(|(_, &n)| n > 0)
-                        .map(|((name, _), n)| format!("{name}: {n}"))
-                        .collect();
+                    let detail: Vec<String> =
+                        feeds.iter().zip(dropped.iter()).filter(|(_, &n)| n > 0).map(|((name, _), n)| format!("{name}: {n}")).collect();
                     tracing::warn!(
                         "pw-sink relay: audio DISCARDED because a target's feed was full — {}. \
                          That sender thread is not draining (host CPU starvation, or its session is wedged), \

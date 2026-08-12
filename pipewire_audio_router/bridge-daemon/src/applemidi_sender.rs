@@ -131,8 +131,7 @@ impl BacklogLimits {
     /// one wakeup is still caught up over the next few instead of being dropped.
     fn for_playout(playout_ms: u16) -> Self {
         let burst_ms = i64::from(playout_ms) * 2 / 3;
-        let burst_packets =
-            ((burst_ms / i64::from(PACKET_MS)) as usize).clamp(MIN_BURST_PACKETS, MAX_BURST_PACKETS);
+        let burst_packets = ((burst_ms / i64::from(PACKET_MS)) as usize).clamp(MIN_BURST_PACKETS, MAX_BURST_PACKETS);
         let burst_ms = (burst_packets as i64) * i64::from(PACKET_MS);
         Self { burst_packets, max_backlog_ms: (burst_ms * 3).max(TARGET_BACKLOG_MS * 2) }
     }
@@ -912,7 +911,7 @@ mod tests {
             control_port: 5004,
             ifname: None,
             format,
-            playout_ms: 100, // the module's own default, as a real target would run
+            playout_ms: 100,        // the module's own default, as a real target would run
             advertise_daemon: None, // standalone: create our own mDNS daemon.
         };
 
