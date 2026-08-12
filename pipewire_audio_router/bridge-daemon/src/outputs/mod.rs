@@ -4,8 +4,9 @@
 //! A backend exists because its receiver cannot take a PipeWire stream: it needs
 //! a capture off the group's anchor monitor, an encoder, and per-device writers.
 //! [`sendspin`] does that for ESPHome speakers and [`ap2`] for AirPlay-2
-//! receivers. `pwsink` is the exception that proves the rule — a remote PipeWire
-//! host speaks our transport natively — and lands here in the next sub-commit.
+//! receivers, which also owns the host-global PTP grandmaster its timing needs.
+//! `pwsink` is the exception that proves the rule — a remote PipeWire host speaks
+//! our transport natively — and lands here in the next sub-commit.
 //!
 //! [`overlay_mixer`] is what every backend shares: while an announcement is
 //! active on one output, that device's frame becomes duck(music)+overlay while its
@@ -17,5 +18,6 @@
 //! and calibration mute, so it lives with the code that gives it meaning — the
 //! hook is in the relays, the reason is not (see `align/mod.rs`).
 
+pub(crate) mod ap2;
 pub(crate) mod overlay_mixer;
 pub(crate) mod sendspin;

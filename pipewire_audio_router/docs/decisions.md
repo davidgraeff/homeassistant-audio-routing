@@ -654,7 +654,7 @@ that stops announcing over mDNS but still answers on the wire stays loaded
 when it re-announced). The vendored sendspin server
 also binds with `SO_REUSEADDR` so a group recreated on the same port can't
 lose the port-rebind race. (AP2 receivers get the analogous treatment via
-`ap2_liveness.rs` — a periodic TCP probe of the RTSP port.)
+`outputs/ap2/liveness.rs` — a periodic TCP probe of the RTSP port.)
 
 ## Runtime image trimming: `systemd-standalone-sysusers`, not full `systemd`
 

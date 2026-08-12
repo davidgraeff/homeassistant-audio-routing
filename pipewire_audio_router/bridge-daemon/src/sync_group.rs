@@ -13,7 +13,7 @@
 //! - a filtered sendspin server (sendspin_server) captures **from** the anchor
 //!   and dials exactly the group's sendspin devices, pushing one timestamped
 //!   stream so they sync (see sendspin's `Group`);
-//! - the group's AP2 receivers are driven by in-process senders (ap2_server.rs)
+//! - the group's AP2 receivers are driven by in-process senders (outputs/ap2/server.rs)
 //!   that capture from the same anchor and stream realtime ALAC with libairptp
 //!   PTP timing, so they share the same timeline.
 //!
@@ -178,9 +178,9 @@ struct RunningGroup {
     /// the graceful `stream/end` runs on the reconcile task like every other
     /// teardown.
     force_device_reconnect: BTreeSet<String>,
-    /// Live AP2 senders (ap2_server.rs) for this group; drop = TEARDOWN each
+    /// Live AP2 senders (outputs/ap2/server.rs) for this group; drop = TEARDOWN each
     /// receiver session. `None` when the group has no present AP2 receivers.
-    ap2_sender: Option<crate::ap2_server::Ap2ServerHandle>,
+    ap2_sender: Option<crate::outputs::ap2::server::Ap2ServerHandle>,
     /// AP2 receiver node names the running senders were started for — the restart
     /// identity. NOTE: render delay is deliberately NOT part of this: a delay change
     /// is applied LIVE (ap2_control → SetRenderDelay), never by a reconnect (that
@@ -258,7 +258,7 @@ struct AnnounceSession {
 /// The per-backend sender behind an [`AnnounceSession`].
 enum AnnounceSessionTransport {
     /// AirPlay-2: drop = TEARDOWN the receiver's RTSP session.
-    Ap2(crate::ap2_server::Ap2ServerHandle),
+    Ap2(crate::outputs::ap2::server::Ap2ServerHandle),
     /// pw-sink: drop = `BY` + withdraw the mDNS advert (the handle is held only for
     /// that, never read — hence the underscore). `control_port` is tracked so port
     /// allocation across groups and sessions never collides.
@@ -346,9 +346,9 @@ pub struct AnnounceDeps<'a> {
     /// same way `reconcile` does, so a *discovered* device's leftover intent
     /// doesn't look like a group that owns its session.
     pub outputs: &'a crate::store::outputs::SharedOutputs,
-    pub ap2_devices: &'a crate::ap2_discovery::SharedAp2Devices,
-    pub ap2_ptp: &'a crate::ap2_ptp::SharedAp2Ptp,
-    pub ap2_control: &'a crate::ap2_volume::SharedAp2Control,
+    pub ap2_devices: &'a crate::outputs::ap2::discovery::SharedAp2Devices,
+    pub ap2_ptp: &'a crate::outputs::ap2::ptp::SharedAp2Ptp,
+    pub ap2_control: &'a crate::outputs::ap2::volume::SharedAp2Control,
     pub sync_settings: &'a crate::sync_settings::SharedSyncSettings,
     /// Receiver-host registry, for the pw-sink on-demand path: an announcement can
     /// only be opened to a host whose agent is connected to take the session.
@@ -691,7 +691,7 @@ impl GroupReconciler {
         // now, which would then play back at the wrong pitch on a 44.1 kHz receiver.
         OverlayMixer::global().set_output_rate(output, rate);
 
-        let server = match crate::ap2_server::start(
+        let server = match crate::outputs::ap2::server::start(
             vec![(output.to_string(), addr.ip(), delay)],
             sink_node_id,
             clock_id,
@@ -706,7 +706,7 @@ impl GroupReconciler {
             }
         };
 
-        let render_delay_ms = u64::from(delay.unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16));
+        let render_delay_ms = u64::from(delay.unwrap_or(crate::outputs::ap2::server::AP2_RENDER_DELAY_MS as u16));
         let linger = ANNOUNCE_LINGER.max(Duration::from_millis(render_delay_ms) + ANNOUNCE_TAIL);
         tracing::info!(
             "on-demand AP2 announce session for '{output}' ({}) opening @ {rate} Hz (sink '{sink_node_name}', lease {}s)",
@@ -871,7 +871,7 @@ impl GroupReconciler {
     /// Called explicitly from main.rs's shutdown path, like `shutdown_pwsink`,
     /// because the reconcile task's own `Drop` isn't guaranteed to run on exit.
     pub async fn shutdown_ap2(&mut self) {
-        let mut handles: Vec<crate::ap2_server::Ap2ServerHandle> = Vec::new();
+        let mut handles: Vec<crate::outputs::ap2::server::Ap2ServerHandle> = Vec::new();
         for g in self.running.values_mut() {
             if let Some(h) = g.ap2_sender.take() {
                 handles.push(h);
@@ -1000,7 +1000,7 @@ fn source_key(sources: &BTreeSet<&str>) -> String {
 fn compute_desired(
     intent: &[RoutingLink],
     devices: &BTreeMap<String, SendspinDevice>,
-    ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
+    ap2_devices: &BTreeMap<String, crate::outputs::ap2::discovery::Ap2Device>,
     ap2_latencies: &BTreeMap<String, u16>,
     pwsink_hosts: &PwsinkHosts,
 ) -> BTreeMap<String, DesiredGroup> {
@@ -1109,10 +1109,10 @@ impl GroupReconciler {
         devices: &SharedSendspinDevices,
         control: &crate::outputs::sendspin::volume::SharedSendspinControl,
         send_ahead_us: i64,
-        ap2_devices: &crate::ap2_discovery::SharedAp2Devices,
-        ap2_ptp: &crate::ap2_ptp::SharedAp2Ptp,
+        ap2_devices: &crate::outputs::ap2::discovery::SharedAp2Devices,
+        ap2_ptp: &crate::outputs::ap2::ptp::SharedAp2Ptp,
         sync_settings: &crate::sync_settings::SharedSyncSettings,
-        ap2_control: &crate::ap2_volume::SharedAp2Control,
+        ap2_control: &crate::outputs::ap2::volume::SharedAp2Control,
         pwsink_hosts: &PwsinkHosts,
     ) {
         // Re-earned every pass: whatever failed last time either succeeds now or
@@ -1581,7 +1581,7 @@ impl GroupReconciler {
                     // Receivers are already PTP peers of the host-global grandmaster
                     // (registered at discovery); ensure it's up and get its clock id.
                     match ap2_ptp.ensure_started() {
-                        Ok(clock_id) => match crate::ap2_server::start(
+                        Ok(clock_id) => match crate::outputs::ap2::server::start(
                             d.ap2_members.clone(),
                             anchor_id,
                             clock_id,
@@ -1951,9 +1951,9 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let ap2: BTreeMap<String, crate::ap2_discovery::Ap2Device> = [(
+        let ap2: BTreeMap<String, crate::outputs::ap2::discovery::Ap2Device> = [(
             "ap2-dev-dusche".to_string(),
-            crate::ap2_discovery::Ap2Device {
+            crate::outputs::ap2::discovery::Ap2Device {
                 fullname: "Dusche._airplay._tcp.local.".into(),
                 display_name: "Dusche".into(),
                 model: None,

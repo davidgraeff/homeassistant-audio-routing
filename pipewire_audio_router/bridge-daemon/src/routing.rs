@@ -230,7 +230,7 @@ fn channel_suffix(port_name: &str) -> &str {
 fn build_matrix(
     reg: &RegistryState,
     devices: &BTreeMap<String, SendspinDevice>,
-    ap2_devices: &BTreeMap<String, crate::ap2_discovery::Ap2Device>,
+    ap2_devices: &BTreeMap<String, crate::outputs::ap2::discovery::Ap2Device>,
     // Connected receiver hosts (`node_name → label`, pwsink_agent.rs). The same
     // source `sync_group` builds its pw-sink members from, so this page and the audio
     // path cannot disagree about whether a host is there — they used to, because this
@@ -369,7 +369,7 @@ fn build_matrix(
                 },
                 latency_ms: node_latency_ms(&name, lat),
                 xruns: xruns.get(&name).copied(),
-                last_error: crate::ap2_health::Ap2Health::global().get(&name),
+                last_error: crate::outputs::ap2::health::Ap2Health::global().get(&name),
                 node_name: name,
                 peak: 0.0, // outputs aren't metered
             }
@@ -480,7 +480,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
             group_lead_ms: sync.group_lead_ms(),
             sendspin_delays: sync.sendspin_delays(),
             ap2_delays: sync.ap2_latencies(),
-            ap2_default_ms: crate::ap2_server::AP2_RENDER_DELAY_MS,
+            ap2_default_ms: crate::outputs::ap2::server::AP2_RENDER_DELAY_MS,
             pwsink_jitters: sync.pwsink_jitters(),
             pwsink_default_ms: u32::from(crate::sync_settings::DEFAULT_PWSINK_JITTER_MS),
         };

@@ -2,7 +2,7 @@
 //! targets + Bluetooth→RTP bridges).
 //!
 //! A **single** shared `ServiceDaemon` lives here behind a shared mutex and both
-//! browsers (outputs/sendspin/discovery.rs + ap2_discovery.rs) run their `browse()` on
+//! browsers (outputs/sendspin/discovery.rs + outputs/ap2/discovery.rs) run their `browse()` on
 //! it — one `mDNS_daemon` OS thread for the whole daemon instead of one per
 //! service type. `start()` builds the daemon (restricted to the LAN interface —
 //! see `lan_restricted_daemon`) and spawns the two worker threads; `stop()`
@@ -15,8 +15,9 @@
 //! left to age out through its normal path (sendspin/AP2 via liveness) so a
 //! toggle never tears down live groups.
 
-use crate::ap2_discovery::{self, SharedAp2Devices};
-use crate::ap2_ptp::SharedAp2Ptp;
+use crate::outputs::ap2;
+use crate::outputs::ap2::discovery::SharedAp2Devices;
+use crate::outputs::ap2::ptp::SharedAp2Ptp;
 use crate::outputs::sendspin;
 use crate::outputs::sendspin::discovery::SharedSendspinDevices;
 use crate::pw::thread::ChangeNotifier;
@@ -115,7 +116,7 @@ struct Inner {
     running: Option<ServiceDaemon>,
     // Inputs kept so discovery can be (re)spawned on demand.
     devices: SharedSendspinDevices,
-    /// Discovered AirPlay-2 receivers (ap2_discovery.rs).
+    /// Discovered AirPlay-2 receivers (outputs/ap2/discovery.rs).
     ap2_devices: SharedAp2Devices,
     /// Host-global AP2 PTP grandmaster — discovery registers each receiver as a peer.
     ap2_ptp: SharedAp2Ptp,
@@ -159,7 +160,7 @@ impl DiscoverySupervisor {
         // its OS thread (the run loop only exits on an explicit shutdown).
         let spawned = (|| -> anyhow::Result<()> {
             sendspin::discovery::spawn(&daemon, inner.devices.clone(), inner.changes.clone())?;
-            ap2_discovery::spawn(&daemon, inner.ap2_devices.clone(), inner.changes.clone(), inner.ap2_ptp.clone())?;
+            ap2::discovery::spawn(&daemon, inner.ap2_devices.clone(), inner.changes.clone(), inner.ap2_ptp.clone())?;
             crate::pw_target_discovery::spawn(&daemon, inner.pw_targets.clone(), inner.changes.clone())?;
             crate::sources::bt_bridge::spawn(&daemon, inner.bt_bridges.clone(), inner.changes.clone())?;
             Ok(())

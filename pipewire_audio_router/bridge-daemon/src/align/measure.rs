@@ -435,7 +435,9 @@ pub struct Knob {
 pub fn knob_of(kind: MemberKind) -> Knob {
     match kind {
         MemberKind::Sendspin => Knob { polarity: KnobPolarity::Advance, min_ms: 0, max_ms: SENDSPIN_ADVANCE_MAX_MS },
-        MemberKind::Airplay2 => Knob { polarity: KnobPolarity::Delay, min_ms: 0, max_ms: crate::ap2_server::AP2_RENDER_DELAY_MAX_MS },
+        MemberKind::Airplay2 => {
+            Knob { polarity: KnobPolarity::Delay, min_ms: 0, max_ms: crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS }
+        }
         // The floor is the whole reason pw-sink is modelled separately from AP2:
         // three packet times of playout buffer is the least the receiving module
         // will accept (`sync_settings::PWSINK_JITTER_MIN_MS`).
@@ -10082,7 +10084,7 @@ mod tests {
         // An AP2 member already at its ceiling: the step goes the other way, and the
         // comparison normalises the sign back (see `equiv_compare`).
         let members = equiv_members(&[("ap2-dev-x", MemberKind::Airplay2)]);
-        let max = crate::ap2_server::AP2_RENDER_DELAY_MAX_MS;
+        let max = crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS;
         let current: HashMap<String, u16> = [("ap2-dev-x".to_string(), max)].into_iter().collect();
         let p = plan_equivalence(&members, &current, &SendAheadContext::default(), None).expect("a plan");
         assert_eq!((p.from_ms, p.to_ms, p.delta_ms), (max, max - EQUIV_STEP_MS, -i32::from(EQUIV_STEP_MS)));

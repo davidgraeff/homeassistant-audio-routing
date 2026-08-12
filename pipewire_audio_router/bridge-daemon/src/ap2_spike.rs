@@ -38,8 +38,8 @@ use airplay_core::codec::{AudioFormat, SampleRate};
 use airplay_core::stream::{PtpMode, StreamConfig, TimingProtocol};
 use tokio::sync::oneshot;
 
-use crate::ap2_ptp::SharedAp2Ptp;
-use crate::ap2_server::{build_device, ALAC_MAGIC_COOKIE};
+use crate::outputs::ap2::ptp::SharedAp2Ptp;
+use crate::outputs::ap2::server::{build_device, ALAC_MAGIC_COOKIE};
 
 /// ALAC magic cookie (ASC) for a given sample rate: the base cookie with its last
 /// 4 bytes (the sample rate, big-endian) rewritten. `ALAC_MAGIC_COOKIE` encodes

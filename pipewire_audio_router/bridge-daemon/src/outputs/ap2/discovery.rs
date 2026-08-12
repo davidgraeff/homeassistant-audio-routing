@@ -8,12 +8,12 @@
 //! anchor + a per-device AP2 RTP sender per co-routed receiver — is built later
 //! by the grouping reconciler (Phase 3); here we only populate the registry and
 //! register each receiver as a PTP peer of the host-global grandmaster
-//! (`ap2_ptp::Ap2PtpService`) so libairptp starts driving its clock.
+//! (`outputs::ap2::ptp::Ap2PtpService`) so libairptp starts driving its clock.
 //!
 //! This is the replacement for RAOP output discovery (discovery.rs): all target
 //! receivers are AirPlay-2-capable.
 
-use crate::ap2_ptp::SharedAp2Ptp;
+use crate::outputs::ap2::ptp::SharedAp2Ptp;
 use crate::pw::thread::ChangeNotifier;
 use crate::util::locks::LockRecover;
 use crate::util::node_names::{slugify, AP2_DEV_PREFIX};
@@ -169,7 +169,7 @@ mod tests {
 
         let devices: SharedAp2Devices = Arc::new(Mutex::new(BTreeMap::new()));
         let (changes, _rx) = tokio::sync::broadcast::channel::<()>(16);
-        let ptp = crate::ap2_ptp::Ap2PtpService::new();
+        let ptp = crate::outputs::ap2::ptp::Ap2PtpService::new();
 
         let daemon = ServiceDaemon::new().expect("mdns daemon");
         spawn(&daemon, devices.clone(), changes, ptp.clone()).expect("spawn ap2 discovery");

@@ -14,7 +14,7 @@
 //! long-lived, not one bounded task) and forwards each captured buffer's bytes
 //! through a **bounded** `tokio::sync::mpsc` channel (non-blocking `try_send`,
 //! drop-on-full, safe to call from any thread, no runtime needed) to whatever
-//! consumer wants the PCM (outputs/sendspin/server.rs / ap2_server.rs). Buffers are
+//! consumer wants the PCM (outputs/sendspin/server.rs / outputs/ap2/server.rs). Buffers are
 //! drawn from a small pool ([`PooledBuf`]) and recycled, so the RT capture
 //! callback does no heap allocation in steady state, and the bounded channel
 //! caps memory/latency if a consumer ever falls behind.

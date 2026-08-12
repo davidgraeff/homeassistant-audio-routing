@@ -111,7 +111,7 @@ outputs:
 | `kind` | What it is | Discovery |
 |---|---|---|
 | `sendspin` | ESPHome sendspin speakers (e.g. HA Voice PE) | mDNS (`outputs/sendspin/discovery.rs`) |
-| `airplay2` | native AirPlay-2 receivers | mDNS (`ap2_discovery.rs`) |
+| `airplay2` | native AirPlay-2 receivers | mDNS (`outputs/ap2/discovery.rs`) |
 | `pwsink` | remote PipeWire hosts | a `pwrouter-agent` on that host dials in (`pwsink_agent.rs`) — not a browse |
 
 Discovery only **offers** a device, though: mDNS on a home network also finds the

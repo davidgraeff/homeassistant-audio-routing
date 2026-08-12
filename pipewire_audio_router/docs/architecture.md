@@ -205,7 +205,7 @@ The AP2 backend replaces the old RAOP/AirPlay-1 output. It is an
 **in-process Rust AP2 sender** — vendored `lmcgartland/airplay2-rs`
 (pairing / SETUP / RTP / streaming) driven by a **host-global PTP
 grandmaster** from OwnTone's MIT `libairptp` via FFI. Devices are
-discovered over `_airplay._tcp` (`ap2_discovery.rs`) and surfaced as
+discovered over `_airplay._tcp` (`outputs/ap2/discovery.rs`) and surfaced as
 `ap2-dev-<slug>`. Per receiver, off the same anchor monitor:
 
 - **`ap2-relay`** [SCHED_FIFO 40]: capture-forward loop. Each sender's feed
@@ -230,7 +230,7 @@ discovered over `_airplay._tcp` (`ap2_discovery.rs`) and surfaced as
 
 **Restart identity + reliability.** The AP2 senders for a group are torn
 down and rebuilt only when the **receiver set** or the **wire rate** (§8)
-changes — never for a render-delay edit. `ap2_liveness.rs` TCP-probes each
+changes — never for a render-delay edit. `outputs/ap2/liveness.rs` TCP-probes each
 receiver's RTSP port (3 failed ticks ⇒ demote; 5 min ⇒ remove + release its
 PTP peer); the reconcile loop coalesces change bursts behind a 400 ms quiet
 window; and `connect_one` retries once after ~1.5 s on a pairing failure
@@ -439,7 +439,7 @@ mistake:
 | Concern | Owner | Notes |
 |---|---|---|
 | **RTP sample timestamp** (`ts`; who-plays-which-sample) | `SharedTimeline` (target) / per-sender RTP counter (current impl) | Stamped once per chunk so every per-device sender in a group emits identical `ts` = sample-coincident. |
-| **Network / PTP clock** (shared wall clock devices slave to) | **`libairptp`, host-global** (`ap2_ptp.rs`) | Binds 319/320 **once**; every AP2 receiver across all groups is a peer of the one grandmaster. PT=87 anchors are stamped from **`CLOCK_MONOTONIC`** (via `airptp_ffi::monotonic_ns()`) — *not* `CLOCK_MONOTONIC_RAW`, not epoch. |
+| **Network / PTP clock** (shared wall clock devices slave to) | **`libairptp`, host-global** (`outputs/ap2/ptp.rs`) | Binds 319/320 **once**; every AP2 receiver across all groups is a peer of the one grandmaster. PT=87 anchors are stamped from **`CLOCK_MONOTONIC`** (via `airptp_ffi::monotonic_ns()`) — *not* `CLOCK_MONOTONIC_RAW`, not epoch. |
 
 **PTP is host-global; RTP/grouping is per-group.** One `Ap2PtpService`
 for the whole daemon; which audio a receiver plays is decided by which

@@ -17,10 +17,10 @@
 //!   that's consistently early/late relative to the rest of its group. Applied
 //!   in-band by the sendspin server on (re)connect (outputs/sendspin/volume.rs).
 //! - **`ap2_latency`** — the AirPlay-2 per-output render delay in ms (the PT=87
-//!   anchor shift; ap2_server.rs), keyed by AP2 node name. It's retuned LIVE on
+//!   anchor shift; outputs/ap2/server.rs), keyed by AP2 node name. It's retuned LIVE on
 //!   the running stream (ap2_control → SetRenderDelay), and used as the initial
 //!   delay on the next (membership/rate) reconnect. `None` = the sender's
-//!   built-in default ([`crate::ap2_server::AP2_RENDER_DELAY_MS`], 0 ms).
+//!   built-in default ([`crate::outputs::ap2::server::AP2_RENDER_DELAY_MS`], 0 ms).
 //! - **`pwsink_jitter`** — the pw-sink per-output playout delay in ms, keyed by
 //!   `pwsink-dev-*` node name. It is the receiver's jitter buffer
 //!   (`sess.latency.msec` on the remote `module-rtp-session`), pushed to that
@@ -78,7 +78,7 @@ pub fn default_opus_floor_ms() -> u32 {
 pub const DEFAULT_PWSINK_JITTER_MS: u16 = 100;
 
 /// Largest pw-sink playout delay the API accepts, matching the AP2 render-delay
-/// ceiling ([`crate::ap2_server::AP2_RENDER_DELAY_MAX_MS`]) so the two knobs span
+/// ceiling ([`crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS`]) so the two knobs span
 /// the same range and a group can be aligned across both kinds.
 pub const PWSINK_JITTER_MAX_MS: u16 = 2000;
 

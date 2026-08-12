@@ -1,8 +1,8 @@
 //! REST API: health check, live PipeWire registry state, and manual link
 //! creation
 
-use crate::ap2_discovery::SharedAp2Devices;
-use crate::ap2_ptp::SharedAp2Ptp;
+use crate::outputs::ap2::discovery::SharedAp2Devices;
+use crate::outputs::ap2::ptp::SharedAp2Ptp;
 use crate::outputs::sendspin::discovery::SharedSendspinDevices;
 use crate::pw::thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
@@ -73,7 +73,7 @@ pub struct AppState {
     /// Live mDNS-discovered sendspin devices (outputs/sendspin/discovery.rs), surfaced
     /// as virtual routing outputs.
     pub sendspin_devices: SharedSendspinDevices,
-    /// Live mDNS-discovered AirPlay-2 receivers (ap2_discovery.rs), surfaced as
+    /// Live mDNS-discovered AirPlay-2 receivers (outputs/ap2/discovery.rs), surfaced as
     /// virtual routing outputs (`ap2-dev-*`). The RAOP-output replacement.
     pub ap2_devices: SharedAp2Devices,
     /// Paired receiver agents (pwsink_agent.rs) — the source of truth for pw-sink
@@ -87,12 +87,12 @@ pub struct AppState {
     /// offer that bridge's diagnostics page. Unconfigured ones are offered for
     /// adoption on the Sources tab.
     pub bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
-    /// The daemon's single host-global AirPlay-2 PTP grandmaster (ap2_ptp.rs),
+    /// The daemon's single host-global AirPlay-2 PTP grandmaster (outputs/ap2/ptp.rs),
     /// reused by the AP2 tone spike (ap2_spike.rs) so it shares 319/320 rather
     /// than double-binding.
     pub ap2_ptp: SharedAp2Ptp,
     pub sendspin_control: crate::outputs::sendspin::volume::SharedSendspinControl,
-    pub ap2_control: crate::ap2_volume::SharedAp2Control,
+    pub ap2_control: crate::outputs::ap2::volume::SharedAp2Control,
     /// Persistent routing intent (store/routing.rs): links by stable node
     /// name, reconciled onto the live graph so routing survives node reloads
     /// and device disappearance/reappearance.
@@ -156,7 +156,7 @@ pub fn router(
     routing: SharedRouting,
     outputs: SharedOutputs,
     sendspin_control: crate::outputs::sendspin::volume::SharedSendspinControl,
-    ap2_control: crate::ap2_volume::SharedAp2Control,
+    ap2_control: crate::outputs::ap2::volume::SharedAp2Control,
     sync_settings: crate::sync_settings::SharedSyncSettings,
     settings: SharedSettings,
     discovery: crate::discovery_supervisor::DiscoverySupervisor,
@@ -547,7 +547,7 @@ pub(crate) struct OutputInfo {
     port: Option<u16>,
     encryption: Option<String>,
     /// Per-output latency override in ms; `None` = the type's built-in default.
-    /// For AirPlay-2 it's the render delay (ap2_server.rs, default 0); for
+    /// For AirPlay-2 it's the render delay (outputs/ap2/server.rs, default 0); for
     /// pw-sink it's the receiver's playout delay / jitter buffer
     /// (`sync_settings::DEFAULT_PWSINK_JITTER_MS`). Not meaningful for sendspin
     /// (uses a separate static-delay knob).
@@ -904,7 +904,9 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             // AirPlay 2 always uses HomeKit transient pairing + encryption.
             encryption: Some("HomeKit".to_string()),
             latency_ms: ap2_latencies.get(&node_name).copied(),
-            latency_effective_ms: Some(ap2_latencies.get(&node_name).copied().unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16)),
+            latency_effective_ms: Some(
+                ap2_latencies.get(&node_name).copied().unwrap_or(crate::outputs::ap2::server::AP2_RENDER_DELAY_MS as u16),
+            ),
             ptp_locked,
             ptp_lock_age_s: ptp_age.map(|a| a.as_secs()),
             ptp_supported,
@@ -927,7 +929,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             pwsink_muted: None,
             pwsink_sink_name: None,
             pwsink_ducked: None,
-            last_error: crate::ap2_health::Ap2Health::global().get(&node_name),
+            last_error: crate::outputs::ap2::health::Ap2Health::global().get(&node_name),
             node_name,
         });
     }
@@ -1905,7 +1907,7 @@ async fn clear_sendspin_stream(
 //
 // AP2 receivers are virtual outputs (`ap2-dev-…`) like sendspin: no PipeWire
 // node volume. Volume is carried in-band as an RTSP SET_PARAMETER the sender
-// pushes to the receiver (ap2_volume.rs → ap2_server.rs); mute is volume 0.
+// pushes to the receiver (outputs/ap2/volume.rs → outputs/ap2/server.rs); mute is volume 0.
 // Volume is 0.0–1.0 (matches the receiver's dB mapping and the matrix field).
 // There's no receiver→daemon feedback yet, so the UI shows the last-set level.
 
@@ -2302,7 +2304,7 @@ struct Ap2SpikeRequest {
     /// Tone duration in seconds (default 60).
     #[serde(default)]
     seconds: Option<f32>,
-    /// Render delay in ms (default `ap2_server::AP2_RENDER_DELAY_MS`).
+    /// Render delay in ms (default `outputs::ap2::server::AP2_RENDER_DELAY_MS`).
     #[serde(default)]
     render_delay_ms: Option<u32>,
     /// Streaming path to exercise: `"file"` (default; `start_streaming`, known-good)
@@ -2344,7 +2346,7 @@ async fn spike_ap2_start(State(state): State<AppState>, Json(req): Json<Ap2Spike
 
     let freq = req.freq.unwrap_or(440.0);
     let secs = req.seconds.unwrap_or(60.0);
-    let delay = req.render_delay_ms.unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS);
+    let delay = req.render_delay_ms.unwrap_or(crate::outputs::ap2::server::AP2_RENDER_DELAY_MS);
     let rate = if req.rate.unwrap_or(44_100) >= 48_000 { 48_000 } else { 44_100 };
     // "voice" = play the embedded test clip (decoded to WAV; the spike's file path
     // then resamples it to `rate`). A voice reveals a wrong playback rate by ear.
@@ -3693,7 +3695,7 @@ async fn set_output_latency(
             }),
         );
     }
-    let clamped = req.latency_ms.map(|ms| ms.min(crate::ap2_server::AP2_RENDER_DELAY_MAX_MS));
+    let clamped = req.latency_ms.map(|ms| ms.min(crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS));
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_latency(&node_name, clamped) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3702,7 +3704,7 @@ async fn set_output_latency(
     }
     // Apply live to the streaming session (no-op if not currently streaming —
     // the persisted value then applies on the next connect).
-    let effective = clamped.unwrap_or(crate::ap2_server::AP2_RENDER_DELAY_MS as u16);
+    let effective = clamped.unwrap_or(crate::outputs::ap2::server::AP2_RENDER_DELAY_MS as u16);
     state.ap2_control.lock().await.set_render_delay(&node_name, effective).await;
     // `latency_ms` is on the routing matrix, and the matrix is only pushed when
     // something says it changed — this used to reach the graph on the next 250 ms

@@ -24,11 +24,11 @@ use airplay_core::features::Features;
 use airplay_core::stream::{PtpMode, StreamConfig, TimingProtocol};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ap2_volume::{Ap2Command, SharedAp2Control};
+use crate::outputs::ap2::volume::{Ap2Command, SharedAp2Control};
 use crate::sync_settings::SharedSyncSettings;
 use crate::util::locks::LockRecover;
 
-/// Depth of the per-group volume-command channel (ap2_volume.rs → this task).
+/// Depth of the per-group volume-command channel (outputs/ap2/volume.rs → this task).
 /// Volume/mute changes are rare and tiny; a small buffer is ample.
 const AP2_CMD_DEPTH: usize = 32;
 
@@ -287,7 +287,7 @@ async fn try_connect_once(
     };
     // Inject the daemon's grandmaster clock id BEFORE setup so PT=87 carries it.
     conn.set_ptp_clock_id(clock_id);
-    // The receiver's OWN volume is authoritative (ap2_volume.rs): never impose one on
+    // The receiver's OWN volume is authoritative (outputs/ap2/volume.rs): never impose one on
     // connect. Suppress the vendored client's default connect-time volume push, which
     // otherwise forces 0 dB = MAX — blasting a powerful AVR and clobbering the level
     // `get_volume()` reads back below. User intent is re-applied post-connect via the
@@ -416,7 +416,7 @@ pub fn start(
         })
         .map_err(|e| anyhow::anyhow!("failed to spawn ap2 relay thread: {e}"))?;
 
-    // Volume/mute commands from ap2_volume.rs (via the API) land here; the task
+    // Volume/mute commands from outputs/ap2/volume.rs (via the API) land here; the task
     // owns the `Connection`s (which need `&mut` to send SET_PARAMETER volume), so
     // it applies them by node name. Each connected device registers this sender.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Ap2Command>(AP2_CMD_DEPTH);
@@ -439,7 +439,7 @@ pub fn start(
                     tracing::info!("AP2: streaming to '{}' ({}) @ {}Hz render_delay={}ms", name, ip, rate, render_delay_ms);
                     // It works — drop any stale "why isn't this playing" note the UI
                     // is still showing from an earlier failure.
-                    crate::ap2_health::Ap2Health::global().clear(name);
+                    crate::outputs::ap2::health::Ap2Health::global().clear(name);
                     // Publish this output's capture rate so announcement overlays are
                     // rate-matched to it (overlay_mixer resamples the 48 kHz clip).
                     crate::outputs::overlay_mixer::OverlayMixer::global().set_output_rate(name, rate);
@@ -476,7 +476,8 @@ pub fn start(
                     // output stayed green in the matrix and simply never played. The
                     // liveness probe overwrites/clears this on its next tick, which is
                     // what turns a one-off failure into a standing diagnosis.
-                    crate::ap2_health::Ap2Health::global().set(name, format!("Could not start the stream at {rate} Hz: {}", fail.msg));
+                    crate::outputs::ap2::health::Ap2Health::global()
+                        .set(name, format!("Could not start the stream at {rate} Hz: {}", fail.msg));
                     // Auto-negotiation fallback: a 48 kHz SETUP rejection ⇒ this
                     // receiver is 44.1k-only. Cache it (persisted) so we don't re-probe,
                     // and flag a reconcile — the group's rate recomputes to 44.1 kHz and

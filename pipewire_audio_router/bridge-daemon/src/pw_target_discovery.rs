@@ -6,7 +6,7 @@
 //! to weed out false positives), `_pipewire-audio._udp` is advertised *only* by
 //! a host actually set up as an RTP-session receiver — a strong enough signal
 //! that targets are directly routable, exactly like discovered sendspin devices
-//! (outputs/sendspin/discovery.rs) and AirPlay-2 receivers (ap2_discovery.rs). So there
+//! (outputs/sendspin/discovery.rs) and AirPlay-2 receivers (outputs/ap2/discovery.rs). So there
 //! is no approval flow and no store: browse, surface, route.
 //!
 //! Like sendspin/ap2 discovery, a discovered target does **not** get a PipeWire
@@ -18,7 +18,7 @@
 //! ## Presence
 //! This module only ever *adds* targets and marks them present; the offline
 //! decision belongs to pw_target_liveness.rs, mirroring outputs/sendspin/liveness.rs /
-//! ap2_liveness.rs. Without that task a target stayed present forever once seen —
+//! outputs/ap2/liveness.rs. Without that task a target stayed present forever once seen —
 //! which made the routing graph show a powered-off host as a happy output.
 //!
 //! ## Filtering our own adverts
@@ -98,7 +98,7 @@ fn is_own_advert(label: &str) -> bool {
 /// Start browsing `_pipewire-audio._udp.local.` on the shared mDNS `daemon`,
 /// keeping `targets` in sync. Our own advertised sessions are filtered out; every
 /// other resolved session is surfaced as a directly-routable target. Mirrors
-/// outputs::sendspin::discovery::spawn / ap2_discovery::spawn.
+/// outputs::sendspin::discovery::spawn / outputs::ap2::discovery::spawn.
 ///
 /// A `ServiceRemoved` never demotes a target here — it only timestamps the
 /// withdrawal for pw_target_liveness.rs to debounce, so a TTL flap can't gray a

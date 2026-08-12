@@ -38,7 +38,7 @@
 //! capture ─▶ outputs::overlay_mixer::mix_into(node, …) ─▶ relay_delay::delay_into(node, …) ─▶ encoder/sender
 //! ```
 //!
-//! (`outputs/sendspin/server.rs`, `ap2_server.rs`, `pwsink_server.rs`; for sendspin this sits
+//! (`outputs/sendspin/server.rs`, `outputs/ap2/server.rs`, `pwsink_server.rs`; for sendspin this sits
 //! *before* the per-member encoder, because the ring stores PCM.)
 //!
 //! The order is forced by what this module is standing in for. The real knob it

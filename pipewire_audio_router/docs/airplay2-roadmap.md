@@ -95,7 +95,7 @@ The AP2 data path is SCHED_FIFO end-to-end (ladder in
 allocation-free on the steady hot path:
 
 - **AP2 relay forward-loop allocations** — ✅ **Done.** The relay
-  (`ap2_server.rs`) fans out with zero steady-state allocation: each sender hands
+  (`outputs/ap2/server.rs`) fans out with zero steady-state allocation: each sender hands
   back a recycled `Vec<i16>` via `LiveFrameSender::take_buffer()` (a bounded
   free-list; the decoder returns drained buffers), captured PCM is a pooled
   buffer, and the overlay `mix_buf` is reused across chunks and devices.

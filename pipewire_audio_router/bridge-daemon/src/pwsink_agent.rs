@@ -936,8 +936,8 @@ async fn pump_until_closed(stream: &mut futures_util::stream::SplitStream<WebSoc
 ///
 /// ## Why no "transient" write and no "forget", unlike `ap2_volume`
 ///
-/// `ap2_volume` needed [`set_volume_transient`](crate::ap2_volume::Ap2Control::set_volume_transient)
-/// and [`forget_volume`](crate::ap2_volume::Ap2Control::forget_volume) because it *stores*
+/// `ap2_volume` needed [`set_volume_transient`](crate::outputs::ap2::volume::Ap2Control::set_volume_transient)
+/// and [`forget_volume`](crate::outputs::ap2::volume::Ap2Control::forget_volume) because it *stores*
 /// a desired level and re-applies a user-set one on every reconnect — so a calibration
 /// level written through the ordinary path outlived the session. [`Agents`] stores
 /// nothing: `set_volume` queues one `SetVolume` for the host and returns, `HostState` is

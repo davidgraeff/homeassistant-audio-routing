@@ -1,7 +1,7 @@
 //! Per-target **pw-sink senders** for a sync group — the audio path to remote
 //! PipeWire hosts running `libpipewire-module-rtp-session`.
 //!
-//! Mirrors `ap2_server::start`, but the transport is the AppleMIDI/RTP audio
+//! Mirrors `outputs::ap2::server::start`, but the transport is the AppleMIDI/RTP audio
 //! sender (`applemidi_sender::AppleMidiSender`) instead of the vendored AirPlay-2
 //! sender. For each pw-sink target in a group it advertises one
 //! `_pipewire-audio._udp` session (`pwrouter-<slug>`) over the daemon's shared

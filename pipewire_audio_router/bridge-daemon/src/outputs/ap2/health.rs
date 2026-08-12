@@ -6,7 +6,7 @@
 //! that *learn* a receiver is unusable are far apart — [`crate::ap2_liveness`] (the
 //! periodic probe) and [`crate::ap2_server`] (a failed connect inside a group's
 //! spawned task) — and neither is on a path that already reaches the API state.
-//! Rather than thread a handle through `sync_group`'s three `ap2_server::start`
+//! Rather than thread a handle through `sync_group`'s three `outputs::ap2::server::start`
 //! call sites, both report here, mirroring [`crate::overlay_mixer`]'s
 //! process-global.
 //!

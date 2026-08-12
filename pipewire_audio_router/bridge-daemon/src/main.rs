@@ -1,14 +1,7 @@
 mod align;
 mod announce;
 mod announce_arbiter;
-mod ap2_discovery;
-mod ap2_health;
-mod ap2_liveness;
-mod ap2_probe;
-mod ap2_ptp;
-mod ap2_server;
 mod ap2_spike;
-mod ap2_volume;
 mod api;
 mod applemidi_sender;
 mod audio;
@@ -211,13 +204,14 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     tracing::info!("{} remembered AirPlay client(s) in {}", airplay_clients.total_clients(), airplay_clients_path.display());
     let meters = pw::metering::MeterHub::new();
     let sendspin_control = outputs::sendspin::volume::shared();
-    let ap2_control = ap2_volume::shared();
+    let ap2_control = outputs::ap2::volume::shared();
     let sendspin_devices: outputs::sendspin::discovery::SharedSendspinDevices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-    // Discovered AirPlay-2 receivers (ap2_discovery.rs) + the host-global PTP
-    // grandmaster (ap2_ptp.rs) they register with. The RAOP-output replacement.
-    let ap2_devices: ap2_discovery::SharedAp2Devices = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-    let ap2_ptp = ap2_ptp::Ap2PtpService::new();
+    // Discovered AirPlay-2 receivers (outputs/ap2/discovery.rs) + the host-global PTP
+    // grandmaster (outputs/ap2/ptp.rs) they register with. The RAOP-output replacement.
+    let ap2_devices: outputs::ap2::discovery::SharedAp2Devices =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let ap2_ptp = outputs::ap2::ptp::Ap2PtpService::new();
     // Hosts advertising an RTP session over mDNS (pw_target_discovery.rs).
     // **Diagnostic only**: pw-sink outputs come from paired agents (plan §3), and
     // these adverts cannot serve that role — they are keyed by hostname alone, while
@@ -303,7 +297,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Same contract for AP2 receivers: mDNS (ap2_discovery) only adds; this
         // task TCP-probes each and demotes/removes a powered-off receiver so its
         // sender is torn down (and its PTP peer released).
-        ap2_liveness::spawn(ap2_devices.clone(), ap2_ptp.clone(), changes.clone());
+        outputs::ap2::liveness::spawn(ap2_devices.clone(), ap2_ptp.clone(), changes.clone());
         // And for pw-sink targets, which have nothing to probe (the receiver dials
         // us): presence follows the advert, debounced, with an established session
         // as proof of life. Without this a target seen once stayed "online" forever.

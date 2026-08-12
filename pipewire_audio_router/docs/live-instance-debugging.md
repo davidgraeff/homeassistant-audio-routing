@@ -147,7 +147,7 @@ PWRSTBY -> PWRN/A    (refused!)    NLSI7   -> NLSN/A (refused!)
 Only a **mains power cycle** clears it. Since `ap2_liveness` probed with a bare
 `TcpStream::connect`, such a receiver read `present: true`/green in the UI
 indefinitely — fixed by probing with a real `GET /info` round-trip
-(`ap2_probe.rs`) and publishing the verdict to `ap2_health.rs`, which surfaces as
+(`outputs/ap2/probe.rs`) and publishing the verdict to `outputs/ap2/health.rs`, which surfaces as
 `last_error` on `/api/outputs` + the routing matrix. A `GET /info` probe is safe
 mid-session: a Yamaha WX-021 streaming from this daemon answered six of them in
 ~4 ms each without a glitch.

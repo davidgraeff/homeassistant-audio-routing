@@ -253,7 +253,7 @@ pub fn db_to_level(db: f64) -> u8 {
     raw.round().clamp(f64::from(MIN_LEVEL), f64::from(MAX_LEVEL)) as u8
 }
 
-/// AP2's knob is a 0.0–1.0 scalar (`ap2_volume::set_volume`), so the solve's
+/// AP2's knob is a 0.0–1.0 scalar (`outputs::ap2::volume::set_volume`), so the solve's
 /// 0–100 level converts by /100. The receiver's own mapping of that scalar to dB
 /// is device-side and is exactly the unknown [`LEVEL_TAPER_NOTE`] describes.
 pub fn ap2_scalar(level: u8) -> f32 {

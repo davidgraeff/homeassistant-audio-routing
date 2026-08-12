@@ -23,10 +23,10 @@
 //! verdict is published to [`crate::ap2_health`] so `/api/outputs` can say *why*
 //! an output isn't usable instead of leaving it silently green.
 
-use crate::ap2_discovery::SharedAp2Devices;
-use crate::ap2_health::Ap2Health;
-use crate::ap2_probe::{probe, Ap2Reach};
-use crate::ap2_ptp::SharedAp2Ptp;
+use crate::outputs::ap2::discovery::SharedAp2Devices;
+use crate::outputs::ap2::health::Ap2Health;
+use crate::outputs::ap2::probe::{probe, Ap2Reach};
+use crate::outputs::ap2::ptp::SharedAp2Ptp;
 use crate::pw::thread::ChangeNotifier;
 use crate::util::locks::LockRecover;
 use std::collections::HashMap;

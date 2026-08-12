@@ -7,7 +7,7 @@
 //! from sendspin:
 //!
 //! * The live `Connection` needs `&mut` to send and lives inside the group's
-//!   sender task (ap2_server.rs), so this registry can't hold it directly — it
+//!   sender task (outputs/ap2/server.rs), so this registry can't hold it directly — it
 //!   holds an mpsc *command channel* to that task and the task owns the
 //!   connections. Commands carry the device node name so the task picks the
 //!   right one.
@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, Mutex};
 /// task hold a clone).
 pub type SharedAp2Control = Arc<Mutex<Ap2Control>>;
 
-/// A command to a running AP2 group task (ap2_server.rs), targeting one receiver
+/// A command to a running AP2 group task (outputs/ap2/server.rs), targeting one receiver
 /// by its virtual node name. Only volume: mute is expressed as volume `0.0` by
 /// [`Ap2Control`] before it reaches the task.
 #[derive(Debug, Clone)]
@@ -237,7 +237,7 @@ impl Ap2Control {
     }
 
     /// Record a **receiver-reported** volume (0.0–1.0), parsed from the AP2 event
-    /// channel (ap2_server.rs → `Connection::volume_events`) — e.g. a user turning
+    /// channel (outputs/ap2/server.rs → `Connection::volume_events`) — e.g. a user turning
     /// the AVR's own knob. Updates the stored level so the UI reflects it, WITHOUT
     /// sending anything back to the receiver (that would fight the physical
     /// control). No-op when unchanged, or while muted (we send ~0 when muted, so a
