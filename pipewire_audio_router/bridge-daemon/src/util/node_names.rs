@@ -6,7 +6,7 @@
 //! and the API handlers share.
 
 /// Node-name prefix for sendspin output sink nodes (shared with
-/// sources.rs and the output classification in api.rs/routing.rs).
+/// sources.rs and the output classification in api/outputs.rs/routing.rs).
 pub const SENDSPIN_NODE_PREFIX: &str = "sendspin-out-";
 
 /// Node-name prefix for a discovered sendspin *device* — a virtual routing

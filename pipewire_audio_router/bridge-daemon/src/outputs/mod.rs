@@ -19,6 +19,7 @@
 //! hook is in the relays, the reason is not (see `align/mod.rs`).
 
 pub(crate) mod ap2;
+pub(crate) mod listing;
 pub(crate) mod overlay_mixer;
 pub(crate) mod pwsink;
 pub(crate) mod sendspin;

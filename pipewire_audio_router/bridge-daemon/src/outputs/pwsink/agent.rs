@@ -778,11 +778,11 @@ pub fn unduck_output(node_name: &str) {
 // ---- WebSocket endpoint ----------------------------------------------------
 
 /// `GET /api/agent/ws` — one connection per agent, dialled *by* the agent.
-pub async fn agent_ws(ws: WebSocketUpgrade, State(state): State<crate::api::AppState>) -> impl IntoResponse {
+pub async fn agent_ws(ws: WebSocketUpgrade, State(state): State<crate::state::AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
+async fn handle_socket(socket: WebSocket, state: crate::state::AppState) {
     let (mut sink, mut stream) = {
         use futures_util::StreamExt as _;
         socket.split()

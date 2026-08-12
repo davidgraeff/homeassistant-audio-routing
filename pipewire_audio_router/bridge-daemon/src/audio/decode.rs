@@ -1,4 +1,4 @@
-//! Decodes announce audio fetched via URL (api.rs's `AnnounceRequest::url`)
+//! Decodes announce audio fetched via URL (api/announce.rs's `AnnounceRequest::url`)
 //! into WAV, using `symphonia`. See docs/decisions.md "Decoding announce
 //! audio: `symphonia`, not an `ffmpeg` subprocess".
 

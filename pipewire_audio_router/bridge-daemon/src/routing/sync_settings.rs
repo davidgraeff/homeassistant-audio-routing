@@ -331,7 +331,7 @@ impl SyncSettings {
 
     /// Set (or clear, when `ms` is `None`) a pw-sink output's playout delay and
     /// persist. Callers clamp to
-    /// [`PWSINK_JITTER_MIN_MS`]..=[`PWSINK_JITTER_MAX_MS`] first (`api.rs`).
+    /// [`PWSINK_JITTER_MIN_MS`]..=[`PWSINK_JITTER_MAX_MS`] first (`api/outputs.rs`).
     pub fn set_pwsink_jitter(&mut self, node_name: &str, ms: Option<u16>) -> anyhow::Result<()> {
         match ms {
             None => {

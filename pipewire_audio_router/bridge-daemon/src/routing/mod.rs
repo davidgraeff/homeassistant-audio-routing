@@ -48,9 +48,9 @@
 pub(crate) mod sync_group;
 pub(crate) mod sync_settings;
 
-use crate::api::AppState;
 use crate::outputs::sendspin::discovery::SendspinDevice;
 use crate::pw::thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
+use crate::state::AppState;
 use crate::store;
 use crate::store::routing::{RoutingLink, SharedRouting};
 use crate::util::locks::LockRecover;
@@ -912,11 +912,11 @@ enum Frame<'a> {
     Matrix(&'a RoutingMatrix),
     /// `/api/outputs` — the adopted devices.
     Outputs {
-        outputs: &'a [crate::api::OutputInfo],
+        outputs: &'a [crate::outputs::listing::OutputInfo],
     },
     /// `/api/outputs/discovered` — offered but not added (plus ignored).
     Discovered {
-        outputs: &'a [crate::api::OutputInfo],
+        outputs: &'a [crate::outputs::listing::OutputInfo],
     },
     /// `/api/agents` — paired receiver hosts and pending pair requests.
     Agents {
@@ -1060,7 +1060,7 @@ async fn push_if_changed(socket: &mut WebSocket, slot: &mut Option<String>, fram
 /// latency on a *background* change; anything the user just clicked is re-read by
 /// the page itself, so it never waits for this path.
 async fn push_listings(socket: &mut WebSocket, state: &AppState, sent: &mut SentListings) -> Result<(), axum::Error> {
-    let (adopted, offered) = crate::api::outputs_listings(state).await;
+    let (adopted, offered) = crate::outputs::listing::outputs_listings(state).await;
     let agents = state.agents.lock().await.snapshot();
     let now_playing = state.now_playing.snapshot();
     push_if_changed(socket, &mut sent.outputs, Frame::Outputs { outputs: &adopted }).await?;
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn listing_frames_are_tagged_by_kind() {
-        let empty: Vec<crate::api::OutputInfo> = Vec::new();
+        let empty: Vec<crate::outputs::listing::OutputInfo> = Vec::new();
         let agents: Vec<crate::outputs::pwsink::agent::AgentInfo> = Vec::new();
         for (frame, expected_type, payload_key) in [
             (Frame::Outputs { outputs: &empty }, "outputs", "outputs"),

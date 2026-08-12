@@ -2,7 +2,7 @@
 //! `pw::stream`, replacing a `pw-cat --playback --target` subprocess.
 //!
 //! Runs a short-lived PipeWire main loop on the calling thread for the length
-//! of the clip, so it's invoked from the async announce handler (api.rs) via
+//! of the clip, so it's invoked from the async announce handler (api/announce.rs) via
 //! `tokio::task::spawn_blocking`. PipeWire's client types are `!Send` and must
 //! stay on one thread — a dedicated blocking thread satisfies that naturally,
 //! and keeps announce playback fully isolated from the long-lived registry/

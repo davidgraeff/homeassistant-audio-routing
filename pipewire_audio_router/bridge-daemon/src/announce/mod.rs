@@ -4,7 +4,7 @@
 // ABOUTME: announcements. This is the AG delivery path for sendspin devices on
 // ABOUTME: per-device senders.
 //
-// Flow: `announce()` decodes are done by the caller (api.rs) — it hands us
+// Flow: `announce()` decodes are done by the caller (api/announce.rs) — it hands us
 // 48k/S16/stereo PCM + targets + policy. We assign an id, ask the scheduler to
 // admit it, and translate the scheduler's per-output actions into OverlayMixer
 // start/stop calls. A periodic `poll()` (driven from main.rs) feeds finished

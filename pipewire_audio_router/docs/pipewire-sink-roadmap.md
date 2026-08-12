@@ -181,7 +181,7 @@ Mirrors the established discovery/output pattern.
 | `rtp_sink.rs` (new) | Load `rtp-sink` (+ SAP announce) as a real node via `pw_thread` `Load`/`Unload`; build the per-device mix bus (loopback + null-sink) | old `raop.rs` module-load; anchor `CreateSinkNode` |
 | `routing/sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
 | `outputs/pwsink/target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `outputs/sendspin/liveness.rs` |
-| `api.rs` | Candidate list + `approve` endpoint + per-target JB setter + help URL; expose `pw-dev-*` as routable output & `media_player` | §9 outputs derivation |
+| `api/outputs.rs` | Candidate list + `approve` endpoint + per-target JB setter + help URL; expose `pw-dev-*` as routable output & `media_player` | §9 outputs derivation |
 | `frontend/` (Svelte) | Discovery listing: approve + help button; per-target JB slider | existing admin console |
 
 Freebies from it being a real node: per-target **volume** works via native
@@ -253,7 +253,7 @@ proven end-to-end against a stock receiver (`E@440`; see
 `outputs/pwsink/discovery.rs` (discovery), `outputs/pwsink/target_liveness.rs` (presence),
 `outputs/pwsink/server.rs` (per-group audio path),
 `outputs/pwsink/sender_liveness.rs` (session-status registry), plus wiring in `routing/sync_group.rs`,
-`supervisor.rs`, `routing.rs`, `api.rs`, `main.rs`.
+`supervisor.rs`, `routing/mod.rs`, `api/`, `main.rs`.
 
 **Data path.** Discovery browses `_pipewire-audio._udp` → `SharedPwTargets`
 (`pwsink-dev-<slug>`) → shown as a matrix column + `/api/outputs`. Routing a

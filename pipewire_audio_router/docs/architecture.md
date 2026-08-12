@@ -123,7 +123,7 @@ duck/overlay (`announce/arbiter.rs` / `announce.rs`).
 ### The `OutputBackend` seam (target end-state)
 
 Historically "output" was scattered node-name-prefix `if`s across
-`routing.rs`, `api.rs`, `routing/sync_group.rs`, `media_player.py`. The intended
+`routing/mod.rs`, `api/`, `routing/sync_group.rs`, `media_player.py`. The intended
 convergence is a single trait so each backend stops touching five files
 and "drop RAOP" becomes a clean delete:
 
@@ -161,7 +161,7 @@ routing intent through the adopted set:
   `media_player` entities from that listing) never sees it;
 - `routing/sync_group.rs::reconcile` — intent whose output isn't adopted is
   dormant, so no group forms and no stream/session is ever opened to it;
-- `api.rs` — `/api/outputs` returns the adopted ones,
+- `api/outputs.rs` — `/api/outputs` returns the adopted ones,
   `/api/outputs/discovered` the rest (the Outputs page's second list).
 
 Intent is *filtered*, never deleted, so adopting a device restores the
@@ -547,7 +547,7 @@ and PipeWire does the SRC in-graph on its RT thread.
 
 The daemon exposes state + native mutation (links, per-device volume in-band
 per backend, announcements mixed per device by the relay) over
-REST + WebSocket (`api.rs`; full list in
+REST + WebSocket (`api/`; full list in
 [`../../docs/api-reference.md`](../../docs/api-reference.md)). The Python
 `custom_components` integration exposes a `media_player` per **music group**
 and per **announcement group** (and, optionally, one per individual output).

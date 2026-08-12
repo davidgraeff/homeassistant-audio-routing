@@ -28,9 +28,12 @@ should graduate into [`decisions.md`](decisions.md).
 - **wave 5** — `routing/`, `announce/`, `spike/`, and `discovery_supervisor.rs`
   -> `supervisor.rs`. 9 files. §3 rows 2, 46–50, 57–59.
 
-**Remaining:** `main.rs`, `api.rs` and `supervisor.rs` at the root — wave 6 is the
-`api/` split and the `state.rs` extraction (§5, §6), then wave 7's sweep (§7).
-`main.rs` now declares 12 modules, every one of them a directory.
+- **wave 6** — `state.rs` extracted, `api.rs` split into `api/` (15 resource
+  modules + the route table), and the cycle broken: the output-listing model moved
+  to `outputs/listing.rs`, so `api/` is now a **leaf** (§5, §6).
+
+**Remaining:** wave 7's reference sweep (§7). The root holds `main.rs`,
+`state.rs`, `supervisor.rs` and 12 directories.
 
 The align wave went first, out of order (§4 lists it as wave 5), and it was not a
 leaf when it did: **eight files outside `align/` reach into it** — `api.rs`,
@@ -214,7 +217,7 @@ by subject.
 
 ## 3. Full rename table
 
-60 files, of which 59 have landed — everything except row 60 (`api.rs`, §5). `★` marks the two moves that change meaning
+60 files, all landed. `★` marks the two moves that change meaning
 rather than location; everything else is pure relocation. The `mod.rs` files each
 directory needs are new files, not rows here — `align/mod.rs` was written from
 scratch (§2, "Directory module style").
@@ -280,7 +283,7 @@ scratch (§2, "Directory module style").
 | 57 ✔ | `per_device_spike.rs` | `spike/per_device.rs` |
 | 58 ✔ | `ap2_spike.rs` | `spike/ap2.rs` |
 | 59 ✔ | `pw_sink_spike.rs` | `spike/pwsink.rs` |
-| 60 | `api.rs` | `api/` + `state.rs` — see §5 |
+| 60 ✔ | `api.rs` | `api/` + `state.rs` — see §5 |
 
 `✔` marks rows already landed. The left column stays at the pre-move spelling on
 purpose — it is the record of what moved, and §7's stale-reference grep should

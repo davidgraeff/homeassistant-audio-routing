@@ -336,7 +336,7 @@ impl AnnounceTransport {
 }
 
 /// The shared handles [`GroupReconciler::ensure_announce_transport`] needs to open a
-/// transport on demand. Bundled so the one call site (api.rs's `/api/announce`) can
+/// transport on demand. Bundled so the one call site (api/announce.rs's `/api/announce`) can
 /// build it once and the signature stays readable.
 pub struct AnnounceDeps<'a> {
     pub pw: &'a SharedState,

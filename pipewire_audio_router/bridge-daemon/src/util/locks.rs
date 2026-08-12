@@ -1,6 +1,6 @@
 //! Poison-safe mutex locking.
 //!
-//! The shared registry snapshot (pw/thread.rs) and the outputs store (api.rs)
+//! The shared registry snapshot (pw/thread.rs) and the outputs store (api/outputs.rs)
 //! are plain data behind a `std::sync::Mutex`. With `lock().unwrap()`, a panic
 //! in *any* holder while the lock is held poisons the mutex, and every later
 //! `lock().unwrap()` then panics too — one transient bug cascading into a fully

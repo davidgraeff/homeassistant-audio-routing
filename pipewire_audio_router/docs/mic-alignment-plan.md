@@ -403,7 +403,7 @@ Any per-speaker frequency labelling is new work (§6.2).
 
 ### 2.3 Correction: a delay write costs tens of seconds, not 5
 
-`set_sendspin_delay_handler` (`api.rs:3117`) persists the delay, pushes it live,
+`set_sendspin_delay_handler` (`api/sync.rs`) persists the delay, pushes it live,
 and then — unless `sendspin_delay_live` is on, which it is not by default
 (`store/settings.rs:52`) — calls `force_device_reconnect` for that one device,
 because current ESPHome firmware reads the static delay only at stream start.
@@ -1124,13 +1124,13 @@ reference — keep manual override available for the by-ear path.
 Normalise so the smallest applied delay is as small as possible. Raising a
 member's delay far enough to lift the group's send-ahead high-water mark triggers
 a **group-wide** stream reconfiguration, not a single-device reconnect — see the
-comment at `api.rs:3136`. Warn before crossing that line, and prefer the
+comment at `api/sync.rs`. Warn before crossing that line, and prefer the
 normalisation that avoids it.
 
 ### 9.3 Persistence
 
 The existing handlers already persist before pushing live
-(`api.rs:3123`), which is what a calibrated offset needs. Nothing new required —
+(`api/sync.rs`), which is what a calibrated offset needs. Nothing new required —
 but write **through the existing endpoints** rather than touching
 `sync_settings` directly, so the reconnect and high-water logic is not duplicated.
 
@@ -1399,7 +1399,7 @@ It also composes with §1.1.1: with the union held once and provisional delays i
 relay, a whole multi-position run contains exactly two reconnect waves — the formation
 and the final real write.
 
-**How it is implemented** (`align/group.rs`, `align/calibrate.rs`, `api.rs`):
+**How it is implemented** (`align/group.rs`, `align/calibrate.rs`, `api/align.rs`):
 
 - `POST /api/align/start {outputs}` means "**hold all of these for the whole run**". Its
   doc comment says so, because it reads counter-intuitively next to a wizard that then
@@ -1498,7 +1498,7 @@ and the final real write.
     `DaemonMsg::SetVolume { volume }` and `SetMute { muted }`, `Agents::set_volume` /
     `set_mute` return `false` when the host is not connected, the agent implements both
     (`pwrouter-agent/src/client.rs:461/465` → `pw::thread::apply_master`), and
-    `api.rs:1954/1972` already drive them in production. `HostState` reports `volume` and
+    `api/volume.rs` already drives them in production. `HostState` reports `volume` and
     `muted` back, so a value can be snapshotted and restored.
 
     Two consequences, both good:

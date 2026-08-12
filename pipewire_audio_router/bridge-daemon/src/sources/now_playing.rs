@@ -9,7 +9,7 @@
 //!
 //! ## Deliberately source-agnostic
 //! Producers are *local* (the AirPlay receiver's handler calls straight in) or
-//! *remote* (a Pi reporter posts to `/api/now_playing/*`, api.rs). Nothing
+//! *remote* (a Pi reporter posts to `/api/now_playing/*`, api/now_playing.rs). Nothing
 //! here knows which — a source is a node name and a bag of optional fields, so no
 //! producer's protocol leaks into the model, the API, or Home Assistant.
 //!
@@ -405,7 +405,7 @@ impl NowPlayingReporter {
 }
 
 /// The path a consumer fetches embedded cover art from — kept next to the model
-/// so the published `path` and the route in api.rs cannot drift apart.
+/// so the published `path` and the route in api/now_playing.rs cannot drift apart.
 pub fn artwork_path(node_name: &str, rev: u32) -> String {
     format!("/api/now_playing/{node_name}/artwork?rev={rev}")
 }

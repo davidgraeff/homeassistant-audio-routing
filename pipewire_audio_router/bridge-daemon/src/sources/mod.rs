@@ -19,7 +19,7 @@
 //! add/remove more than one of either type at runtime, each independently
 //! routable. Mirrors store/outputs.rs: no `options.json` seeding — starts empty
 //! on a fresh install, then the `/data` file is authoritative and everything is
-//! managed live via the API (api.rs).
+//! managed live via the API (api/sources.rs).
 //!
 //! Persisted shape (`sources.json`):
 //!

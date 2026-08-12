@@ -367,7 +367,7 @@ impl Default for Timing {
     }
 }
 
-/// Largest sendspin advance the API accepts (`api.rs`'s `delay_ms.min(5000)`,
+/// Largest sendspin advance the API accepts (`api/measure.rs`'s `delay_ms.min(5000)`,
 /// plan §2.4). There is no named constant on the write path to borrow, so this
 /// mirrors it; the two must move together.
 pub const SENDSPIN_ADVANCE_MAX_MS: u16 = 5_000;
@@ -1366,7 +1366,7 @@ impl MicFeed for LiveMic {
 
 /// Writes one member's delay knob.
 ///
-/// Implemented in `api.rs` **on top of the existing endpoint handlers** rather
+/// Implemented in `api/measure.rs` **on top of the existing endpoint handlers** rather
 /// than on `sync_settings`, so the persistence order, the clamping, the live push
 /// and — the one that matters — the per-device reconnect and its group-wide
 /// high-water exception are not duplicated here (plan §9.3).
@@ -3456,7 +3456,7 @@ impl MeasureManager {
     /// A receiver that fires whenever [`Self::status`] would return something new
     /// (plan §11: progress is pushed, not polled). Survives `abandon`/`start`,
     /// which replace the state but carry the notifier across.
-    #[allow(dead_code)] // used by `measure_ws`, whose route api.rs owns
+    #[allow(dead_code)] // used by `measure_ws`, whose route api/measure.rs owns
     fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.inner.lock_recover().changes.subscribe()
     }
@@ -5828,7 +5828,7 @@ pub struct EquivalencePlan {
 /// scheme exists for.
 ///
 /// **AP2 second.** Its knob is a plain delay, so there is no sign question, and
-/// `api.rs`'s handler pushes it *live* to the running stream — so its "reconnect" may
+/// `api/measure.rs`'s handler pushes it *live* to the running stream — so its "reconnect" may
 /// not happen at all, which makes it a poor probe of the ε item 3 is about.
 ///
 /// **pw-sink last.** Its knob is floored at `PWSINK_JITTER_MIN_MS`, so its baseline
@@ -5917,7 +5917,7 @@ pub fn plan_equivalence(
             ),
             MemberKind::Airplay2 => format!(
                 "'{}' is an AirPlay-2 member, used because this group has no sendspin member. Its render delay is a plain delay, so there \
-                 is no sign question here — and `api.rs` pushes it *live* to the running stream, so the two baselines may not be separated \
+                 is no sign question here — and `api/measure.rs` pushes it *live* to the running stream, so the two baselines may not be separated \
                  by a reconnect at all, which makes the ε this experiment reports a weaker number than it would be on sendspin. \
                  {others} other member(s) were not used.",
                 m.node_name
@@ -6231,7 +6231,7 @@ pub struct EquivalenceManager {
 
 /// The process-wide experiment, for the same reason [`shared`] is process-wide: one
 /// mic, one session, one group.
-// Used by the API handlers that own the routes, which `api.rs` has yet to add.
+// Used by the API handlers that own the routes, which `api/measure.rs` has yet to add.
 #[allow(dead_code)]
 pub fn equivalence() -> &'static EquivalenceManager {
     static M: OnceLock<EquivalenceManager> = OnceLock::new();
@@ -6246,7 +6246,7 @@ impl EquivalenceManager {
     /// Fires whenever [`Self::status`] would return something new — including the
     /// gate's progress, because the experiment spends most of its wall clock inside
     /// gates (plan §11).
-    #[allow(dead_code)] // used by `equivalence_ws`, whose route api.rs owns
+    #[allow(dead_code)] // used by `equivalence_ws`, whose route api/measure.rs owns
     fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.st.changes.subscribe()
     }
@@ -6256,7 +6256,7 @@ impl EquivalenceManager {
     /// Refuses up front on everything knowable without playing anything: a measurement
     /// run in flight (both would solo the same session), no alignment session, no
     /// microphone, no knob headroom.
-    #[allow(dead_code)] // wired by api.rs, which owns the router
+    #[allow(dead_code)] // wired by api/measure.rs, which owns the router
     pub async fn start(&self, deps: EquivalenceDeps) -> Result<EquivalenceStatus, Refusal> {
         {
             let g = self.st.inner.lock_recover();
@@ -6327,7 +6327,7 @@ impl EquivalenceManager {
     /// and leaving a speaker 20 ms out because someone closed a tab is not an option.
     /// So this marks the experiment cancelled and lets the task put the state back,
     /// which is why the status stays readable afterwards instead of being reset.
-    #[allow(dead_code)] // wired by api.rs, which owns the router
+    #[allow(dead_code)] // wired by api/measure.rs, which owns the router
     pub fn abandon(&self) -> EquivalenceStatus {
         {
             let mut g = self.st.inner.lock_recover();
@@ -6958,8 +6958,8 @@ const EQUIV_CANNOT_TELL: [&str; 6] = [
 ///
 /// Worth a socket for the same reason the measurement is: it spends minutes inside
 /// gates, waiting for a speaker to come back, and the *message* is the only thing
-/// moving. Registered in `api.rs`, which owns the router.
-#[allow(dead_code)] // the route belongs to api.rs
+/// moving. Registered in `api/measure.rs`, which owns the router.
+#[allow(dead_code)] // the route belongs to api/measure.rs
 pub async fn equivalence_ws(ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|socket| {
         let m = equivalence();
@@ -6975,7 +6975,7 @@ pub async fn equivalence_ws(ws: axum::extract::ws::WebSocketUpgrade) -> impl axu
 /// inside a gate whose *message* is the only thing moving, and polling that at any
 /// useful rate is what §11 objected to.
 ///
-/// Registered in `api.rs`, which owns the router.
+/// Registered in `api/measure.rs`, which owns the router.
 pub async fn measure_ws(ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|socket| {
         let m = shared();
@@ -8001,7 +8001,7 @@ mod tests {
                 self.writes.lock_recover().push((node_name.clone(), delay_ms));
                 // Worded like the real sendspin handler's reply, because W21 reads it:
                 // whether a write said it forced a reconnect is evidence about what the
-                // two device-arm baselines are separated by (`api.rs`'s
+                // two device-arm baselines are separated by (`api/measure.rs`'s
                 // `set_sendspin_delay_handler`).
                 Ok(format!("set '{node_name}' static delay to {delay_ms} ms (reconnecting just this speaker to apply)"))
             })

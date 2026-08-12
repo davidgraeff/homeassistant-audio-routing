@@ -7,6 +7,7 @@ mod pw;
 mod routing;
 mod sources;
 mod spike;
+mod state;
 mod store;
 mod supervisor;
 mod util;
@@ -33,7 +34,7 @@ struct Cli {
 enum Command {
     /// Run the long-lived daemon: connect to the already-running PipeWire
     /// instance, bring up the stored AirPlay and RTP sources, and serve the REST
-    /// API — all of which can be reconfigured live (api.rs's
+    /// API — all of which can be reconfigured live (api/sources.rs's
     /// `/api/sources`). Sendspin devices and AirPlay-2
     /// receivers are discovered and grouped dynamically, so there's nothing
     /// stored for them.
@@ -182,7 +183,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 
     // Running AirPlay receivers, keyed by source id (one per configured AirPlay
     // source), reconciled against the store below and via the API.
-    let airplay: api::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let airplay: state::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     // Remembered AirPlay senders (Sources-tab connection list), per-receiver.
     // One backing file beside sources.json in /data holds a client list per
@@ -540,8 +541,8 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 /// here — they're auto-discovered and grouped from the routing intent; see
 /// routing/sync_group.rs.)
 async fn spawn_stored_sources(
-    sources: &api::SharedSources,
-    airplay: &api::SharedAirplay,
+    sources: &state::SharedSources,
+    airplay: &state::SharedAirplay,
     airplay_clients: &crate::sources::airplay_clients::AirplayClientStore,
     now_playing: &crate::sources::now_playing::NowPlayingStore,
     pw: &pw::thread::SharedState,

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Ducked-but-audible default: sources are ducked, not silenced, while an
-/// announce plays (api.rs).
+/// announce plays (api/announce.rs).
 pub const DEFAULT_DUCK: f32 = 0.25;
 
 fn default_duck() -> f32 {

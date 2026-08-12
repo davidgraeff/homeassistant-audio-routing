@@ -10,8 +10,8 @@
 //! This thread does two things: it *observes* the registry (nodes/ports/links)
 //! into a shared snapshot, and it *mutates the graph* on request — loading and
 //! unloading modules into its own context (how RAOP outputs are added/removed
-//! live — `pw_control::module`, api.rs's `/api/outputs`) and creating/destroying links
-//! natively via `Core::create_object`/`Registry::destroy_global` (api.rs,
+//! live — `pw_control::module`, api/outputs.rs) and creating/destroying links
+//! natively via `Core::create_object`/`Registry::destroy_global` (api/nodes.rs,
 //! routing.rs). All mutations arrive over a `pipewire::channel` (`PwCommand`),
 //! which attaches to the loop as an IO source and is the thread-safe way to
 //! run code on this non-`Send` thread from the axum side; each command carries
@@ -49,7 +49,7 @@ pub struct LinkSpec {
 }
 
 /// A request run on the PipeWire thread. Each variant carries a `oneshot`
-/// reply so the async caller (api.rs) can await success/failure.
+/// reply so the async caller (api/nodes.rs) can await success/failure.
 pub enum PwCommand {
     /// Load `module_name` with `args` and remember it under `node_name` so it
     /// can be unloaded later. `Err` if it's already loaded or libpipewire
