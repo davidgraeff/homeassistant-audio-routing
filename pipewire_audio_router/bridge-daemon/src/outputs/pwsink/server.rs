@@ -28,7 +28,7 @@
 #![allow(dead_code)] // wired into routing/sync_group/mod.rs in the same phase
 
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::outputs::pwsink::applemidi::{AppleMidiSender, PcmChunk, SessionConfig, SessionFormat};
 use crate::outputs::pwsink::sender_liveness::{PwSinkLiveness, PwSinkStatus};
@@ -119,6 +119,16 @@ pub fn session_name_for(node_name: &str) -> String {
 /// nobody can hear the end of.
 const PCM_FEED_DEPTH: usize = 8;
 
+/// How often an unattached session re-asks its target's receiver to rebuild
+/// (`PwSinkLiveness::request_rebuild`, docs/receiver-agent.md §7.4).
+///
+/// Long enough that a receiver which is simply slow to resolve and invite gets there
+/// first (a reload takes milliseconds, the mDNS resolve rather more), short enough that
+/// a target which came up on the wrong side of the race is back within one glance at
+/// the Outputs page. Each attempt costs one module reload on a host that is playing
+/// nothing, so the price of being wrong is zero either way.
+const REBUILD_RETRY: Duration = Duration::from_secs(15);
+
 /// Best-effort real-time scheduling for the capture→feed relay thread. Same
 /// rationale + priority (40) as ap2_server's relay: the hop from capture to each
 /// sender's PCM channel must never queue behind the daemon's general-purpose
@@ -183,6 +193,13 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
                     m.control_port,
                     m.node_name
                 );
+                // The socket is bound and the advert is up (both inside `start`), so
+                // now is the moment to ask this host's receiver to (re)handshake —
+                // it invites exactly once per resolve and would otherwise keep
+                // talking to the socket of the sender this one replaced (§7.4 /
+                // `PwSinkLiveness::request_rebuild`). Ordering matters: asking before
+                // the bind would re-create the very race this fixes.
+                PwSinkLiveness::global().request_rebuild(&m.node_name);
                 senders.push((m.node_name.clone(), Arc::new(sender)));
                 feeds.push((m.node_name.clone(), pcm_tx));
             }
@@ -263,14 +280,31 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
     let weak_senders: Vec<(String, Weak<AppleMidiSender>)> = senders.iter().map(|(n, s)| (n.clone(), Arc::downgrade(s))).collect();
     let status_task = tokio::spawn(async move {
         let liveness = PwSinkLiveness::global();
+        // When each target was last asked to re-handshake, so the retry below paces
+        // itself. Seeded with "just now": `start` has already asked once.
+        let mut last_asked: Vec<Instant> = vec![Instant::now(); weak_senders.len()];
         loop {
             let mut any_alive = false;
-            for (name, weak) in &weak_senders {
+            for (index, (name, weak)) in weak_senders.iter().enumerate() {
                 match weak.upgrade() {
                     Some(sender) => {
                         any_alive = true;
                         let st = sender.status();
                         liveness.set(name, PwSinkStatus { established: st.established, peer_count: st.peer_count });
+                        // The self-heal half of §7.4: the one ask in `start` can still
+                        // miss (the agent was reconnecting, its mDNS resolve was slow,
+                        // the host had just resumed), and nothing else will ever
+                        // produce an invitation. So keep asking while this sender has
+                        // no peer — it is carrying no audio, so a reload costs nothing
+                        // — and stop the moment one arrives.
+                        if !st.established && last_asked[index].elapsed() >= REBUILD_RETRY {
+                            tracing::info!(
+                                "pw-sink: '{name}' still has no receiver attached to its session; \
+                                 asking its agent to rebuild the receive side again"
+                            );
+                            liveness.request_rebuild(name);
+                            last_asked[index] = Instant::now();
+                        }
                     }
                     None => liveness.remove(name),
                 }

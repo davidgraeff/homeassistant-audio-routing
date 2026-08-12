@@ -48,7 +48,10 @@ already the steady QUANT-1024 48 kHz mix, nothing resamples anywhere on this pat
   the announce arbiter by `routing::sync_group::dialed_session_established`. A
   reachable-but-unattached target gets a drawn-but-not-animated wire and an amber
   "not connected", instead of being called offline or being animated as if it were
-  carrying audio.
+  carrying audio. Getting *out* of that state is not the receiver's job either: it
+  invites once per mDNS resolve, so every new sender has to **ask** its agent to
+  rebuild the receive side ([receiver-agent.md](receiver-agent.md) §7.4) — without
+  that, an add-on restart or any group rebuild left the target amber indefinitely.
 
 **The jitter buffer is the daemon's decision, not the host's.** It is stored per
 output as `pwsink_jitter` (`routing/sync_settings.rs`), set through the same

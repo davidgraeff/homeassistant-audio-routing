@@ -316,6 +316,31 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // `streaming` (whether a route is really being carried), so a receiver
         // attaching or dropping has to push a frame of its own.
         outputs::pwsink::sender_liveness::PwSinkLiveness::global().set_change_notifier(changes.clone());
+        // …and how an unattached session asks its receiver to re-handshake. Stock
+        // `module-rtp-session` invites once per resolve, so a *new* sender — this
+        // process starting, a group rebuild, an alignment hold — is one no receiver will
+        // ever invite on its own (docs/receiver-agent.md §7.4). The lever is the agent's
+        // `welcome`, which reloads its receive side; the hook lives here because the
+        // sender's poll task knows nothing about agents, and it spawns because that
+        // registry is behind an async mutex.
+        {
+            let agents = agents.clone();
+            let settings = sync_settings.clone();
+            let rt = tokio::runtime::Handle::current();
+            outputs::pwsink::sender_liveness::PwSinkLiveness::global().set_rebuild_hook(Box::new(move |node_name: &str| {
+                let (agents, settings, node) = (agents.clone(), settings.clone(), node_name.to_string());
+                rt.spawn(async move {
+                    let jitter = settings.lock_recover().pwsink_jitter_effective(&node);
+                    if agents.lock().await.retune(&node, jitter) {
+                        tracing::debug!("pw-sink: asked '{node}' to rebuild its receive side ({jitter} ms buffer)");
+                    } else {
+                        // Not an error: an agent that is not connected has nothing to
+                        // rebuild, and its next hello brings up the receiver anyway.
+                        tracing::debug!("pw-sink: '{node}' has no connected agent to rebuild");
+                    }
+                });
+            }));
+        }
 
         // Seed persisted per-device static delays so they re-apply when each
         // device (re)connects, exactly like stored volumes (outputs/sendspin/volume.rs).

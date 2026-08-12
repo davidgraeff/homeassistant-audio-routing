@@ -179,6 +179,10 @@ pub async fn run(
         };
         desktop.set_daemon(Some(addr.clone())).await;
 
+        // Did this attempt get a socket up at all? What follows treats "the daemon was
+        // there and the connection later broke" differently from "the daemon is not
+        // answering" — see the `Err` arm.
+        let mut connected = false;
         match session(
             &addr,
             &mut config,
@@ -187,6 +191,7 @@ pub async fn run(
             &mut events,
             &desktop,
             &mut requests,
+            &mut connected,
         )
         .await
         {
@@ -226,6 +231,18 @@ pub async fn run(
                 // discovery on the next attempt unless it was given explicitly.
                 if override_addr.is_none() {
                     config.daemon = None;
+                }
+                // A socket that was up and then broke is not evidence that the daemon
+                // is unreachable — it is what an add-on restart looks like from here
+                // (the WS dies mid-frame: "Connection reset without closing
+                // handshake"), and the daemon is usually back within seconds. Without
+                // this reset the backoff only ever grew, so from the second restart
+                // onwards every one cost a **full minute** of a host that was offline
+                // in the add-on while the agent sat waiting — measured 2026-08-12,
+                // where every reconnect in the journal was exactly 60 s late. Only a
+                // genuinely unreachable daemon (connect refused, no mDNS) may back off.
+                if connected {
+                    backoff = BACKOFF_START;
                 }
             }
         }
@@ -324,6 +341,9 @@ fn new_pair_code() -> String {
     }
 }
 
+/// `connected` is set the moment the socket is up, so the caller can tell a broken
+/// connection (retry promptly) from an absent daemon (back off).
+#[allow(clippy::too_many_arguments)]
 async fn session(
     addr: &str,
     config: &mut Config,
@@ -332,12 +352,14 @@ async fn session(
     events: &mut tokio::sync::mpsc::Receiver<Event>,
     desktop: &Desktop,
     requests: &mut tokio::sync::mpsc::Receiver<Request>,
+    connected: &mut bool,
 ) -> anyhow::Result<Outcome> {
     let url = format!("ws://{addr}/api/agent/ws");
     tracing::info!("connecting to {url}");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .with_context(|| format!("connecting to {url}"))?;
+    *connected = true;
 
     let hello = AgentMsg::Hello {
         protocol: PROTOCOL_VERSION,

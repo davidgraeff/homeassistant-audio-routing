@@ -339,6 +339,64 @@ keeping:
 what every host did before the picker and is still right for a laptop. The
 `media.class`/send-twin interaction is worth an upstream report either way.
 
+### 7.4 The receiver invites **once**, so the daemon has to ask for a rebuild
+
+Diagnosed live on 2026-08-12, from the report *"after a fresh add-on start the
+output says 'not connected', the agent says 'Paired', and only restarting the agent
+fixes it."* All three halves were healthy; what was missing was an invitation.
+
+**Stock `module-rtp-session` handshakes once per resolve, and a resolve does not
+repeat for a service the resolver already knows.** So a *new* `AppleMidiSender` — a
+new socket for the same session name and port — waits for an invitation that will
+never arrive, while the receiver keeps addressing the socket of the sender this one
+replaced. Nothing recovers it: the daemon has nothing on the target to poke (§1.1),
+there is no RTCP (`pipewire-sink-output.md` §2), and the advert it might re-notice is
+already in the resolver's cache, stale but present. Only reloading the receive-side
+module produces a fresh resolve, which is why restarting the agent "fixed" it.
+
+**At add-on start the race is guaranteed, not chance.** A pw-sink member *is* a
+connected agent (§3), so the daemon cannot build the sender until the agent has
+connected — and the agent loads its receiver the instant it is welcomed. Measured
+from the two logs, one add-on start:
+
+```
+21:47:27.043  daemon: agent connected as pwsink-dev-david_local_david
+21:47:27.045  agent : loading receiver for session 'pwrouter-david_local_david'   ← invites here
+21:47:27.483  daemon: advertising session … on control port 6200                  ← socket exists here
+```
+
+438 ms on the wrong side of it. And it is not only about starting up: every group
+rebuild makes a new sender, so a routing change, an alignment hold and its release,
+or a playout-delay retune each leave the target stuck the same way. The host in the
+report had been dead for 40 minutes across two alignment runs, with
+`pwsink_streaming: false` and — the tell that named the cause — the agent's two
+`module-rtp-session` sockets *unconnected* (`ss -unp`: no peer at all), while the
+agent's own control socket to the daemon was fine.
+
+**The fix is to ask.** `PwSinkLiveness::request_rebuild` (`sender_liveness.rs`) is a
+hook `main.rs` fills with "re-send this host's `welcome`" — the same lever as a
+retune (§5.1), so it needed no protocol change and works against already-deployed
+agents. It is called from two places, both in `outputs/pwsink/server.rs`:
+
+- **once per sender, immediately after `AppleMidiSender::start`** — the bind and the
+  advert both happen inside `start`, so by then there is a live socket to invite.
+  Asking any earlier would re-create the very race being fixed;
+- **again every 15 s while a sender has no established peer**, from the status poll
+  task that already publishes `established`. The single ask can still miss (the agent
+  was mid-reconnect, its resolve was slow, the host had just resumed) and nothing else
+  would ever try again. A target with no peer is carrying no audio, so a reload there
+  costs nothing — which is what makes an unconditional retry the right shape.
+
+Proven live before it was built: re-sending `welcome` by hand
+(`PUT /api/outputs/{node}/latency` with the value it already had) took that host from
+`pwsink_streaming: false` to `true` in under a second.
+
+**The agent's own contribution**: its reconnect backoff never reset after a *dropped*
+connection (only after a graceful one), so it doubled to the 60 s ceiling and stayed
+there — every add-on restart after the first cost a full minute of an output that was
+offline in the UI while the agent sat waiting. `client.rs` now resets it whenever the
+socket had actually been up; only a daemon that cannot be reached at all backs off.
+
 ## 8. Pairing and discovery
 
 1. The daemon advertises `_pwrouter-ctl._tcp` on the shared, LAN-restricted mDNS
