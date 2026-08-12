@@ -83,17 +83,17 @@ pub const DEFAULT_PWSINK_JITTER_MS: u16 = 100;
 pub const PWSINK_JITTER_MAX_MS: u16 = 2000;
 
 /// Smallest pw-sink playout delay the API accepts: **three packet times**
-/// ([`crate::applemidi_sender::PACKET_MS`] = 5 ms ⇒ 15 ms).
+/// ([`crate::outputs::pwsink::applemidi::PACKET_MS`] = 5 ms ⇒ 15 ms).
 ///
 /// Two independent reasons, both from the transport rather than from taste:
 /// * the receiving module refuses a `sess.latency.msec` below `rtp.ptime`
 ///   outright ("cannot be lower than"), and warns unless it is an integer
 ///   multiple of it;
 /// * the sender sizes its catch-up burst at two thirds of this buffer
-///   ([`crate::applemidi_sender::BacklogLimits`]), and a burst has to fit
+///   ([`crate::outputs::pwsink::applemidi::BacklogLimits`]), and a burst has to fit
 ///   *inside* the buffer with headroom to spare — at two packet times it would be
 ///   the entire buffer, so the smallest useful buffer is three.
-pub const PWSINK_JITTER_MIN_MS: u16 = 3 * crate::applemidi_sender::PACKET_MS as u16;
+pub const PWSINK_JITTER_MIN_MS: u16 = 3 * crate::outputs::pwsink::applemidi::PACKET_MS as u16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SyncConfig {

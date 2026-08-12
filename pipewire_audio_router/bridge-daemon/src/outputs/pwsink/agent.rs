@@ -693,7 +693,7 @@ impl Agents {
 /// route to us better than we do.
 fn welcome(node_name: &str, jitter_ms: u16) -> DaemonMsg {
     DaemonMsg::Welcome {
-        session_name: crate::pwsink_server::session_name_for(node_name),
+        session_name: crate::outputs::pwsink::server::session_name_for(node_name),
         ifname: None,
         jitter_ms: Some(u32::from(jitter_ms)),
         keepalive_secs: PING_INTERVAL.as_secs(),

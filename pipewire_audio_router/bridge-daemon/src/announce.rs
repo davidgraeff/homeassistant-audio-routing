@@ -17,7 +17,7 @@
 // One exception: a pw-sink target is a whole *host*, which may be playing music of
 // its own that isn't in our stream at all. Our overlay duck cannot reach that, so
 // start/stop on a `pwsink-dev-*` output is mirrored to that host's agent, which
-// attenuates the foreign streams on its sink (pwsink_agent::duck_output —
+// attenuates the foreign streams on its sink (outputs::pwsink::agent::duck_output —
 // docs/receiver-agent-plan.md §11 P3).
 
 use crate::announce_arbiter::{Action, Admission, AnnounceScheduler, AnnouncementId, Effects, OnBusy, Request};
@@ -102,8 +102,8 @@ impl Inner {
 /// — the same value the mix applies. No-op for every other output kind.
 pub(crate) fn sync_agent_duck(output: &str) {
     match OverlayMixer::global().effective_duck(output) {
-        Some(depth) => crate::pwsink_agent::duck_output(output, depth),
-        None => crate::pwsink_agent::unduck_output(output),
+        Some(depth) => crate::outputs::pwsink::agent::duck_output(output, depth),
+        None => crate::outputs::pwsink::agent::unduck_output(output),
     }
 }
 

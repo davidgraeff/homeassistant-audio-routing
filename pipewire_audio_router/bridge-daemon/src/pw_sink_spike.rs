@@ -13,8 +13,8 @@
 //! The receiver plays it via a static `rtp-source` (proven) or auto-discovery.
 //! `DELETE /api/spike/pw-sink` tears everything down. One at a time.
 
+use crate::outputs::pwsink;
 use crate::pw::thread::{PwCommand, PwCommandSender, SharedState};
-use crate::pw_sink;
 use crate::routing::node_id_for;
 use crate::util::locks::LockRecover;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -183,9 +183,9 @@ pub async fn start(
     };
 
     // 2. rtp-sink unicasting to the target.
-    let port = pw_sink::DEFAULT_PWSINK_PORT;
-    let sink_args = pw_sink::rtp_sink_module_args(SINK_NODE_NAME, SESS_NAME, target_ip, port, ifname);
-    if let Err(e) = reload_module(pw_cmd, SINK_NODE_NAME, pw_sink::PWSINK_MODULE_NAME, &sink_args).await {
+    let port = pwsink::module_args::DEFAULT_PWSINK_PORT;
+    let sink_args = pwsink::module_args::rtp_sink_module_args(SINK_NODE_NAME, SESS_NAME, target_ip, port, ifname);
+    if let Err(e) = reload_module(pw_cmd, SINK_NODE_NAME, pwsink::module_args::PWSINK_MODULE_NAME, &sink_args).await {
         cleanup(pw_cmd, anchor_id).await;
         return Err(format!("failed to load rtp-sink: {e}"));
     }

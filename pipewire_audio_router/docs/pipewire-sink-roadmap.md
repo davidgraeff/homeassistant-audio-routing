@@ -175,12 +175,12 @@ Mirrors the established discovery/output pattern.
 
 | File | Change | Mirrors |
 |---|---|---|
-| `pw_target_discovery.rs` (new) | Browse `_workstation._tcp`, populate `SharedPwTargets` (`pw-dev-<slug>`, `approved` flag), fire `changes` | `outputs/sendspin/discovery.rs` |
+| `outputs/pwsink/discovery.rs` (new) | Browse `_workstation._tcp`, populate `SharedPwTargets` (`pw-dev-<slug>`, `approved` flag), fire `changes` | `outputs/sendspin/discovery.rs` |
 | `discovery_supervisor.rs` | Register the browser on the shared LAN-restricted daemon in `start()` | existing browsers |
 | `util/node_names.rs` / `store/outputs.rs` | `PW_DEV_PREFIX`; persist approved targets + per-target `jb_msec`, dest IP/port | `RaopOutputConfig` |
 | `rtp_sink.rs` (new) | Load `rtp-sink` (+ SAP announce) as a real node via `pw_thread` `Load`/`Unload`; build the per-device mix bus (loopback + null-sink) | old `raop.rs` module-load; anchor `CreateSinkNode` |
 | `sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
-| `pw_target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `outputs/sendspin/liveness.rs` |
+| `outputs/pwsink/target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `outputs/sendspin/liveness.rs` |
 | `api.rs` | Candidate list + `approve` endpoint + per-target JB setter + help URL; expose `pw-dev-*` as routable output & `media_player` | §9 outputs derivation |
 | `frontend/` (Svelte) | Discovery listing: approve + help button; per-target JB slider | existing admin console |
 
@@ -249,10 +249,10 @@ refuses plain RTP; SAP multicast doesn't cross consumer routers). The sender was
 proven end-to-end against a stock receiver (`E@440`; see
 [spike-results](pipewire-sink-spike-results.md) "PROVEN" section).
 
-**Files.** `applemidi_sender.rs` (transport, frozen interface — Task 1),
-`pw_target_discovery.rs` (discovery), `pw_target_liveness.rs` (presence),
-`pwsink_server.rs` (per-group audio path),
-`pw_sink_liveness.rs` (session-status registry), plus wiring in `sync_group.rs`,
+**Files.** `outputs/pwsink/applemidi.rs` (transport, frozen interface — Task 1),
+`outputs/pwsink/discovery.rs` (discovery), `outputs/pwsink/target_liveness.rs` (presence),
+`outputs/pwsink/server.rs` (per-group audio path),
+`outputs/pwsink/sender_liveness.rs` (session-status registry), plus wiring in `sync_group.rs`,
 `discovery_supervisor.rs`, `routing.rs`, `api.rs`, `main.rs`.
 
 **Data path.** Discovery browses `_pipewire-audio._udp` → `SharedPwTargets`
@@ -302,7 +302,7 @@ RTP. Liveness = `AppleMidiSender::status().established`, polled into
 
 **Presence vs delivery (done 2026-08-05).** These are two questions and the UI now
 answers both, everywhere, by the same rule:
-- `present` = **reachable**. `pw_target_liveness.rs` owns it (the counterpart to
+- `present` = **reachable**. `outputs/pwsink/target_liveness.rs` owns it (the counterpart to
   `sendspin_liveness`/`ap2_liveness`, which this backend had lacked, so a target
   seen once stayed "online" for the daemon's lifetime). No active probe is possible
   — the receiver dials *us*, so there's no port of ours on the target to poke, and

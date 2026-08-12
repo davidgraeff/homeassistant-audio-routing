@@ -12,12 +12,12 @@
 //! Like sendspin/ap2 discovery, a discovered target does **not** get a PipeWire
 //! node here — it is a *virtual* routing output `pwsink-dev-<slug>`; the audio
 //! path (a per-target AppleMIDI/RTP sender fed from the group anchor's monitor —
-//! pwsink_server.rs) is built by the grouping reconciler (sync_group.rs) from the
+//! outputs/pwsink/server.rs) is built by the grouping reconciler (sync_group.rs) from the
 //! routing intent.
 //!
 //! ## Presence
 //! This module only ever *adds* targets and marks them present; the offline
-//! decision belongs to pw_target_liveness.rs, mirroring outputs/sendspin/liveness.rs /
+//! decision belongs to outputs/pwsink/target_liveness.rs, mirroring outputs/sendspin/liveness.rs /
 //! outputs/ap2/liveness.rs. Without that task a target stayed present forever once seen —
 //! which made the routing graph show a powered-off host as a happy output.
 //!
@@ -53,11 +53,11 @@ pub struct PwTarget {
     /// does not dial it, since the *receiver* initiates the AppleMIDI handshake
     /// to our advertised session). `None` until resolved.
     pub addr: Option<std::net::IpAddr>,
-    /// mDNS presence: a resolve sets it `true`, and pw_target_liveness.rs owns the
+    /// mDNS presence: a resolve sets it `true`, and outputs/pwsink/target_liveness.rs owns the
     /// demotion to `false` (never this browse loop — a TTL flap must not gray a
     /// live target). Note this is *reachability*, not delivery: whether a receiver
     /// has actually attached to the session we advertise is a separate question,
-    /// answered by pw_sink_liveness.rs.
+    /// answered by outputs/pwsink/sender_liveness.rs.
     pub present: bool,
     /// When the host's advert last went away — a goodbye packet (clean shutdown, or
     /// the module being unloaded) or SRV-record expiry ~2 min after the host stops
@@ -101,7 +101,7 @@ fn is_own_advert(label: &str) -> bool {
 /// outputs::sendspin::discovery::spawn / outputs::ap2::discovery::spawn.
 ///
 /// A `ServiceRemoved` never demotes a target here — it only timestamps the
-/// withdrawal for pw_target_liveness.rs to debounce, so a TTL flap can't gray a
+/// withdrawal for outputs/pwsink/target_liveness.rs to debounce, so a TTL flap can't gray a
 /// target that is streaming fine.
 pub fn spawn(daemon: &ServiceDaemon, targets: SharedPwTargets, changes: ChangeNotifier) -> anyhow::Result<()> {
     let receiver = daemon.browse(PIPEWIRE_AUDIO_SERVICE_TYPE)?;

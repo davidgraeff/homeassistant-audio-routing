@@ -186,7 +186,7 @@ fn ap2_level(level: u8) -> f32 {
 /// The same meeting point for a **pw-sink host's** scale (W20): a calibration level is an
 /// integer 0–100, while the receiver agent speaks the cubic **0.0–1.0** its own
 /// `HostState::volume`, `wpctl` and HA's `volume_level` all use
-/// ([`crate::pwsink_agent::Agents::set_volume`]).
+/// ([`crate::outputs::pwsink::agent::Agents::set_volume`]).
 ///
 /// Written out for the same reason as [`ap2_level`]: a factor of 100 the wrong way clamps
 /// at a rail, and a rail on someone's desktop speakers is either silence or full scale.
@@ -661,7 +661,7 @@ struct Session {
     /// pass is genuinely unknown to us, and inventing a level for someone's desktop is the
     /// failure mode that matters.
     ///
-    /// Unlike AP2 there is nothing else to undo: [`crate::pwsink_agent::Agents`] stores no
+    /// Unlike AP2 there is nothing else to undo: [`crate::outputs::pwsink::agent::Agents`] stores no
     /// desired level and re-applies none on reconnect, so a write leaves no daemon-side
     /// mark — no `set_volume_transient`/`forget_volume` counterpart is needed here.
     saved_oob_levels: HashMap<String, f32>,

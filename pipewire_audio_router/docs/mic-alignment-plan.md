@@ -174,7 +174,7 @@ daemon**, and writes the real knobs **once** after the last step.
 
 The mechanism is a **per-device delay line**, not per-device tone synthesis. Every
 per-device relay already calls `mix_into(node_name, block, &mut buf)`
-(`outputs/sendspin/server.rs:824`, `outputs/ap2/server.rs:408`, `pwsink_server.rs:220`); a per-device
+(`outputs/sendspin/server.rs:824`, `outputs/ap2/server.rs:408`, `outputs/pwsink/server.rs:220`); a per-device
 ring buffer read at an offset of *d* samples emits older content against the unchanged
 timestamp schedule, so the device renders it later — exactly a delay.
 
@@ -646,7 +646,7 @@ which is nothing on a LAN. Handle a 44.1 kHz `AudioContext` (iOS) as well as
 48 kHz; carry the rate in a JSON hello frame.
 
 New endpoint `GET /api/align/mic/ws`, upgraded with `axum`'s ws feature —
-`routing::routing_ws` (`routing.rs:738`) and `pwsink_agent::agent_ws` are the
+`routing::routing_ws` (`routing.rs:738`) and `outputs::pwsink::agent::agent_ws` are the
 in-repo precedents for the handler shape. One socket at a time; a second
 connection is rejected. Closing the socket does **not** tear down the session (the
 user may be switching modes), but the 15 min safety timeout still applies.
@@ -918,7 +918,7 @@ all**. It does not need to know the content position, a frame index, or a
 presentation timestamp — which is precisely what the AP2 and pw-sink relays cannot
 provide (§6.3). The injection point already exists in all three:
 `outputs::overlay_mixer::mix_into(node_name, …)` is called per device in
-`outputs/sendspin/server.rs:824`, `outputs/ap2/server.rs:408` and `pwsink_server.rs:220`. A
+`outputs/sendspin/server.rs:824`, `outputs/ap2/server.rs:408` and `outputs/pwsink/server.rs:220`. A
 sibling `cal_gate(node_name, block, &mut buf)` slots in beside it.
 
 Design notes:
@@ -970,7 +970,7 @@ The other two transports have no such anchor:
   `LiveFrameSender`; there is no presentation timestamp in the loop, and it runs
   from its **own** capture (`spawn_with_rate("ap2", …)`, `outputs/ap2/server.rs:371`) with
   an independent frame origin.
-- `pwsink_server.rs` is the same shape.
+- `outputs/pwsink/server.rs` is the same shape.
 
 Using each relay's local monotonic "now" instead would inject that relay's
 scheduling jitter (~one quantum, 10–20 ms) straight into the measurement — far
@@ -1031,7 +1031,7 @@ currently reflect it (`align/calibrate.rs:92` knows only Sendspin and Airplay2):
 |---|---|---|
 | sendspin | `set_volume`, live | already used by the session |
 | AP2 | `outputs::ap2::volume::set_volume` (`outputs/ap2/volume.rs:168`) | exists, but the session deliberately leaves AP2 level device-authoritative — needs snapshot/restore alongside `saved_sendspin`, and the "no-impose" decision must be revisited for the session's duration only. **Restore cannot simply mirror `saved_sendspin`:** `ap2_volume` treats an absent level as genuinely *unknown*, so the restore entry is optional and "unknown" must mean *leave the receiver alone*, never write an invented level |
-| pw-sink | **`pwsink_agent::Agents::set_volume`, when an agent is answering** (W20) | Corrected: this row said "none in this path", which was true only until the receiver agent existed. The host's `SetVolume` drives the receiving sink and its `HostState.volume` reports the level back, so such a member is a `SnapshotRestore` knob — the *same shape as AP2 and for the same reason*, that the level lives on the device and is only restorable because the far end reports it. `HostState` speaks cubic 0.0–1.0 (`calibrate::host_level` is where that meets our 0–100), and "unknown ⇒ leave the host alone" applies exactly as for AP2 — the agent reports a level only while it is *receiving*, so a host whose stream came up after the snapshot pass is genuinely unknown |
+| pw-sink | **`outputs::pwsink::agent::Agents::set_volume`, when an agent is answering** (W20) | Corrected: this row said "none in this path", which was true only until the receiver agent existed. The host's `SetVolume` drives the receiving sink and its `HostState.volume` reports the level back, so such a member is a `SnapshotRestore` knob — the *same shape as AP2 and for the same reason*, that the level lives on the device and is only restorable because the far end reports it. `HostState` speaks cubic 0.0–1.0 (`calibrate::host_level` is where that meets our 0–100), and "unknown ⇒ leave the host alone" applies exactly as for AP2 — the agent reports a level only while it is *receiving*, so a host whose stream came up after the snapshot pass is genuinely unknown |
 | anything else | none | no agent answering, a sink with neither a device route nor a node volume (`pwrouter-agent` prints `lever: <none>`), a future output kind |
 
 **The level knob is a per-output capability, not a property of the kind** (W20, the same
@@ -1494,7 +1494,7 @@ and the final real write.
     between resolve and use can never leave a speaker audible.
 
     **The primary fix already exists: the pwrouter-agent.** This section was written as
-    though pw-sink had no mute at all; that is wrong. `pwsink_agent.rs` carries
+    though pw-sink had no mute at all; that is wrong. `outputs/pwsink/agent.rs` carries
     `DaemonMsg::SetVolume { volume }` and `SetMute { muted }`, `Agents::set_volume` /
     `set_mute` return `false` when the host is not connected, the agent implements both
     (`pwrouter-agent/src/client.rs:461/465` → `pw::thread::apply_master`), and

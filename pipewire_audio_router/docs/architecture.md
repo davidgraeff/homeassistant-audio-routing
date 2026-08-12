@@ -424,7 +424,7 @@ up already ducked.
 **Agent-backed hosts need the aggregate, not the delta.** A pw-sink target is a
 whole host that may be playing music of its own, outside our stream, which the
 overlay mix cannot reach — so its duck is mirrored to that host's agent
-(`pwsink_agent::duck_output`), which attenuates the foreign streams on its sink.
+(`outputs::pwsink::agent::duck_output`), which attenuates the foreign streams on its sink.
 The agent takes an **absolute** depth and does no ref-counting, so every producer
 of ducking re-asserts `OverlayMixer::effective_duck` (the same value the mix
 applies) through `announce::sync_agent_duck` rather than clearing the host

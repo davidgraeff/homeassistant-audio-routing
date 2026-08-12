@@ -3,19 +3,12 @@ mod announce;
 mod announce_arbiter;
 mod ap2_spike;
 mod api;
-mod applemidi_sender;
 mod audio;
 mod discovery_supervisor;
 mod outputs;
 mod per_device_spike;
 mod pw;
-mod pw_sink;
-mod pw_sink_liveness;
 mod pw_sink_spike;
-mod pw_target_discovery;
-mod pw_target_liveness;
-mod pwsink_agent;
-mod pwsink_server;
 mod routing;
 mod sources;
 mod store;
@@ -212,13 +205,14 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let ap2_devices: outputs::ap2::discovery::SharedAp2Devices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     let ap2_ptp = outputs::ap2::ptp::Ap2PtpService::new();
-    // Hosts advertising an RTP session over mDNS (pw_target_discovery.rs).
+    // Hosts advertising an RTP session over mDNS (outputs/pwsink/discovery.rs).
     // **Diagnostic only**: pw-sink outputs come from paired agents (plan §3), and
     // these adverts cannot serve that role — they are keyed by hostname alone, while
     // a pairing (and therefore every routing link and HA entity) carries the user
     // too. Kept because "that host advertises a session" is worth a log line; read
     // by nothing but its own liveness bookkeeping.
-    let pw_targets: pw_target_discovery::SharedPwTargets = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let pw_targets: outputs::pwsink::discovery::SharedPwTargets =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // Discovered Bluetooth→RTP bridges (sources/bt_bridge.rs): Pis advertising
     // `_pwrouter-btbridge._tcp`. These are input *senders*, so unlike the four
     // registries above they drive no audio path — they let the Sources tab offer
@@ -234,12 +228,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // track restored from disk would be a lie.
     let now_playing = crate::sources::now_playing::NowPlayingStore::new(changes.clone());
 
-    // Paired receiver agents (pwsink_agent.rs): the token store *and* the source
+    // Paired receiver agents (outputs/pwsink/agent.rs): the token store *and* the source
     // of truth for pw-sink targets — a pw-sink output exists because a helper on
     // that host paired, not because something answered an mDNS browse
     // (docs/receiver-agent-plan.md §3).
     let agents_path = routing_path.with_file_name("agents.json");
-    let agents = pwsink_agent::Agents::shared(agents_path.clone(), changes.clone());
+    let agents = outputs::pwsink::agent::Agents::shared(agents_path.clone(), changes.clone());
     let agents_for_duck = agents.clone();
 
     // mDNS auto-discovery (sendspin devices + AirPlay-2 receivers), runtime
@@ -301,7 +295,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // And for pw-sink targets, which have nothing to probe (the receiver dials
         // us): presence follows the advert, debounced, with an established session
         // as proof of life. Without this a target seen once stayed "online" forever.
-        pw_target_liveness::spawn(pw_targets.clone(), changes.clone());
+        outputs::pwsink::target_liveness::spawn(pw_targets.clone(), changes.clone());
 
         // Let device-reported sendspin volume changes (outputs/sendspin/server.rs) nudge
         // the routing-matrix WebSocket, so the UI slider syncs live to a physical
@@ -312,7 +306,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Same for the pw-sink handshake: the matrix reports it as each output's
         // `streaming` (whether a route is really being carried), so a receiver
         // attaching or dropping has to push a frame of its own.
-        pw_sink_liveness::PwSinkLiveness::global().set_change_notifier(changes.clone());
+        outputs::pwsink::sender_liveness::PwSinkLiveness::global().set_change_notifier(changes.clone());
 
         // Seed persisted per-device static delays so they re-apply when each
         // device (re)connects, exactly like stored volumes (outputs/sendspin/volume.rs).
@@ -346,7 +340,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // estimator would measure as a real offset. Without this the session falls back
         // to zero-filling in the relay, which also works; with it, the better mechanism
         // is used wherever an agent is actually there.
-        align.set_out_of_band_mute(std::sync::Arc::new(pwsink_agent::AgentSilencer(agents.clone())));
+        align.set_out_of_band_mute(std::sync::Arc::new(outputs::pwsink::agent::AgentSilencer(agents.clone())));
         {
             let pw = pw_state.clone();
             let cmd = pw_cmd.clone();
@@ -508,12 +502,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Tell receiver agents where to dial in (docs/receiver-agent-plan.md §8).
         // After bind, so the port in the advert is one that is actually listening.
         if let Ok(addr) = listener.local_addr() {
-            pwsink_agent::advertise(addr.port());
+            outputs::pwsink::agent::advertise(addr.port());
         }
         // Relay for announcement ducks on agent-backed hosts: announce.rs is
         // synchronous, so it posts requests here instead of taking the async
-        // registry lock (pwsink_agent.rs).
-        pwsink_agent::spawn_duck_relay(agents_for_duck);
+        // registry lock (outputs/pwsink/agent.rs).
+        outputs::pwsink::agent::spawn_duck_relay(agents_for_duck);
         tracing::info!("listening on {listen}");
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 

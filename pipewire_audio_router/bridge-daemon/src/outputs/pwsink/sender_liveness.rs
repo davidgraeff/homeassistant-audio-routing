@@ -4,9 +4,9 @@
 //! Unlike sendspin/AP2 (where the daemon dials the receiver, so a failed connect
 //! is observable directly), a pw-sink target's `module-rtp-session` *initiates*
 //! the AppleMIDI handshake to the session the daemon advertises. So "present on
-//! mDNS" (pw_target_discovery.rs) is not the same as "connected and playing" —
-//! the truth lives in each [`crate::applemidi_sender::AppleMidiSender`]'s
-//! `status()`. The per-group sender task (pwsink_server.rs) polls that status and
+//! mDNS" (outputs/pwsink/discovery.rs) is not the same as "connected and playing" —
+//! the truth lives in each [`crate::outputs::pwsink::applemidi::AppleMidiSender`]'s
+//! `status()`. The per-group sender task (outputs/pwsink/server.rs) polls that status and
 //! publishes it here, keyed by output node name; the API (`/api/outputs`) reads
 //! it so the UI can show a target as present-but-not-yet-connected vs streaming.
 //!

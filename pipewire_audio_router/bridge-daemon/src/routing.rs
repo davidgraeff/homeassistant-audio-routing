@@ -231,7 +231,7 @@ fn build_matrix(
     reg: &RegistryState,
     devices: &BTreeMap<String, SendspinDevice>,
     ap2_devices: &BTreeMap<String, crate::outputs::ap2::discovery::Ap2Device>,
-    // Connected receiver hosts (`node_name → label`, pwsink_agent.rs). The same
+    // Connected receiver hosts (`node_name → label`, outputs/pwsink/agent.rs). The same
     // source `sync_group` builds its pw-sink members from, so this page and the audio
     // path cannot disagree about whether a host is there — they used to, because this
     // read mDNS discovery (`pwsink-dev-<host>`) while everything else used the pairing
@@ -348,7 +348,7 @@ fn build_matrix(
                     ap2_volumes.get(&name).copied()
                 } else if name.starts_with(PWSINK_DEV_PREFIX) {
                     // Same contract as the two above, via the agent's control lane
-                    // (`pwsink_agent::DaemonMsg::SetVolume`, already used by
+                    // (`outputs::pwsink::agent::DaemonMsg::SetVolume`, already used by
                     // `PUT /api/pwsink/volume`). Only the *read* side was missing, which
                     // is why the UI showed no control for a host it could already drive.
                     pwsink_volumes.get(&name).copied()
@@ -907,7 +907,7 @@ enum Frame<'a> {
     },
     /// `/api/agents` — paired receiver hosts and pending pair requests.
     Agents {
-        agents: &'a [crate::pwsink_agent::AgentInfo],
+        agents: &'a [crate::outputs::pwsink::agent::AgentInfo],
     },
     /// Per-source now-playing metadata (sources/now_playing.rs), keyed by source node
     /// name. Its own frame rather than a field on [`Frame::Matrix`] **on purpose**:
@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn listing_frames_are_tagged_by_kind() {
         let empty: Vec<crate::api::OutputInfo> = Vec::new();
-        let agents: Vec<crate::pwsink_agent::AgentInfo> = Vec::new();
+        let agents: Vec<crate::outputs::pwsink::agent::AgentInfo> = Vec::new();
         for (frame, expected_type, payload_key) in [
             (Frame::Outputs { outputs: &empty }, "outputs", "outputs"),
             (Frame::Discovered { outputs: &empty }, "discovered", "outputs"),

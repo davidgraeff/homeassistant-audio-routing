@@ -120,8 +120,8 @@ struct Inner {
     ap2_devices: SharedAp2Devices,
     /// Host-global AP2 PTP grandmaster — discovery registers each receiver as a peer.
     ap2_ptp: SharedAp2Ptp,
-    /// Discovered pw-sink targets (pw_target_discovery.rs).
-    pw_targets: crate::pw_target_discovery::SharedPwTargets,
+    /// Discovered pw-sink targets (outputs/pwsink/discovery.rs).
+    pw_targets: crate::outputs::pwsink::discovery::SharedPwTargets,
     /// Discovered Bluetooth→RTP bridges (sources/bt_bridge.rs). Unlike the
     /// others these are not outputs and build no audio path — they annotate RTP
     /// *sources* with their sender's identity and diagnostics page.
@@ -137,7 +137,7 @@ impl DiscoverySupervisor {
         devices: SharedSendspinDevices,
         ap2_devices: SharedAp2Devices,
         ap2_ptp: SharedAp2Ptp,
-        pw_targets: crate::pw_target_discovery::SharedPwTargets,
+        pw_targets: crate::outputs::pwsink::discovery::SharedPwTargets,
         bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
         changes: ChangeNotifier,
     ) -> Self {
@@ -161,7 +161,7 @@ impl DiscoverySupervisor {
         let spawned = (|| -> anyhow::Result<()> {
             sendspin::discovery::spawn(&daemon, inner.devices.clone(), inner.changes.clone())?;
             ap2::discovery::spawn(&daemon, inner.ap2_devices.clone(), inner.changes.clone(), inner.ap2_ptp.clone())?;
-            crate::pw_target_discovery::spawn(&daemon, inner.pw_targets.clone(), inner.changes.clone())?;
+            crate::outputs::pwsink::discovery::spawn(&daemon, inner.pw_targets.clone(), inner.changes.clone())?;
             crate::sources::bt_bridge::spawn(&daemon, inner.bt_bridges.clone(), inner.changes.clone())?;
             Ok(())
         })();

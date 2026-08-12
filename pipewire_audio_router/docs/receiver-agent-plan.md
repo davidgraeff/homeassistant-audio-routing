@@ -4,7 +4,7 @@ Status: **implemented** (2026-08-03) — P1-P3 built, control plane verified liv
 (§14.2); deferrals listed in §13. Supersedes the static receiver drop-in described
 in [pipewire-sink-roadmap.md](pipewire-sink-roadmap.md) §10.
 
-Code: `pwrouter-agent/` (the helper) and `bridge-daemon/src/pwsink_agent.rs` (the
+Code: `pwrouter-agent/` (the helper) and `bridge-daemon/src/outputs/pwsink/agent.rs` (the
 daemon side).
 
 ## 1. Why
@@ -80,14 +80,14 @@ therefore changes from "browse `_pipewire-audio._udp`" (which detects a
 *statically configured* receiver) to "an agent has paired and is connected",
 which is a stronger and more honest signal — it also finally answers roadmap §4's
 "configured vs. connected" question, and makes the liveness poll in
-`pw_sink_liveness.rs` a second-order detail rather than the only signal.
+`outputs/pwsink/sender_liveness.rs` a second-order detail rather than the only signal.
 
 Consequences, accepted:
 
 * Existing hosts stop working until their agent is installed. There is no
   migration path and none is wanted (same "start clean" stance as the output
   adoption gate).
-* `pw_target_discovery.rs` loses its role as the source of truth for targets; it
+* `outputs/pwsink/discovery.rs` loses its role as the source of truth for targets; it
   survives as a **diagnostic only** — its browse still logs "discovered pw-sink
   target", and nothing reads its registry (it is not even in `AppState` any more).
 
@@ -114,7 +114,7 @@ Consequences, accepted:
 ```
   add-on (bridge-daemon)                        receiver host (user session)
   ┌───────────────────────────┐                 ┌──────────────────────────────┐
-  │ pwsink_agent.rs           │   WS  (agent    │ pwrouter-agent               │
+  │ outputs/pwsink/agent.rs           │   WS  (agent    │ pwrouter-agent               │
   │  · pairing + token store  │◄── dials out ───┤  · own pw_context (client)    │
   │  · per-host command chan  │   token auth)   │  · loads module-rtp-session   │
   │  · volume/mute registry   │                 │    into that context  ← §7    │
@@ -124,7 +124,7 @@ Consequences, accepted:
             └── AppleMIDI/RTP ─────────────────►└──────────────────────────────┘
 ```
 
-The audio path does not change: `pwsink_server.rs` keeps advertising one
+The audio path does not change: `outputs/pwsink/server.rs` keeps advertising one
 `pwrouter-<slug>` session per target and streaming L16 to it. The agent only adds
 a control plane — and takes over creating the receive side.
 
@@ -271,7 +271,7 @@ Stock `module-rtp-session` cannot be scoped, and cannot be pointed at a peer:
 * `destination.ip`/`destination.port` are set internally from a resolved mDNS
   service before `make_session()` — there is no static-peer configuration.
 
-That is the deferred cross-talk problem in `pwsink_server.rs` ("Deferred:
+That is the deferred cross-talk problem in `outputs/pwsink/server.rs` ("Deferred:
 multi-target routing scoping"), and it cannot be fixed with module arguments.
 What the agent *can* use: `make_session()` stamps every session's streams with
 `rtp.session = <session name>`, so the agent identifies its own session's nodes
@@ -504,7 +504,7 @@ desktop, a different feature; folding it into the agent is a separate decision.
 | **S1b** (spike) | session-name scoping for `rtp-session` | ✅ answered — impossible in the module, done agent-side via `rtp.session` (§7.1) |
 | **S2** (spike) | link-walk to the target sink + volume get/set | ✅ walk + read verified; ❗ write must use the device `Route` param, not node `Props` (§6.1) |
 | **S2b** (spike) | `SPA_PARAM_Route` set on the Device (volume + mute), read-back observed by `wpctl` | `wpctl get-volume` reflects an agent-set value; local changes read back |
-| **P1** | agent (config, pairing, reconnect, restore rails); `pwsink_agent.rs`; master volume/mute through to the HA `media_player` | ✅ built; control plane verified live (§14.2). `pw-control` extraction deferred (§13) |
+| **P1** | agent (config, pairing, reconnect, restore rails); `outputs/pwsink/agent.rs`; master volume/mute through to the HA `media_player` | ✅ built; control plane verified live (§14.2). `pw-control` extraction deferred (§13) |
 | **P2** | receiver config owned by the agent; targets sourced from paired agents (§3); drop-in deleted; systemd unit | ✅ built; adoption gate verified live. "Targets sourced from paired agents" was only half done until 2026-08-05 — the *listing* was, the audio path and the matrix were not, so no pw-sink output could carry audio (§3). Serving the binary from the add-on frontend deferred (needs a cross-arch build stage) |
 | **P3** | per-stream duck of *foreign* streams with local ramp, wired to the announce path alongside `overlay_mixer` | ✅ built (`duck_output`/`unduck_output` from `announce.rs`); not yet heard on real audio |
 | **P4** | host-scoped extras: report sinks (target a *named* sink), report xruns into the profiler badges | deferred |
@@ -526,11 +526,11 @@ applications' streams on that sink, never `pwsink-in`.
 | `pw-control/` (own workspace root) | shared with the daemon: volume/route pods, the cubic scale, and the `pw_context_load_module` FFI neither `pipewire-rs` wraps nor either side should duplicate |
 | `frontend/src/components/OutputsTab.svelte` | the pairing UI, such as it is: a host waiting to pair is a discovered output card carrying the code, and Add/Unpair are its decisions. (`AgentsPanel.svelte` used to own a section of its own; deleted — see §8.3) |
 | `pw-control/` (new crate, P1) | `channelVolumes` get/set + cubic scale, shared with the daemon |
-| `bridge-daemon/src/pwsink_agent.rs` (new) | daemon side: WS endpoint, token store, per-host command channel, keepalive |
+| `bridge-daemon/src/outputs/pwsink/agent.rs` (new) | daemon side: WS endpoint, token store, per-host command channel, keepalive |
 | `bridge-daemon/src/volume.rs` | source of the shared volume code (moves to `pw-control`) |
 | `bridge-daemon/src/pw_module.rs` | the client-context module-load FFI the agent reuses |
-| `bridge-daemon/src/pw_target_discovery.rs` | diagnostic only, read by nothing (§3) — the audio path and the matrix take pw-sink hosts from `Agents::connected_targets()` |
-| `bridge-daemon/src/pwsink_server.rs` | unchanged audio path; gains session-scoping once S1b lands |
+| `bridge-daemon/src/outputs/pwsink/discovery.rs` | diagnostic only, read by nothing (§3) — the audio path and the matrix take pw-sink hosts from `Agents::connected_targets()` |
+| `bridge-daemon/src/outputs/pwsink/server.rs` | unchanged audio path; gains session-scoping once S1b lands |
 | `custom_components/pipewire_audio_router/media_player.py` | `VOLUME_SET`/`VOLUME_MUTE` for pw-sink outputs with a connected agent |
 
 ## 13. Decisions and deferrals

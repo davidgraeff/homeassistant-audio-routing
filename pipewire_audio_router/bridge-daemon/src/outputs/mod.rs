@@ -6,7 +6,7 @@
 //! [`sendspin`] does that for ESPHome speakers and [`ap2`] for AirPlay-2
 //! receivers, which also owns the host-global PTP grandmaster its timing needs.
 //! `pwsink` is the exception that proves the rule — a remote PipeWire host speaks
-//! our transport natively — and lands here in the next sub-commit.
+//! our transport natively: [`pwsink`] needs no codec and no hot path of its own.
 //!
 //! [`overlay_mixer`] is what every backend shares: while an announcement is
 //! active on one output, that device's frame becomes duck(music)+overlay while its
@@ -20,4 +20,5 @@
 
 pub(crate) mod ap2;
 pub(crate) mod overlay_mixer;
+pub(crate) mod pwsink;
 pub(crate) mod sendspin;

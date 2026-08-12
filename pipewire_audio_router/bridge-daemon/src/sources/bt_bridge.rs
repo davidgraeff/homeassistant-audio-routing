@@ -13,12 +13,12 @@
 //!
 //! ## Why not `_pipewire-audio._udp`
 //! That type means the opposite: a host running `module-rtp-session` willing to
-//! **receive**, which `pw_target_discovery.rs` already surfaces as a routing
+//! **receive**, which `outputs/pwsink/discovery.rs` already surfaces as a routing
 //! *output*. A bridge advertising it would appear as a speaker. It also could not
 //! carry this direction's audio: stock `module-rtp-session` refuses plain RTP
 //! (it wants the AppleMIDI handshake) and in discover mode attaches to *every*
 //! session of the media type — including the `pwrouter-*` sessions
-//! `pwsink_server.rs` advertises for outputs, which would loop our own output
+//! `outputs/pwsink/server.rs` advertises for outputs, which would loop our own output
 //! audio back in as an input. So the audio path stays
 //! `module-rtp-sink` → `module-rtp-source`; only *discovery* is shared in spirit.
 //!
@@ -229,7 +229,7 @@ fn bridge_from_service(info: &ResolvedService) -> Option<BtBridge> {
 }
 
 /// Start browsing for bridges on the shared mDNS `daemon`, keeping `bridges` in
-/// sync. Mirrors `pw_target_discovery::spawn`: resolves are merged, removes are
+/// sync. Mirrors `outputs::pwsink::discovery::spawn`: resolves are merged, removes are
 /// ignored (an mDNS TTL flap is not a bridge going away — and unlike an output,
 /// a stale entry here cannot misroute audio, it can only offer a stale link,
 /// which the probe then refuses).

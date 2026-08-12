@@ -2,7 +2,7 @@
 //! between "we found a speaker on the network" and "this speaker is part of the
 //! system".
 //!
-//! Discovery (outputs/sendspin/discovery.rs, outputs/ap2/discovery.rs, pw_target_discovery.rs)
+//! Discovery (outputs/sendspin/discovery.rs, outputs/ap2/discovery.rs, outputs/pwsink/discovery.rs)
 //! finds every compatible device on the LAN, which used to make each one
 //! immediately routable *and* — with the `expose_outputs_as_media_players`
 //! toggle on — spawn a Home Assistant `media_player` for it. On a normal home

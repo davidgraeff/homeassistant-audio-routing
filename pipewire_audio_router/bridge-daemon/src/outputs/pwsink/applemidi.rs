@@ -915,7 +915,7 @@ mod tests {
             advertise_daemon: None, // standalone: create our own mDNS daemon.
         };
 
-        // Bounded like the real feed (pwsink_server::PCM_FEED_DEPTH), so the spike
+        // Bounded like the real feed (outputs::pwsink::server::PCM_FEED_DEPTH), so the spike
         // exercises the same drop-instead-of-grow shape the daemon runs.
         let (tx, rx) = sync_channel::<PcmChunk>(8);
         // Feed a 440 Hz stereo tone (amplitude ~8000) at real time until the

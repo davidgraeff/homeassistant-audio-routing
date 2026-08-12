@@ -1,6 +1,6 @@
 //! Advert-driven presence + demotion for **pw-sink targets**.
 //!
-//! mDNS (pw_target_discovery.rs) only ever *adds* targets; this task owns the
+//! mDNS (outputs/pwsink/discovery.rs) only ever *adds* targets; this task owns the
 //! online/offline flag and eventual removal, so a discovered host stops being
 //! listed as a live output once it's gone. Without it a target stayed
 //! `present: true` for the daemon's lifetime — the routing graph then showed a
@@ -17,20 +17,20 @@
 //! - the **advert**: `ServiceRemoved` (a goodbye on clean shutdown / module unload,
 //!   or SRV expiry ~2 min after the host stops answering) timestamps a withdrawal
 //!   in `PwTarget::withdrawn_since`; a fresh resolve clears it.
-//! - the **session**: an established AppleMIDI handshake (pw_sink_liveness.rs) is
+//! - the **session**: an established AppleMIDI handshake (outputs/pwsink/sender_liveness.rs) is
 //!   proof of life that outranks the advert — a receiver streaming from us is
 //!   online no matter what mDNS currently says (and this is what keeps a host whose
 //!   zeroconf publishing is off, but whose rtp-session runs, from being demoted).
 //!
 //! Note the split this preserves: `present` here is *reachability*, while
-//! "a receiver has actually attached" stays pw_sink_liveness.rs's `established`
+//! "a receiver has actually attached" stays outputs/pwsink/sender_liveness.rs's `established`
 //! (surfaced as `streaming` in the routing matrix and `pwsink_streaming` on
 //! `/api/outputs`). A host that is up but has no session is honestly reported as
 //! present-but-not-streaming rather than either "offline" or "playing".
 
+use crate::outputs::pwsink::discovery::SharedPwTargets;
+use crate::outputs::pwsink::sender_liveness::PwSinkLiveness;
 use crate::pw::thread::ChangeNotifier;
-use crate::pw_sink_liveness::PwSinkLiveness;
-use crate::pw_target_discovery::SharedPwTargets;
 use crate::util::locks::LockRecover;
 use std::time::{Duration, Instant};
 

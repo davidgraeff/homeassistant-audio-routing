@@ -2,7 +2,7 @@
 //! PipeWire hosts running `libpipewire-module-rtp-session`.
 //!
 //! Mirrors `outputs::ap2::server::start`, but the transport is the AppleMIDI/RTP audio
-//! sender (`applemidi_sender::AppleMidiSender`) instead of the vendored AirPlay-2
+//! sender (`outputs::pwsink::applemidi::AppleMidiSender`) instead of the vendored AirPlay-2
 //! sender. For each pw-sink target in a group it advertises one
 //! `_pipewire-audio._udp` session (`pwrouter-<slug>`) over the daemon's shared
 //! storm-safe mDNS daemon; the target's `module-rtp-session` discovers it,
@@ -30,8 +30,8 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crate::applemidi_sender::{AppleMidiSender, PcmChunk, SessionConfig, SessionFormat};
-use crate::pw_sink_liveness::{PwSinkLiveness, PwSinkStatus};
+use crate::outputs::pwsink::applemidi::{AppleMidiSender, PcmChunk, SessionConfig, SessionFormat};
+use crate::outputs::pwsink::sender_liveness::{PwSinkLiveness, PwSinkStatus};
 use crate::util::node_names::{PWSINK_DEV_PREFIX, PWSINK_SESSION_PREFIX};
 
 /// One target this group streams to: the virtual output node name
@@ -46,7 +46,7 @@ pub struct PwSinkMember {
     /// This target's configured playout delay in ms — the `sess.latency.msec` its
     /// agent was told to run (`sync_settings::pwsink_jitter_effective`). Passed down
     /// because the sender sizes its catch-up burst and backlog ceiling against the
-    /// far end's buffer; see [`crate::applemidi_sender::BacklogLimits`]. It is read
+    /// far end's buffer; see [`crate::outputs::pwsink::applemidi::BacklogLimits`]. It is read
     /// when the session starts, so a change to the knob reaches this on the next
     /// session (re)start — which is also when the receiver reloads.
     pub playout_ms: u16,
@@ -102,7 +102,7 @@ impl Drop for PwSinkServerHandle {
 
 /// The AppleMIDI session name the daemon advertises for a target — the target's
 /// virtual node name (`pwsink-dev-<slug>`) re-prefixed to `pwrouter-<slug>` so
-/// discovery (pw_target_discovery.rs) filters it out of the target list.
+/// discovery (outputs/pwsink/discovery.rs) filters it out of the target list.
 pub fn session_name_for(node_name: &str) -> String {
     let slug = node_name.strip_prefix(PWSINK_DEV_PREFIX).unwrap_or(node_name);
     format!("{PWSINK_SESSION_PREFIX}{slug}")
@@ -143,7 +143,7 @@ fn set_relay_realtime_priority() {
 /// receiver completes the handshake.
 pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<PwSinkServerHandle> {
     if members.is_empty() {
-        anyhow::bail!("pwsink_server::start called with no members");
+        anyhow::bail!("outputs::pwsink::server::start called with no members");
     }
 
     // Capture the anchor monitor at the fixed 48 kHz / S16 / stereo bus rate —

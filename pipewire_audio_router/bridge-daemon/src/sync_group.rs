@@ -35,7 +35,7 @@ use crate::outputs::overlay_mixer::OverlayMixer;
 use crate::util::locks::LockRecover;
 use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SYNC_GRP_PREFIX};
 /// Connected receiver hosts, `node_name → label`, as
-/// `pwsink_agent::Agents::connected_targets` reports them. A pw-sink target exists
+/// `outputs::pwsink::agent::Agents::connected_targets` reports them. A pw-sink target exists
 /// because an agent is on the socket (plan §3) — mDNS is not consulted, and cannot
 /// be: its node names lack the `_<user>` half that routing intent carries.
 type PwsinkHosts = std::collections::BTreeMap<String, String>;
@@ -189,10 +189,10 @@ struct RunningGroup {
     /// The AP2 capture/wire rate (Hz) the running senders were started at — part
     /// of the restart identity alongside `ap2_members`.
     ap2_rate: u32,
-    /// Live pw-sink senders (pwsink_server.rs) for this group; drop = tear down
+    /// Live pw-sink senders (outputs/pwsink/server.rs) for this group; drop = tear down
     /// each target's advertised session. `None` when the group has no present
     /// pw-sink targets.
-    pwsink_server: Option<crate::pwsink_server::PwSinkServerHandle>,
+    pwsink_server: Option<crate::outputs::pwsink::server::PwSinkServerHandle>,
     /// pw-sink target node names the running senders were started for — the
     /// restart identity (a membership change drops + recreates the senders).
     pwsink_members: Vec<String>,
@@ -262,7 +262,7 @@ enum AnnounceSessionTransport {
     /// pw-sink: drop = `BY` + withdraw the mDNS advert (the handle is held only for
     /// that, never read — hence the underscore). `control_port` is tracked so port
     /// allocation across groups and sessions never collides.
-    PwSink { _server: crate::pwsink_server::PwSinkServerHandle, control_port: u16 },
+    PwSink { _server: crate::outputs::pwsink::server::PwSinkServerHandle, control_port: u16 },
 }
 
 #[derive(Default)]
@@ -352,7 +352,7 @@ pub struct AnnounceDeps<'a> {
     pub sync_settings: &'a crate::sync_settings::SharedSyncSettings,
     /// Receiver-host registry, for the pw-sink on-demand path: an announcement can
     /// only be opened to a host whose agent is connected to take the session.
-    pub agents: &'a crate::pwsink_agent::SharedAgents,
+    pub agents: &'a crate::outputs::pwsink::agent::SharedAgents,
 }
 
 /// Why an output with no live per-device sender can't carry an announcement, for
@@ -425,7 +425,7 @@ pub fn dialed_session_established(output: &str, ap2_connected: &HashSet<String>)
         return Some(ap2_connected.contains(output));
     }
     if output.starts_with(PWSINK_DEV_PREFIX) {
-        return Some(crate::pw_sink_liveness::PwSinkLiveness::global().get(output).is_some_and(|s| s.established));
+        return Some(crate::outputs::pwsink::sender_liveness::PwSinkLiveness::global().get(output).is_some_and(|s| s.established));
     }
     None
 }
@@ -756,8 +756,8 @@ impl GroupReconciler {
         // The sender sizes its catch-up burst against the buffer the receiver was
         // told to keep, so it is told the same figure the agent got.
         let playout_ms = deps.sync_settings.lock_recover().pwsink_jitter_effective(output);
-        let member = crate::pwsink_server::PwSinkMember { node_name: output.to_string(), control_port, playout_ms };
-        let server = match crate::pwsink_server::start(vec![member], sink_node_id) {
+        let member = crate::outputs::pwsink::server::PwSinkMember { node_name: output.to_string(), control_port, playout_ms };
+        let server = match crate::outputs::pwsink::server::start(vec![member], sink_node_id) {
             Ok(handle) => handle,
             Err(e) => {
                 self.abandon_announce_sink(output, sink_node_id, deps.pw_cmd).await;
@@ -1629,17 +1629,17 @@ impl GroupReconciler {
                 }
                 if !d.pwsink_members.is_empty() {
                     let ports = self.alloc_pwsink_ports(d.pwsink_members.len());
-                    let members: Vec<crate::pwsink_server::PwSinkMember> = d
+                    let members: Vec<crate::outputs::pwsink::server::PwSinkMember> = d
                         .pwsink_members
                         .iter()
                         .zip(ports.iter())
-                        .map(|(node_name, port)| crate::pwsink_server::PwSinkMember {
+                        .map(|(node_name, port)| crate::outputs::pwsink::server::PwSinkMember {
                             playout_ms: sync_settings.lock_recover().pwsink_jitter_effective(node_name),
                             node_name: node_name.clone(),
                             control_port: *port,
                         })
                         .collect();
-                    match crate::pwsink_server::start(members, anchor_id) {
+                    match crate::outputs::pwsink::server::start(members, anchor_id) {
                         Ok(handle) => {
                             tracing::info!(
                                 "sync group '{anchor_name}': pw-sink senders advertising {} target session(s)",
@@ -2163,7 +2163,7 @@ mod tests {
     /// `compute_desired`, so nothing noticed.
     #[test]
     fn a_connected_receiver_host_joins_the_group_of_whatever_feeds_it() {
-        use crate::pwsink_agent::{Agents, HelloClaim, PROTOCOL_VERSION};
+        use crate::outputs::pwsink::agent::{Agents, HelloClaim, PROTOCOL_VERSION};
 
         let path = std::env::temp_dir().join(format!("sync-group-agents-{}.json", std::process::id()));
         let mut agents = Agents::new(path.clone(), tokio::sync::broadcast::channel(1).0);

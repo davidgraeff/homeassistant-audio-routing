@@ -25,13 +25,13 @@ pub const AP2_DEV_PREFIX: &str = "ap2-dev-";
 /// Node-name prefix for a discovered **pw-sink** target — a remote PipeWire host
 /// reached over RTP (`module-rtp-session`, mDNS-discovered). A virtual routing
 /// output (no local PipeWire node of its own), mirroring `SENDSPIN_DEV_PREFIX` /
-/// `AP2_DEV_PREFIX`. See pw_target_discovery.rs / pw_sink.rs.
+/// `AP2_DEV_PREFIX`. See outputs/pwsink/discovery.rs / outputs/pwsink/module_args.rs.
 pub const PWSINK_DEV_PREFIX: &str = "pwsink-dev-";
 
 /// mDNS/AppleMIDI **session-name** prefix for the sessions the daemon itself
 /// advertises for pw-sink targets (`pwrouter-<slug>`, one per routed target —
-/// see pwsink_server.rs). Distinct from `PWSINK_DEV_PREFIX` (the discovered
-/// target's virtual-output node name). Discovery (pw_target_discovery.rs) filters
+/// see outputs/pwsink/server.rs). Distinct from `PWSINK_DEV_PREFIX` (the discovered
+/// target's virtual-output node name). Discovery (outputs/pwsink/discovery.rs) filters
 /// these out when it browses `_pipewire-audio._udp`, so the daemon never treats
 /// its own advertised sessions as discoverable targets.
 pub const PWSINK_SESSION_PREFIX: &str = "pwrouter-";

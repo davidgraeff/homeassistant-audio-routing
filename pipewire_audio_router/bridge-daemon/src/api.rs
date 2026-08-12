@@ -76,11 +76,11 @@ pub struct AppState {
     /// Live mDNS-discovered AirPlay-2 receivers (outputs/ap2/discovery.rs), surfaced as
     /// virtual routing outputs (`ap2-dev-*`). The RAOP-output replacement.
     pub ap2_devices: SharedAp2Devices,
-    /// Paired receiver agents (pwsink_agent.rs) — the source of truth for pw-sink
+    /// Paired receiver agents (outputs/pwsink/agent.rs) — the source of truth for pw-sink
     /// outputs (there is no mDNS registry behind them: `pw_target_discovery` is a
     /// diagnostic that nothing here reads), their volume/mute control channel, and
     /// the pairing queue.
-    pub agents: crate::pwsink_agent::SharedAgents,
+    pub agents: crate::outputs::pwsink::agent::SharedAgents,
     /// Live mDNS-discovered Bluetooth→RTP bridges (sources/bt_bridge.rs).
     /// Unlike the other discoveries these are *senders*, not outputs: they build
     /// no audio path, they annotate an RTP source with which bridge feeds it and
@@ -150,7 +150,7 @@ pub fn router(
     xruns: crate::pw::profiler::SharedXruns,
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
-    agents: crate::pwsink_agent::SharedAgents,
+    agents: crate::outputs::pwsink::agent::SharedAgents,
     bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
     ap2_ptp: SharedAp2Ptp,
     routing: SharedRouting,
@@ -309,7 +309,7 @@ pub fn router(
         // Pairing decisions are *output* operations (`/adopt`, `/ignore`, `/unpair`)
         // — a host asking to pair is a discovered output, so it is decided where
         // every other output is. This listing is left for diagnostics.
-        .route("/api/agent/ws", get(crate::pwsink_agent::agent_ws))
+        .route("/api/agent/ws", get(crate::outputs::pwsink::agent::agent_ws))
         .route("/api/agents", get(get_agents))
         .route("/api/pwsink/volume", put(set_pwsink_volume))
         .route("/api/pwsink/mute", put(set_pwsink_mute))
@@ -938,7 +938,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
     // here because a helper on it dialled in, not because something answered an mDNS
     // browse — which is why `present` means "the agent is connected" and
     // `pwsink_streaming` still means "a receiver completed the AppleMIDI handshake"
-    // (pw_sink_liveness.rs).
+    // (outputs/pwsink/sender_liveness.rs).
     //
     // A host that has only *asked* to pair is listed too, as a `discovered` output
     // carrying its pairing code: pairing is this kind's "Add" (`adopt_output`), so
@@ -962,7 +962,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             .map(|h| h.label.clone())
             .unwrap_or_else(|| node_name.strip_prefix(PWSINK_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
         let host_state = agent_rows.iter().find(|row| row.node_name == node_name).and_then(|row| row.state.clone());
-        let streaming = crate::pw_sink_liveness::PwSinkLiveness::global().get(&node_name).map(|s| s.established);
+        let streaming = crate::outputs::pwsink::sender_liveness::PwSinkLiveness::global().get(&node_name).map(|s| s.established);
         outputs.push(OutputInfo {
             kind: "pwsink",
             present: connected,
@@ -1944,7 +1944,7 @@ async fn set_ap2_mute(State(state): State<AppState>, Json(req): Json<SetAp2MuteR
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
 
-// ---- Receiver agents (pwsink_agent.rs) -----------------------------------
+// ---- Receiver agents (outputs/pwsink/agent.rs) -----------------------------------
 //
 // A pw-sink output is a receiver agent (docs/receiver-agent-plan.md §3). The pairing
 // *decisions* are output operations — `/api/outputs/{n}/adopt` pairs, `/unpair`
@@ -1955,7 +1955,7 @@ async fn set_ap2_mute(State(state): State<AppState>, Json(req): Json<SetAp2MuteR
 // for later": the host owns the value and reports it back, so an unreachable host is
 // an error rather than a stored intent (§9.4).
 
-async fn get_agents(State(state): State<AppState>) -> Json<Vec<crate::pwsink_agent::AgentInfo>> {
+async fn get_agents(State(state): State<AppState>) -> Json<Vec<crate::outputs::pwsink::agent::AgentInfo>> {
     Json(state.agents.lock().await.snapshot())
 }
 
@@ -3721,7 +3721,7 @@ async fn set_output_latency(
 /// it to the host's agent.
 ///
 /// Clamped into [`PWSINK_JITTER_MIN_MS`]..=[`PWSINK_JITTER_MAX_MS`] and rounded up
-/// to a multiple of the sender's packet time ([`crate::applemidi_sender::PACKET_MS`]).
+/// to a multiple of the sender's packet time ([`crate::outputs::pwsink::applemidi::PACKET_MS`]).
 /// Both bounds come from the receiving module rather than from taste: it refuses a
 /// buffer below `rtp.ptime` outright, and warns when the buffer is not an integer
 /// multiple of it.
@@ -3732,7 +3732,7 @@ async fn set_output_latency(
 async fn set_pwsink_jitter(state: AppState, node_name: String, requested: Option<u16>) -> (StatusCode, Json<OutputOpResponse>) {
     use crate::sync_settings::{PWSINK_JITTER_MAX_MS, PWSINK_JITTER_MIN_MS};
 
-    let packet_ms = crate::applemidi_sender::PACKET_MS as u16;
+    let packet_ms = crate::outputs::pwsink::applemidi::PACKET_MS as u16;
     let clamped = requested.map(|ms| {
         let bounded = ms.clamp(PWSINK_JITTER_MIN_MS, PWSINK_JITTER_MAX_MS);
         // Round *up* to a whole number of packets: rounding down could re-cross the

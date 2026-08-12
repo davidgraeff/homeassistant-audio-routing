@@ -38,7 +38,7 @@
 //! capture ─▶ outputs::overlay_mixer::mix_into(node, …) ─▶ relay_delay::delay_into(node, …) ─▶ encoder/sender
 //! ```
 //!
-//! (`outputs/sendspin/server.rs`, `outputs/ap2/server.rs`, `pwsink_server.rs`; for sendspin this sits
+//! (`outputs/sendspin/server.rs`, `outputs/ap2/server.rs`, `outputs/pwsink/server.rs`; for sendspin this sits
 //! *before* the per-member encoder, because the ring stores PCM.)
 //!
 //! The order is forced by what this module is standing in for. The real knob it
@@ -260,7 +260,7 @@
 
 // W13 delivers this library plus the three relay hooks; the measurement state machine
 // and the HTTP surface that drive it (plan §11) land separately, so the setters and
-// inspectors have no in-tree caller yet. Same convention pwsink_server.rs used while its
+// inspectors have no in-tree caller yet. Same convention outputs/pwsink/server.rs used while its
 // reconciler wiring was pending.
 #![allow(dead_code)]
 
