@@ -52,7 +52,7 @@ one `support.null-audio-sink` per source-set, §4):
    <target>`), `sess.latency.msec = <configurable JB>`, format S16/48000/2.
 2. The remote host, running `libpipewire-module-rtp-sap` in listen mode,
    auto-instantiates the matching `rtp-source` and plays.
-3. `sync_group.rs::reconcile` links `A_G.monitor → pw-dev-<slug>` (a monitor
+3. `routing/sync_group.rs::reconcile` links `A_G.monitor → pw-dev-<slug>` (a monitor
    link — the RAOP-style follower-sink step that was deleted; we re-introduce
    exactly one such branch). Load on first route, unlink + unload on unroute.
 
@@ -151,7 +151,7 @@ connection-driven" (§5.1).
   presentation offset (the Sendspin send-ahead lead / AP2's render delay, §5).
   Account for the two extra graph quanta from the loopback + mix bus (§3).
   **DONE** (2026-08-10): stored per output as `pwsink_jitter`
-  (`sync_settings.rs`, default `DEFAULT_PWSINK_JITTER_MS` = the module's own
+  (`routing/sync_settings.rs`, default `DEFAULT_PWSINK_JITTER_MS` = the module's own
   100 ms), set through the same `PUT /api/outputs/{node}/latency` endpoint and
   the same slider as the AP2 render delay, and pushed to the host by re-sending
   `welcome` (the agent reloads its receiver on every one). Clamped to 15–2000 ms in
@@ -176,10 +176,10 @@ Mirrors the established discovery/output pattern.
 | File | Change | Mirrors |
 |---|---|---|
 | `outputs/pwsink/discovery.rs` (new) | Browse `_workstation._tcp`, populate `SharedPwTargets` (`pw-dev-<slug>`, `approved` flag), fire `changes` | `outputs/sendspin/discovery.rs` |
-| `discovery_supervisor.rs` | Register the browser on the shared LAN-restricted daemon in `start()` | existing browsers |
+| `supervisor.rs` | Register the browser on the shared LAN-restricted daemon in `start()` | existing browsers |
 | `util/node_names.rs` / `store/outputs.rs` | `PW_DEV_PREFIX`; persist approved targets + per-target `jb_msec`, dest IP/port | `RaopOutputConfig` |
 | `rtp_sink.rs` (new) | Load `rtp-sink` (+ SAP announce) as a real node via `pw_thread` `Load`/`Unload`; build the per-device mix bus (loopback + null-sink) | old `raop.rs` module-load; anchor `CreateSinkNode` |
-| `sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
+| `routing/sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
 | `outputs/pwsink/target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `outputs/sendspin/liveness.rs` |
 | `api.rs` | Candidate list + `approve` endpoint + per-target JB setter + help URL; expose `pw-dev-*` as routable output & `media_player` | §9 outputs derivation |
 | `frontend/` (Svelte) | Discovery listing: approve + help button; per-target JB slider | existing admin console |
@@ -217,7 +217,7 @@ AP2 receiver, both ends must slave to one clock:
   flow (real-LAN spike is the oracle).
 - **P1 — Routable output (~2–3 days).** Discovery browser + `SharedPwTargets` +
   approval + config persistence; `rtp_sink.rs` node load/unload; the
-  follower-sink branch in `sync_group.rs`; expose in API + matrix + media_player;
+  follower-sink branch in `routing/sync_group.rs`; expose in API + matrix + media_player;
   frontend listing with approve + help.
 - **P2 — Per-device native announce/duck (~1–2 days).** The mix-bus topology
   (§3): loopback duck gain + announce-stream links + ramp. AG duck/overlay parity
@@ -252,8 +252,8 @@ proven end-to-end against a stock receiver (`E@440`; see
 **Files.** `outputs/pwsink/applemidi.rs` (transport, frozen interface — Task 1),
 `outputs/pwsink/discovery.rs` (discovery), `outputs/pwsink/target_liveness.rs` (presence),
 `outputs/pwsink/server.rs` (per-group audio path),
-`outputs/pwsink/sender_liveness.rs` (session-status registry), plus wiring in `sync_group.rs`,
-`discovery_supervisor.rs`, `routing.rs`, `api.rs`, `main.rs`.
+`outputs/pwsink/sender_liveness.rs` (session-status registry), plus wiring in `routing/sync_group.rs`,
+`supervisor.rs`, `routing.rs`, `api.rs`, `main.rs`.
 
 **Data path.** Discovery browses `_pipewire-audio._udp` → `SharedPwTargets`
 (`pwsink-dev-<slug>`) → shown as a matrix column + `/api/outputs`. Routing a
@@ -312,7 +312,7 @@ answers both, everywhere, by the same rule:
   after a 45 s grace window / removes after 5 min — unless a session is established,
   which outranks the advert.
 - `streaming` = **a session is up**, from `PwSinkLiveness.established` (AP2's half
-  is `Ap2Control::connected`), shared by `sync_group::dialed_session_established`
+  is `Ap2Control::connected`), shared by `routing::sync_group::dialed_session_established`
   with the announce arbiter. Carried on the routing matrix (`RoutingNode.streaming`)
   and `/api/outputs` (`pwsink_streaming`), so the routing graph draws a wire to a
   reachable-but-unattached target *still* (amber "not connected") instead of

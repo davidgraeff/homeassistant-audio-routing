@@ -64,7 +64,7 @@ curl -XPOST :8099/api/spike/ap2 -d '{"ips":["192.168.178.165"],"freq":440,"mode"
 curl -XDELETE :8099/api/spike/ap2      # stop
 ```
 
-`ap2_spike.rs`. Use it as the A/B oracle for **any** audio-path change
+`spike/ap2.rs`. Use it as the A/B oracle for **any** audio-path change
 (e.g. the 48 kHz harmonization) — it touches the just-stabilized audio
 path.
 

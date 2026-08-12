@@ -94,7 +94,7 @@ backends** (Sendspin and AirPlay-2). It was validated on hardware by the
 Sendspin overhaul and AP2 was aligned onto it.
 
 - **One steady PCM source per group** = the group's
-  `support.null-audio-sink` **anchor** (`sync_group.rs`, keyed
+  `support.null-audio-sink` **anchor** (`routing/sync_group.rs`, keyed
   `sync-grp-<hash>` by source-set). It is a **QUANT-1024 steady clock
   driver** and does the graph-native mix + resample. A *standalone
   per-device* null-sink is **not** a steady driver — it produced ~1 glitch
@@ -118,12 +118,12 @@ Sendspin overhaul and AP2 was aligned onto it.
 **Two-tier grouping:** an **MG** (Music Group) is the routable unit — a
 routing target is polymorphic (`output | MG | …`); an **AG**
 (Announcement Group) is additive, priority-preempting, with per-device
-duck/overlay (`announce_arbiter.rs` / `announce.rs`).
+duck/overlay (`announce/arbiter.rs` / `announce.rs`).
 
 ### The `OutputBackend` seam (target end-state)
 
 Historically "output" was scattered node-name-prefix `if`s across
-`routing.rs`, `api.rs`, `sync_group.rs`, `media_player.py`. The intended
+`routing.rs`, `api.rs`, `routing/sync_group.rs`, `media_player.py`. The intended
 convergence is a single trait so each backend stops touching five files
 and "drop RAOP" becomes a clean delete:
 
@@ -139,7 +139,7 @@ trait OutputBackend {
 }
 ```
 
-`sync_group.rs::reconcile` would iterate backends and, per group, create
+`routing/sync_group.rs::reconcile` would iterate backends and, per group, create
 one `PerDeviceSender` per member off the group's `Arc<SharedTimeline>` +
 anchor capture. With RAOP gone there are exactly two impls —
 `SendspinBackend`, `Ap2Backend` — and no follower-sink exceptions.
@@ -159,7 +159,7 @@ routing intent through the adopted set:
 - `routing.rs::build_matrix` — an unadopted device isn't in the matrix, so
   it can't be routed **and** the HA integration (which builds its
   `media_player` entities from that listing) never sees it;
-- `sync_group.rs::reconcile` — intent whose output isn't adopted is
+- `routing/sync_group.rs::reconcile` — intent whose output isn't adopted is
   dormant, so no group forms and no stream/session is ever opened to it;
 - `api.rs` — `/api/outputs` returns the adopted ones,
   `/api/outputs/discovered` the rest (the Outputs page's second list).
@@ -308,7 +308,7 @@ announced to?" reduces to "does it have a running sender?", and the answer
 differs per backend:
 
 - **Sendspin: connection always, audio on demand.** An ungrouped device keeps an
-  **idle sender** (`sync_group.rs`, `IdleSender`) on its own silent
+  **idle sender** (`routing/sync_group.rs`, `IdleSender`) on its own silent
   `null-audio-sink`, so an announcement (or a volume command) never pays a cold
   dial. But the connection carries **no audio** while idle
   (`StreamPolicy::WhenAnnounced`): the device isn't in a group, so it gets no
@@ -353,7 +353,7 @@ differs per backend:
   session-scoping decision, `docs/pipewire-sink-roadmap.md` §4/§10).
 
 **"Live" means connected, not dialed.** For both dialed backends, group
-membership only says what the group *dialed*: `sync_group::dialed_session_established`
+membership only says what the group *dialed*: `routing::sync_group::dialed_session_established`
 therefore reads `Ap2Control::connected` (its sender registered a command channel)
 and `PwSinkLiveness` `established` (a receiver completed the handshake), and
 `has_live_sender` builds on it. A routed endpoint that never came up is reported as
@@ -369,7 +369,7 @@ that same target were correctly refused):
 | Question | Field | Owner |
 | --- | --- | --- |
 | Is it **reachable**? | `present` | the per-backend liveness tasks: `sendspin_liveness` (connection + TCP probe), `ap2_liveness` (RTSP-port probe), `pw_target_liveness` (advert withdrawal, debounced) — mDNS discovery only ever *adds* |
-| Is a **session up**? | `streaming` (matrix) / `pwsink_streaming` (`/api/outputs`) | `sync_group::dialed_session_established` — `Ap2Control::connected` + `PwSinkLiveness.established` |
+| Is a **session up**? | `streaming` (matrix) / `pwsink_streaming` (`/api/outputs`) | `routing::sync_group::dialed_session_established` — `Ap2Control::connected` + `PwSinkLiveness.established` |
 
 `streaming` is `None`/absent where the question doesn't apply: sources, and sendspin
 devices (which always have a sender while adopted). It matters most for pw-sink,
@@ -522,7 +522,7 @@ and PipeWire does the SRC in-graph on its RT thread.
   (then it's 48 kHz end-to-end, no resampling anywhere), else **44.1 kHz**
   with PipeWire doing 48→44.1 in-graph. No steady Rust resampling; don't
   unify the wire rates by hand.
-- **AP2 rate negotiation (`sync_settings.rs`).** Each output has an
+- **AP2 rate negotiation (`routing/sync_settings.rs`).** Each output has an
   `Ap2RateMode`: **`Auto`** (default) optimistically streams 48 kHz and, on a
   SETUP rejection (`ConnectFail { at_setup }`), learns a persisted per-device
   **44.1 kHz cap** so it doesn't re-probe; **`Fixed44100`** forces 44.1 for
@@ -585,7 +585,7 @@ flow in text.
  PIPEWIRE GRAPH          ┌──────────────────────────────────────────────────────────┐
  (data-loop, FIFO 83)    │ "airplay-in" producer node — RT_PROCESS drains ring        │
                          │   → F32LE 44.1 kHz   (mainloop thread FIFO 45)              │
-                         │        ▼   (sync_group.rs links airplay-in INTO the anchor) │
+                         │        ▼   (routing/sync_group.rs links airplay-in INTO the anchor) │
                          │ ANCHOR support.null-audio-sink  (one per source-set)        │
                          │   · MIX inputs · resample 44.1→48 kHz · QUANT-1024 driver   │
                          │        ▼                                                    │

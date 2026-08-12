@@ -18,13 +18,13 @@
 //!
 //! ## How the group is formed, and why it is formed this way
 //!
-//! Grouping in this daemon is *derived*, not declared: `sync_group.rs` groups every
+//! Grouping in this daemon is *derived*, not declared: `routing/sync_group.rs` groups every
 //! output that shares a source set, and one group == one sync anchor == one clock.
 //! So "form a group around an arbitrary output set" means one thing only — make those
 //! outputs share a source set that nothing else does.
 //!
 //! It is done with an **in-memory intent override** ([`GroupReconciler::set_align_hold`],
-//! `sync_group.rs`), not by editing the routing store:
+//! `routing/sync_group.rs`), not by editing the routing store:
 //!
 //! - every intent link whose output is held is dropped for the duration, so no music
 //!   source reaches it (the *displacement*);
@@ -126,10 +126,10 @@
 //! settling; that is required by plan §12.2's "stop must work at every point".
 
 use crate::align::calibrate::{AlignMember, MemberKind};
-use crate::announce_arbiter::ReservationId;
+use crate::announce::arbiter::ReservationId;
 use crate::pw::thread::ChangeNotifier;
+use crate::routing::sync_group::SharedGroups;
 use crate::store::routing::{RoutingLink, SharedRouting};
-use crate::sync_group::SharedGroups;
 use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -997,14 +997,14 @@ mod tests {
     /// The outputs are named so they cannot collide with any other test's.
     #[tokio::test]
     async fn a_hold_takes_exclusivity_reports_violations_and_gives_everything_back() {
-        use crate::announce_arbiter::{Admission, OnBusy};
+        use crate::announce::arbiter::{Admission, OnBusy};
         let a = "sendspin-dev-holdtest-a".to_string();
         let b = "sendspin-dev-holdtest-b".to_string();
         let members = vec![
             AlignMember { node_name: a.clone(), kind: MemberKind::Sendspin, node_id: None },
             AlignMember { node_name: b.clone(), kind: MemberKind::Sendspin, node_id: None },
         ];
-        let groups: SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
+        let groups: SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(crate::routing::sync_group::GroupReconciler::new()));
         let (changes, _rx) = tokio::sync::broadcast::channel(4);
         let displaced = vec![RoutingLink { source: "airplay-in".into(), output: a.clone() }];
 
@@ -1066,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn releasing_or_dropping_a_hold_drops_its_relay_calibration_mutes() {
         let relay = crate::align::relay_delay::RelayDelay::global();
-        let groups: SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
+        let groups: SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(crate::routing::sync_group::GroupReconciler::new()));
         let (changes, _rx) = tokio::sync::broadcast::channel(4);
         let others = "pwsink-dev-someone-elses-mute";
         relay.set_muted(others, true);
@@ -1106,7 +1106,7 @@ mod tests {
     /// re-form (a by-ear pass and a measured walk hold the same union).
     #[tokio::test]
     async fn the_mode_can_change_without_re_forming_the_hold() {
-        let groups: SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
+        let groups: SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(crate::routing::sync_group::GroupReconciler::new()));
         let (changes, _rx) = tokio::sync::broadcast::channel(4);
         let all = adopted(&["sendspin-dev-modea", "sendspin-dev-modeb"]);
         let members = validate_selection(&["sendspin-dev-modea".into(), "sendspin-dev-modeb".into()], &all).unwrap();

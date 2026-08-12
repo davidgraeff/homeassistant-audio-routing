@@ -44,7 +44,7 @@
 //!
 //! (Sendspin is not configured here: devices are auto-discovered
 //! (outputs/sendspin/discovery.rs) and grouped from the routing intent
-//! (sync_group.rs), so there's nothing per-output to persist.)
+//! (routing/sync_group.rs), so there's nothing per-output to persist.)
 
 pub(crate) mod airplay;
 pub(crate) mod airplay_clients;

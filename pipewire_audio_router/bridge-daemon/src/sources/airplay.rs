@@ -224,7 +224,7 @@ pub async fn start(
     // daemon thread with everything else — avoids the host-network multicast
     // amplification across Docker veths. Falls back to shairplay's own daemon if
     // the shared one is unavailable.
-    if let Some(daemon) = crate::discovery_supervisor::shared_advertise_daemon() {
+    if let Some(daemon) = crate::supervisor::shared_advertise_daemon() {
         builder = builder.mdns_daemon(daemon);
     }
     if auth_setup {

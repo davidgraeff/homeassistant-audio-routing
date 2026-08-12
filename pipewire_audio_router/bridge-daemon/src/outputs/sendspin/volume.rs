@@ -2,7 +2,7 @@
 //!
 //! Unlike AirPlay outputs — real PipeWire `raop-sink` nodes whose volume the
 //! matrix drives through `node_id` — sendspin devices are *virtual* outputs fed
-//! by a shared group sink (sync_group.rs), so there's no per-device
+//! by a shared group sink (routing/sync_group.rs), so there's no per-device
 //! PipeWire volume to set. Sendspin instead carries volume in-band: the server
 //! sends a `server/command` player `Volume` message to a specific client
 //! (`ServerSender::send_player_command`).
@@ -120,7 +120,7 @@ pub struct SendspinControl {
     change_notifier: Option<crate::pw::thread::ChangeNotifier>,
     /// Desired per-device *static delay* (ms), keyed by virtual device node
     /// name; absent = no extra delay. Unlike volume this IS persisted (across
-    /// restarts) by sync_settings.rs and seeded back in via [`Self::seed_delays`]
+    /// restarts) by routing/sync_settings.rs and seeded back in via [`Self::seed_delays`]
     /// — a calibrated offset is useless if it resets. It's the per-client half of
     /// group sync: trim one speaker that's consistently early/late relative to
     /// the rest of its group.
@@ -208,7 +208,7 @@ impl SendspinControl {
     }
 
     /// Seed desired per-device delays at startup from the persisted sync
-    /// settings (sync_settings.rs), so they re-apply as devices connect. Existing
+    /// settings (routing/sync_settings.rs), so they re-apply as devices connect. Existing
     /// live entries are left untouched (a startup-only merge).
     pub fn seed_delays(&mut self, delays: HashMap<String, u16>) {
         for (node_name, ms) in delays {

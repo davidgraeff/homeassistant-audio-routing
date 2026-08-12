@@ -25,7 +25,7 @@
 //! advertised sessions (cross-talk). The single-target separate-room case (the
 //! primary use case) is unaffected. Scoping which receiver binds to which session
 //! is a deliberately deferred decision (see docs/pipewire-sink-roadmap.md §4).
-#![allow(dead_code)] // wired into sync_group.rs in the same phase
+#![allow(dead_code)] // wired into routing/sync_group.rs in the same phase
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -37,14 +37,14 @@ use crate::util::node_names::{PWSINK_DEV_PREFIX, PWSINK_SESSION_PREFIX};
 /// One target this group streams to: the virtual output node name
 /// (`pwsink-dev-<slug>`) plus the concrete control port the daemon binds +
 /// advertises for its session (data port = `control_port + 1`). The port is
-/// allocated by the reconciler (sync_group.rs) so ports never collide across
+/// allocated by the reconciler (routing/sync_group.rs) so ports never collide across
 /// groups.
 #[derive(Clone, Debug)]
 pub struct PwSinkMember {
     pub node_name: String,
     pub control_port: u16,
     /// This target's configured playout delay in ms — the `sess.latency.msec` its
-    /// agent was told to run (`sync_settings::pwsink_jitter_effective`). Passed down
+    /// agent was told to run (`routing::sync_settings::pwsink_jitter_effective`). Passed down
     /// because the sender sizes its catch-up burst and backlog ceiling against the
     /// far end's buffer; see [`crate::outputs::pwsink::applemidi::BacklogLimits`]. It is read
     /// when the session starts, so a change to the knob reaches this on the next
@@ -155,7 +155,7 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
     // One AppleMIDI sender per target, each with its own std::mpsc PCM channel the
     // relay feeds. The shared advertise daemon is fetched by AppleMidiSender when
     // `advertise_daemon` is Some (storm-safe, LAN-restricted); None only in tests.
-    let advertise_daemon = crate::discovery_supervisor::shared_advertise_daemon();
+    let advertise_daemon = crate::supervisor::shared_advertise_daemon();
     let format = SessionFormat::default(); // 48 kHz / 2ch
     let mut senders: Vec<(String, Arc<AppleMidiSender>)> = Vec::with_capacity(members.len());
     // (node_name, PCM sender) list moved into the relay thread for fan-out.

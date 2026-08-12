@@ -197,7 +197,7 @@
 //!    first number this design has for it rather than an argument.
 //! 2. **What is written back is not what was applied.** The knobs are integer
 //!    milliseconds and pw-sink's has a hard floor of three packet times
-//!    (`sync_settings::PWSINK_JITTER_MIN_MS` = 15 ms), while this line is sample-accurate
+//!    (`routing::sync_settings::PWSINK_JITTER_MIN_MS` = 15 ms), while this line is sample-accurate
 //!    (20.8 µs at 48 kHz). So the provisional value is *strictly more expressive* than
 //!    the final one: rounding costs up to 0.5 ms per member, and a sub-15 ms pw-sink
 //!    delay cannot be written at all. Independent of any equivalence question, the

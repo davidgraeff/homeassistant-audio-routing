@@ -12,7 +12,7 @@
 //!
 //! Capture is the same anchor-monitor source the sendspin per-device path uses
 //! (48 kHz / S16 / stereo); `LiveAudioDecoder` resamples 48k→44.1k internally.
-#![allow(dead_code)] // wired into sync_group.rs in the same phase
+#![allow(dead_code)] // wired into routing/sync_group.rs in the same phase
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ use airplay_core::stream::{PtpMode, StreamConfig, TimingProtocol};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::outputs::ap2::volume::{Ap2Command, SharedAp2Control};
-use crate::sync_settings::SharedSyncSettings;
+use crate::routing::sync_settings::SharedSyncSettings;
 use crate::util::locks::LockRecover;
 
 /// Depth of the per-group volume-command channel (outputs/ap2/volume.rs → this task).
@@ -62,7 +62,7 @@ const AP2_FEED_FRAMES: usize = 128;
 /// this much audio before playing. **Default 0** — the anchor says "play now", which
 /// the target receivers handle; every ms here is latency the whole system pays for.
 ///
-/// Per-output and live-tunable (sync_settings.rs). Raise it for a receiver that goes
+/// Per-output and live-tunable (routing/sync_settings.rs). Raise it for a receiver that goes
 /// *silent* rather than merely early: that is the signature of packets arriving past
 /// their play deadline, which a receiver drops rather than plays late.
 pub const AP2_RENDER_DELAY_MS: u32 = 0;

@@ -23,8 +23,14 @@ should graduate into [`decisions.md`](decisions.md).
 - **wave 2** — `store/`, 5 files plus a new `mod.rs`. §3 rows 14–18.
 - **wave 3** — `sources/`, 6 files (`sources_store.rs` became the `mod.rs`).
   §3 rows 19–24.
+- **wave 4** — `outputs/`, in three sub-commits: `sendspin/` + the shared
+  `overlay_mixer.rs`, then `ap2/`, then `pwsink/`. 20 files. §3 rows 25, 27–45.
+- **wave 5** — `routing/`, `announce/`, `spike/`, and `discovery_supervisor.rs`
+  -> `supervisor.rs`. 9 files. §3 rows 2, 46–50, 57–59.
 
-**Remaining:** 31 files still flat at the crate root. Waves 4–7 (§4).
+**Remaining:** `main.rs`, `api.rs` and `supervisor.rs` at the root — wave 6 is the
+`api/` split and the `state.rs` extraction (§5, §6), then wave 7's sweep (§7).
+`main.rs` now declares 12 modules, every one of them a directory.
 
 The align wave went first, out of order (§4 lists it as wave 5), and it was not a
 leaf when it did: **eight files outside `align/` reach into it** — `api.rs`,
@@ -208,7 +214,7 @@ by subject.
 
 ## 3. Full rename table
 
-60 files, of which 29 have landed. `★` marks the two moves that change meaning
+60 files, of which 59 have landed — everything except row 60 (`api.rs`, §5). `★` marks the two moves that change meaning
 rather than location; everything else is pure relocation. The `mod.rs` files each
 directory needs are new files, not rows here — `align/mod.rs` was written from
 scratch (§2, "Directory module style").
@@ -216,7 +222,7 @@ scratch (§2, "Directory module style").
 | # | current | target |
 |---:|---|---|
 | 1 | `main.rs` | `main.rs` *(unchanged)* |
-| 2 | `discovery_supervisor.rs` | `supervisor.rs` |
+| 2 ✔ | `discovery_supervisor.rs` | `supervisor.rs` |
 | 3 ✔ | `pw_thread.rs` | `pw/thread.rs` |
 | 4 ✔ | `sendspin_capture.rs` | `pw/capture.rs` ★ |
 | 5 ✔ | `player.rs` | `pw/player.rs` |
@@ -239,41 +245,41 @@ scratch (§2, "Directory module style").
 | 22 ✔ | `rtp_source.rs` | `sources/rtp.rs` |
 | 23 ✔ | `now_playing.rs` | `sources/now_playing.rs` |
 | 24 ✔ | `bt_bridge_discovery.rs` | `sources/bt_bridge.rs` |
-| 25 | `overlay_mixer.rs` | `outputs/overlay_mixer.rs` |
+| 25 ✔ | `overlay_mixer.rs` | `outputs/overlay_mixer.rs` |
 | 26 ✔ | `relay_delay.rs` | `align/relay_delay.rs` — §10.3, not `outputs/` |
-| 27 | `sendspin_server.rs` | `outputs/sendspin/server.rs` |
-| 28 | `sendspin_codec.rs` | `outputs/sendspin/codec.rs` |
-| 29 | `sendspin_discovery.rs` | `outputs/sendspin/discovery.rs` |
-| 30 | `sendspin_liveness.rs` | `outputs/sendspin/liveness.rs` |
-| 31 | `sendspin_volume.rs` | `outputs/sendspin/volume.rs` |
-| 32 | `ap2_server.rs` | `outputs/ap2/server.rs` |
-| 33 | `ap2_discovery.rs` | `outputs/ap2/discovery.rs` |
-| 34 | `ap2_liveness.rs` | `outputs/ap2/liveness.rs` |
-| 35 | `ap2_health.rs` | `outputs/ap2/health.rs` |
-| 36 | `ap2_probe.rs` | `outputs/ap2/probe.rs` |
-| 37 | `ap2_volume.rs` | `outputs/ap2/volume.rs` |
-| 38 | `ap2_ptp.rs` | `outputs/ap2/ptp.rs` |
-| 39 | `pwsink_server.rs` | `outputs/pwsink/server.rs` |
-| 40 | `pwsink_agent.rs` | `outputs/pwsink/agent.rs` |
-| 41 | `applemidi_sender.rs` | `outputs/pwsink/applemidi.rs` |
-| 42 | `pw_sink.rs` | `outputs/pwsink/module_args.rs` |
-| 43 | `pw_target_discovery.rs` | `outputs/pwsink/discovery.rs` |
-| 44 | `pw_sink_liveness.rs` | `outputs/pwsink/sender_liveness.rs` |
-| 45 | `pw_target_liveness.rs` | `outputs/pwsink/target_liveness.rs` |
-| 46 | `routing.rs` | `routing/mod.rs` |
-| 47 | `sync_group.rs` | `routing/sync_group.rs` |
-| 48 | `sync_settings.rs` | `routing/sync_settings.rs` |
-| 49 | `announce.rs` | `announce/mod.rs` |
-| 50 | `announce_arbiter.rs` | `announce/arbiter.rs` |
+| 27 ✔ | `sendspin_server.rs` | `outputs/sendspin/server.rs` |
+| 28 ✔ | `sendspin_codec.rs` | `outputs/sendspin/codec.rs` |
+| 29 ✔ | `sendspin_discovery.rs` | `outputs/sendspin/discovery.rs` |
+| 30 ✔ | `sendspin_liveness.rs` | `outputs/sendspin/liveness.rs` |
+| 31 ✔ | `sendspin_volume.rs` | `outputs/sendspin/volume.rs` |
+| 32 ✔ | `ap2_server.rs` | `outputs/ap2/server.rs` |
+| 33 ✔ | `ap2_discovery.rs` | `outputs/ap2/discovery.rs` |
+| 34 ✔ | `ap2_liveness.rs` | `outputs/ap2/liveness.rs` |
+| 35 ✔ | `ap2_health.rs` | `outputs/ap2/health.rs` |
+| 36 ✔ | `ap2_probe.rs` | `outputs/ap2/probe.rs` |
+| 37 ✔ | `ap2_volume.rs` | `outputs/ap2/volume.rs` |
+| 38 ✔ | `ap2_ptp.rs` | `outputs/ap2/ptp.rs` |
+| 39 ✔ | `pwsink_server.rs` | `outputs/pwsink/server.rs` |
+| 40 ✔ | `pwsink_agent.rs` | `outputs/pwsink/agent.rs` |
+| 41 ✔ | `applemidi_sender.rs` | `outputs/pwsink/applemidi.rs` |
+| 42 ✔ | `pw_sink.rs` | `outputs/pwsink/module_args.rs` |
+| 43 ✔ | `pw_target_discovery.rs` | `outputs/pwsink/discovery.rs` |
+| 44 ✔ | `pw_sink_liveness.rs` | `outputs/pwsink/sender_liveness.rs` |
+| 45 ✔ | `pw_target_liveness.rs` | `outputs/pwsink/target_liveness.rs` |
+| 46 ✔ | `routing.rs` | `routing/mod.rs` |
+| 47 ✔ | `sync_group.rs` | `routing/sync_group.rs` |
+| 48 ✔ | `sync_settings.rs` | `routing/sync_settings.rs` |
+| 49 ✔ | `announce.rs` | `announce/mod.rs` |
+| 50 ✔ | `announce_arbiter.rs` | `announce/arbiter.rs` |
 | 51 ✔ | `align_measure.rs` | `align/measure.rs` |
 | 52 ✔ | `align_estimator.rs` | `align/estimator.rs` |
 | 53 ✔ | `align_levels.rs` | `align/levels.rs` |
 | 54 ✔ | `align_group.rs` | `align/group.rs` |
 | 55 ✔ | `align_mic.rs` | `align/mic.rs` |
 | 56 ✔ | `calibrate.rs` | `align/calibrate.rs` |
-| 57 | `per_device_spike.rs` | `spike/per_device.rs` |
-| 58 | `ap2_spike.rs` | `spike/ap2.rs` |
-| 59 | `pw_sink_spike.rs` | `spike/pwsink.rs` |
+| 57 ✔ | `per_device_spike.rs` | `spike/per_device.rs` |
+| 58 ✔ | `ap2_spike.rs` | `spike/ap2.rs` |
+| 59 ✔ | `pw_sink_spike.rs` | `spike/pwsink.rs` |
 | 60 | `api.rs` | `api/` + `state.rs` — see §5 |
 
 `✔` marks rows already landed. The left column stays at the pre-move spelling on

@@ -328,7 +328,7 @@ impl FlacEncoder {
 /// - **PCM** and **FLAC**: 0 — no floor imposed. FLAC decode is cheap integer work,
 ///   so a floor would only add latency.
 /// - **Opus**: [`DEFAULT_OPUS_FLOOR_MS`], and configurable
-///   ([`crate::sync_settings::SyncSettings::opus_floor_ms`]);
+///   ([`crate::routing::sync_settings::SyncSettings::opus_floor_ms`]);
 ///   [`opus_floor_lower_bound_ms`] is how low the value may go.
 ///
 /// A device that states its own `min_buffer_ms` overrides this in both directions.
@@ -345,7 +345,7 @@ pub fn min_send_ahead_us(codec: &str, opus_floor_ms: u32) -> i64 {
 /// Opus plays cleanly at this lead. It covers one block of encoder output plus the
 /// WiFi hop, the MCU's decode and its scheduling.
 ///
-/// Tunable per install ([`crate::sync_settings::SyncSettings::opus_floor_ms`]), since
+/// Tunable per install ([`crate::routing::sync_settings::SyncSettings::opus_floor_ms`]), since
 /// the network half of that budget belongs to the site rather than to the codec: a
 /// congested band spends more of it on retransmissions.
 pub const DEFAULT_OPUS_FLOOR_MS: u32 = 40;

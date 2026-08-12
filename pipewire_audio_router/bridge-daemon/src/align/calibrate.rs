@@ -129,7 +129,7 @@
 use crate::align::group::{AlignMode, ExclusiveHold, HoldDeps, Interference};
 use crate::outputs::ap2::volume::SharedAp2Control;
 use crate::outputs::sendspin::volume::SharedSendspinControl;
-use crate::sync_group::SharedGroups;
+use crate::routing::sync_group::SharedGroups;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::f64::consts::PI;
@@ -243,7 +243,7 @@ pub enum MemberKind {
     Airplay2,
     /// A remote PipeWire host (`pwsink-dev-*`). Alignable, with one property neither other
     /// kind has — its playout-delay knob has a **hard floor** of three packet times
-    /// (`sync_settings::PWSINK_JITTER_MIN_MS`), so it cannot be placed arbitrarily early —
+    /// (`routing::sync_settings::PWSINK_JITTER_MIN_MS`), so it cannot be placed arbitrarily early —
     /// and one thing neither of its own knobs comes with: **its transport carries neither a
     /// mute nor a level**. Both are the *host's*, reached through the receiver agent when one
     /// is answering, so both are resolved per output ([`SilenceChannel`], [`LevelChannel`])
@@ -1993,7 +1993,8 @@ mod tests {
     async fn teardown_puts_the_users_levels_back() {
         let sendspin = crate::outputs::sendspin::volume::shared();
         let ap2 = crate::outputs::ap2::volume::shared();
-        let groups: crate::sync_group::SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
+        let groups: crate::routing::sync_group::SharedGroups =
+            Arc::new(tokio::sync::Mutex::new(crate::routing::sync_group::GroupReconciler::new()));
         let mgr = AlignManager::new(sendspin.clone(), ap2, groups);
         let node = "sendspin-dev-leveltest";
         let m = vec![member(node, MemberKind::Sendspin)];
@@ -2095,7 +2096,7 @@ mod tests {
 
     impl UnionFixture {
         async fn new(tag: &str, held: &[(&str, MemberKind)]) -> Self {
-            let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
+            let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::routing::sync_group::GroupReconciler::new()));
             let (changes, _changes_rx) = tokio::sync::broadcast::channel(8);
             let (sendspin, ap2) = (crate::outputs::sendspin::volume::shared(), crate::outputs::ap2::volume::shared());
             let mgr = AlignManager::new(sendspin.clone(), ap2.clone(), groups.clone());
@@ -2539,7 +2540,7 @@ mod tests {
         let sendspin = crate::outputs::sendspin::volume::shared();
         let ap2 = crate::outputs::ap2::volume::shared();
         let new_mgr = || {
-            let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
+            let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::routing::sync_group::GroupReconciler::new()));
             AlignManager::new(sendspin.clone(), ap2.clone(), groups)
         };
 
@@ -2596,7 +2597,7 @@ mod tests {
         let relay = crate::align::relay_delay::RelayDelay::global();
         let (spin, node) = ("sendspin-dev-refuse", "pwsink-dev-refuse");
         let m = vec![member(spin, MemberKind::Sendspin), member(node, MemberKind::PwSink)];
-        let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
+        let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::routing::sync_group::GroupReconciler::new()));
         let mgr = AlignManager::new(crate::outputs::sendspin::volume::shared(), crate::outputs::ap2::volume::shared(), groups);
         mgr.set_out_of_band_mute(FakeHost::refusing(&[(node, false)], &[node]));
         mgr.apply_audibility(&m, &audible(&[spin]), 20).await;

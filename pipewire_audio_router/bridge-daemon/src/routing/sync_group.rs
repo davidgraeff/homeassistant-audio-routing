@@ -349,7 +349,7 @@ pub struct AnnounceDeps<'a> {
     pub ap2_devices: &'a crate::outputs::ap2::discovery::SharedAp2Devices,
     pub ap2_ptp: &'a crate::outputs::ap2::ptp::SharedAp2Ptp,
     pub ap2_control: &'a crate::outputs::ap2::volume::SharedAp2Control,
-    pub sync_settings: &'a crate::sync_settings::SharedSyncSettings,
+    pub sync_settings: &'a crate::routing::sync_settings::SharedSyncSettings,
     /// Receiver-host registry, for the pw-sink on-demand path: an announcement can
     /// only be opened to a host whose agent is connected to take the session.
     pub agents: &'a crate::outputs::pwsink::agent::SharedAgents,
@@ -1097,7 +1097,7 @@ impl GroupReconciler {
     }
 
     /// `send_ahead_us` is the group presentation lead from the sync settings
-    /// (sync_settings.rs), applied to every group's sendspin server.
+    /// (routing/sync_settings.rs), applied to every group's sendspin server.
     // Reconciliation reads from every subsystem it has to line up.
     #[allow(clippy::too_many_arguments)]
     pub async fn reconcile(
@@ -1111,7 +1111,7 @@ impl GroupReconciler {
         send_ahead_us: i64,
         ap2_devices: &crate::outputs::ap2::discovery::SharedAp2Devices,
         ap2_ptp: &crate::outputs::ap2::ptp::SharedAp2Ptp,
-        sync_settings: &crate::sync_settings::SharedSyncSettings,
+        sync_settings: &crate::routing::sync_settings::SharedSyncSettings,
         ap2_control: &crate::outputs::ap2::volume::SharedAp2Control,
         pwsink_hosts: &PwsinkHosts,
     ) {
@@ -1162,10 +1162,10 @@ impl GroupReconciler {
                         .iter()
                         .map(|n| ss.sendspin_codec(n))
                         .min_by_key(|m| match m {
-                            crate::sync_settings::SendspinCodec::Pcm => 0,
-                            crate::sync_settings::SendspinCodec::Flac => 1,
-                            crate::sync_settings::SendspinCodec::Opus => 2,
-                            crate::sync_settings::SendspinCodec::Auto => 3,
+                            crate::routing::sync_settings::SendspinCodec::Pcm => 0,
+                            crate::routing::sync_settings::SendspinCodec::Flac => 1,
+                            crate::routing::sync_settings::SendspinCodec::Opus => 2,
+                            crate::routing::sync_settings::SendspinCodec::Auto => 3,
                         })
                         .unwrap_or_default();
                     d.sendspin_codec = sendspin::server::resolve_codec(mode, member_codecs.iter());

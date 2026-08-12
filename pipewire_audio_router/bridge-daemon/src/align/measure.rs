@@ -440,11 +440,11 @@ pub fn knob_of(kind: MemberKind) -> Knob {
         }
         // The floor is the whole reason pw-sink is modelled separately from AP2:
         // three packet times of playout buffer is the least the receiving module
-        // will accept (`sync_settings::PWSINK_JITTER_MIN_MS`).
+        // will accept (`routing::sync_settings::PWSINK_JITTER_MIN_MS`).
         MemberKind::PwSink => Knob {
             polarity: KnobPolarity::Delay,
-            min_ms: crate::sync_settings::PWSINK_JITTER_MIN_MS,
-            max_ms: crate::sync_settings::PWSINK_JITTER_MAX_MS,
+            min_ms: crate::routing::sync_settings::PWSINK_JITTER_MIN_MS,
+            max_ms: crate::routing::sync_settings::PWSINK_JITTER_MAX_MS,
         },
     }
 }
@@ -7544,7 +7544,7 @@ mod tests {
     fn the_pw_sink_floor_can_be_what_constrains_the_target() {
         let k = knob_of(MemberKind::PwSink);
         assert_eq!(k.polarity, KnobPolarity::Delay);
-        assert_eq!(k.min_ms, crate::sync_settings::PWSINK_JITTER_MIN_MS);
+        assert_eq!(k.min_ms, crate::routing::sync_settings::PWSINK_JITTER_MIN_MS);
         assert!(k.min_ms > 0, "the floor is the whole reason pw-sink is modelled apart from AP2");
 
         let floor = f64::from(k.min_ms);
@@ -9361,7 +9361,7 @@ mod tests {
                 let p = s.proposal.clone().expect("a proposal");
                 let sink = proposed(&s, "pwsink-dev-host");
                 assert_eq!(sink.polarity, KnobPolarity::Delay);
-                assert!(sink.new_delay_ms >= crate::sync_settings::PWSINK_JITTER_MIN_MS, "{sink:?}");
+                assert!(sink.new_delay_ms >= crate::routing::sync_settings::PWSINK_JITTER_MIN_MS, "{sink:?}");
                 assert!(p.blocked.is_none(), "{:?}", p.blocked);
             }
             Phase::Refused => {
@@ -10034,8 +10034,8 @@ mod tests {
         let members = equiv_members(&[("pwsink-dev-y", MemberKind::PwSink)]);
         let current: HashMap<String, u16> = [("pwsink-dev-y".to_string(), 0u16)].into_iter().collect();
         let p = plan_equivalence(&members, &current, &ctx, None).expect("a plan");
-        assert_eq!(p.from_ms, crate::sync_settings::PWSINK_JITTER_MIN_MS, "a pw-sink knob cannot sit below its floor");
-        assert_eq!(p.to_ms, crate::sync_settings::PWSINK_JITTER_MIN_MS + EQUIV_STEP_MS);
+        assert_eq!(p.from_ms, crate::routing::sync_settings::PWSINK_JITTER_MIN_MS, "a pw-sink knob cannot sit below its floor");
+        assert_eq!(p.to_ms, crate::routing::sync_settings::PWSINK_JITTER_MIN_MS + EQUIV_STEP_MS);
         assert_eq!(p.stored_ms, 0, "…but what the restore writes back is what was stored, not the floor it had to start from");
 
         // An explicit override is honoured; an unknown name is refused rather than

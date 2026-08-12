@@ -175,7 +175,7 @@ pub struct SessionConfig {
     /// Audio rate/channels (wire encoding is always L16/big-endian).
     pub format: SessionFormat,
     /// The receiver's jitter buffer for this target, in ms — the `sess.latency.msec`
-    /// the daemon told its agent to use (`sync_settings::pwsink_jitter_effective`).
+    /// the daemon told its agent to use (`routing::sync_settings::pwsink_jitter_effective`).
     ///
     /// The sender never sets this on the far end; it is told what it is, because both
     /// of its own backlog limits have to respect it: a catch-up burst must fit that
@@ -183,7 +183,7 @@ pub struct SessionConfig {
     /// [`BacklogLimits::for_playout`].
     pub playout_ms: u16,
     /// Shared mDNS advertise daemon
-    /// ([`crate::discovery_supervisor::shared_advertise_daemon`]). Reuse it to
+    /// ([`crate::supervisor::shared_advertise_daemon`]). Reuse it to
     /// stay storm-safe; `None` makes the sender create its own daemon (only for
     /// standalone testing — never in the daemon).
     pub advertise_daemon: Option<mdns_sd::ServiceDaemon>,
@@ -860,7 +860,7 @@ mod tests {
         // Only across what the API permits (>= PWSINK_JITTER_MIN_MS): below that the
         // two-packet floor *is* the whole buffer, which is exactly why that minimum
         // is three packet times.
-        for playout_ms in [crate::sync_settings::PWSINK_JITTER_MIN_MS, 20, 50, 100, 250] {
+        for playout_ms in [crate::routing::sync_settings::PWSINK_JITTER_MIN_MS, 20, 50, 100, 250] {
             let l = BacklogLimits::for_playout(playout_ms);
             let burst_ms = (l.burst_packets as i64) * i64::from(PACKET_MS);
             assert!(burst_ms < i64::from(playout_ms), "playout {playout_ms}: burst {burst_ms} ms must fit inside it");

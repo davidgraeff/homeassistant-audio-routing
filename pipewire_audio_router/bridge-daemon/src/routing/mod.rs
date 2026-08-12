@@ -34,6 +34,19 @@
 //! `playback_FL` all pair as `FL`) — matches the convention already used
 //! by hand in every test script in `tests/`, generalized here instead of
 //! being hardcoded per source/output type.
+//!
+//! The directory adds the two modules the matrix cannot work without:
+//! [`sync_group`] builds and reconciles the group sinks a routed source actually
+//! plays through — the anchor plus one writer per member — and [`sync_settings`]
+//! holds the timing that keeps those members together (group presentation lead,
+//! per-device static delay) and pushes it into the senders when it changes.
+//!
+//! `sync_settings` persists, but it is not one of the pure `store/` modules for
+//! exactly that reason: writing a setting reaches into the AP2, AppleMIDI and
+//! sendspin codecs. See `store/mod.rs`.
+
+pub(crate) mod sync_group;
+pub(crate) mod sync_settings;
 
 use crate::api::AppState;
 use crate::outputs::sendspin::discovery::SendspinDevice;
@@ -73,7 +86,7 @@ pub struct RoutingNode {
     /// were correctly refused). `None` = the question doesn't apply (sources; a
     /// sendspin device, which always has a sender while adopted). Same rule as the
     /// announce arbiter and the Outputs page, via
-    /// [`crate::sync_group::dialed_session_established`].
+    /// [`crate::routing::sync_group::dialed_session_established`].
     #[serde(skip_serializing_if = "Option::is_none")]
     streaming: Option<bool>,
     /// Live PipeWire node id when present (needed for per-node ops like
@@ -282,7 +295,7 @@ fn build_matrix(
     }
 
     // Every output is now virtual + auto-discovered (sendspin + AP2 devices) —
-    // audio reaches them via a group sink (sync_group.rs), not a live node here.
+    // audio reaches them via a group sink (routing/sync_group.rs), not a live node here.
 
     // Union of every output name to show: present ∪ discovered devices ∪ intent
     // ∪ adopted — then narrowed to the adopted ones, the only routable outputs.
@@ -325,7 +338,7 @@ fn build_matrix(
                 // Reachable is not the same as connected for the dialed backends —
                 // report the session state separately so the UI can tell the two
                 // apart instead of implying delivery from mere presence.
-                streaming: crate::sync_group::dialed_session_established(&name, ap2_connected),
+                streaming: crate::routing::sync_group::dialed_session_established(&name, ap2_connected),
                 node_id,
                 // Every output is now auto-discovered (sendspin + AP2); nothing is
                 // manually configured anymore (the RAOP store is gone).
@@ -482,7 +495,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
             ap2_delays: sync.ap2_latencies(),
             ap2_default_ms: crate::outputs::ap2::server::AP2_RENDER_DELAY_MS,
             pwsink_jitters: sync.pwsink_jitters(),
-            pwsink_default_ms: u32::from(crate::sync_settings::DEFAULT_PWSINK_JITTER_MS),
+            pwsink_default_ms: u32::from(crate::routing::sync_settings::DEFAULT_PWSINK_JITTER_MS),
         };
         (lat, source_labels)
     };
@@ -586,7 +599,7 @@ pub(crate) fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32>
 }
 
 /// The set of sources feeding `output` in the intent (unique, sorted). Shared
-/// with sync_group.rs, which keys sync groups by this source-set.
+/// with routing/sync_group.rs, which keys sync groups by this source-set.
 pub(crate) fn source_set_of<'a>(intent: &'a [RoutingLink], output: &str) -> std::collections::BTreeSet<&'a str> {
     intent.iter().filter(|l| l.output == output).map(|l| l.source.as_str()).collect()
 }
@@ -625,7 +638,7 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
 /// After the RAOP output path was removed, every routable output is *virtual*
 /// (sendspin/AP2 devices with no live PipeWire node), so `node_id_for(output)`
 /// returns `None` and this loop no-ops for them — their audio path is built by
-/// sync_group.rs from a group anchor, not by a direct link here. The loop is
+/// routing/sync_group.rs from a group anchor, not by a direct link here. The loop is
 /// kept (rather than deleted) so a future real-node output would still be
 /// direct-linked, and it stays a cheap no-op for the current output kinds.
 pub async fn reconcile(pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting) {
@@ -694,7 +707,7 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
     // effect promptly, not only on the next PipeWire registry event.
     let _ = state.changes.send(());
     // Every output is now virtual (sendspin/AP2): its audio path is built by
-    // sync_group.rs from a group anchor, not a direct link here. If the output
+    // routing/sync_group.rs from a group anchor, not a direct link here. If the output
     // has no live PipeWire node (the normal case), there's nothing to link now —
     // the reconcilers woken above build the path.
     let ids = {

@@ -1,19 +1,14 @@
 mod align;
 mod announce;
-mod announce_arbiter;
-mod ap2_spike;
 mod api;
 mod audio;
-mod discovery_supervisor;
 mod outputs;
-mod per_device_spike;
 mod pw;
-mod pw_sink_spike;
 mod routing;
 mod sources;
+mod spike;
 mod store;
-mod sync_group;
-mod sync_settings;
+mod supervisor;
 mod util;
 
 use crate::util::locks::LockRecover;
@@ -147,14 +142,14 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // routing.json in /data. Derived from the routing path so there's no extra
     // CLI flag to thread through.
     let sync_settings_path = routing_path.with_file_name("sync-settings.json");
-    let sync_settings = sync_settings::SyncSettings::load(&sync_settings_path)?;
+    let sync_settings = routing::sync_settings::SyncSettings::load(&sync_settings_path)?;
     tracing::info!(
         "sync settings: group lead {} ms, {} device delay(s) in {}",
         sync_settings.group_lead_ms(),
         sync_settings.sendspin_delays().len(),
         sync_settings_path.display()
     );
-    let sync_settings: sync_settings::SharedSyncSettings = std::sync::Arc::new(std::sync::Mutex::new(sync_settings));
+    let sync_settings: routing::sync_settings::SharedSyncSettings = std::sync::Arc::new(std::sync::Mutex::new(sync_settings));
 
     // General app settings (announce duck default, discovery on/off), beside the
     // other /data stores. On a fresh install the discovery flag is seeded from
@@ -237,12 +232,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let agents_for_duck = agents.clone();
 
     // mDNS auto-discovery (sendspin devices + AirPlay-2 receivers), runtime
-    // toggleable from the Settings page (discovery_supervisor.rs). Discovery only
-    // populates the shared registries — the grouping reconciler (sync_group.rs)
+    // toggleable from the Settings page (supervisor.rs). Discovery only
+    // populates the shared registries — the grouping reconciler (routing/sync_group.rs)
     // builds the audio path from the routing intent. Whether discovery runs comes
     // from the persisted settings flag. The supervisor is held for the process
     // lifetime (serve never returns in practice) so the daemons stay alive.
-    let discovery = discovery_supervisor::DiscoverySupervisor::new(
+    let discovery = supervisor::DiscoverySupervisor::new(
         sendspin_devices.clone(),
         ap2_devices.clone(),
         ap2_ptp.clone(),
@@ -326,7 +321,8 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // The reconciler is shared (SharedGroups) so the alignment API
         // (align/calibrate.rs) can read the live group layout — anchor + members — to
         // drive the latency-alignment wizard.
-        let groups: sync_group::SharedGroups = std::sync::Arc::new(tokio::sync::Mutex::new(sync_group::GroupReconciler::new()));
+        let groups: routing::sync_group::SharedGroups =
+            std::sync::Arc::new(tokio::sync::Mutex::new(routing::sync_group::GroupReconciler::new()));
 
         // Latency-alignment session manager (align/calibrate.rs): reads the live group
         // layout, plays a click into a group's anchor, and mutes non-audible
@@ -381,7 +377,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
                 // exactly the ones a failing group doesn't produce.
                 const RECONCILE_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
                 loop {
-                    let lead = sync_settings::group_lead_us(&settings);
+                    let lead = routing::sync_settings::group_lead_us(&settings);
                     routing::reconcile(&pw, &cmd, &routing).await;
                     let pwsink_hosts = agents_for_groups.lock().await.connected_targets();
                     let retry = {
@@ -444,7 +440,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             }
         });
 
-        // On-demand AP2 announce sessions (sync_group.rs): an unrouted receiver gets
+        // On-demand AP2 announce sessions (routing/sync_group.rs): an unrouted receiver gets
         // a temporary sender so an announcement can reach it, kept on a short lease
         // afterwards. This tick hands the receiver's single AirPlay session back once
         // the lease runs out. Slow on purpose (nothing is time-critical) and
@@ -542,7 +538,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 /// Starts the persisted sources: the native AirPlay receiver (sources/airplay.rs)
 /// and the RTP source (a PipeWire module). (Sendspin devices aren't started
 /// here — they're auto-discovered and grouped from the routing intent; see
-/// sync_group.rs.)
+/// routing/sync_group.rs.)
 async fn spawn_stored_sources(
     sources: &api::SharedSources,
     airplay: &api::SharedAirplay,

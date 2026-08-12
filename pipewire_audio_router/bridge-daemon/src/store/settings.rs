@@ -1,6 +1,6 @@
 //! General, daemon-wide app settings — the "Settings" page's backing store.
 //!
-//! Mirrors the other `/data` stores (sources.rs, sync_settings.rs): no
+//! Mirrors the other `/data` stores (sources.rs, routing/sync_settings.rs): no
 //! `options.json` seeding, every field has a `serde(default)` so an older/newer
 //! config file still loads, and the file is authoritative once written (created
 //! on the first mutation, or seeded on a fresh install — see main.rs).
@@ -8,14 +8,14 @@
 //! What lives here are genuinely *global* knobs that don't belong to a single
 //! output/source (those stay per-entity in outputs_store/sources_store) and
 //! aren't sync-specific (the group lead + per-device delays stay in
-//! sync_settings.rs):
+//! routing/sync_settings.rs):
 //!
 //! - **`default_duck`** — the level surviving sources are ducked to for an
 //!   announce that doesn't specify one. The production announce path (HA's
 //!   integration) always passes its own value, so this only affects callers
 //!   that omit it — the Diagnostics test tool, mainly.
 //! - **`discovery_enabled`** — runtime mDNS on/off, applied live by the
-//!   discovery supervisor (discovery_supervisor.rs). Disabling stops
+//!   discovery supervisor (supervisor.rs). Disabling stops
 //!   discovering *new* devices; already-present ones age out normally (RAOP via
 //!   the absent-grace, sendspin via liveness). The initial value is seeded from
 //!   `BRIDGE_DISCOVERY` on a fresh install (main.rs), then this is authoritative.

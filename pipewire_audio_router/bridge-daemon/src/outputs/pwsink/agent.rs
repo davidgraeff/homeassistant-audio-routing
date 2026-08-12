@@ -229,7 +229,7 @@ const CONTROL_SERVICE_TYPE: &str = "_pwrouter-ctl._tcp.local.";
 /// Failure is not fatal: `pwrouter-agent run --daemon host:port` works without any
 /// discovery at all.
 pub fn advertise(port: u16) {
-    let Some(daemon) = crate::discovery_supervisor::shared_advertise_daemon() else {
+    let Some(daemon) = crate::supervisor::shared_advertise_daemon() else {
         tracing::warn!("no shared mDNS daemon; agents will need --daemon <host:port>");
         return;
     };
@@ -637,7 +637,7 @@ impl Agents {
     }
 
     /// Connected paired hosts, `node_name → label`. **This is the gate for the audio
-    /// path** (§3: no agent, no target): `sync_group::compute_desired` builds a
+    /// path** (§3: no agent, no target): `routing::sync_group::compute_desired` builds a
     /// group's pw-sink members from it and `routing::build_matrix` reads presence
     /// from it, so both agree with `/api/outputs` about which hosts exist and what
     /// they are called.
@@ -850,7 +850,7 @@ async fn handle_socket(socket: WebSocket, state: crate::api::AppState) {
 
     tracing::info!("agent '{label}' connected as {node_name} (agent {agent_version})");
     // The playout delay this host is configured for (its override, else the
-    // module's own default made explicit — sync_settings.rs). Sent on every hello,
+    // module's own default made explicit — routing/sync_settings.rs). Sent on every hello,
     // so a host that reconnects after the value changed comes up on the new one.
     let jitter_ms = state.sync_settings.lock_recover().pwsink_jitter_effective(&node_name);
     let _ = tx.try_send(welcome(&node_name, jitter_ms));

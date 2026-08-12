@@ -12,7 +12,7 @@
 //! Like sendspin/ap2 discovery, a discovered target does **not** get a PipeWire
 //! node here — it is a *virtual* routing output `pwsink-dev-<slug>`; the audio
 //! path (a per-target AppleMIDI/RTP sender fed from the group anchor's monitor —
-//! outputs/pwsink/server.rs) is built by the grouping reconciler (sync_group.rs) from the
+//! outputs/pwsink/server.rs) is built by the grouping reconciler (routing/sync_group.rs) from the
 //! routing intent.
 //!
 //! ## Presence
@@ -39,7 +39,7 @@ use std::time::Instant;
 /// The mDNS service type `module-rtp-session` uses for audio sessions.
 const PIPEWIRE_AUDIO_SERVICE_TYPE: &str = "_pipewire-audio._udp.local.";
 
-/// The dev-spike session name (pw_sink_spike.rs) — one of our own adverts to skip.
+/// The dev-spike session name (spike/pwsink.rs) — one of our own adverts to skip.
 const SPIKE_SESSION_NAME: &str = "pw-audio-router-spike";
 
 /// One discovered pw-sink target host.

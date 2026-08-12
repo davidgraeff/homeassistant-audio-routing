@@ -88,7 +88,7 @@ pub struct AppState {
     /// adoption on the Sources tab.
     pub bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
     /// The daemon's single host-global AirPlay-2 PTP grandmaster (outputs/ap2/ptp.rs),
-    /// reused by the AP2 tone spike (ap2_spike.rs) so it shares 319/320 rather
+    /// reused by the AP2 tone spike (spike/ap2.rs) so it shares 319/320 rather
     /// than double-binding.
     pub ap2_ptp: SharedAp2Ptp,
     pub sendspin_control: crate::outputs::sendspin::volume::SharedSendspinControl,
@@ -101,19 +101,19 @@ pub struct AppState {
     /// only *offers* a device; until it's added here it stays out of the routing
     /// matrix, out of Home Assistant and out of the group reconciler.
     pub outputs: SharedOutputs,
-    /// Persistent sync/latency tuning (sync_settings.rs): the group presentation
+    /// Persistent sync/latency tuning (routing/sync_settings.rs): the group presentation
     /// lead + per-sendspin-device static delays.
-    pub sync_settings: crate::sync_settings::SharedSyncSettings,
+    pub sync_settings: crate::routing::sync_settings::SharedSyncSettings,
     /// General app settings (store/settings.rs): announce default duck, mDNS
     /// discovery on/off.
     pub settings: SharedSettings,
     /// Runtime mDNS on/off, driven by the discovery flag above.
-    pub discovery: crate::discovery_supervisor::DiscoverySupervisor,
+    pub discovery: crate::supervisor::DiscoverySupervisor,
     /// Latency-alignment session manager (align/calibrate.rs) for the alignment panel.
     pub align: crate::align::calibrate::AlignManager,
-    /// Live sync-group layout (sync_group.rs) — used to restart a group's
+    /// Live sync-group layout (routing/sync_group.rs) — used to restart a group's
     /// sendspin stream when a static-delay change needs it to take effect.
-    pub groups: crate::sync_group::SharedGroups,
+    pub groups: crate::routing::sync_group::SharedGroups,
     /// Named music/announcement groups (store/groups.rs) — the MG/AG data model.
     pub groups_config: crate::store::groups::SharedGroupsStore,
     /// Add-on version string (main.rs `addon_version()`), for `/api/status`.
@@ -157,11 +157,11 @@ pub fn router(
     outputs: SharedOutputs,
     sendspin_control: crate::outputs::sendspin::volume::SharedSendspinControl,
     ap2_control: crate::outputs::ap2::volume::SharedAp2Control,
-    sync_settings: crate::sync_settings::SharedSyncSettings,
+    sync_settings: crate::routing::sync_settings::SharedSyncSettings,
     settings: SharedSettings,
-    discovery: crate::discovery_supervisor::DiscoverySupervisor,
+    discovery: crate::supervisor::DiscoverySupervisor,
     align: crate::align::calibrate::AlignManager,
-    groups: crate::sync_group::SharedGroups,
+    groups: crate::routing::sync_group::SharedGroups,
     groups_config: crate::store::groups::SharedGroupsStore,
     version: String,
     started: std::time::Instant,
@@ -549,7 +549,7 @@ pub(crate) struct OutputInfo {
     /// Per-output latency override in ms; `None` = the type's built-in default.
     /// For AirPlay-2 it's the render delay (outputs/ap2/server.rs, default 0); for
     /// pw-sink it's the receiver's playout delay / jitter buffer
-    /// (`sync_settings::DEFAULT_PWSINK_JITTER_MS`). Not meaningful for sendspin
+    /// (`routing::sync_settings::DEFAULT_PWSINK_JITTER_MS`). Not meaningful for sendspin
     /// (uses a separate static-delay knob).
     latency_ms: Option<u16>,
     /// The latency this output is **actually running** in ms — the override
@@ -701,7 +701,7 @@ struct OutputOpResponse {
 fn sendspin_codec_info(
     node_name: &str,
     device_codecs: &[String],
-    settings: &crate::sync_settings::SyncSettings,
+    settings: &crate::routing::sync_settings::SyncSettings,
 ) -> (&'static str, &'static str, Vec<CodecOption>) {
     let mode = settings.sendspin_codec(node_name);
     let active = crate::outputs::sendspin::server::resolve_codec(mode, std::iter::once(&device_codecs.to_vec()));
@@ -833,7 +833,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
     // are the RAOP-output replacement; like sendspin devices they're virtual (no
     // PipeWire node) and always auto-discovered.
     let ap2_devices = state.ap2_devices.lock_recover().clone();
-    // Per-output AP2 render-delay overrides (sync_settings.rs), keyed by node name
+    // Per-output AP2 render-delay overrides (routing/sync_settings.rs), keyed by node name
     // — the per-output latency field (`latency_ms`).
     let ap2_latencies = state.sync_settings.lock_recover().ap2_latencies();
     // Routing intent snapshot + the set of present AP2 receivers, so we can tell
@@ -886,8 +886,8 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         let (rate_mode, rate) = {
             let ss = state.sync_settings.lock_recover();
             let mode = match ss.ap2_rate_mode(&node_name) {
-                crate::sync_settings::Ap2RateMode::Auto => "auto",
-                crate::sync_settings::Ap2RateMode::Fixed44100 => "fixed_44100",
+                crate::routing::sync_settings::Ap2RateMode::Auto => "auto",
+                crate::routing::sync_settings::Ap2RateMode::Fixed44100 => "fixed_44100",
             };
             (mode, ss.ap2_effective_rate(&node_name))
         };
@@ -975,7 +975,9 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             port: None,
             encryption: Some("None".to_string()), // L16 RTP is unencrypted
             latency_ms: pwsink_jitters.get(&node_name).copied(),
-            latency_effective_ms: Some(pwsink_jitters.get(&node_name).copied().unwrap_or(crate::sync_settings::DEFAULT_PWSINK_JITTER_MS)),
+            latency_effective_ms: Some(
+                pwsink_jitters.get(&node_name).copied().unwrap_or(crate::routing::sync_settings::DEFAULT_PWSINK_JITTER_MS),
+            ),
             ptp_locked: None,
             ptp_lock_age_s: None,
             ptp_supported: None,
@@ -1999,7 +2001,7 @@ async fn set_pwsink_mute(State(state): State<AppState>, Json(req): Json<SetPwsin
 
 // ---- Sync tuning: group lead + per-device static delay -------------------
 //
-// The user-facing latency dials for group sync (sync_settings.rs). The group
+// The user-facing latency dials for group sync (routing/sync_settings.rs). The group
 // lead is one daemon-wide value (raise it so the slowest member still plays in
 // time; lower it for a snappier start). The per-sendspin-device static delay
 // trims one speaker that's consistently early/late. The AP2 per-output
@@ -2240,7 +2242,7 @@ async fn set_settings(State(state): State<AppState>, Json(req): Json<SetSettings
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "settings saved".to_string() }))
 }
 
-/// S3 spike (per_device_spike.rs): stand up one per-device PipeWire node +
+/// S3 spike (spike/per_device.rs): stand up one per-device PipeWire node +
 /// single-member sendspin sender for `device`, optionally fed from `source`.
 #[derive(Deserialize)]
 struct SpikeStartRequest {
@@ -2257,7 +2259,7 @@ struct SpikeStartResponse {
     ok: bool,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    spike: Option<crate::per_device_spike::SpikeInfo>,
+    spike: Option<crate::spike::per_device::SpikeInfo>,
 }
 
 async fn spike_per_device_start(
@@ -2265,7 +2267,7 @@ async fn spike_per_device_start(
     Json(req): Json<SpikeStartRequest>,
 ) -> (StatusCode, Json<SpikeStartResponse>) {
     let send_ahead_us = state.sync_settings.lock_recover().group_lead_us();
-    match crate::per_device_spike::start(
+    match crate::spike::per_device::start(
         &req.device,
         req.source.as_deref(),
         &state.pw,
@@ -2284,13 +2286,13 @@ async fn spike_per_device_start(
 }
 
 async fn spike_per_device_stop(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
-    match crate::per_device_spike::stop(&state.pw_cmd, &state.changes, &state.routing).await {
+    match crate::spike::per_device::stop(&state.pw_cmd, &state.changes, &state.routing).await {
         Ok(msg) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg })),
         Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
     }
 }
 
-/// AirPlay-2 synchronized **test tone** spike (ap2_spike.rs). Streams a sine tone
+/// AirPlay-2 synchronized **test tone** spike (spike/ap2.rs). Streams a sine tone
 /// to the target receivers via the PROVEN file path (`start_streaming`), bypassing
 /// the live-capture producer, to check that AP2 + PTP multi-room works on the Pi.
 #[derive(Deserialize)]
@@ -2363,7 +2365,7 @@ async fn spike_ap2_start(State(state): State<AppState>, Json(req): Json<Ap2Spike
         (req.mode.as_deref() == Some("live"), None)
     };
 
-    match crate::ap2_spike::start(targets, &state.ap2_ptp, freq, secs, delay, live, rate, file_wav).await {
+    match crate::spike::ap2::start(targets, &state.ap2_ptp, freq, secs, delay, live, rate, file_wav).await {
         Ok(info) => {
             (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{} — {}", info.message, info.targets.join(", ")) }))
         }
@@ -2372,11 +2374,11 @@ async fn spike_ap2_start(State(state): State<AppState>, Json(req): Json<Ap2Spike
 }
 
 async fn spike_ap2_stop() -> (StatusCode, Json<OutputOpResponse>) {
-    let msg = crate::ap2_spike::stop().await;
+    let msg = crate::spike::ap2::stop().await;
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg }))
 }
 
-/// pw-sink transport spike (pw_sink_spike.rs). Streams a self-driving test tone
+/// pw-sink transport spike (spike/pwsink.rs). Streams a self-driving test tone
 /// to a remote PipeWire host via native rtp-sink + rtp-sap — the real-LAN A/B
 /// oracle for the pw-sink output backend. No user interaction; the remote host
 /// (running rtp-sap in discover mode) auto-creates a source and plays it.
@@ -2399,14 +2401,14 @@ async fn spike_pwsink_start(State(state): State<AppState>, Json(req): Json<PwSin
     }
     let freq = req.freq.unwrap_or(440.0);
     let ifname = req.ifname.as_deref().or(Some("end0"));
-    match crate::pw_sink_spike::start(&state.pw, &state.pw_cmd, &req.target_ip, freq, ifname).await {
+    match crate::spike::pwsink::start(&state.pw, &state.pw_cmd, &req.target_ip, freq, ifname).await {
         Ok(info) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: info.message })),
         Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
     }
 }
 
 async fn spike_pwsink_stop() -> (StatusCode, Json<OutputOpResponse>) {
-    crate::pw_sink_spike::stop().await;
+    crate::spike::pwsink::stop().await;
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "pw-sink spike stopped".into() }))
 }
 
@@ -2425,7 +2427,7 @@ async fn spike_multi_device_start(
     Json(req): Json<SpikeMultiRequest>,
 ) -> (StatusCode, Json<SpikeStartResponse>) {
     let send_ahead_us = state.sync_settings.lock_recover().group_lead_us();
-    match crate::per_device_spike::start_multi(
+    match crate::spike::per_device::start_multi(
         &req.devices,
         req.source.as_deref(),
         &state.pw,
@@ -2500,7 +2502,7 @@ async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, St
 ///
 /// Each target needs a per-device sender to *consume* its overlay, so the handler
 /// first ensures one exists — including opening an **on-demand AP2 session** for a
-/// receiver with nothing routed into it (sync_group.rs) — and reports any target
+/// receiver with nothing routed into it (routing/sync_group.rs) — and reports any target
 /// nothing can carry instead of dropping the clip silently.
 #[derive(Deserialize)]
 struct AgAnnounceRequest {
@@ -2609,8 +2611,8 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     }
     let duck = req.duck.or(ag_duck).unwrap_or_else(|| state.settings.lock_recover().default_duck());
     let on_busy = match req.on_busy.as_deref() {
-        Some("reject") => crate::announce_arbiter::OnBusy::Reject,
-        _ => crate::announce_arbiter::OnBusy::Queue,
+        Some("reject") => crate::announce::arbiter::OnBusy::Reject,
+        _ => crate::announce::arbiter::OnBusy::Queue,
     };
 
     // Make sure each target actually has a sender that will *consume* the overlay.
@@ -2620,7 +2622,7 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     // slow) clip fetch/decode so the connect overlaps it. Targets that nothing can
     // carry are dropped from the announcement and reported, rather than silently
     // swallowing the clip and answering "playing".
-    use crate::sync_group::{AnnounceDeps, AnnounceTransport};
+    use crate::routing::sync_group::{AnnounceDeps, AnnounceTransport};
     let mut transports: Vec<(String, AnnounceTransport)> = Vec::with_capacity(targets.len());
     {
         let deps = AnnounceDeps {
@@ -2674,7 +2676,7 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     let played: Vec<String> = targets.iter().map(|t| output_label(&state, t)).collect();
     let admission =
         crate::announce::AnnounceCoordinator::global().announce(targets, pcm, duck, priority, on_busy, req.barge_in, req.ttl_ms, grace);
-    use crate::announce_arbiter::Admission;
+    use crate::announce::arbiter::Admission;
     let (label, position, reason, ok) = match admission {
         Admission::Playing => ("playing", None, None, true),
         Admission::Queued { position } => ("queued", Some(position), None, true),
@@ -3660,7 +3662,7 @@ struct SetOutputLatencyRequest {
 }
 
 /// Set an output's per-output playout delay (ms), persisted per node name in
-/// sync_settings.rs. `latency_ms: null` clears the override, back to the kind's
+/// routing/sync_settings.rs. `latency_ms: null` clears the override, back to the kind's
 /// default. Two kinds have such a knob, and both land here because they are the
 /// same decision — "this speaker plays too early/late, shift it":
 ///
@@ -3730,7 +3732,7 @@ async fn set_output_latency(
 /// picks it up in the `welcome` of its next connect, which is how every other
 /// setting for an absent device behaves here.
 async fn set_pwsink_jitter(state: AppState, node_name: String, requested: Option<u16>) -> (StatusCode, Json<OutputOpResponse>) {
-    use crate::sync_settings::{PWSINK_JITTER_MAX_MS, PWSINK_JITTER_MIN_MS};
+    use crate::routing::sync_settings::{PWSINK_JITTER_MAX_MS, PWSINK_JITTER_MIN_MS};
 
     let packet_ms = crate::outputs::pwsink::applemidi::PACKET_MS as u16;
     let clamped = requested.map(|ms| {
@@ -3764,7 +3766,7 @@ struct SetAp2RateModeRequest {
     mode: String,
 }
 
-/// Set an AP2 output's wire-rate mode (persisted in sync_settings.rs) and nudge the
+/// Set an AP2 output's wire-rate mode (persisted in routing/sync_settings.rs) and nudge the
 /// reconciler so the group re-negotiates + restarts at the new rate. Choosing `auto`
 /// also clears any learned 44.1k cap so 48 kHz is re-probed.
 /// Per-sendspin-output wire codec (`{"codec": "auto"|"pcm"|"opus"|"flac"}`).
@@ -3787,7 +3789,7 @@ async fn set_sendspin_codec(
     if !node_name.starts_with(SENDSPIN_DEV_PREFIX) {
         return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not a sendspin output") }));
     }
-    let Some(codec) = crate::sync_settings::SendspinCodec::parse(&req.codec) else {
+    let Some(codec) = crate::routing::sync_settings::SendspinCodec::parse(&req.codec) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(OutputOpResponse { ok: false, message: format!("unknown codec '{}' (use auto, pcm, opus or flac)", req.codec) }),
@@ -3825,8 +3827,8 @@ async fn set_ap2_rate_mode(
         );
     }
     let mode = match req.mode.as_str() {
-        "auto" => crate::sync_settings::Ap2RateMode::Auto,
-        "fixed_44100" | "fixed44100" | "44100" => crate::sync_settings::Ap2RateMode::Fixed44100,
+        "auto" => crate::routing::sync_settings::Ap2RateMode::Auto,
+        "fixed_44100" | "fixed44100" | "44100" => crate::routing::sync_settings::Ap2RateMode::Fixed44100,
         other => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -3843,8 +3845,8 @@ async fn set_ap2_rate_mode(
     // Rate is part of the AP2 restart identity → the group re-negotiates + restarts.
     let _ = state.changes.send(());
     let label = match mode {
-        crate::sync_settings::Ap2RateMode::Auto => "auto (negotiate 48 kHz)",
-        crate::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
+        crate::routing::sync_settings::Ap2RateMode::Auto => "auto (negotiate 48 kHz)",
+        crate::routing::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' sample rate to {label} (applies shortly)") }))
 }

@@ -227,7 +227,7 @@ untouched and so nulls §1.1.2 item 2's MDCT confound *for this measurement* —
 of saying nothing about item 2 for an arbitrary delay.
 
 Two incidental findings worth keeping: **AP2's render delay is applied live** by
-`set_output_latency`, contradicting §2.4 and `sync_settings.rs:19`'s "on next reconnect";
+`set_output_latency`, contradicting §2.4 and `routing/sync_settings.rs:19`'s "on next reconnect";
 and `set_sendspin_delay_handler` reconnects **unconditionally**, which is what makes a
 `from → from` write a usable symmetric baseline.
 
@@ -409,7 +409,7 @@ and then — unless `sendspin_delay_live` is on, which it is not by default
 because current ESPHome firmware reads the static delay only at stream start.
 Hardware-confirmed: a reconnecting sendspin device takes **tens of seconds** to
 render again regardless of how the previous session ended. AP2 render delay is the
-same story — `sync_settings.rs:19` notes it takes on the next membership/rate
+same story — `routing/sync_settings.rs:19` notes it takes on the next membership/rate
 reconnect.
 
 This is the single most important constraint on the orchestration, and it has a
@@ -715,7 +715,7 @@ unambiguous over the full 2 s.
 A group misaligned by more than a large fraction of the period must therefore be
 refused rather than silently mismeasured — the implementation refuses beyond
 0.4 × pattern (800 ms) and says to rough the group in by ear first. AP2 members
-carrying 800 ms render delays (`sync_settings.rs:465` uses exactly that as its test
+carrying 800 ms render delays (`routing/sync_settings.rs:465` uses exactly that as its test
 value) sit right at that boundary, so this is not theoretical.
 
 Two further corrections from building it: **§6.1's alternation is not sufficient for
@@ -1586,7 +1586,7 @@ and the final real write.
     output kind. Reusing the duck-hold path instead would make the session report
     interference against itself (§12.3), so it needs its own mechanism. The "how do I
     silence this member?" decision is therefore **per-output capability, not per-kind**.
-  - **`sync_group::GroupSnapshot` has no `pwsink_members`**, so the by-ear entry point
+  - **`routing::sync_group::GroupSnapshot` has no `pwsink_members`**, so the by-ear entry point
     that resolves a group from a source set (`AlignManager::groups` / `start(sources)`)
     still cannot see or hold a group's pw-sink targets. Selecting them on the Outputs page
     works; closing that gap belongs with `sync_group`.

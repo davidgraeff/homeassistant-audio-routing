@@ -3,7 +3,7 @@
 //! over mDNS** (`_pipewire-audio._udp`, via the daemon's own storm-safe `mdns-sd`
 //! — no Avahi/`module-rtp-session`, which can't run in the addon container; see
 //! docs/pipewire-sink-spike-results.md). A/B oracle for the pw-sink transport
-//! (mirrors `ap2_spike.rs`).
+//! (mirrors `spike/ap2.rs`).
 //!
 //! `POST /api/spike/pw-sink {"target_ip":"…","freq":440}` creates a
 //! `null-audio-sink` anchor (steady QUANT-1024 driver), loops a sine into it,
@@ -70,7 +70,7 @@ pub struct PwSinkSpikeInfo {
 }
 
 /// `secs` of a stereo sine at `freq_hz` as a 48k/16-bit WAV (seamless loop at
-/// integer `freq_hz`). Mirrors `ap2_spike::tone_wav`.
+/// integer `freq_hz`). Mirrors `spike::ap2::tone_wav`.
 fn tone_wav(freq_hz: f32, secs: f32, rate: u32) -> Vec<u8> {
     let n = (secs * rate as f32).max(0.0) as usize;
     let mut pcm = Vec::with_capacity(n * 4);
@@ -117,7 +117,7 @@ async fn reload_module(pw_cmd: &PwCommandSender, node_name: &str, module: &str, 
 /// daemon's shared storm-safe advertise daemon. Returns `(daemon, fullname)`
 /// for later unregister, or `None` if advertising is unavailable.
 fn advertise(port: u16) -> Option<(ServiceDaemon, String)> {
-    let daemon = crate::discovery_supervisor::shared_advertise_daemon()?;
+    let daemon = crate::supervisor::shared_advertise_daemon()?;
     let props = [
         ("format", "S16LE"),
         ("rate", "48000"),

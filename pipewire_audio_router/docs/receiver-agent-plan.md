@@ -93,7 +93,7 @@ Consequences, accepted:
 
   **This half was missed the first time round, and it made every pw-sink output
   silent** (found live 2026-08-05: paired, adopted, routed, and the agent still
-  reporting `receiving: false`). `sync_group::compute_desired` and
+  reporting `receiving: false`). `routing::sync_group::compute_desired` and
   `routing::build_matrix` still built their pw-sink half from that registry, which
   keys a host `pwsink-dev-<host>` — while a pairing, and therefore every routing
   link, adoption verdict and HA entity, carries `pwsink-dev-<host>_<user>`. So
@@ -162,7 +162,7 @@ commands it knows.
 buffer); the agent builds the `rtp-session` argument string itself.
 
 The jitter buffer is now **always sent** and is the host's per-output playout-delay
-setting (`sync_settings::pwsink_jitter`, default = the module's own 100 ms): the
+setting (`routing::sync_settings::pwsink_jitter`, default = the module's own 100 ms): the
 daemon decides what a target runs at, so the figure the UI shows and the figure the
 receiver uses cannot disagree. Changing it re-sends `welcome` — the agent reloads
 its receiver on every one by design (§13.4), so retuning needed no new message type
@@ -344,7 +344,7 @@ Worth an upstream report either way.
 ## 8. Pairing and discovery
 
 1. Daemon advertises `_pwrouter-ctl._tcp` over the shared storm-safe mDNS daemon
-   (`discovery_supervisor.rs`, LAN-restricted per the mDNS-storm fix).
+   (`supervisor.rs`, LAN-restricted per the mDNS-storm fix).
 2. `pwrouter-agent run` browses for it, connects, sends `hello` without a token.
    The hello carries a **pairing code the agent mints once per process** and logs at
    startup. The daemon validates its shape (6 uppercase hex, `valid_pair_code`) and

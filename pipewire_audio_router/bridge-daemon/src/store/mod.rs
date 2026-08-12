@@ -14,7 +14,7 @@
 //! registry, no senders, no discovery. A module that needs those is not a store,
 //! it is a supervisor that persists — which is why `sources/mod.rs` is *not*
 //! here (it reconciles live AirPlay and RTP handles) and neither is
-//! `sync_settings.rs` (it pushes settings into the senders on write). Keeping the
+//! `routing/sync_settings.rs` (it pushes settings into the senders on write). Keeping the
 //! rule means these files can be read, tested and reasoned about without the rest
 //! of the daemon.
 

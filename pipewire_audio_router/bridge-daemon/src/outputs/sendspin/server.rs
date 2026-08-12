@@ -154,7 +154,7 @@ fn set_relay_realtime_priority() {}
 /// `Supervisor::stop`.
 ///
 /// It does **not** own the sink node it captures from: that's the shared sync
-/// anchor created and destroyed by sync_group.rs, whose lifetime is independent
+/// anchor created and destroyed by routing/sync_group.rs, whose lifetime is independent
 /// of this server (the server can be restarted — e.g. when the dialed-device set
 /// changes — without disturbing the anchor or the RAOP outputs also fed from
 /// it). Only the capture/discovery/advertise/accept resources are torn down here.
@@ -287,7 +287,7 @@ impl Drop for SendspinServerHandle {
         // sender and closes the relay's channel → the relay thread exits.
         // `client_manager`'s Drop stops every reconnect loop; `_advertisement`'s
         // Drop unregisters mDNS. The sink node is the shared anchor owned by
-        // sync_group.rs — not destroyed here.
+        // routing/sync_group.rs — not destroyed here.
     }
 }
 
@@ -509,7 +509,7 @@ pub fn required_send_ahead_us(
 ) -> i64 {
     // A device that reports nothing still needs enough lead to decode a compressed
     // stream, so the codec's own floor applies to it — see `min_send_ahead_us`.
-    // `opus_floor_ms` is the user's setting for that headroom (sync_settings.rs).
+    // `opus_floor_ms` is the user's setting for that headroom (routing/sync_settings.rs).
     let codec_floor = crate::outputs::sendspin::codec::min_send_ahead_us(codec, opus_floor_ms);
     members
         .into_iter()
@@ -536,10 +536,10 @@ fn resolve_node_name(devices: &crate::outputs::sendspin::discovery::SharedSendsp
 }
 
 /// Advertise a sendspin server on the process-wide shared, LAN-restricted mDNS
-/// daemon ([`crate::discovery_supervisor::shared_advertise_daemon`]), falling
+/// daemon ([`crate::supervisor::shared_advertise_daemon`]), falling
 /// back to a private per-advertisement daemon if that's unavailable.
 fn advertise(node_name: &str, display_name: &str, port: u16) -> Result<Advertisement, sendspin::error::Error> {
-    match crate::discovery_supervisor::shared_advertise_daemon() {
+    match crate::supervisor::shared_advertise_daemon() {
         Some(daemon) => Advertisement::with_daemon(daemon, node_name, display_name, port, SENDSPIN_PATH),
         None => Advertisement::new(node_name, display_name, port, SENDSPIN_PATH),
     }
@@ -998,7 +998,7 @@ pub const ENCODABLE_CODECS: &[&str] = &["opus", "flac", "pcm"];
 /// [`ENCODABLE_CODECS`] ∩ the device's advertised codecs.
 pub const OFFERED_CODECS: &[&str] = &["opus", "flac", "pcm"];
 
-/// Preference order for [`crate::sync_settings::SendspinCodec::Auto`]: Opus when
+/// Preference order for [`crate::routing::sync_settings::SendspinCodec::Auto`]: Opus when
 /// everything in the way supports it (≈10× less WiFi airtime than PCM), else PCM.
 /// FLAC is deliberately not auto-selected — it's a deliberate lossless choice, and
 /// picking it silently over Opus would trade a lot of bandwidth for inaudibility.
@@ -1039,7 +1039,7 @@ pub fn device_supports(device_codecs: &[String], codec: &str) -> bool {
 /// proves otherwise. Per-device *display* of what a codec is worth stays honest —
 /// that's [`device_supports`], which still answers "unknown ⇒ only PCM is assured".
 pub fn resolve_codec<'a>(
-    mode: crate::sync_settings::SendspinCodec,
+    mode: crate::routing::sync_settings::SendspinCodec,
     device_codecs: impl IntoIterator<Item = &'a Vec<String>> + Clone,
 ) -> &'static str {
     let usable =
@@ -1251,7 +1251,7 @@ async fn drain_messages_per_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync_settings::SendspinCodec;
+    use crate::routing::sync_settings::SendspinCodec;
 
     fn codecs(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

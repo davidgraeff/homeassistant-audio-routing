@@ -19,8 +19,16 @@
 // start/stop on a `pwsink-dev-*` output is mirrored to that host's agent, which
 // attenuates the foreign streams on its sink (outputs::pwsink::agent::duck_output —
 // docs/receiver-agent-plan.md §11 P3).
+//
+// The split here is between deciding and doing. [`arbiter`] is the *pure*
+// scheduler: queue-by-default, per-announcement barge-in and TTL, no audio path
+// and no I/O, which is why it is unit-tested to a degree the delivery side cannot
+// be. This module is the doing — resolving targets, holding overlay sessions
+// open, tearing them down.
 
-use crate::announce_arbiter::{Action, Admission, AnnounceScheduler, AnnouncementId, Effects, OnBusy, Request};
+pub(crate) mod arbiter;
+
+use crate::announce::arbiter::{Action, Admission, AnnounceScheduler, AnnouncementId, Effects, OnBusy, Request};
 use crate::outputs::overlay_mixer::OverlayMixer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -156,12 +164,12 @@ impl AnnounceCoordinator {
     /// temporary exclusive group (align/group.rs). While held, ordinary announcements
     /// to those outputs queue (or are rejected per `OnBusy`); a `barge_in` still
     /// plays and is reported back through [`crate::align::group::registry`].
-    pub fn reserve_outputs(&self, id: crate::announce_arbiter::ReservationId, outputs: Vec<String>) {
+    pub fn reserve_outputs(&self, id: crate::announce::arbiter::ReservationId, outputs: Vec<String>) {
         self.inner.lock().unwrap().sched.reserve(id, outputs);
     }
 
     /// Drop a reservation and let anything that queued behind it play.
-    pub fn release_reservation(&self, id: crate::announce_arbiter::ReservationId) {
+    pub fn release_reservation(&self, id: crate::announce::arbiter::ReservationId) {
         let now = now_ms();
         let mut inner = self.inner.lock().unwrap();
         let eff = inner.sched.release_reservation(id, now);
@@ -170,7 +178,7 @@ impl AnnounceCoordinator {
 
     /// Outputs with an announcement playing or queued — see
     /// [`AnnounceScheduler::outputs_in_flight`]. Read by the on-demand transport
-    /// lease (sync_group.rs) so a session isn't handed back before its clip's turn.
+    /// lease (routing/sync_group.rs) so a session isn't handed back before its clip's turn.
     pub fn outputs_in_flight(&self) -> std::collections::BTreeSet<String> {
         self.inner.lock().unwrap().sched.outputs_in_flight()
     }

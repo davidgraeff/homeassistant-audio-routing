@@ -12,7 +12,7 @@
 //! **not** get its own PipeWire sink loaded here. It's surfaced as a *virtual*
 //! routing output (`sendspin-dev-<slug>`); the actual audio path — one sink +
 //! one synchronized sendspin `Group` per set of co-routed devices — is built
-//! by the grouping reconciler (sync_group.rs) from the routing intent.
+//! by the grouping reconciler (routing/sync_group.rs) from the routing intent.
 //! This mirrors RAOP's "devices appear in the matrix automatically" UX while
 //! honoring sendspin's group-based multi-room model.
 
