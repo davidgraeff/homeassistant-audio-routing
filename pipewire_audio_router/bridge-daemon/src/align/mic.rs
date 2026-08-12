@@ -28,7 +28,7 @@
 //! Two concurrent captures would interleave into garbage, so a second connection
 //! is **rejected** with a close reason rather than silently accepted. Closing the
 //! socket marks the ingest disconnected but touches nothing else: the alignment
-//! session (`align/calibrate.rs`) survives, because the user may just be switching
+//! session (`align/calibrate/mod.rs`) survives, because the user may just be switching
 //! modes, and its own 15 min safety timeout still governs teardown.
 //!
 //! ## What the consumer gets
@@ -50,7 +50,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// How much recent audio the ring holds, in seconds.
 ///
-/// The calibration pattern is a 2 s loop (`align/calibrate.rs` `PATTERN_SECS`) and the
+/// The calibration pattern is a 2 s loop (`align/calibrate/mod.rs` `PATTERN_SECS`) and the
 /// estimator averages over "several loop periods" (plan §5.3), so a window worth
 /// keeping is a handful of periods long. 10 s = 5 pattern periods: enough for the
 /// estimator to average, and enough slack that a consumer polling at a lazy 1 Hz

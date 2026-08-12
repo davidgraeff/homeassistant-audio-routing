@@ -282,7 +282,7 @@ pub(crate) struct AgAnnounceRequest {
     /// Use the built-in test-announcement clip (no url needed).
     #[serde(default)]
     pub(crate) test: bool,
-    /// Use the built-in calibration tone (the `align/calibrate.rs` click track) as a
+    /// Use the built-in calibration tone (the `align/calibrate/mod.rs` click track) as a
     /// quick "is this speaker alive and correctly wired" check.
     #[serde(default)]
     pub(crate) tone: bool,

@@ -1,6 +1,6 @@
 use super::*;
 
-// ---- Latency alignment (align/calibrate.rs) -----------------------------
+// ---- Latency alignment (align/calibrate/mod.rs) -----------------------------
 
 /// Alignable groups (a source-set with its present members), for the picker.
 pub(crate) async fn align_groups(State(state): State<AppState>) -> Json<Vec<crate::align::calibrate::AlignGroup>> {

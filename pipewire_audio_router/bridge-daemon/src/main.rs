@@ -333,17 +333,17 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // source are (re)formed into synchronized groups (sync_group).
         //
         // The reconciler is shared (SharedGroups) so the alignment API
-        // (align/calibrate.rs) can read the live group layout — anchor + members — to
+        // (align/calibrate/mod.rs) can read the live group layout — anchor + members — to
         // drive the latency-alignment wizard.
         let groups: routing::sync_group::SharedGroups =
             std::sync::Arc::new(tokio::sync::Mutex::new(routing::sync_group::GroupReconciler::new()));
 
-        // Latency-alignment session manager (align/calibrate.rs): reads the live group
+        // Latency-alignment session manager (align/calibrate/mod.rs): reads the live group
         // layout, plays a click into a group's anchor, and mutes non-audible
         // members while the user tunes offsets by ear.
         let align = align::calibrate::AlignManager::new(sendspin_control.clone(), ap2_control.clone(), groups.clone());
         // How a *pw-sink* member is silenced during a solo. Alignment resolves the
-        // mechanism per output rather than per kind (align/calibrate.rs `SilenceChannel`):
+        // mechanism per output rather than per kind (align/calibrate/mod.rs `SilenceChannel`):
         // sendspin and AP2 have in-band mutes, and a receiver host is silenced over its
         // agent's control lane — preferred, because only the remote sink's volume moves,
         // so the stream keeps flowing and unmuting cannot introduce a discontinuity the

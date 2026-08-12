@@ -102,7 +102,7 @@ pub struct AppState {
     pub settings: SharedSettings,
     /// Runtime mDNS on/off, driven by the discovery flag above.
     pub discovery: crate::supervisor::DiscoverySupervisor,
-    /// Latency-alignment session manager (align/calibrate.rs) for the alignment panel.
+    /// Latency-alignment session manager (align/calibrate/mod.rs) for the alignment panel.
     pub align: crate::align::calibrate::AlignManager,
     /// Live sync-group layout (routing/sync_group/mod.rs) — used to restart a group's
     /// sendspin stream when a static-delay change needs it to take effect.

@@ -6,7 +6,7 @@ the daemon computes each group member's render offset in milliseconds from the m
 signal, writes the delays, and verifies the result — instead of the user dragging a
 slider until two clicks sound like one.
 
-**What it reuses.** The session model in `align/calibrate.rs` — server-owned
+**What it reuses.** The session model in `align/calibrate/mod.rs` — server-owned
 playback, level/mute snapshot and restore, a safety timeout, the two-tone click
 track — was the right shape and is used wholesale. The measurement path sits
 *beside* the by-ear path, which remains the fallback when the phone has no usable
@@ -354,7 +354,7 @@ that:
 
 ### 2.1 The session
 
-`align/calibrate.rs` owns one alignment session at a time:
+`align/calibrate/mod.rs` owns one alignment session at a time:
 
 - `click_wav()` builds a 2 s S16LE/44.1k stereo loop: an 8 ms Hann-enveloped
   3000 Hz burst ("A") at t=0, an 8 ms 1500 Hz burst ("B") at t=1.0 s, amplitude 0.5.
@@ -1345,7 +1345,7 @@ above), and simply accepting the cost (reasonable only for single-position runs)
 Composed with §1.1.1, a whole multi-position run then contains exactly two reconnect
 waves — the formation and the final real write.
 
-How it works (`align/group.rs`, `align/calibrate.rs`, `api/align.rs`):
+How it works (`align/group.rs`, `align/calibrate/mod.rs`, `api/align.rs`):
 
 - `POST /api/align/start {outputs}` means "**hold all of these for the whole run**".
   Its doc comment says so, because it reads counter-intuitively next to a wizard that

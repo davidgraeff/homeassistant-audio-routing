@@ -2,7 +2,7 @@
 //! (docs/mic-alignment-plan.md §12.1, §12.3).
 //!
 //! Alignment used to resolve a group from an existing *source set* and required one to
-//! already exist (`align/calibrate.rs`), which is why its panel lived on source cards. The
+//! already exist (`align/calibrate/mod.rs`), which is why its panel lived on source cards. The
 //! target scenario inverts that: the user picks speakers on the Outputs page and
 //! alignment forms a group around them.
 //!
@@ -40,7 +40,7 @@
 //! that cannot half-succeed, is idempotent, and does the right thing even if the
 //! process dies (a restart reads the unmodified store). The only state that genuinely
 //! *is* mutated, and therefore genuinely needs snapshot/restore, is per-device level
-//! and mute; `align/calibrate.rs` owns that snapshot, and it is a small, bounded set.
+//! and mute; `align/calibrate/mod.rs` owns that snapshot, and it is a small, bounded set.
 //!
 //! ## What exclusivity covers, and what it does not
 //!
@@ -241,7 +241,7 @@ pub struct Interference {
 /// The live hold, as the rest of the daemon sees it.
 ///
 /// A process-global single slot: exactly one alignment session exists at a time
-/// (`align/calibrate.rs` enforces that), and the two reporters — the announce path and the
+/// (`align/calibrate/mod.rs` enforces that), and the two reporters — the announce path and the
 /// overlay mixer — need a cheap, lock-light "is this output reserved?" that does not
 /// reach into the reconciler or the arbiter.
 #[derive(Default)]
@@ -516,7 +516,7 @@ impl ExclusiveHold {
     /// A hold that has taken **only** the routing override on the reconciler it is
     /// given — no process-global registry entry, no announce reservation.
     ///
-    /// For tests in other modules that need a `Session` to exist (`align/calibrate.rs`'s
+    /// For tests in other modules that need a `Session` to exist (`align/calibrate/mod.rs`'s
     /// union-hold tests) without a PipeWire graph to produce an anchor. Deliberately
     /// keeps its hands off the two process-global singletons: exactly one test —
     /// `a_hold_takes_exclusivity_reports_violations_and_gives_everything_back` — drives

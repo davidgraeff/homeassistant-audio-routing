@@ -77,7 +77,7 @@ pub struct LevelSeam {
 ///   !self.aggregate_ok"). The session's audibility control makes **at most two**
 ///   members audible (`calibrate::apply_audibility` solos reference + target), so
 ///   a group of three or more cannot honour that round. It needs W7's per-device
-///   `cal_gate`, or a new all-members mode in `align/calibrate.rs`.
+///   `cal_gate`, or a new all-members mode in `align/calibrate/mod.rs`.
 /// * AP2 members' level knob is `LevelKnob::SnapshotRestore`, i.e. it requires a
 ///   pre-session snapshot restored on teardown. That snapshot belongs next to
 ///   `calibrate::Session::saved_sendspin` (plan §7 says so explicitly), and

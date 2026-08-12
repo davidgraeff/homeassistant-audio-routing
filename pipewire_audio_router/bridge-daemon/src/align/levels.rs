@@ -996,7 +996,7 @@ impl LevelSolver {
     }
 
     /// Restores for teardown: only members whose level this solve actually wrote.
-    /// `align/calibrate.rs` already snapshots sendspin volumes, so the [`LevelKnob::Live`]
+    /// `align/calibrate/mod.rs` already snapshots sendspin volumes, so the [`LevelKnob::Live`]
     /// entries are belt-and-braces; the [`LevelKnob::SnapshotRestore`] ones are the
     /// reason this exists (plan §7: an AP2 receiver's level — and a pw-sink host's
     /// master level — is device-authoritative outside the session, and the

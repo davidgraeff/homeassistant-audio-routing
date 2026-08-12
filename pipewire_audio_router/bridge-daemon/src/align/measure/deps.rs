@@ -5,7 +5,7 @@
 //! ([`MicFeed`]), and somewhere to write the delays it decides on
 //! ([`DelayWriter`]). [`MeasureDeps`] bundles them, [`LiveMic`] is the real
 //! microphone, and the `SessionControl` impl here is the real session — the
-//! alignment manager in `align/calibrate.rs`.
+//! alignment manager in `align/calibrate/mod.rs`.
 //!
 //! That is the whole reason the run is testable: the fakes in `tests/harness.rs`
 //! implement these three traits, so an entire measurement can happen in a
@@ -51,7 +51,7 @@ impl SessionSnapshot {
     }
 }
 
-/// What the orchestration needs from the alignment session (`align/calibrate.rs`).
+/// What the orchestration needs from the alignment session (`align/calibrate/mod.rs`).
 ///
 /// Deliberately two methods: this module must **not** own muting, volume,
 /// playback or teardown — that machinery already exists and is live-tested, and a

@@ -175,7 +175,7 @@ rename (`state.rs` on `api.rs`, `pw/mod.rs` on `sendspin_capture.rs`,
 `util/mod.rs` on `config.rs`, `outputs/pwsink/mod.rs` on the two liveness files).
 
 Beware the measurement, too — `grep -c 'calibrate\.rs'` counts the *correct*
-`align/calibrate.rs`, and reading that as 22 stale references is how you invent
+`align/calibrate/mod.rs`, and reading that as 22 stale references is how you invent
 work that does not exist. Drive the check from the **old** names rather than from
 "does this basename exist under `src/`" (the existence test flagged 25 files in
 other trees — the sendspin submodule, `vendor/`, `pw-control`, the Pi firmware —
@@ -188,7 +188,7 @@ grep -rnE "(^|[^/[:alnum:]_])($OLD)\.rs" bridge-daemon/src docs ../docs \
 ```
 
 The leading `[^/]` is what makes it useful: it matches bare `calibrate.rs` and
-skips the already-correct `align/calibrate.rs`. `architecture.md`, `decisions.md`
+skips the already-correct `align/calibrate/mod.rs`. `architecture.md`, `decisions.md`
 and the alignment write-up carry the densest references and deserve a read rather
 than a `sed` — they explain *mechanisms* by filename, so a mechanical rewrite can
 leave a sentence that parses and no longer means anything. One file type the
@@ -256,7 +256,7 @@ had grown past that:
 | file | before | after | tests |
 |---|---:|---:|---|
 | `align/measure/mod.rs` | 10092 | 7032 | `measure/tests/` — 9 files by subject |
-| `align/calibrate.rs` | 2841 | 1704 | `calibrate/tests.rs` |
+| `align/calibrate/mod.rs` | 2841 | 1704 | `calibrate/tests.rs` |
 | `routing/sync_group/mod.rs` | 2216 | 1851 | `sync_group/tests.rs` |
 | `align/levels.rs` | 2153 | 1579 | `levels/tests.rs` |
 | `align/estimator.rs` | 1501 | 953 | `estimator/tests.rs` |
@@ -275,7 +275,7 @@ A file may have a sibling directory of the same name, so nothing needs renaming 
 `mod.rs` and no `#[path]` attribute is involved:
 
 ```rust
-// align/calibrate.rs
+// align/calibrate/mod.rs
 #[cfg(test)]
 mod tests;                    // -> align/calibrate/tests.rs
 ```
@@ -316,7 +316,7 @@ the suite; it silently stops running those tests, and the only signal is the tot
 lines**, the largest in the crate by a factor of nearly four, and it grew ~3.9k
 lines *during* this refactor (multi-position chaining plus the relay-vs-device
 equivalence experiment). The rest of the cluster is defensible at its size:
-`routing/sync_group/mod.rs` 1851, `align/calibrate.rs` 1704, `align/levels.rs` 1579.
+`routing/sync_group/mod.rs` 1851, `align/calibrate/mod.rs` 1704, `align/levels.rs` 1579.
 The growth rate is the argument — a file that adds 4k lines in a week will not
 get easier to split later.
 
@@ -364,7 +364,7 @@ tests, the driver is what has `await` points. And keep `Inner` in `mod.rs`,
 passing `&Arc<Mutex<Inner>>` down as today: making it public across submodules to
 avoid one parameter would undo the point of the split.
 
-The other three, for completeness. **`align/calibrate.rs`** would split into
+The other three, for completeness. **`align/calibrate/mod.rs`** would split into
 `mod.rs` (manager + session + teardown), `audibility.rs` (the per-output silence
 and level channel resolution — a self-contained decision table) and `click.rs`
 (the tone constants, which nothing else needs), with teardown staying with the

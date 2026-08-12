@@ -3,7 +3,7 @@
 //!
 //! Drives the state machine that turns a microphone capture into a set of
 //! per-member delay corrections: arm → learn → measure → solve → write → settle →
-//! verify. Owns the binding between an alignment session (`align/calibrate.rs`) and the
+//! verify. Owns the binding between an alignment session (`align/calibrate/mod.rs`) and the
 //! mic ingest (`align/mic.rs`), and feeds the captured audio to the estimator
 //! (`align/estimator.rs`).
 //!

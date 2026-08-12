@@ -740,7 +740,7 @@ and `align/` is the machinery for choosing its value — by ear, or by measuring
 with the phone's microphone. The full design, its measured numbers and its known
 blind spots are in [mic-alignment-plan.md](mic-alignment-plan.md).
 
-**The session** (`align/calibrate.rs`) owns one alignment at a time. Starting it
+**The session** (`align/calibrate/mod.rs`) owns one alignment at a time. Starting it
 **holds a set of outputs**: they are given a source set nothing else has
 (`align-hold-source`), which derives a temporary group with its own anchor, and
 the two-tone click track (8 ms bursts at 3 kHz and 1.5 kHz, 2 s apart) is looped

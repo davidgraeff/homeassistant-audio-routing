@@ -68,7 +68,7 @@
 //! replaced with exact silence of the same length. It is the universal fallback, not the
 //! preferred mechanism — where a device or its host can mute itself that is better,
 //! because the stream keeps flowing and the receiver's jitter buffer never re-anchors.
-//! `align/calibrate.rs` resolves which mechanism each member gets, per output.
+//! `align/calibrate/mod.rs` resolves which mechanism each member gets, per output.
 //!
 //! Two properties make it safe to compose with everything else here:
 //!
@@ -770,7 +770,7 @@ impl RelayDelay {
     // The universal fallback for audibility: it needs no cooperation from the device or
     // its host, so it covers a member whose transport has no mute of its own, a pw-sink
     // host whose agent is gone or whose sink has no volume lever, and any future kind.
-    // `align/calibrate.rs` decides per output which mechanism a member gets.
+    // `align/calibrate/mod.rs` decides per output which mechanism a member gets.
 
     /// Silence `output` at the relay hook, or stop silencing it. Returns the previous
     /// state, so a caller can tell a change from a no-op.

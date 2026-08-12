@@ -225,7 +225,7 @@ pub enum AnnounceTransport {
     Unavailable(String),
 }
 
-/// Shared handle so the alignment API (align/calibrate.rs) can read the live group
+/// Shared handle so the alignment API (align/calibrate/mod.rs) can read the live group
 /// layout the reconcile task owns.
 pub type SharedGroups = std::sync::Arc<tokio::sync::Mutex<GroupReconciler>>;
 

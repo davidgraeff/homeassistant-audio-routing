@@ -10,7 +10,7 @@ pub(crate) async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<
         return Ok(crate::audio::resample::to_48k_stereo_s16le(pcm, rate, ch));
     }
     if req.tone {
-        // The calibration click (align/calibrate.rs) — already 16-bit PCM WAV, so no
+        // The calibration click (align/calibrate/mod.rs) — already 16-bit PCM WAV, so no
         // decode step; just standardize to the announce mix format.
         let wav = crate::align::calibrate::click_wav();
         let (rate, ch, pcm) = crate::audio::wav::read_pcm16(&wav).ok_or("tone clip not a PCM WAV")?;
