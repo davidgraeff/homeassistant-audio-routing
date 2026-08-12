@@ -360,12 +360,6 @@ export interface AlignMember {
   node_id: number | null;
 }
 
-/** An alignable sync group (a source-set with its present members). */
-export interface AlignGroup {
-  sources: string[];
-  members: AlignMember[];
-}
-
 /** Which acoustic promise a *session* is making (align/group.rs `AlignMode`).
  *
  *  Not the same enum as `MeasureMode` below, and deliberately so: this is the
@@ -399,9 +393,10 @@ export interface Interference {
 /** Current calibration session state (`/api/align`). */
 export interface AlignState {
   active: boolean;
-  /** The session's identity as the UI compares it: the source set for a session
-   *  started from a source card, the selected output set for one started from a
-   *  selection. Either way, the thing the user picked. */
+  /** The session's identity: the selected output set for a session started from the
+   *  Outputs page — which is every session this UI starts — or the source set when one
+   *  was started through `POST /api/align/start {sources}` by something else. Either
+   *  way, the thing whoever started it picked. */
   sources: string[];
   /** The fixed member everything is aligned against. */
   reference: string | null;
@@ -486,10 +481,16 @@ export interface MicStatus {
 // bridge-daemon/src/align/measure.rs field-for-field; the plan is
 // docs/mic-alignment-plan.md §§5, 8-11.
 
-/** Which acoustic promise a run makes (plan §1). `near_field` is accepted by the
- *  type but refused by the daemon with `mode_unsupported` (it is W8), which is
- *  deliberate: the two modes align *different* things, so silently substituting
- *  one for the other would lie to the user. */
+/** Which acoustic promise a run makes (plan §1). Both are implemented and
+ *  orchestrated differently: `sweet_spot` measures every member itself from wherever
+ *  the phone is sitting (optionally once per listening position — see `ChainProgress`),
+ *  while `near_field` is driven by the *user* walking to each speaker in turn (see
+ *  `WalkProgress`). They align different things, which is why one is never silently
+ *  substituted for the other.
+ *
+ *  What the daemon still refuses is `mode_unsupported` on a near-field run asked to
+ *  **link to an earlier run's** aligned set (W8b): nothing stores a finished run's
+ *  delays, so there is nothing to propagate a shift into. The UI never sends that. */
 export type MeasureMode = 'sweet_spot' | 'near_field';
 
 /** Plan §8's state machine. `proposed` is the state that parks the run waiting
@@ -808,6 +809,75 @@ export interface Verification {
   scope_note?: string;
 }
 
+// ---- Near field: the walk (W8a, plan §1, §1.2, §10.4) -------------------------
+// The user walks to each speaker in turn and holds the phone *at* it, so the
+// propagation path collapses and what is measured is the wire — right everywhere
+// rather than at one seat. Three facts drive the UI and none of them is visible in
+// the numbers:
+//
+//   * **the premise is the user's to keep.** A phone held a metre away instead of at
+//     the driver adds ~3 ms to that speaker's reading, and nothing in the measurement
+//     can tell that apart from the speaker genuinely being 3 ms late. The daemon
+//     raises `near_field_path_assumed` on *every* walk for exactly this reason;
+//   * **the last stop is a revisit, not a new speaker.** One pass per member has no
+//     time baseline for the drift fit, and a walk through a house takes minutes — so
+//     the first speaker is measured again at the end, and the difference *is* the
+//     drift fit (plan §5.3). An implausible closure refuses the **whole** walk,
+//     because the correction it carries was applied to every member;
+//   * **verification walks again** (plan §10.4). A stationary residual after a correct
+//     wire alignment measures each speaker's distance to wherever the phone stands —
+//     tens of ms against a 2 ms tolerance — so it would fail every near-field run.
+//     `WalkPurpose::Verify` is that second walk, and it is not a repeat or an error.
+
+/** Whether a walk is acquiring the measurement or confirming what was written. */
+export type WalkPurpose = 'measure' | 'verify';
+
+/** What the walk expects the UI to do next. */
+export type WalkAction =
+  /** `POST measure/arrival` naming the speaker the user is standing at. */
+  | 'arrival'
+  /** Every member has been read: walk back to `WalkProgress.anchor` and
+   *  `POST measure/close` for the closure reading. */
+  | 'close'
+  /** A reading is in progress; a second call is refused rather than queued. */
+  | 'busy'
+  /** The walk is over — look at `MeasureStatus.phase` for how it ended. Kept visible
+   *  rather than cleared, because the closure numbers are part of the verdict. */
+  | 'done';
+
+/** A near-field walk's live state (`MeasureStatus.walk`). */
+export interface WalkProgress {
+  purpose: WalkPurpose;
+  next: WalkAction;
+  /** The first speaker measured — the one to come back to. Null before the walk has
+   *  started. */
+  anchor: string | null;
+  /** Members measured so far, **in walk order**. That order is the abscissa of the
+   *  drift correction, which is why it is a list and not a set. */
+  measured: string[];
+  /** Members still to visit. In no particular order: the walk order is the user's to
+   *  choose (plan §12.1 — near field's UI owns it). */
+  remaining: string[];
+  /** The member being read right now. */
+  reading: string | null;
+  /** Times this walk has started over because the capture reconnected. A walk is one
+   *  capture (plan §1.2), so a reconnect voids the readings — and costs the *user* a
+   *  re-walk, not the daemon a loop. */
+  restarts: number;
+  /** What to do next, in the daemon's own words. */
+  prompt: string;
+  /** Set once the closure reading has been taken. */
+  closure: ClosureReport | null;
+  /** What this walk's result is coherent *with* — one walk is internally coherent and
+   *  related to nothing else, not even an earlier walk sharing a speaker (linking two
+   *  is W8b). Verbatim. */
+  scope_note: string;
+  /** Where each arrival's playback level comes from: it is set *at* the speaker, per
+   *  arrival, because at arm's length the risk inverts from too-quiet to clipping
+   *  (plan §12.2). Verbatim. */
+  level_note: string;
+}
+
 // ---- Multi-position chaining (W12, plan §1.1) ---------------------------------
 // One run, several listening spots: align what you can hear from here, walk, align the
 // next set through *overlap* speakers you can hear from both places. Two facts drive the
@@ -995,6 +1065,10 @@ export interface MeasureStatus {
   refusal: Refusal | null;
   warnings: Warning[];
   gate?: GateProgress;
+  /** Near field only: where the walk is and what it wants next. Absent for a
+   *  multi-position run, and **retained after the walk ends** so the closure numbers
+   *  stay readable on the review page. */
+  walk?: WalkProgress | null;
   /** Chained multi-position only: where the chain is, what it wants next, the per-position
    *  numbers, and what the result is *not* coherent with. Absent for a single-position run
    *  (which is a chain with one step and needs no calls) and for a near-field walk. */

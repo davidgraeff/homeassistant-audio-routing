@@ -8,7 +8,6 @@
 import type {
   AgentInfo,
   AirplayClient,
-  AlignGroup,
   AlignSessionMode,
   AlignState,
   AnnounceRequest,
@@ -266,10 +265,16 @@ export const api = {
   status: () => request<StatusInfo>('GET', 'api/status'),
   nodes: () => request<NodesResponse>('GET', 'api/nodes'),
 
-  // Latency alignment (by-ear calibration of a sync group).
-  alignGroups: () => request<AlignGroup[]>('GET', 'api/align/groups'),
+  // Latency alignment: the session that holds speakers, plays the click and owns
+  // their levels and mutes. One at a time, process-wide.
+  //
+  // Only the *selection* entry point below is used: a session's identity is the set of
+  // speakers the user picked on the Outputs page (plan §12.1), in every mode including
+  // by-ear. The daemon's other entry point (`POST /api/align/start {sources}`, "hold
+  // whatever this source is playing to") has no client here on purpose — a source set
+  // was the old framing, and two ways to name the one session is how two pages come to
+  // believe they each own it.
   alignStatus: () => request<AlignState>('GET', 'api/align'),
-  alignStart: (sources: string[]) => request<AlignState>('POST', 'api/align/start', { sources }),
   /** Start a session on an arbitrary **selection of speakers** (plan §12.1): a
    *  temporary exclusive group is formed around exactly these, whatever they are
    *  routed to now. This is the wizard's entry point, and the mode travels with it
@@ -326,6 +331,33 @@ export const api = {
    *  needs none of those calls. Ignored for `near_field`, which walks instead. */
   measureStart: (mode: MeasureMode, chain = false) =>
     request<MeasureStatus>('POST', 'api/align/measure/start', { mode, chain }),
+  /** Near field's "I am at this speaker now" (plan §1, W8a).
+   *
+   *  **This call is the near-field measurement loop.** Nothing in a mixed capture says
+   *  which speaker the phone is closest to — per-speaker excitation is a separate work
+   *  package — so the user points, and the run then solos, levels, gates and measures
+   *  that one member. One pass per speaker, in whatever order the user walks.
+   *
+   *  `level` overrides the level to measure at; omitted uses the level the session last
+   *  applied to this speaker, i.e. whatever `alignAudible` was called with while the
+   *  user stood there watching the signal check (plan §12.2 folds the level into each
+   *  arrival, because at arm's length the danger is clipping, not being too quiet).
+   *
+   *  Refused — never a 500 — when the run is not a walk, is busy taking a reading, has
+   *  already measured this speaker, or has never heard of it. */
+  measureArrival: (nodeName: string, level?: number) =>
+    request<MeasureStatus>('POST', 'api/align/measure/arrival', {
+      node_name: nodeName,
+      ...(level == null ? {} : { level }),
+    }),
+  /** Near field's **closure** reading: "I have walked back to the speaker I started at."
+   *
+   *  The difference between the anchor's two readings is the mic-vs-audio clock drift
+   *  accumulated over the whole walk, and feeding it to the drift fit is what makes a
+   *  one-pass walk trustworthy at all (plan §5.3). Refused until every member has been
+   *  visited — a walk with a hole in it has nothing to close — and an implausible
+   *  closure refuses the *whole* walk, because its correction went to every member. */
+  measureClose: () => request<MeasureStatus>('POST', 'api/align/measure/close'),
   /** One listening position of a chain: `members` are the speakers to align from where
    *  the user is standing now, `overlaps` are already-aligned speakers still audible
    *  here (plan §1.1).

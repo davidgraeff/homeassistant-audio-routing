@@ -4,10 +4,7 @@
   import { peakOf, routing } from '../lib/routing';
   import { run } from '../lib/toast';
   import { askConfirm } from '../lib/confirm.svelte';
-  import { align } from '../lib/align.svelte';
   import RtpSenderDocs from './RtpSenderDocs.svelte';
-  import AlignDocs from './AlignDocs.svelte';
-  import AlignPanel from './AlignPanel.svelte';
   import type {
     AirplayClient,
     AirplaySourceCfg,
@@ -103,20 +100,17 @@
     }
   }
 
+  // Nothing about speaker *timing* lives on this page any more (plan §12.1): aligning
+  // means picking a set of speakers and holding them, which is a choice about speakers,
+  // so all three modes — measured, walked and by ear — are on the Outputs page. This
+  // page therefore does not touch the alignment session at all, and that is the point:
+  // there is one session process-wide, and a page that neither starts nor shows it
+  // cannot tear it down either.
   onMount(() => {
     refresh();
     // Light poll so connect/disconnect/ban shows up without a manual reload.
     const timer = setInterval(refreshAllClients, 5000);
-    // By-ear alignment lives on this page (a sync group is identified by its source):
-    // attach loads the session + alignable groups and, on unmount, stops a *by-ear*
-    // session so speakers aren't left muted with the click looping. It deliberately
-    // leaves a microphone run alone — that one is owned by the Outputs page (plan
-    // §12.1), and tearing it down from here would discard a chain mid-walk.
-    const detachAlign = align.attach();
-    return () => {
-      clearInterval(timer);
-      detachAlign();
-    };
+    return () => clearInterval(timer);
   });
 
   // Live input-level meters. Subscribing to the `routing` store opens the same
@@ -356,10 +350,6 @@
     if (rtpMode === 'multicast') rtpMulticastAddr = cfg.source_addr ?? '239.255.42.42';
   }
 
-  // ---- Alignment docs ------------------------------------------------------
-  // Static document (no per-source parameters), so a simple open flag.
-  let alignDocsOpen = $state(false);
-
   // ---- Sender setup docs (RTP only) ---------------------------------------
   // Fed the port/rate/mode currently in view so the sample configs are
   // copy-pasteable for this install (see RtpSenderDocs.svelte).
@@ -402,14 +392,6 @@
       <button
         class="ghost"
         type="button"
-        title="Why speakers on one source drift apart, and how to align them by ear"
-        onclick={() => (alignDocsOpen = true)}
-      >
-        Explain speaker alignment
-      </button>
-      <button
-        class="ghost"
-        type="button"
         title="How to turn a PipeWire machine into a sender that feeds an RTP-receive source"
         onclick={openDocs}
       >
@@ -425,9 +407,8 @@
   </p>
   <p class="card-sub" style="margin-bottom:0">
     A <span class="badge on">present</span> source has a live PipeWire node right now; an
-    <span class="badge off">offline</span> one is configured but not currently receiving. Each card also lists the
-    speakers currently playing that source — they play off one clock, so that's the set you can
-    <strong>align</strong> by ear. Expand a card for its settings, its connected senders, and to remove it.
+    <span class="badge off">offline</span> one is configured but not currently receiving. Expand a card for its
+    settings, its connected senders, and to remove it.
   </p>
 </div>
 
@@ -597,10 +578,6 @@
           </div>
         {/if}
       </header>
-
-      <!-- The sync group this source feeds + its alignment session. Shown
-           collapsed as well as expanded: it's live state, not a setting. -->
-      <AlignPanel sourceNodeName={s.node_name} />
 
       {#if isExpanded(s)}
         <form class="src-form" onsubmit={save}>
@@ -776,10 +753,6 @@
       </table>
     </section>
   {/if}
-{/if}
-
-{#if alignDocsOpen}
-  <AlignDocs onClose={() => (alignDocsOpen = false)} />
 {/if}
 
 {#if docsParams}

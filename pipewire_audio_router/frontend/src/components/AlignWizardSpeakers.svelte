@@ -22,26 +22,52 @@
   // work with it. One speaker, not two: a shared click track means every member
   // emits both bursts, so an SNR measured with two of them playing cannot be
   // attributed to either.
+  //
+  // **Three modes come through this page, and two of the three halves are shared.** The
+  // selection and the hold are identical for all of them — by-ear needs a group too, and
+  // under §12.3.1 that is the same temporary exclusive hold, formed once. What by-ear does
+  // *not* have is the level phase: its levels are one shared playback volume on the tuning
+  // page, and every readout here (the verdict, the SNR) comes from a microphone it is not
+  // using. So that half is skipped rather than shown greyed out, and — this is the part
+  // that made the mode a lie before — **the microphone is not a precondition for starting**.
+  //
+  // Near field skips it for a different reason (§12.2): its level is only meaningful *at*
+  // each speaker, and the risk there inverts from too-quiet to clipping, so the level is
+  // folded into each arrival on the walk page instead of being set from here.
   import AlignSignalVerdict from './AlignSignalVerdict.svelte';
-  import { DEFAULT_MEASURE_LEVEL, align, levelControl, memberKindLabel } from '../lib/align.svelte';
+  import {
+    DEFAULT_MEASURE_LEVEL,
+    align,
+    isMeasured,
+    levelControl,
+    memberKindLabel,
+    type WizardMode,
+  } from '../lib/align.svelte';
   import { askConfirm } from '../lib/confirm.svelte';
   import { measure } from '../lib/measure.svelte';
   import { mic } from '../lib/mic.svelte';
-  import type { MeasureMode, OutputInfo, SignalCheck } from '../lib/types';
+  import type { OutputInfo, SignalCheck } from '../lib/types';
 
   interface Props {
     /** The promise picked on page 1 — it travels with the session, so the hold the
      *  daemon forms is labelled with the same mode the run will make. */
-    mode: MeasureMode;
+    mode: WizardMode;
     /** Multi-position, measured from several spots (plan §1.1). Changes nothing about
      *  what this page *does* — the scope is the whole run's either way, which is the
      *  point of §12.3.1 — only what starting it will do next. */
     chained: boolean;
     label: (nodeName: string) => string;
-    /** Start measuring (the wizard owns the run). */
+    /** Start measuring, or (for by-ear) move on to the sliders. The wizard owns both. */
     onStart: () => void;
   }
   let { mode, chained, label, onStart }: Props = $props();
+
+  /** Does this mode measure? Decides whether the level phase and the microphone
+   *  precondition belong on this page at all. */
+  const measured = $derived(isMeasured(mode));
+  /** Is the level set here, one speaker at a time? Only for a stationary measurement:
+   *  by-ear has one shared volume, and near field sets each level at the speaker. */
+  const levelsHere = $derived(mode === 'sweet_spot');
 
   $effect(() => {
     void align.loadOutputs();
@@ -101,13 +127,18 @@
     align.recordVerdict(node, s.verdict);
   });
 
-  // Leaving this page stops the tone — unless a run is under way, which solos members
-  // itself and must not have the audibility pulled out from under it. `running`, not
-  // `live`: a chain parked between positions has the set the user is about to measure
-  // made audible, and silencing that because they stepped back a page would undo the
-  // check they came here to make.
+  // Leaving this page stops the tone — with two exceptions, both of which are cases where
+  // something else is relying on what is currently audible.
+  //
+  //   * a run is under way. It solos members itself and must not have the audibility
+  //     pulled out from under it. `running`, not `live`: a chain parked between positions
+  //     has the set the user is about to measure made audible, and silencing that because
+  //     they stepped back a page would undo the check they came here to make;
+  //   * the mode is by-ear. Its next page *is* two speakers playing together, and it never
+  //     solos anything itself, so silencing on the way there would leave the user looking
+  //     at tuning sliders for a group that has gone quiet.
   $effect(() => () => {
-    if (!measure.running) void align.stopTone();
+    if (!measure.running && measured) void align.stopTone();
   });
 
   async function formHold() {
@@ -155,10 +186,15 @@
 
   const why = $derived(
     scopeCount < 2
-      ? 'Measuring compares speakers against each other, so it needs at least two.'
+      ? measured
+        ? 'Measuring compares speakers against each other, so it needs at least two.'
+        : 'Aligning by ear means comparing two speakers, so it needs at least two.'
       : !held
         ? 'The speakers have to be taken for the alignment first — that is what puts them on one clock, which is what makes their arrivals comparable.'
-        : !capturing
+        : // The microphone is a precondition for the two *measured* modes and for nothing
+          // else. By-ear exists for the case where there is no usable one (plan §4.1), so
+          // requiring a capture here is what made the mode unreachable in practice.
+          measured && !capturing
           ? 'Start the microphone above — the daemon refuses to measure without a capture, because it has nothing to listen to.'
           : null,
   );
@@ -178,12 +214,30 @@
         When measuring from more than one position, you will not choose speakers again: you say which of <em>these</em>
         you can hear from each spot, and that is a mute, which is instant.
       </p>
+    {:else if mode === 'near_field'}
+      <p class="hint">
+        You will walk to every speaker you pick here, so pick the set you want to be coherent — one floor, one wing — and
+        leave out the ones you are not going to visit. Excluding speakers is the point: a whole-house walk is a long walk,
+        and a set aligned later will not be related to this one.
+      </p>
+    {:else}
+      <p class="hint">
+        By ear you compare two at a time, but the whole set is held together: they have to be on one clock for their
+        clicks to mean anything relative to each other.
+      </p>
     {/if}
   {:else}
     <strong>These speakers are held for the whole run</strong>
     <p>
       Nothing else plays on them until you stop, and the set does not change again — each listening position works from
-      what it can hear of <em>this</em> group, which costs nothing. Now set each one's level.
+      what it can hear of <em>this</em> group, which costs nothing.
+      {#if levelsHere}
+        Now set each one's level.
+      {:else if mode === 'near_field'}
+        You will set each speaker's level <em>at</em> it, as you reach it on the walk.
+      {:else}
+        Next comes the tuning itself: two speakers play at a time and you nudge one onto the other.
+      {/if}
     </p>
   {/if}
 </div>
@@ -301,6 +355,22 @@
     {/if}
   </div>
 
+  {#if !levelsHere}
+    <!-- Why there is no level list here, said rather than left as an absence: for by-ear
+         because there is nothing a microphone would judge, for near field because the only
+         place its level means anything is at the speaker (plan §12.2). -->
+    <p class="hint">
+      {#if mode === 'near_field'}
+        Levels are not set here. Each speaker is set at the speaker, as you reach it — this close the risk is clipping
+        rather than being too quiet, so a level chosen from across the room is the wrong one.
+      {:else}
+        Levels are not set here: by ear there is one shared playback volume, on the next page, and no microphone whose
+        opinion of it matters.
+      {/if}
+    </p>
+  {/if}
+
+  {#if levelsHere}
   <div class="level-head">
     <span class="lbl">Levels</span>
     <span class="hint">
@@ -374,10 +444,11 @@
   {#if soloed}
     <button class="ghost" disabled={align.busy} onclick={() => void align.stopTone()}>Silence all speakers</button>
   {/if}
+  {/if}
 
   {#if why}<p class="hint blocked">{why}</p>{/if}
 
-  {#if !why && unchecked.length}
+  {#if levelsHere && !why && unchecked.length}
     <!-- Advisory. The daemon learns levels itself and refuses with a reason if it
          cannot, so this is "you have not looked at these", not "you may not start". -->
     <p class="hint caution">
@@ -391,13 +462,36 @@
     <button
       class="primary"
       disabled={!!why || align.busy}
-      title={why ?? (chained ? 'Start the chain and ask for the first listening position' : 'Measure every speaker and propose delays')}
+      title={why ??
+        (!measured
+          ? 'Go to the tuning sliders — the speakers are already playing the click'
+          : mode === 'near_field'
+            ? 'Begin the walk: it will ask you to go to each speaker in turn'
+            : chained
+              ? 'Start the chain and ask for the first listening position'
+              : 'Measure every speaker and propose delays')}
       onclick={onStart}
     >
-      {chained ? 'Start the first position' : 'Start alignment'}
+      {#if !measured}
+        Tune these {scopeCount} speakers by ear
+      {:else if mode === 'near_field'}
+        Start the walk
+      {:else if chained}
+        Start the first position
+      {:else}
+        Start alignment
+      {/if}
     </button>
     <span class="hint">
-      {#if chained}
+      {#if !measured}
+        The click is already looping through them, with two of them audible — the reference and the one you are tuning.
+        Nothing else is measured or written: every nudge on the next page goes straight to that speaker's own setting.
+      {:else if mode === 'near_field'}
+        Then walk to each speaker in turn and say when you are at it — <strong>hold the phone within a hand's width of
+        it</strong>, which is the assumption the whole method rests on. About eleven seconds per speaker, plus one last
+        stop back at the first one. Keep the microphone running the whole way: it is the timing reference, and reopening it
+        starts the walk over.
+      {:else if chained}
         Nothing is measured until you say which of these speakers you can hear from where you are standing — that is the
         first position. Each position takes about eleven seconds per speaker per pass, and the delays it works out are
         held inside the add-on until the whole chain is finished, so no speaker reconnects in between.

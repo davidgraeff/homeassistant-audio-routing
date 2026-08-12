@@ -39,7 +39,7 @@
       <strong>Sendspin</strong> speakers — the open multi-room protocol used by ESPHome and Home
       Assistant Voice PE. And <strong>PipeWire hosts</strong>: an ordinary Linux machine running the
       receiver agent, which plays what you send it through its own speakers (see
-      <em>Explain receiver hosts</em>).
+      <em>Setup Linux/PipeWire host</em>).
     </p>
     <p class="card-sub">
       Route one source to several of them — any mix of kinds — and they play as one synchronized

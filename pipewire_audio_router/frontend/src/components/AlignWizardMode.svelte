@@ -1,21 +1,32 @@
 <script lang="ts">
   // Wizard page 1: what "aligned" is going to mean (plan §1 and §12.1).
   //
-  // All three modes are listed even though only one can be run today, because they
-  // are not variations on a setting — they make *different promises* about where
-  // the speakers will be aligned, and a user who cannot see the other two cannot
-  // tell which promise they are getting. Each disabled one says why in one line,
-  // rather than being hidden and rediscovered as a missing feature.
-  import type { MeasureMode } from '../lib/types';
+  // All three of plan §1's modes are here and all three are selectable. They are not
+  // variations on a setting — they make *different promises* about where the speakers
+  // end up aligned — so the choice is the first thing the wizard asks, and each option
+  // says what it aligns and what it costs rather than only what it does.
+  //
+  // Two things this page used to get wrong, both fixed by the modes actually existing:
+  //
+  //   * **near field is built** (W8a). The daemon parks the run in a walk and takes one
+  //     arrival per speaker, then a closure reading. A disabled option saying "not built
+  //     yet" was describing the plan, not the code;
+  //   * **manual is a mode, not a leftover.** It used to point at by-ear sliders that sat
+  //     under this wizard on a source card; those moved with the wizard (§12.1), so
+  //     "already below" pointed at nothing. It is the documented fallback for a mic that
+  //     cannot be used (§4.1) or an estimator that refuses (§5.5), and it needs no
+  //     microphone — but it does need a group, so it goes through the same selection and
+  //     the same temporary hold (§12.3.1) as the other two.
+  import type { WizardMode } from '../lib/align.svelte';
 
   interface Props {
-    mode: MeasureMode;
+    mode: WizardMode;
     /** Multi-position only: measure from several listening spots and join them through
      *  overlap speakers (plan §1.1). A sub-choice of the mode rather than a fourth mode,
      *  because the promise is the same one — "aligned at the spot it was measured from" —
      *  made once per position instead of once. */
     chained: boolean;
-    onPick: (mode: MeasureMode) => void;
+    onPick: (mode: WizardMode) => void;
     onChain: (chained: boolean) => void;
   }
   let { mode, chained, onPick, onChain }: Props = $props();
@@ -31,7 +42,7 @@
   <label class="mode" class:on={mode === 'sweet_spot'}>
     <input type="radio" name="align-mode" value="sweet_spot" checked={mode === 'sweet_spot'} onchange={() => onPick('sweet_spot')} />
     <div class="body">
-      <div class="title">Multi-position <span class="badge on">available</span></div>
+      <div class="title">Multi-position <span class="badge">default · you stay put</span></div>
       <p>
         Aligns the speakers you can hear from where you are standing, at <em>that</em> spot. Stand where you normally
         listen and hold the phone still.
@@ -68,26 +79,38 @@
     </div>
   </label>
 
-  <label class="mode disabled">
-    <input type="radio" name="align-mode" value="near_field" disabled />
+  <label class="mode" class:on={mode === 'near_field'}>
+    <input type="radio" name="align-mode" value="near_field" checked={mode === 'near_field'} onchange={() => onPick('near_field')} />
     <div class="body">
-      <div class="title">Near field <span class="badge off">not built yet</span></div>
+      <div class="title">Near field <span class="badge">you walk to every speaker</span></div>
       <p>
-        Walking to each speaker in turn aligns the <em>wiring</em> rather than one spot, so it is right everywhere in the
-        house.
+        You walk to each speaker in turn and hold the phone <em>at</em> it. That takes the room out of the measurement, so
+        what gets aligned is the <em>wiring</em> — and a wire alignment is right everywhere in the house rather than at one
+        seat. Choose this for whole-house coherence: correct while walking around, not at N specific spots.
       </p>
-      <p class="hint">The daemon refuses this mode explicitly rather than quietly measuring a position instead.</p>
+      <p class="hint">
+        Costs a walk, and depends on you holding the phone <strong>within a hand's width of each speaker</strong>: held a
+        metre away it reads as that speaker being 3 ms late, and nothing in the measurement can tell the difference. The
+        last stop is a <strong>revisit</strong> of the speaker you started at, which is what separates the phone's clock
+        drift over a long walk from real offsets. Keep the microphone running the whole way — reopening it starts the walk
+        again.
+      </p>
     </div>
   </label>
 
-  <label class="mode disabled">
-    <input type="radio" name="align-mode" value="manual" disabled />
+  <label class="mode" class:on={mode === 'manual'}>
+    <input type="radio" name="align-mode" value="manual" checked={mode === 'manual'} onchange={() => onPick('manual')} />
     <div class="body">
-      <div class="title">Manual <span class="badge off">already below</span></div>
-      <p>By ear: nudge one speaker until its clicks sit on the reference's. The fallback when the microphone cannot be
-        used or the estimator refuses.</p>
+      <div class="title">Manual <span class="badge">by ear · no microphone</span></div>
+      <p>
+        You judge it: the reference speaker and the one you are tuning play together, and you nudge the tuned one until
+        its clicks sit exactly on the reference's. Aligned wherever you happen to be standing, to whatever your ears
+        accept.
+      </p>
       <p class="hint">
-        It is not a wizard page yet — the sliders are on this panel, under the wizard, and stay usable throughout.
+        The fallback when the microphone cannot be used at all — no HTTPS, permission denied, no working input — or when
+        the estimator refuses to answer. It still needs a <strong>group</strong>, so you pick the speakers on the next
+        page exactly as the measured modes do; only the microphone step is skipped.
       </p>
     </div>
   </label>
@@ -103,8 +126,8 @@
     display: grid;
     gap: 10px;
   }
-  /* Three peers, one enabled: the disabled two are dimmed but not hidden, and keep
-     their explanation — that is the whole point of listing them. */
+  /* Three peers, all selectable: they are alternatives with different promises, not a
+     feature and two placeholders, so none of them is dimmed. */
   .mode {
     display: flex;
     gap: 10px;
@@ -120,10 +143,6 @@
   .mode.on {
     border-color: var(--primary-color);
     background: color-mix(in srgb, var(--primary-color) 8%, transparent);
-  }
-  .mode.disabled {
-    cursor: default;
-    opacity: 0.65;
   }
   .mode input {
     margin-top: 3px;

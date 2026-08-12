@@ -1,21 +1,21 @@
-// Latency-alignment session state, shared by every source card on the Sources
-// page (SourcesTab → AlignPanel).
+// The latency-alignment **session**: the speakers held exclusively for an alignment,
+// the click looping through them, and who is audible at what level.
 //
-// The daemon allows exactly one alignment session at a time (it mutes the
-// group's other members and loops a click through the group's anchor), so the
-// session can't live in a per-card component: one module owns it and each card
-// renders the slice for its own sync group.
+// The daemon allows exactly one session at a time, process-wide, so it cannot live in
+// a component: this module owns it and the wizard on the Outputs page renders it.
 //
-// A sync group is identified by its *source set* — the outputs fed by exactly
-// those sources play off one clock (see bridge-daemon/src/align/calibrate.rs). That's
-// why alignment hangs off a source card: "these speakers are playing me right
-// now, align them against each other".
+// **Its identity is a set of speakers, not a source set** (plan §12.1, §12.3.1). It
+// used to be the other way round — a group was resolved from the sources feeding it,
+// which is why the panel lived on source cards — and every trace of that framing is
+// gone from here on purpose: with one session process-wide, a second way to name it is
+// how two pages come to believe they each own it. All three modes (§1) go through
+// `startSelection`, including by-ear, which is what stops `manual` being a special
+// case with its own entry point and its own lifecycle rules.
 
 import { api } from './api';
 import { run } from './toast';
 import { mic } from './mic.svelte';
 import type {
-  AlignGroup,
   AlignMember,
   AlignMemberKind,
   AlignSessionMode,
@@ -97,19 +97,32 @@ export function sliderMax(m: { kind: AlignMemberKind }): number {
   return m.kind === 'pwsink' ? 2000 : 5000;
 }
 
-/** The session promise (`AlignMode`) a measurement mode makes. Two enums, one
- *  meaning: `sweet_spot` and `multi_position` are the same promise under the two
- *  names the daemon uses (`MeasureMode` vs `AlignMode`), so the mapping is written
- *  once here instead of guessed at each call site. */
-export function sessionModeFor(mode: MeasureMode): AlignSessionMode {
+/** What the wizard is doing: one of the two measured modes, or the by-ear path.
+ *
+ *  Deliberately *not* `MeasureMode` widened. `MeasureMode` is the measurement state
+ *  machine's own enum and `manual` is not one of its values — no run is started, no
+ *  microphone is needed, nothing is proposed. But `manual` **is** one of plan §1's
+ *  three modes and one of the daemon's `AlignMode`s, so it is a mode of the *wizard*:
+ *  same speaker selection, same temporary exclusive hold (§12.3.1), different body. */
+export type WizardMode = MeasureMode | 'manual';
+
+/** Whether this wizard mode drives the microphone measurement state machine. Where it
+ *  is false, `measure.*` must not be called at all: `POST /api/align/measure/start`
+ *  has no `manual` mode and would refuse. */
+export function isMeasured(mode: WizardMode): mode is MeasureMode {
+  return mode !== 'manual';
+}
+
+/** The session promise (`AlignMode`) a wizard mode makes. Two enums, one meaning:
+ *  `sweet_spot` and `multi_position` are the same promise under the two names the
+ *  daemon uses (`MeasureMode` vs `AlignMode`), so the mapping is written once here
+ *  instead of guessed at each call site. */
+export function sessionModeFor(mode: WizardMode): AlignSessionMode {
+  if (mode === 'manual') return 'manual';
   return mode === 'near_field' ? 'near_field' : 'multi_position';
 }
 
-const sameSet = (a: string[], b: string[]) =>
-  a.length === b.length && [...a].sort().join('|') === [...b].sort().join('|');
-
 function createAlign() {
-  let groups = $state<AlignGroup[]>([]);
   let session = $state<AlignState | null>(null);
   let loading = $state(true);
   let busy = $state(false);
@@ -172,16 +185,12 @@ function createAlign() {
     return audible.length === 1 ? audible[0] : null;
   }
 
-  /** Full load: session state, the alignable groups, and the delay-live setting. */
+  /** Full load: session state, the delay-live setting, and the per-member knob values a
+   *  by-ear session's sliders start from. */
   async function refresh() {
     try {
-      const [st, gs, settings] = await Promise.all([
-        api.alignStatus(),
-        api.alignGroups(),
-        api.settings().catch(() => null),
-      ]);
+      const [st, settings] = await Promise.all([api.alignStatus(), api.settings().catch(() => null)]);
       session = st;
-      groups = gs;
       if (settings) sendspinDelayLive = settings.sendspin_delay_live;
       if (st.active) {
         level = st.volume;
@@ -189,18 +198,8 @@ function createAlign() {
       }
     } catch {
       session = null;
-      groups = [];
     }
     loading = false;
-  }
-
-  /** Cheap poll: which groups are alignable changes with routing and presence. */
-  async function refreshGroups() {
-    try {
-      groups = await api.alignGroups();
-    } catch {
-      /* keep last-known */
-    }
   }
 
   /** Session state only — no groups, no offsets, no settings.
@@ -227,9 +226,6 @@ function createAlign() {
   let pending: { m: AlignMember; ms: number } | null = null;
 
   const ctl = {
-    get groups() {
-      return groups;
-    },
     get session() {
       return session;
     },
@@ -310,40 +306,24 @@ function createAlign() {
     },
 
     refresh,
-    refreshGroups,
     refreshStatus,
 
-    /** Mount hook for the **by-ear** panel: load, keep the group list fresh, and never
-     *  leave a by-ear session running behind a page the user navigated away from.
+    /** Mount hook for the wizard: load the session, the knob values its by-ear sliders
+     *  start from, and the delay-live setting, then keep the session state fresh.
      *
-     *  The teardown is deliberately narrow: it stops a `manual` session only. There is one
-     *  session process-wide but it is no longer always this page's — the microphone wizard
-     *  lives on the Outputs page now (plan §12.1), and its session's mode is
-     *  `multi_position` / `near_field`. Stopping *any* session here would mean a user who
-     *  glanced at the Sources page mid-run came back to a measurement that had been torn
-     *  down, its provisional delays discarded, by a page that had nothing to do with it.
-     *  A by-ear session, by contrast, can only have been started from here. */
-    attach(): () => void {
+     *  **It deliberately stops nothing on teardown.** The old hook stopped a session whose
+     *  mode was `manual`, on the theory that a by-ear session could only have been started
+     *  by the page being unmounted — true while by-ear lived on source cards, and false
+     *  now that `manual` is one of the wizard's three modes (plan §1). Keeping that rule
+     *  would mean a by-ear hold, formed on the Outputs page like every other, being torn
+     *  down by *another* page unmounting; and applying it here would tear one down the
+     *  moment the user switched tabs mid-tuning. So there is exactly one way a session
+     *  ends: someone asks for it to end (`stop()`, the wizard's "Stop and restore"), or the
+     *  daemon's own idle timeout does it. */
+    attachSession(): () => void {
       void refresh();
-      const timer = setInterval(refreshGroups, 5000);
-      return () => {
-        clearInterval(timer);
-        if (session?.active && session.mode === 'manual') void api.alignStop().catch(() => {});
-        session = null;
-      };
-    },
-
-    /** The alignable group `sourceNodeName` currently feeds, if any. */
-    groupForSource(sourceNodeName: string): AlignGroup | undefined {
-      return groups.find((g) => g.sources.includes(sourceNodeName));
-    },
-    /** Whether the running session is this group's. */
-    isActive(g: AlignGroup): boolean {
-      return !!session?.active && sameSet(session.sources, g.sources);
-    },
-    /** Whether *another* group's session is running (blocks starting this one). */
-    isBlocked(g: AlignGroup): boolean {
-      return !!session?.active && !sameSet(session.sources, g.sources);
+      const timer = setInterval(refreshStatus, 3000);
+      return () => clearInterval(timer);
     },
 
     /** Load the adopted outputs the picker offers. Cheap and idempotent; the picker
@@ -375,13 +355,19 @@ function createAlign() {
       selection = [];
     },
 
-    /** Form the temporary exclusive group over the **whole** selection and go quiet.
+    /** Form the temporary exclusive group over the **whole** selection (plan §12.3.1).
      *
-     *  Silence is deliberate: forming a group leaves the daemon's first two members
-     *  audible, and the level phase is one speaker at a time (plan §12.2). Starting
-     *  with two speakers playing would both mis-set levels and contradict what the
-     *  page says it is doing. */
-    async startSelection(mode: MeasureMode): Promise<boolean> {
+     *  For a **measured** mode it then goes quiet, deliberately: forming a group leaves
+     *  the daemon's first two members audible, and the level phase is one speaker at a
+     *  time (plan §12.2), so starting with two of them playing would both mis-set levels
+     *  and contradict what the page says it is doing.
+     *
+     *  For **by-ear** the opposite is true — the whole method is comparing two speakers
+     *  against each other — so the pair the daemon made audible when it formed the hold
+     *  (its first two members, as reference and target) is left playing. Silencing it and
+     *  making the user find the play button would be a step that exists only because the
+     *  other two modes need it. */
+    async startSelection(mode: WizardMode): Promise<boolean> {
       if (selection.length < 2) return false;
       busy = true;
       try {
@@ -389,7 +375,7 @@ function createAlign() {
         level = session.volume;
         soloIntent = null;
         await seedOffsets();
-        session = await api.alignAudible([], level);
+        if (isMeasured(mode)) session = await api.alignAudible([], level);
         busy = false;
         return true;
       } catch (e) {
@@ -480,18 +466,6 @@ function createAlign() {
     recordVerdict(nodeName: string, verdict: SignalCheck['verdict']) {
       if (verdicts[nodeName] === verdict) return;
       verdicts = { ...verdicts, [nodeName]: verdict };
-    },
-
-    async start(g: AlignGroup) {
-      busy = true;
-      try {
-        session = await api.alignStart(g.sources);
-        level = session.volume;
-        await seedOffsets();
-      } catch (e) {
-        await run(() => Promise.reject(e));
-      }
-      busy = false;
     },
 
     async stop() {

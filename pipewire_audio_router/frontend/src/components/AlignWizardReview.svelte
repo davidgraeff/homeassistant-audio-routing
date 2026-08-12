@@ -31,7 +31,7 @@
   import AlignCheck from './AlignCheck.svelte';
   import AlignRefusal from './AlignRefusal.svelte';
   import { memberKindLabel } from '../lib/align.svelte';
-  import { confidenceBand, uncertaintyDominates, warningKindLabel } from '../lib/measure.svelte';
+  import { WALK_FEWER_CHECKS, confidenceBand, uncertaintyDominates, warningKindLabel } from '../lib/measure.svelte';
   import type { MeasureStatus, Warning } from '../lib/types';
 
   interface Props {
@@ -47,6 +47,13 @@
 
   const proposal = $derived(status.proposal);
   const verification = $derived(status.verification);
+  /** Was this a **walk**? It changes which checks exist rather than which ones passed
+   *  (plan §10.4), and the difference has to survive onto this page: a walk gains the
+   *  closure and loses pass-to-pass repeatability, and reporting the second as a green
+   *  check — its residual is zero by construction, because the drift slope was fitted
+   *  from exactly those two points — would be dishonest. */
+  const walked = $derived(status.mode === 'near_field');
+  const closure = $derived(proposal?.checks.closure ?? null);
   /** A chained run's positions. They belong on this page as much as on the run page: the
    *  proposal below is one write over the whole house, and how that house was joined up —
    *  which joins were checked, which were not, and what the total error can be said to
@@ -193,6 +200,19 @@
       }: ${proposal.checks.transitivity.worst_ms.toFixed(2)} ms of a ${proposal.checks.transitivity.tolerance_ms.toFixed(1)} ms tolerance`}
       note={proposal.checks.transitivity.caveat}
     />
+    {#if closure}
+      <!-- Near field's own check, and the one a stationary run does not have: the walk's
+           first speaker read again at the end. It is *not* a bonus — the drift correction
+           applied to every member came out of it, which is why an implausible closure
+           refuses the whole walk rather than one reading. -->
+      <AlignCheck
+        name="Closure (the first speaker, measured again at the end)"
+        state={closure.passed ? 'pass' : 'fail'}
+        blocking
+        detail={`${label(closure.anchor)}: ${closure.error_ms.toFixed(2)} ms apart over ${closure.span_s.toFixed(0)} s — ${closure.drift_ppm.toFixed(0)} ppm of clock drift, against a ${closure.tolerance_ms.toFixed(1)} ms allowance for a walk this long`}
+        note={closure.caveat}
+      />
+    {/if}
     {#if proposal.checks.repeatability}
       <AlignCheck
         name="Repeatability between passes"
@@ -200,6 +220,18 @@
         detail={`worst ${
           proposal.checks.repeatability.worst_member ? label(proposal.checks.repeatability.worst_member) : '—'
         }: ${proposal.checks.repeatability.worst_ms.toFixed(2)} ms of a ${proposal.checks.repeatability.tolerance_ms.toFixed(1)} ms tolerance`}
+      />
+    {:else if walked}
+      <!-- Absent by construction, not failed and not skipped (plan §10.4). A walk reads
+           each speaker once, so the only member with two readings is the closure anchor —
+           and the drift slope was fitted from exactly those two points, making its
+           residual identically zero. Printing that as a pass would be reporting an
+           identity as evidence. -->
+      <AlignCheck
+        name="Repeatability between passes"
+        state="unavailable"
+        detail="a walk measures each speaker once, so there is no second pass to compare"
+        note="Not a failure and not a shortcut: the one speaker read twice is the closure anchor above, and the drift was fitted from exactly those two readings, so its agreement with itself is arithmetic rather than evidence. What this costs is that nothing here would notice you changing how you hold the phone partway through the walk — which is the thing pass-to-pass agreement catches for a stationary run."
       />
     {:else}
       <AlignCheck
@@ -218,10 +250,18 @@
     <AlignCheck
       name="Residual after writing"
       state="unavailable"
-      detail="runs after the knobs are written"
-      note="It re-measures the group once the speakers are back, and is the check that most directly says the write landed."
+      detail={walked ? 'runs after the knobs are written, and it is another walk' : 'runs after the knobs are written'}
+      note={walked
+        ? 'A reading taken from one spot cannot check a near-field alignment: once the wiring is right, what is left is each speaker’s distance to wherever the phone is standing — tens of milliseconds against a two-millisecond tolerance, which would fail every correct run. So applying this walks the same route again, with its own closure. Expect to be asked to walk, and do not read it as the run repeating itself.'
+        : 'It re-measures the group once the speakers are back, and is the check that most directly says the write landed.'}
     />
   </div>
+  {#if walked}
+    <!-- Said with the checks rather than in the warning list: it is a property of the
+         method, and a user comparing this page against a stationary run's will otherwise
+         read the shorter list as something having gone wrong. -->
+    <p class="honest">{WALK_FEWER_CHECKS}</p>
+  {/if}
 {:else if status.phase === 'writing' || status.phase === 'settling' || status.phase === 'verifying'}
   <p class="lead">{status.message}</p>
 {/if}
@@ -263,6 +303,15 @@
     />
     <AlignCheck name="Merged peak" state="unavailable" detail="not implemented" note={verification.merged_peak.reason} />
   </div>
+  {#if walked}
+    <!-- The re-measurement was a second walk, and saying so is the difference between
+         "that was the check" and "why did it make me do it again" (plan §10.4). -->
+    <p class="scope-note">
+      <strong>How this was checked:</strong> by walking the same route again, speaker by speaker, with its own closure
+      reading. A near-field write cannot be checked from one spot — the residual would measure the phone's distance to
+      each speaker and fail every correct run — so the second walk is the check rather than a repeat of the first.
+    </p>
+  {/if}
   <p class="honest">
     {#if verification.passed}
       The knobs were written and re-measured, and {verification.scope_note
@@ -271,10 +320,12 @@
       is what was checked — not that the result is right: a reflection arriving one or two milliseconds after the direct
       sound biases the measurement while looking excellent to all of these checks, and the cross-band tolerance is a few
       milliseconds wide so that different tweeter crossovers don't trip it. If it still sounds smeared from where you
-      listen, trust your ears and use the sliders below.
+      listen, trust your ears: go back to <strong>Mode</strong>, pick <strong>Manual</strong>, and tune it by hand — the
+      speakers are still held, so nothing has to be set up again.
     {:else}
-      The knobs were written, but the re-measurement did not confirm them. The by-ear sliders below are the fallback,
-      and <strong>Revert</strong> puts every speaker back to the value it had before this run.
+      The knobs were written, but the re-measurement did not confirm them. <strong>Revert</strong> puts every speaker back
+      to the value it had before this run; <strong>Manual</strong> on the mode page is the by-ear fallback, and the
+      speakers stay held while you switch to it.
     {/if}
   </p>
 {/if}

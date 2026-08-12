@@ -30,6 +30,8 @@ import type {
   Refusal,
   RefusalKind,
   EstimatorReason,
+  WalkAction,
+  WalkPurpose,
   WarningKind,
 } from './types';
 
@@ -93,15 +95,22 @@ export const PHASE_CHAIN: readonly MeasurePhase[] = [
   'done',
 ];
 
-/** The same spine, with the acquisition state this run actually has. A chained run
+/** The same spine, with the acquisition states this run actually has. A chained run
  *  loops `positioning` → `measuring` once per listening spot, and a walk parks in
  *  `walking`; leaving them out made every step of a chained run look unreached,
- *  because the current phase was not on the strip at all. */
+ *  because the current phase was not on the strip at all.
+ *
+ *  A walk also *loses* a state: plan §12.2's "near field breaks the two-phase shape" —
+ *  its level is only meaningful at the speaker, so there is no group-wide level-learning
+ *  phase to run, and the daemon goes straight from `arming` to the walk. Leaving
+ *  `learning` on the strip promised a step that is never coming. */
 export function phaseChain(opts: { chained?: boolean; mode?: MeasureMode }): readonly MeasurePhase[] {
-  const extra: MeasurePhase | null = opts.mode === 'near_field' ? 'walking' : opts.chained ? 'positioning' : null;
-  if (!extra) return PHASE_CHAIN;
-  const at = PHASE_CHAIN.indexOf('measuring');
-  return [...PHASE_CHAIN.slice(0, at), extra, ...PHASE_CHAIN.slice(at)];
+  const walked = opts.mode === 'near_field';
+  const extra: MeasurePhase | null = walked ? 'walking' : opts.chained ? 'positioning' : null;
+  const spine = walked ? PHASE_CHAIN.filter((p) => p !== 'learning') : PHASE_CHAIN;
+  if (!extra) return spine;
+  const at = spine.indexOf('measuring');
+  return [...spine.slice(0, at), extra, ...spine.slice(at)];
 }
 
 const PHASE_LABELS: Record<MeasurePhase, string> = {
@@ -131,6 +140,8 @@ const PHASE_NOTES: Partial<Record<MeasurePhase, string>> = {
   learning: 'Finding a playback level each speaker can be heard at over the room.',
   measuring:
     'Each speaker is soloed in turn and measured twice. Every switch waits for the tone to settle, so this is the long part — about 11 seconds per speaker per pass.',
+  walking:
+    'Nothing is being measured: the walk is waiting for you to reach a speaker and say so. The microphone capture is the timing reference for the whole walk, so leave it running while you move.',
   positioning:
     'Nothing is being measured: the chain is waiting for you to say which speakers you can hear from where you are standing now. Everything aligned so far is holding its delay in the meantime.',
   solving: "Turning the arrivals into a setting for each speaker's own timing knob.",
@@ -235,6 +246,55 @@ export const MODE_LABELS: Record<MeasureMode, string> = {
   sweet_spot: 'Multi-position',
   near_field: 'Near field',
 };
+
+// ---- Near field's walk, as presentation only (plan §1, §10.4) ---------------
+//
+// Nothing below decides anything either. In particular the closure verdict is the
+// daemon's: an implausible closure refuses the whole walk, and a client that formed
+// its own opinion about "close enough" would be a second, quieter policy over the one
+// number that separates clock drift from a speaker having moved.
+
+/** What the walk expects next, in the user's words. */
+const WALK_ACTIONS: Record<WalkAction, string> = {
+  arrival: 'Walk to a speaker and hold the phone at it',
+  close: 'Walk back to the speaker you started at',
+  busy: 'Measuring — stay where you are',
+  done: 'The walk is finished',
+};
+
+export function walkActionLabel(action: WalkAction): string {
+  return WALK_ACTIONS[action];
+}
+
+/** Which walk this is. Both walk the same way; only one of them writes anything. */
+const WALK_PURPOSES: Record<WalkPurpose, string> = {
+  measure: 'measuring walk',
+  verify: 'check walk',
+};
+
+export function walkPurposeLabel(purpose: WalkPurpose): string {
+  return WALK_PURPOSES[purpose];
+}
+
+/** Near field's premise, in the UI's own words, shown at the top of the walk rather
+ *  than left to the warning list at the bottom.
+ *
+ *  The daemon raises `near_field_path_assumed` on **every** walk and its sentence is
+ *  the authority (it is quoted verbatim beside this). This exists because the failure
+ *  it describes is invisible: a phone held a metre away reads as a perfectly good
+ *  measurement of a speaker that is 3 ms late, so the moment to say it is *before* each
+ *  arrival, not in the report afterwards. */
+export const WALK_PATH_PREMISE =
+  'Hold the phone within a hand’s width of the speaker you are measuring — at the driver, not across the room. This mode works by assuming the sound has no distance to travel; a phone held a metre away adds about 3 ms to that speaker’s reading, and nothing in the measurement can tell that apart from the speaker genuinely playing 3 ms late.';
+
+/** Why the last stop is a revisit and not a new speaker (plan §5.3, §1). */
+export const WALK_CLOSURE_WHY =
+  'Every speaker is read once, in the order you walked, so there is no second pass to fit the phone’s clock drift against — and a walk through a house takes minutes, which at a plausible drift is milliseconds of creep that looks exactly like a real offset. Reading the *first* speaker again at the end closes the loop: same speaker, same knob, the whole walk in between, so the difference between the two readings is the drift and it is taken back out of every speaker in proportion to when it was measured.';
+
+/** Why a walk has fewer cross-checks than a stationary run, said as a property of the
+ *  method rather than as something that went wrong (plan §10.4). */
+export const WALK_FEWER_CHECKS =
+  'A walk has fewer independent cross-checks than a run measured from one spot: each speaker is read once, so pass-to-pass repeatability does not exist here — it is absent by construction, not failed. What replaces it is the closure reading, which nothing in a stationary run has. The gap this leaves is that nothing detects a change in *how you hold the phone* partway through the walk.';
 
 // ---- Chaining, as presentation only (plan §1.1) -----------------------------
 //
@@ -553,6 +613,15 @@ function createMeasure() {
     },
 
     start: (mode: MeasureMode, chain = false) => act(() => api.measureStart(mode, chain)),
+    /** Near field: "I am standing at this speaker" (plan §1, W8a). The run solos it,
+     *  applies its level, gates and measures it — so this one call *is* the walk's
+     *  measurement loop, and the same `act()` path keeps a refusal's structure: an
+     *  out-of-order arrival names the speaker the walk actually wants. */
+    arrival: (nodeName: string, level?: number) => act(() => api.measureArrival(nodeName, level)),
+    /** Near field: the closure reading back at the walk's first speaker. Refused until
+     *  every member has been visited; a closure the daemon cannot explain as clock drift
+     *  refuses the **whole** walk, because its correction reached every member. */
+    close: () => act(() => api.measureClose()),
     /** One listening position of a chain (plan §1.1). A refusal is the *step's*, not the
      *  run's — `status.chain.refusal` carries it and the chain stays parked — so this
      *  keeps the same `act()` path as everything else and the caller does not have to

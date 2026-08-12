@@ -9,6 +9,7 @@
   // gets blamed on the user's hand for something a doorbell did.
   import AlignRefusal from './AlignRefusal.svelte';
   import AlignWizardChain from './AlignWizardChain.svelte';
+  import AlignWizardWalk from './AlignWizardWalk.svelte';
   import { knobNoun, memberKindLabel } from '../lib/align.svelte';
   import {
     elapsed,
@@ -30,16 +31,22 @@
     onPosition: (members: string[], overlaps: string[]) => void;
     /** Renormalise the chain and propose the single write. */
     onFinish: () => void;
-    /** Make exactly these members audible — how a position is previewed. */
+    /** Near field: "I am standing at this speaker" — takes its reading (plan §1, W8a). */
+    onArrival: (nodeName: string) => void;
+    /** Near field: the closure reading, back at the walk's first speaker. */
+    onClose: () => void;
+    /** Make exactly these members audible — how a position is previewed, and how a walk
+     *  hears the speaker it is standing at to set its level. */
     onHear: (nodeNames: string[]) => void;
     busy: boolean;
   }
-  let { status, label, onRetry, onPosition, onFinish, onHear, busy }: Props = $props();
+  let { status, label, onRetry, onPosition, onFinish, onArrival, onClose, onHear, busy }: Props = $props();
 
   const live = $derived(isLive(status.phase));
   // A chained run's acquisition loop is `positioning` → `measuring` per listening spot,
-  // so the strip has to contain the phase the run is actually in — otherwise every step
-  // reads as unreached while the chain is being walked.
+  // and a walk's is `walking` → `measuring` per speaker, so the strip has to contain the
+  // phase the run is actually in — otherwise every step reads as unreached while the
+  // house is being walked.
   const chainPhases = $derived(phaseChain({ chained: !!status.chain, mode: status.mode }));
   const reached = $derived(chainPhases.indexOf(status.phase));
   const gate = $derived(status.gate);
@@ -48,11 +55,22 @@
   /** Newest observations first — the run appends, and the recent ones are the
    *  interesting ones while it is still going. */
   const recent = $derived([...status.observations].reverse().slice(0, 12));
-  /** The doorway caveat is `chain.scope_note` *and* a `chain_scope` warning carrying the
-   *  identical sentence. It is shown once, by the chain panel, under a heading that says
-   *  what it is about — printing the same paragraph twice on one page teaches the reader
-   *  to skip it, which is the opposite of what it is for. */
-  const warnings = $derived(status.warnings.filter((w) => !(status.chain && w.kind === 'chain_scope')));
+  const walk = $derived(status.walk ?? null);
+  /** Near field's premise, as the daemon words it. Handed to the walk panel so it can be
+   *  quoted where the user is about to take a reading, instead of only at the bottom of
+   *  the page with everything else. */
+  const premise = $derived(status.warnings.find((w) => w.kind === 'near_field_path_assumed')?.message);
+  /** Two caveats are carried twice by the API — the chain's doorway note is
+   *  `chain.scope_note` *and* a `chain_scope` warning with the identical sentence, and
+   *  near field's path premise is a `near_field_path_assumed` warning the walk panel
+   *  quotes where it matters. Each is shown once, under a heading that says what it is
+   *  about: the same paragraph twice on one page teaches the reader to skip it, which is
+   *  the opposite of what it is for. */
+  const warnings = $derived(
+    status.warnings.filter(
+      (w) => !(status.chain && w.kind === 'chain_scope') && !(walk && w.kind === 'near_field_path_assumed'),
+    ),
+  );
 </script>
 
 <div class="chain" aria-label="Measurement stage">
@@ -77,6 +95,23 @@
      per-position numbers stay readable while the next one is being measured. -->
 {#if status.chain}
   <AlignWizardChain chain={status.chain} {label} {busy} onPost={onPosition} {onFinish} {onHear} />
+{/if}
+
+<!-- Near field's body, in the same place and for the same reason: while the walk is parked
+     the only thing that matters is which speaker the user is standing at. Kept mounted
+     after the walk ends, because the closure numbers are part of the verdict. -->
+{#if walk}
+  <AlignWizardWalk
+    {walk}
+    {label}
+    {busy}
+    {premise}
+    message={status.message}
+    {onArrival}
+    {onClose}
+    onHear={(node) => onHear([node])}
+    onSilence={() => onHear([])}
+  />
 {/if}
 
 {#if gate}
@@ -153,7 +188,13 @@
   <AlignRefusal refusal={status.refusal} {label} />
   <div class="retry">
     <button class="ghost" onclick={onRetry}>Measure again</button>
-    <span class="hint">Nothing was written, so a retry costs only the time. The by-ear sliders below still work.</span>
+    <!-- Where the fallback actually is, now that it is a mode of this wizard rather than a
+         panel underneath it: the speakers are still held, so switching to it costs nothing
+         and no speaker reconnects. -->
+    <span class="hint">
+      Nothing was written, so a retry costs only the time. If the estimator keeps refusing, go back to
+      <strong>Mode</strong> and pick <strong>Manual</strong> — by ear, no microphone, and the speakers stay held.
+    </span>
   </div>
 {/if}
 

@@ -1,9 +1,13 @@
 <script lang="ts">
-  // "Explain speaker alignment" — the document behind the help button in the
-  // Input-sources header. Alignment lives on this page because a sync group is
-  // identified by the source feeding it (bridge-daemon/src/align/calibrate.rs): the
-  // speakers listed on a source card are exactly the ones that play off one
-  // clock, and those are the ones worth aligning against each other.
+  // "Explain speaker alignment" — the document behind the help button on the **Outputs**
+  // page's timing card, beside the wizard it describes (plan §12.1).
+  //
+  // It used to live in the Sources header and explain why alignment was *per source*: a
+  // sync group was resolved from the source set feeding it, so a source card listed the
+  // only set that could be aligned. That model is gone — alignment now forms a temporary
+  // group around whichever speakers the user picks — so the document moved with the
+  // feature and the "why it's per source" section is replaced by the thing that actually
+  // decides what a user gets: which of plan §1's three modes they choose.
   interface Props {
     onClose: () => void;
   }
@@ -31,7 +35,7 @@
     onclick={(e) => e.stopPropagation()}
   >
     <div class="card-head">
-      <h2 id="align-docs-title">Aligning speakers by ear</h2>
+      <h2 id="align-docs-title">Aligning speakers</h2>
       <button class="ghost" type="button" onclick={onClose}>Close</button>
     </div>
     <p class="card-sub">
@@ -44,16 +48,53 @@
     </p>
 
     <section>
-      <h3>Why it's per source</h3>
+      <h3>You pick the speakers, and they are held for the run</h3>
       <p>
-        Speakers fed by the same source play off one clock — that's what makes them a sync group, and only speakers in
-        one group can be aligned against each other. So each source card lists the speakers currently playing it and
-        offers <strong>Align speakers</strong> for exactly that set. Two speakers on different sources are not
-        comparable: they're two independent streams.
+        Speakers can only be compared if they are playing off <em>one clock</em>, so alignment starts by taking the ones
+        you selected and grouping them on their own for the duration. Whatever they were playing stops and comes back when
+        you finish, and nothing else — no other source, no ordinary announcement — reaches them in between. An alarm or a
+        voice-assistant answer still gets through on purpose, and when it does you are told, because it spoils the reading
+        it landed on.
       </p>
+      <p>
+        Grouping them makes each speaker reconnect, which costs tens of seconds — and the same again when the run ends. So
+        it happens <strong>once, for the whole run</strong>: pick every speaker the run will touch, usually all of them or
+        one floor. When a measurement then asks which ones you can hear from where you are standing, that is only muting,
+        which is instant.
+      </p>
+    </section>
+
+    <section>
+      <h3>Three ways to align, and they promise different things</h3>
+      <p>
+        A microphone in one place hears the electrical delay <em>and</em> the sound's travel time together and cannot
+        separate them — about 3 ms per extra metre. That is not a problem to be solved but a choice about what "aligned"
+        should mean, so it is the wizard's first question.
+      </p>
+      <ul>
+        <li>
+          <strong>Multi-position</strong> — you sit still and the add-on measures every speaker it can hear. Aligned at
+          <em>that spot</em>. If no single spot hears everything, do it once per room and name one or two speakers you can
+          hear from both: those overlaps are what tie the rooms together, and each room still ends up aligned at its own
+          spot, so a doorway between two of them is approximate.
+        </li>
+        <li>
+          <strong>Near field</strong> — you walk to each speaker in turn and hold the phone <em>at</em> it. That takes the
+          room out of the measurement, so what gets aligned is the wiring, and a wire alignment is right everywhere rather
+          than at one seat. It depends entirely on you holding the phone within a hand's width of the driver: a metre away
+          adds ~3 ms and reads as that speaker being late, which nothing can detect. The last stop is a
+          <em>revisit</em> of the speaker you started at — that second reading is what separates the phone's clock drift
+          over a long walk from real offsets, and it is also why checking the result means walking it again.
+        </li>
+        <li>
+          <strong>Manual</strong> — by ear, no microphone. The fallback when there is no usable mic (it needs HTTPS and
+          permission) or when the estimator refuses to answer. Same speaker selection, same hold; you just judge it
+          yourself.
+        </li>
+      </ul>
       <p class="hint">
-        Nothing listed on a card? Route the source to speakers first — <strong>Music groups</strong> → a group's
-        <em>Source</em> dropdown, or the routing graph below it.
+        The two measured modes propose a setting per speaker and <strong>write nothing until you approve it</strong>. By
+        ear there is nothing to approve: each nudge goes straight to that speaker's own setting.
       </p>
     </section>
 
@@ -69,7 +110,7 @@
     </section>
 
     <section>
-      <h3>How to run it</h3>
+      <h3>How to run it by ear</h3>
       <ul>
         <li>
           <strong>Pick the reference — which one depends on the kinds.</strong> Each speaker's knob only moves it one
@@ -95,8 +136,9 @@
           actually use, or accept that it's a compromise between positions.
         </li>
         <li>
-          <strong>Finish</strong> when done. That stops the click and restores every speaker's volume. The offsets
-          themselves are persisted per device, so they survive restarts and apply to normal playback.
+          <strong>Stop and restore</strong> when done. That stops the click, gives the speakers back and puts their
+          volumes, mutes and routing right. It does <em>not</em> undo your tuning: each offset was written to its device as
+          you made it, so it is already persisted and applies to normal playback.
         </li>
       </ul>
     </section>
@@ -132,13 +174,13 @@
           (<strong>Diagnostics</strong>).
         </li>
         <li>
-          <strong>Dropouts and stutter</strong> need buffer, not delay: raise the source's jitter buffer on this page,
-          or the group lead under <strong>Settings</strong>. Watch the ⚠ xrun badges in the routing graph to see which
-          node is dropping.
+          <strong>Dropouts and stutter</strong> need buffer, not delay: raise the source's jitter buffer on the
+          <strong>Sources</strong> page, or the group lead under <strong>Settings</strong>. Watch the ⚠ xrun badges in the
+          routing graph to see which node is dropping.
         </li>
         <li>
-          <strong>One speaker silent</strong> is a routing or connection problem — the click plays on every member of
-          the group, so if one stays quiet, look at its card under <strong>Outputs</strong>.
+          <strong>One speaker silent</strong> is a routing or connection problem — the click plays on every speaker in the
+          run, so if one stays quiet, look at its card on this page.
         </li>
       </ul>
     </section>

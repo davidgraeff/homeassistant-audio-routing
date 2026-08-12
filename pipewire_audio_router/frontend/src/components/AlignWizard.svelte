@@ -1,74 +1,56 @@
 <script lang="ts">
-  // The microphone-assisted alignment wizard (docs/mic-alignment-plan.md §12.1).
+  // The speaker-alignment wizard (docs/mic-alignment-plan.md §12.1) — **all three of
+  // plan §1's modes**, not just the measured ones.
   //
-  // Self-contained on purpose: it takes a name resolver, an optional group to seed
-  // the selection from, and a close callback, and owns nothing else.
+  // Self-contained on purpose: it takes a name resolver and a close callback, and owns
+  // nothing else. In particular it takes no group: the model §12.1 asked for is the real
+  // one now, so the user *picks speakers* and the daemon forms a temporary exclusive
+  // group around them (`POST /api/align/start {outputs, mode}`). The old `group` seed
+  // came from being mounted on a source card, and with the wizard on the Outputs page
+  // there is nothing to seed from — which is the point rather than a loss.
   //
-  // The model plan §12.1 asked for is now the real one: the user *picks speakers*
-  // and the daemon forms a temporary exclusive group around them
-  // (`POST /api/align/start {outputs, mode}`), so the wizard no longer needs a
-  // pre-existing sync group at all. `group` survives only as a *seed* — mounted from
-  // a source card, "the speakers this source is playing to" is a good first guess at
-  // the scope — which is also what keeps moving this to the Outputs page down to
-  // dropping the prop.
+  // Page flow: mode → speakers → the mode's own body → review. The run's own phase drives
+  // the page forward (a run that starts moves you to the body; a proposal moves you to
+  // review), but only when the phase *changes*, so pressing Back still works.
   //
-  // Page flow: mode → speakers → run → review. The run's own phase drives the
-  // page forward (a run that starts moves you to the run page; a proposal moves you
-  // to review), but only when the phase *changes*, so pressing Back still works.
+  // The three modes differ in exactly two places, and everything else is shared:
   //
-  // The microphone lives here rather than on a page, because the capture must
-  // survive page changes: the analysis grid is one continuous capture, and a mic
-  // that restarted mid-run has thrown away the reference frame everything measured
-  // so far shares.
+  //   * **the body**: a stationary measurement (with the chain inside it), a walk, or the
+  //     by-ear sliders;
+  //   * **the microphone**: by-ear does not use one, so the capture is not even mounted
+  //     for it — the mode exists precisely for the case where there is no usable mic
+  //     (§4.1), and asking for permission would contradict that.
+  //
+  // The microphone lives here rather than on a page, because the capture must survive
+  // page changes: the analysis grid is one continuous capture, and a mic that restarted
+  // mid-run has thrown away the reference frame everything measured so far shares.
   import AlignRefusal from './AlignRefusal.svelte';
+  import AlignWizardManual from './AlignWizardManual.svelte';
   import AlignWizardMode from './AlignWizardMode.svelte';
   import AlignWizardReview from './AlignWizardReview.svelte';
   import AlignWizardRun from './AlignWizardRun.svelte';
   import AlignWizardSpeakers from './AlignWizardSpeakers.svelte';
   import MicCapture from './MicCapture.svelte';
-  import { align } from '../lib/align.svelte';
+  import { align, isMeasured, type WizardMode } from '../lib/align.svelte';
   import { askConfirm } from '../lib/confirm.svelte';
   import { MODE_LABELS, elapsed, isRunning, measure, phaseLabel } from '../lib/measure.svelte';
-  import type { AlignGroup, MeasureMode, MeasurePhase } from '../lib/types';
+  import type { MeasurePhase } from '../lib/types';
 
   interface Props {
-    /** Speakers to pre-select as the run's scope — the group this wizard was opened
-     *  from, when it was opened from one. The user can add to or cut from it; the
-     *  scope is theirs, not the source's. */
-    group?: AlignGroup;
     label: (nodeName: string) => string;
     onClose: () => void;
   }
-  let { group, label, onClose }: Props = $props();
-
-  // Seeded once, here rather than in the selection page: that page is destroyed and
-  // rebuilt every time the user steps back to the mode picker, and re-seeding a scope
-  // the user had just edited would be maddening. The guard is what makes it once —
-  // not a defensive check.
-  let seeded = false;
-  $effect(() => {
-    if (seeded) return;
-    seeded = true;
-    const seed = group?.members.map((m) => m.node_name) ?? [];
-    if (seed.length && !align.sessionActive && align.selection.length === 0) align.setSelection(seed);
-  });
+  let { label, onClose }: Props = $props();
 
   /** Is a session holding speakers right now? Read from the store rather than passed
-   *  in: a wizard run's session is identified by its *selection*, so a caller that
-   *  compares source sets (the by-ear panel does) would say "not mine" about the
-   *  very session this wizard started. */
+   *  in: a session's identity is the *selection* it was formed over, and no page outside
+   *  this wizard has an opinion about whose it is. */
   const holding = $derived(align.sessionActive);
 
-  type Page = 'mode' | 'speakers' | 'run' | 'review';
-  const PAGES: { id: Page; name: string }[] = [
-    { id: 'mode', name: 'Mode' },
-    { id: 'speakers', name: 'Speakers' },
-    { id: 'run', name: 'Measure' },
-    { id: 'review', name: 'Review' },
-  ];
+  type Page = 'mode' | 'speakers' | 'body' | 'review';
 
   let page = $state<Page>('mode');
-  let mode = $state<MeasureMode>('sweet_spot');
+  let mode = $state<WizardMode>('sweet_spot');
   /** Measure from more than one listening position, joining them through overlap
    *  speakers (plan §1.1). Chosen on the mode page and only meaningful for
    *  multi-position; a chain with one step *is* the single-position run, which is why the
@@ -76,26 +58,35 @@
   let chained = $state(false);
 
   const status = $derived(measure.status);
-  /** A run parked in `positioning` is alive: it holds the group and carries provisional
-   *  delays nobody has written. So every question this shell asks — may it be abandoned,
-   *  may the user leave, is a run in progress — is `running`, never `live` (which only
-   *  says whether the *daemon* is busy this second). */
+  /** A run parked in `positioning` or `walking` is alive: it holds the group, and a chain
+   *  is carrying provisional delays nobody has written. So every question this shell asks
+   *  — may it be abandoned, may the user leave, is a run in progress — is `running`, never
+   *  `live` (which only says whether the *daemon* is busy this second). */
   const running = $derived(measure.running);
   const hasResult = $derived(!!status && (!!status.proposal || !!status.verification));
+  /** Does this mode drive the measurement state machine? Where it does not, `measure.*`
+   *  is never called and the microphone is never asked for. A *running* run wins over the
+   *  picker: switching the radio to by-ear mid-run must not unmount the capture the run
+   *  depends on. */
+  const measured = $derived(running || isMeasured(mode));
 
   // One poll loop for the whole run, ref-counted in the store.
   $effect(() => measure.attach());
 
-  // The *session* is polled too, and only from here. `AlignState.interference`
-  // changes without the UI doing anything — a barge-in announcement or a voice-duck
-  // hold legitimately outranks the alignment's exclusive hold (plan §12.3) — and
-  // that report is worth nothing if it appears an hour later. Slower than the run
-  // poll: it is an explanation, not a progress bar.
-  $effect(() => {
-    void align.refreshStatus();
-    const id = setInterval(() => void align.refreshStatus(), 3000);
-    return () => clearInterval(id);
-  });
+  // The *session* is loaded and then polled from here, and only from here — no other page
+  // touches it (plan §12.1). Two reasons it is polled at all: `AlignState.interference`
+  // changes without the UI doing anything, because a barge-in announcement or a voice-duck
+  // hold legitimately outranks the alignment's exclusive hold (plan §12.3) and that report
+  // is worth nothing if it appears an hour later; and a by-ear session's reference/target
+  // can be moved by something else holding the same session.
+  //
+  // The full load matters for by-ear specifically: it is what fetches each speaker's
+  // current knob value and the `sendspin_delay_live` setting, without which the tuning
+  // sliders would start from zero and stream changes to firmware that cannot take them.
+  //
+  // `attachSession` stops nothing on teardown — see the store. Leaving this page is not
+  // consent to drop a hold; "Stop and restore" is.
+  $effect(() => align.attachSession());
 
   const interference = $derived(align.interference);
 
@@ -108,26 +99,73 @@
     const st = measure.status;
     if (!st || st.phase === lastPhase) return;
     lastPhase = st.phase;
-    // Everything the daemon is actively doing belongs on the run page — including
-    // `settling`, which is where the gate explains a group that has gone quiet, and
-    // `positioning`, which is where a chain asks for the next listening position.
-    if (isRunning(st.phase)) page = 'run';
+    // Everything the daemon is actively doing belongs on the body page — including
+    // `settling`, which is where the gate explains a group that has gone quiet;
+    // `positioning`, where a chain asks for the next listening position; and `walking`,
+    // where near field asks which speaker the phone is at. `walking` is also how the
+    // *verification* of a near-field write asks for its second walk (plan §10.4), which is
+    // why coming back here from the review page is right rather than a regression.
+    if (isRunning(st.phase)) page = 'body';
     else if (st.phase === 'proposed' || st.phase === 'done') page = 'review';
-    else if (st.phase === 'refused') page = st.proposal ? 'review' : 'run';
+    else if (st.phase === 'refused') page = st.proposal ? 'review' : 'body';
   });
 
+  /** The mode the wizard is *showing*: a run's own mode wins over the picker, for the same
+   *  reason the header badge does — once something is running, every label has to describe
+   *  what is running rather than what is selected. */
+  const shownMode = $derived<WizardMode>(status && status.phase !== 'idle' ? status.mode : mode);
+  /** The body page's name, which is the mode's own verb. Not cosmetic: "Measure" over a
+   *  page of by-ear sliders would promise a measurement that is not happening, and
+   *  "Measure" over a walk hides the fact that the user is the one doing the work. */
+  const bodyName = $derived(shownMode === 'manual' ? 'Tune' : shownMode === 'near_field' ? 'Walk' : 'Measure');
+  const PAGES: { id: Page; name: string }[] = $derived([
+    { id: 'mode', name: 'Mode' },
+    { id: 'speakers', name: 'Speakers' },
+    { id: 'body', name: bodyName },
+    { id: 'review', name: 'Review' },
+  ]);
+
   function reachable(id: Page): boolean {
-    if (id === 'run') return !!status && status.phase !== 'idle';
-    if (id === 'review') return hasResult;
+    // By-ear's body is the hold itself: there is no run to have started, so what makes it
+    // reachable is that speakers are held.
+    if (id === 'body') return measured ? !!status && status.phase !== 'idle' : holding;
+    // ...and it never produces a proposal to review, because every nudge is already
+    // written. A step that could never light up would be a promise of a page that is not
+    // coming.
+    if (id === 'review') return measured && hasResult;
     return true;
   }
 
   async function start() {
     measure.clearError();
+    // By-ear starts nothing: the hold formed on the Speakers page *is* the session, the
+    // daemon has already made a reference/target pair audible, and there is no run to
+    // begin. Calling `measure.start` here would be refused — `manual` is not one of the
+    // measurement state machine's modes.
+    if (!isMeasured(mode)) {
+      page = 'body';
+      return;
+    }
     // `chained` only reaches the daemon for multi-position: near field has its own
     // acquisition (a walk) and needs no overlaps at all, and sending both would invite
     // the reader to think the two compose.
-    if (await measure.start(mode, mode === 'sweet_spot' && chained)) page = 'run';
+    if (await measure.start(mode, mode === 'sweet_spot' && chained)) page = 'body';
+  }
+
+  /** Near field: "I am standing at this speaker." A refusal here is the *call's* — the
+   *  wrong speaker, or one already measured — and the walk stays parked exactly where it
+   *  was, so there is nothing to unwind and no page to leave. */
+  async function arrival(nodeName: string) {
+    measure.clearError();
+    await measure.arrival(nodeName);
+  }
+
+  /** Near field: the closure reading. Refused until every speaker has been visited; a
+   *  closure too large for any plausible clock refuses the whole walk, and that arrives as
+   *  the run's own refusal rather than as this call's. */
+  async function closeWalk() {
+    measure.clearError();
+    await measure.close();
   }
 
   /** One listening position of a chain. A refusal here is the *step's*: the chain stays
@@ -171,10 +209,21 @@
 
 <div class="wizard">
   <div class="head">
-    <strong>Measure with a microphone</strong>
+    <!-- The title is the mode's promise, not the feature's name: "Measure with a
+         microphone" over the by-ear sliders would be simply false. -->
+    <strong>{measured ? 'Measure the timing between speakers' : 'Align speakers by ear'}</strong>
     <!-- A run's own mode wins over the picker: once something is running, the
-         header must describe what is running, not what is selected. -->
-    <span class="badge">{MODE_LABELS[status && status.phase !== 'idle' ? status.mode : mode]}</span>
+         header must describe what is running, not what is selected. `manual` has no
+         `MeasureMode`, and that is exactly why it is named separately here. -->
+    <span class="badge">
+      {#if status && status.phase !== 'idle'}
+        {MODE_LABELS[status.mode]}
+      {:else if mode === 'manual'}
+        By ear
+      {:else}
+        {MODE_LABELS[mode]}
+      {/if}
+    </span>
     {#if status && status.phase !== 'idle'}
       <span class="badge" class:on={running} class:warn={status.phase === 'refused'}>{phaseLabel(status.phase)}</span>
     {/if}
@@ -217,9 +266,18 @@
     {/each}
   </div>
 
-  <!-- Mounted for the wizard's whole life, not per page: a capture that restarts
-       loses the timing reference every earlier reading shares. -->
-  <MicCapture />
+  <!-- Mounted for the wizard's whole life, not per page: a capture that restarts loses the
+       timing reference every earlier reading shares — and for near field that costs the
+       *user* another walk.
+
+       Not mounted at all for by-ear, and that is the mode's whole reason for existing
+       (plan §1, §4.1): it is the fallback for a browser that has no usable microphone, so
+       putting a "Use microphone" button on it would offer the thing that just failed.
+       `measured` is sticky while a run is in progress, so flipping the radio to by-ear
+       mid-run cannot pull the capture out from under it. -->
+  {#if measured}
+    <MicCapture />
+  {/if}
 
   <!-- Shown on every page, because it can happen on any of them. Exclusivity over
        the aligning speakers is real but not absolute: an urgent announcement or a
@@ -258,8 +316,12 @@
       <div class="nav">
         <button class="ghost" onclick={() => (page = 'mode')}>Back</button>
       </div>
-    {:else if page === 'run'}
-      {#if status && status.phase !== 'idle'}
+    {:else if page === 'body'}
+      <!-- Page 3 is the mode's own body (plan §12.1): the measurement run — which carries
+           the chain or the walk inside it — or the by-ear sliders. -->
+      {#if !measured}
+        <AlignWizardManual {label} />
+      {:else if status && status.phase !== 'idle'}
         <AlignWizardRun
           {status}
           {label}
@@ -267,6 +329,8 @@
           onRetry={() => void start()}
           onPosition={(members, overlaps) => void position(members, overlaps)}
           onFinish={() => void finish()}
+          onArrival={(node) => void arrival(node)}
+          onClose={() => void closeWalk()}
           onHear={(nodes) => void align.hear(nodes)}
         />
       {:else}
@@ -287,7 +351,7 @@
         onRetry={() => void start()}
       />
       <div class="nav">
-        <button class="ghost" onclick={() => (page = 'run')}>Back to the run</button>
+        <button class="ghost" onclick={() => (page = 'body')}>Back to the run</button>
       </div>
     {/if}
   </div>
