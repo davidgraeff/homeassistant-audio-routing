@@ -7,10 +7,10 @@
 //! and merely discovered.
 //!
 //! It lives here, not with the HTTP handlers that serve it, because it has two
-//! consumers: the Outputs page (`api/outputs.rs`) and the routing matrix frame
-//! (`routing/mod.rs`). While it sat inside the API module, the routing layer had
-//! to depend on `api::` to name its own matrix column type — the last thing
-//! keeping `api/` from being a leaf (plan §6).
+//! consumers and neither owns it: the Outputs page (`api/outputs.rs`) and the
+//! routing matrix frame (`routing/mod.rs`). Filing it under either would force the
+//! other to reach into a module it has no business depending on — this way the
+//! API layer stays a leaf and the matrix names its own column type.
 
 use crate::state::AppState;
 use crate::store::outputs::OutputState;
@@ -193,9 +193,9 @@ pub(crate) struct OutputInfo {
     pub(crate) pwsink_ducked: Option<bool>,
     /// Why this output currently can't play — a human-readable sentence, or `None`
     /// when nothing is known to be wrong. AirPlay-2 only so far
-    /// ([`crate::ap2_health`], written by the liveness probe and by a failed
-    /// connect). Exists because "routed, present, and silent" used to be
-    /// indistinguishable from "playing" in the UI: the reason lived only in the
+    /// ([`crate::outputs::ap2::health`], written by the liveness probe and by a
+    /// failed connect). Without it, "routed, present, and silent" is
+    /// indistinguishable from "playing" in the UI and the reason exists only in the
     /// daemon log. Kind-agnostic on purpose — sendspin/pw-sink can fill it later.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_error: Option<String>,

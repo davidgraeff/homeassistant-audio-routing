@@ -8,10 +8,10 @@
 //! is playing ([`metering`]) and watch whether one is dropping frames
 //! ([`profiler`]).
 //!
-//! [`capture`] used to be `sendspin_capture.rs`. It never was sendspin-specific:
-//! the AP2, pw-sink and sendspin senders, the overlay mixer and the alignment
-//! measurement all pull their audio through it. That the name said otherwise is
-//! the clearest example of what this refactor is for.
+//! [`capture`] is backend-agnostic, and every consumer shares the one
+//! implementation: the sendspin, AP2 and pw-sink senders, the overlay mixer and
+//! the alignment measurement all pull their PCM through it. There is no
+//! per-backend capture path, and a new backend should not add one.
 
 pub(crate) mod capture;
 pub(crate) mod metering;

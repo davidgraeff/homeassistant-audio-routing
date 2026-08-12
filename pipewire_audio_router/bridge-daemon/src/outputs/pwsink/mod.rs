@@ -13,10 +13,10 @@
 //! [`server`] drives one group's targets off the anchor monitor.
 //!
 //! Two liveness modules, because there are two independent things to be wrong:
-//! [`sender_liveness`] watches our own AppleMIDI sender (is it draining?),
-//! [`target_liveness`] watches the remote host (is it still there?). The old names
-//! — `pw_sink_liveness.rs` and `pw_target_liveness.rs` — differed by one
-//! character for two different questions.
+//! [`sender_liveness`] watches our own AppleMIDI sender (is it draining?) and
+//! feeds each target's status into the UI, [`target_liveness`] watches the remote
+//! host (is it still reachable?). A target can be perfectly reachable while our
+//! sender is stalled, and vice versa — check the one that matches the symptom.
 
 pub(crate) mod agent;
 pub(crate) mod applemidi;

@@ -936,15 +936,15 @@ enum Frame<'a> {
     /// keyed by node name, so the client merges them onto the matrix it already
     /// has.
     ///
-    /// **Why this exists.** The matrix frame used to be re-sent every 250 ms for
-    /// exactly this data. Measured on the live instance: a 2 210-byte frame of
-    /// which the peaks were 36 bytes — **1.6 %** — with 73 % static configuration,
-    /// 49 of 49 consecutive frames byte-identical at idle, and 9.0 KiB/s per client
-    /// of it. The cost was never the daemon's CPU (~0.2 % of a core per client);
-    /// it was that every client rebuilt its whole view four times a second — the
-    /// web UI recomputing the graph layout, the HA integration re-rendering every
-    /// entity — to learn nothing. So the matrix moved to the `changes` channel
-    /// (deduped), and this frame carries what actually ticks.
+    /// **Why this is a frame of its own** rather than a matrix re-send on a timer,
+    /// measured on the live instance: the matrix is a 2 210-byte frame carrying 36
+    /// bytes of peaks — **1.6 %** — with 73 % static configuration, and 49 of 49
+    /// consecutive frames byte-identical at idle; at 4 Hz that is 9.0 KiB/s per
+    /// client. The cost is not the daemon's CPU (~0.2 % of a core per client), it is
+    /// that every client rebuilds its whole view four times a second — the web UI
+    /// recomputing the graph layout, the HA integration re-rendering every entity —
+    /// to learn nothing. So the matrix goes out on the `changes` channel (deduped)
+    /// and this frame carries what actually ticks.
     Meters {
         nodes: &'a BTreeMap<String, MeterSample>,
     },

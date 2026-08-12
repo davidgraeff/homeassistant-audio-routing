@@ -70,9 +70,9 @@ pub enum SourceKind {
     Rtp,
 }
 
-/// AirPlay-receive source config. Gathers the four formerly-scattered
-/// `airplay_*` fields into one struct; the serde defaults match the old
-/// per-field defaults so a config written by an older daemon still loads.
+/// AirPlay-receive source config: the four `airplay_*` knobs of one source, in one
+/// struct. Every field has a serde default matching what an older daemon wrote as a
+/// flat top-level key, so a config file from one still loads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AirplaySourceConfig {
     /// AirPlay producer jitter-buffer target, ms.

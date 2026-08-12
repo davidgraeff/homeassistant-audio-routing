@@ -2,11 +2,10 @@
 //!
 //! `AppState` is the daemon's one wide handle: every live store, registry
 //! snapshot, control channel and manager the HTTP layer can reach. It lives in
-//! its own module because it is the one type the API and the subsystems *both*
-//! need — `routing/`, `outputs/pwsink/agent.rs` and the alignment handlers all
-//! take an `&AppState`. While it sat inside `api.rs`, every one of those had to
-//! depend on the API module to name it, which made `api/` something the rest of
-//! the crate pointed *at* instead of a leaf (plan §6).
+//! its own module because both the API and the subsystems need it — `routing/`,
+//! `outputs/pwsink/agent.rs` and `outputs/listing.rs` all take an `&AppState`.
+//! Keeping it out of `api/` is what lets that module stay a leaf: nothing in the
+//! crate depends on the API except `main.rs`, which wires the server up.
 //!
 //! Handlers extract just the piece they need via `FromRef`, so adding a field
 //! here does not touch them.

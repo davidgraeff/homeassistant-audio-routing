@@ -236,9 +236,10 @@ pub(crate) mod spike;
 pub(crate) mod sync;
 pub(crate) mod volume;
 
-// Each submodule owns one resource's handlers and DTOs. The route table above
-// and the handlers themselves address each other by bare name, exactly as they
-// did when this was one file — the split is a filing change, not an API change.
+// Each submodule owns one resource's handlers and DTOs, re-exported here so the
+// route table above and the handlers themselves address each other by bare name.
+// The file boundaries organise the code; they are not a visibility boundary, and
+// a handler that needs a sibling's DTO just uses it.
 pub(crate) use agents::*;
 pub(crate) use align::*;
 pub(crate) use announce::*;
@@ -246,8 +247,8 @@ pub(crate) use clients::*;
 pub(crate) use duck::*;
 pub(crate) use groups::*;
 pub(crate) use measure::*;
-// The output listing model lives in outputs/, since the routing matrix consumes
-// it too (plan §6); re-exported here so the handlers keep addressing it by name.
+// The output listing model lives in outputs/listing.rs, because the routing matrix
+// consumes it too; re-exported so the handlers address it by bare name as well.
 pub(crate) use crate::outputs::listing::*;
 pub(crate) use nodes::*;
 pub(crate) use now_playing::*;
