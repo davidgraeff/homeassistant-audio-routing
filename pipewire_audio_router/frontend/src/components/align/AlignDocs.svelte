@@ -193,15 +193,14 @@
   .modal-card.wide {
     width: min(880px, 100%);
   }
+  /* Tighter than the shared section head (styles/sections.css): a docs panel's
+     title sits closer to its body. Only the differences are listed. */
   .card-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     margin-bottom: 4px;
-  }
-  .card-head h2 {
-    margin: 0;
   }
   section {
     margin-top: 20px;

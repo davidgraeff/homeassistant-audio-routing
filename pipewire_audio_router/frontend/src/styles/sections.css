@@ -1,0 +1,72 @@
+/*
+ * The section pattern: a titled block with actions beside the title and, when it
+ * collapses, a chevron button that opens it.
+ *
+ * Global on purpose. Every tab in this app is built from these — Outputs, Sources,
+ * Alignment, the groups tabs and every docs panel — and a Svelte `<style>` block is
+ * scoped to one component, so a pattern used by five of them cannot live in any of
+ * them. It lived in three at once before this file existed: `.card-head` here in the
+ * global sheet, and a byte-identical copy under the name `.info-head` inside both the
+ * Outputs and Sources tabs, which is why the Alignment tab's markup used `.info-head`
+ * and got no styling at all.
+ *
+ * Loaded from main.ts after app.css, which owns the theme tokens these reference.
+ */
+
+/* A section's title line, with its actions (a docs button, a collapse toggle)
+   pushed to the right. Wraps rather than overflowing on a narrow phone. */
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.card-head h2 {
+  margin: 0;
+}
+.card-head .actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/*
+ * A square icon-only button, sized for touch, that opens or closes the section it
+ * heads. Distinct from a labelled toggle: this one is 28×28 with no text, so it needs
+ * its own hit area and hover surface.
+ *
+ * `FlowGraph`'s `.collapse-toggle` is a *different* control — a labelled row that
+ * inherits the surrounding font — and keeps its own scoped rules. Two controls that
+ * both "collapse a thing" are not one pattern, and sharing a class name for them is
+ * what made this look duplicated when it was not.
+ */
+.icon-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--secondary-text-color);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.icon-toggle:hover {
+  background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+  color: var(--primary-color);
+}
+
+/* The chevron itself, and the one transform that says "this section is open". */
+.chevron {
+  font-size: 0.7rem;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+.icon-toggle[aria-expanded='true'] .chevron {
+  transform: rotate(90deg);
+}

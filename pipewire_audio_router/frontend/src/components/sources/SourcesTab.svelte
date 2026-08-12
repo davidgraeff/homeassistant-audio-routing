@@ -13,6 +13,8 @@
     SourceKind,
     SourceView,
   } from '../../lib/types';
+  import { clientLabel, formatWhen, kindLabel, pct } from '../../lib/sources/labels';
+  import { deriveRtpMode, RTP_MODES, type RtpMode, rtpModeToParams } from '../../lib/sources/rtp-mode';
 
   // The set of configured input sources (AirPlay-receive + RTP-receive). Loaded
   // from the daemon's /api/sources collection; the user adds / edits / removes
@@ -59,13 +61,6 @@
   }
   const connectedCount = (id: string) => (clientsBySource[id] ?? []).filter((c) => c.connected).length;
 
-  function clientLabel(c: AirplayClient): string {
-    return c.name ?? c.addr ?? c.key;
-  }
-  function formatWhen(unixSecs: number): string {
-    if (!unixSecs) return 'never';
-    return new Date(unixSecs * 1000).toLocaleString();
-  }
 
   async function refreshClients(id: string) {
     try {
@@ -115,52 +110,13 @@
 
   // Live input-level meters. Subscribing to the `routing` store opens the same
   // WebSocket the routing matrix uses, whose `meters` frame carries each metered
-  // source's current peak (0.0–1.0) — absent meaning no signal. Match by the
-  // daemon's stable source node name; every SourceView carries its `node_name`.
-  const pct = (peak: number) => Math.min(100, Math.round(peak * 100));
   function peakFor(nodeName: string): number {
     return peakOf($routing, nodeName);
   }
 
-  function kindLabel(kind: SourceKind): string {
-    return kind === 'airplay' ? 'AirPlay' : 'RTP';
-  }
 
-  // ---- RTP "Source" mode (same mapping as the legacy single RTP panel) -----
-  // Two of the three modes pin source.ip to 0.0.0.0 and differ only in
-  // sess.ignore-ssrc; the multicast mode reveals the group-address field.
-  type RtpMode = 'all' | 'multicast' | 'single';
-  const RTP_MODES: { value: RtpMode; label: string; desc: string }[] = [
-    {
-      value: 'all',
-      label: 'Accept all senders',
-      desc: 'Any device sending to this port is received. Packets from two senders may interleave and corrupt the audio.',
-    },
-    {
-      value: 'single',
-      label: 'Only one client',
-      desc: "Locks onto the first sender's stream and rejects all others — the corruption guard. Needs firmware with a stable SSRC (any recent bt-bridge build).",
-    },
-    {
-      value: 'multicast',
-      label: 'Multicast group',
-      desc: 'Join a group so several boxes share one stream. Set the same group on every receiver and point the firmware’s RTP host at it. IPv4 or IPv6.',
-    },
-  ];
   const rtpModeInfo = $derived(RTP_MODES.find((m) => m.value === rtpMode) ?? RTP_MODES[0]);
 
-  // A non-empty, non-0.0.0.0 source.ip means the receiver joined a multicast
-  // group; otherwise ignore-ssrc distinguishes "accept all" from "single".
-  function deriveRtpMode(addr: string, ignoreSsrc: boolean): RtpMode {
-    if (addr && addr !== '0.0.0.0') return 'multicast';
-    return ignoreSsrc ? 'all' : 'single';
-  }
-  // Map the "Source" mode to the two backend knobs.
-  function rtpModeToParams(): { sourceAddr: string; ignoreSsrc: boolean } {
-    if (rtpMode === 'multicast') return { sourceAddr: rtpMulticastAddr.trim() || '239.255.42.42', ignoreSsrc: true };
-    if (rtpMode === 'single') return { sourceAddr: '0.0.0.0', ignoreSsrc: false };
-    return { sourceAddr: '0.0.0.0', ignoreSsrc: true };
-  }
 
   // Custom dropdown for the RTP mode (a native <select> can't show a per-option
   // description). Only one form is open at a time, so a single open-state suffices.
@@ -257,7 +213,7 @@
     return body;
   }
   function rtpBody(): Partial<RtpSourceCfg> {
-    const { sourceAddr, ignoreSsrc } = rtpModeToParams();
+    const { sourceAddr, ignoreSsrc } = rtpModeToParams(rtpMode, rtpMulticastAddr);
     return {
       port: rtpPort,
       latency_msec: rtpLatency,
@@ -366,7 +322,7 @@
   // defaults a fresh RTP source would get (never a generic template).
   function openDocs() {
     if (form?.kind === 'rtp') {
-      const { sourceAddr, ignoreSsrc } = rtpModeToParams();
+      const { sourceAddr, ignoreSsrc } = rtpModeToParams(rtpMode, rtpMulticastAddr);
       docsParams = { port: rtpPort, latencyMsec: rtpLatency, rate: rtpRate, sourceAddr, ignoreSsrc };
       return;
     }
@@ -386,9 +342,9 @@
 <svelte:window onpointerdown={onDocPointerDown} onkeydown={onDocKeydown} />
 
 <div class="card info">
-  <div class="info-head">
+  <div class="card-head">
     <h2>Input sources</h2>
-    <div class="info-actions">
+    <div class="actions">
       <button
         class="ghost"
         type="button"
@@ -539,7 +495,7 @@
     <article class="card src-card" class:offline={!s.present} class:collapsed={!isExpanded(s)}>
       <header class="src-head">
         <button
-          class="collapse-toggle"
+          class="icon-toggle"
           type="button"
           aria-expanded={isExpanded(s)}
           title={isExpanded(s) ? 'Hide settings' : 'Show settings'}
@@ -769,30 +725,11 @@
 <style>
   /* Tab header: title with the sender-setup docs button beside it, so the
      document is reachable before the first RTP source exists. */
-  .info-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-  .info-head h2 {
-    margin: 0;
-  }
-  .info-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
 
   /* One card per source; offline ones dim like the outputs list. */
   .src-card.offline {
     opacity: 0.6;
   }
-  /* Collapsed cards are a single compact line (same shape as the outputs
-     list): no body, tighter padding, and nothing wraps — the node name
-     truncates instead. */
   .src-card.collapsed {
     padding-top: 12px;
     padding-bottom: 12px;
@@ -816,32 +753,6 @@
     align-items: center;
     gap: 12px;
     flex-wrap: wrap;
-  }
-  .collapse-toggle {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    background: transparent;
-    border: none;
-    color: var(--secondary-text-color);
-    cursor: pointer;
-    border-radius: 6px;
-  }
-  .collapse-toggle:hover {
-    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
-    color: var(--primary-color);
-  }
-  .chevron {
-    font-size: 0.7rem;
-    line-height: 1;
-    transition: transform 0.15s ease;
-  }
-  .collapse-toggle[aria-expanded='true'] .chevron {
-    transform: rotate(90deg);
   }
   .src-title {
     display: flex;

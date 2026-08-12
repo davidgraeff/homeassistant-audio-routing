@@ -60,9 +60,9 @@
 </script>
 
 <div class="card info">
-  <div class="info-head">
+  <div class="card-head">
     <h2>Timing between speakers</h2>
-    <div class="info-actions">
+    <div class="actions">
       <button
         class="ghost"
         type="button"

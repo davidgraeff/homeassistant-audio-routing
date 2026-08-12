@@ -5,6 +5,8 @@
   import { run, runUndoable, toast } from '../../lib/toast';
   import { askConfirm, removeOutputConfirm } from '../../lib/confirm.svelte';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../../lib/types';
+  import { delaySpec, hasDelayKnob } from '../../lib/outputs/delay';
+  import { canTest, kindLabel, ptpBadge, statusBadge, testHint } from '../../lib/outputs/labels';
   import GroupTitle from '../groups/GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
@@ -83,110 +85,8 @@
   });
 
 
-  // One delay slider, three kinds. AirPlay 2 shifts its render delay, a PipeWire host
-  // sets its receiver's jitter buffer, a sendspin speaker takes a static trim against
-  // its group — different mechanisms, one gesture: "this speaker is out of step, move it
-  // in time". The scales differ by an order of magnitude, so each kind brings its own
-  // spec.
-  //
-  // Defaults are not hardcoded here: the daemon reports what each output is actually
-  // running, as `latency_effective_ms`.
-  type DelaySpec = {
-    min: number;
-    max: number;
-    step: number;
-    /** Below this the low end is dangerous. **0 disables the risky zone** — for a
-     *  knob whose zero simply means "no adjustment", low is not a risk at all. */
-    riskyBelow: number;
-    highAbove: number;
-    label: string;
-    /** Sentence for the low end; only used when `riskyBelow > 0`. */
-    risk: string;
-    /** Sentence for the healthy middle, in this knob's own terms. */
-    good: string;
-    /** Push intermediate values *while* dragging, so the knob can be found by ear?
-     *  Only where applying one is cheap and gapless. */
-    liveDuringDrag: boolean;
-    /** Is there an *override* to drop (→ a "Default" button)? False for a knob whose
-     *  neutral position is 0, which the slider can already reach. */
-    clearable: boolean;
-    /** Which endpoint holds this value: the shared per-output latency, or sendspin's
-     *  own static-delay store. */
-    store: 'latency' | 'sendspin';
-  };
-  const AP2_DELAY: DelaySpec = {
-    min: 0,
-    max: 2000,
-    step: 10,
-    // The daemon shifts the next PT=87 anchor on the running stream: no reconnect and
-    // nothing to reload, so hearing the drag is worth the throttled round trips.
-    liveDuringDrag: true,
-    // 0 is the normal position — the receivers render from the anchors as they arrive —
-    // so the low end carries no warning. A receiver that goes *silent* needs more delay
-    // rather than less, which its fault badge reports; it is not a slider zone.
-    riskyBelow: 0,
-    // Above this it plays fine, but the delay is latency the whole system pays for.
-    highAbove: 200,
-    label: 'Render delay',
-    risk: '',
-    good: 'Shifts when this receiver renders, relative to the rest of its group',
-    clearable: true,
-    store: 'latency',
-  };
-  const PWSINK_DELAY: DelaySpec = {
-    // Three packet times (sync_settings::PWSINK_JITTER_MIN_MS): the receiving module
-    // refuses a buffer below its packet time, and the sender needs room for a
-    // catch-up burst *inside* the buffer. 0 is not on offer here the way it is for
-    // AP2 — the daemon would clamp it anyway.
-    min: 15,
-    // Well short of what the API accepts (2000 ms), but far enough to line a remote
-    // host up against a slow receiver rather than only to tune its own buffer. The
-    // zone marks below stay where they are: past `highAbove` this is still latency
-    // you are choosing to add, which is exactly what aligning against something slow
-    // means, and the note says so rather than warning you off.
-    max: 800,
-    step: 5, // a whole number of 5 ms packets, which is what the receiver wants
-    // Four packet times: below that the receiver holds under a packet of slack for
-    // network or scheduling jitter.
-    riskyBelow: 20,
-    highAbove: 300,
-    label: 'Playout delay',
-    risk: 'the receiving host holds under a packet of slack for network or scheduling jitter — expect crackles',
-    // Applying one reloads `module-rtp-session` on the remote host — a short gap in
-    // that speaker's audio. Doing that at every step of a drag would be a stutter,
-    // so this kind commits only when you let go.
-    liveDuringDrag: false,
-    good: "Buffers the network hop and the remote host's scheduling",
-    clearable: true,
-    store: 'latency',
-  };
-  const SENDSPIN_DELAY: DelaySpec = {
-    // 0 is the *normal* position here, not a risky one: this knob trims a speaker
-    // that is consistently early against the rest of its group, so "no trim" is the
-    // resting state and there is no low-end risk zone at all.
-    min: 0,
-    // The daemon clamps a static delay at 5000 ms, so the slider reaches everything
-    // the API accepts. A tighter ceiling would make an already-stored larger value
-    // unreachable — and silently shrink it on the next drag.
-    max: 5000,
-    step: 10,
-    riskyBelow: 0,
-    highAbove: 1000,
-    label: 'Static delay',
-    risk: '',
-    good: 'Trims this speaker against the rest of its group',
-    // The change is in-band, but whether the *firmware* applies it live is a
-    // per-setup question (Settings → sendspin delay applied live). Where it does not,
-    // every change reconnects that speaker, which costs tens of seconds of silence —
-    // so this commits on release, which is right either way.
-    liveDuringDrag: false,
-    clearable: false,
-    store: 'sendspin',
-  };
-  const delaySpec = (o: OutputInfo) =>
-    o.kind === 'pwsink' ? PWSINK_DELAY : o.kind === 'sendspin' ? SENDSPIN_DELAY : AP2_DELAY;
-  /** Every adopted kind has one now; still a predicate, so the row keeps its guard. */
-  const hasDelayKnob = (o: OutputInfo) => o.kind === 'airplay2' || o.kind === 'pwsink' || o.kind === 'sendspin';
+  // The delay-knob specs live in lib/outputs/delay.ts; the display helpers in
+  // lib/outputs/labels.ts. Both are pure — no component state.
 
   /** What the daemon has stored for this output right now — the slider's resting
    *  position and its during-drag readout. Sendspin keeps its static delays in a store
@@ -365,101 +265,6 @@
     return collapsed[o.node_name] ?? true;
   }
 
-  function kindLabel(o: OutputInfo): string {
-    if (o.kind === 'sendspin') return 'Sendspin';
-    if (o.kind === 'pwsink') return 'PipeWire';
-    return 'AirPlay 2';
-  }
-
-  // Status badge, three-state: offline (not reachable) / not connected (no session) /
-  // online. `present` is reachability only — mDNS presence as owned by the liveness
-  // tasks. For pw-sink that really is all it means: the remote host advertises over
-  // mDNS, but audio only flows once its module-rtp-session initiates the AppleMIDI
-  // handshake (receiver-driven), so reachable-but-unattached is a genuine third
-  // state. Folding it into "offline" (as this page used to) is what made it
-  // disagree with the routing graph about the same target — the graph read
-  // presence, this page read the session. Now both show all three states.
-  //
-  // Only an *added* pw-sink target has a session to wait for; a merely discovered
-  // one has none by definition, so it just reads online.
-  function statusBadge(o: OutputInfo): { cls: string; text: string; title: string } {
-    if (!o.present) return { cls: 'badge off', text: 'offline', title: 'Not on the network right now. Its routing is kept and reapplied when it returns.' };
-    if (o.kind === 'pwsink' && o.state === 'adopted' && o.pwsink_streaming !== true) {
-      return {
-        cls: 'badge caution',
-        text: 'not connected',
-        title:
-          "On the network, but no receiver has connected to the session we advertise — its module-rtp-session initiates the handshake, so until it does, anything routed here isn't played. Announcements open a temporary session instead.",
-      };
-    }
-    return { cls: 'badge on', text: 'online', title: 'On the network and carrying audio routed to it.' };
-  }
-
-  // PTP-lock badge for an AirPlay-2 output — tri-state, because a lock is not
-  // needed for single-room realtime playback (the receiver free-runs off our
-  // PT=87 anchors); it only prevents drift in a multi-room group. So we only
-  // *alarm* (red) when the receiver is both unlocked AND in a ≥2-member group.
-  // Returns null when no badge should show (non-AP2 or offline).
-  function ptpBadge(o: OutputInfo): { cls: string; text: string; title: string } | null {
-    if (o.kind !== 'airplay2' || !o.present) return null;
-    const age = o.ptp_lock_age_s != null ? ` (last clock sync ${o.ptp_lock_age_s}s ago)` : '';
-    if (o.ptp_locked) {
-      return { cls: 'badge on', text: 'PTP ✓', title: `Exchanging PTP with our clock${age} — multi-room sync is tight.` };
-    }
-    if (o.ptp_supported === false) {
-      return {
-        cls: 'badge',
-        text: 'PTP n/a',
-        title: "This receiver doesn't advertise PTP support (features bit 41); our sender streams realtime without it.",
-      };
-    }
-    if (o.ptp_relevant) {
-      return {
-        cls: 'badge warn',
-        text: 'no PTP lock',
-        title: `Not exchanging PTP with us${age}. This receiver is in a multi-room AirPlay-2 group, so without a shared clock the rooms can drift out of sync. Re-route it (disconnect then reconnect) to re-establish PTP.`,
-      };
-    }
-    return {
-      cls: 'badge',
-      text: 'PTP —',
-      title: `Not exchanging PTP with us${age} — fine for single-room realtime playback; a live PTP lock only matters for keeping multiple rooms in sync.`,
-    };
-  }
-
-  // Which outputs can be announced to individually via the per-device path
-  // (/api/announce). Every output kind is a per-device sender wired into the
-  // OverlayMixer: sendspin, AirPlay 2 (own overlay path), and pw-sink (the
-  // per-target AppleMIDI relay applies mix_into). Neither dialed backend needs a
-  // wired input — the daemon opens an on-demand session for an unrouted AirPlay-2
-  // receiver or pw-sink target — so the gate is reachability (`present`), NOT
-  // whether a session is attached: standing one up is exactly what this does.
-  //
-  // For AirPlay 2 and pw-sink this deliberately works on a merely *discovered*
-  // device too: playing a tone is how you find out which speaker
-  // `ap2-dev-living-2` is before adding it.
-  //
-  // Sendspin is the exception. A sendspin speaker is only reachable while the
-  // daemon holds a WebSocket to it, and it doesn't open one to a device that
-  // hasn't been added — and there's no on-demand equivalent, because a fresh
-  // sendspin connection takes tens of seconds to start rendering (ESPHome
-  // firmware), so a "test tone" over it would land long after you'd stopped
-  // listening. Add it first; then it's instantly testable like anything else.
-  function canTest(o: OutputInfo): boolean {
-    if (!o.present) return false;
-    if (o.kind === 'sendspin') return o.state === 'adopted';
-    return o.kind === 'airplay2' || o.kind === 'pwsink';
-  }
-  function testHint(o: OutputInfo): string {
-    if (!o.present) return 'Output is offline';
-    if (o.kind === 'sendspin' && o.state !== 'adopted')
-      return 'Add this speaker first — the router only connects to a Sendspin device once it has been added, and a fresh connection takes tens of seconds to start playing, so there is no instant test tone before that';
-    // No session attached yet (`pwsink_streaming`), so the clip rides an on-demand
-    // one — not `isOnline`, which is only reachability.
-    if (o.kind === 'pwsink' && o.pwsink_streaming !== true)
-      return 'Opens a temporary session — the target connects to it, so audio starts a moment later';
-    return '';
-  }
 
   // The daemon's own message is the honest one: whether the clip is playing now,
   // queued behind another, or waiting on an on-demand AirPlay session that takes a
@@ -771,9 +576,9 @@
 {/snippet}
 
 <div class="card info">
-  <div class="info-head">
+  <div class="card-head">
     <h2>Supported outputs</h2>
-    <div class="info-actions">
+    <div class="actions">
       <button
         class="ghost"
         type="button"
@@ -822,7 +627,7 @@
       <article class="card out-card" class:offline={!o.present} class:collapsed={isCollapsed(o)}>
         <header class="out-head">
           <button
-            class="collapse-toggle"
+            class="icon-toggle"
             aria-expanded={!isCollapsed(o)}
             title={isCollapsed(o) ? 'Show details' : 'Hide details'}
             onclick={() => toggle(o)}
@@ -996,7 +801,7 @@
     <article class="card out-card offer" class:offline={!o.present} class:collapsed={isCollapsed(o)} class:dismissed={o.state === 'ignored'}>
       <header class="out-head">
         <button
-          class="collapse-toggle"
+          class="icon-toggle"
           aria-expanded={!isCollapsed(o)}
           title={isCollapsed(o) ? 'Show details' : 'Hide details'}
           onclick={() => toggle(o)}
@@ -1085,22 +890,6 @@
 <style>
   /* Card header with help buttons — same shape as the Input-sources card on the
      Sources page, so the two pages read alike. */
-  .info-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-  .info-head h2 {
-    margin: 0;
-  }
-  .info-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
 
   /* The alignment card — the way in and the two notices. The wizard is a page of its own
      now, so this only has to hold the header, the sentence, the live-hold line and the
@@ -1163,8 +952,6 @@
   .out-card.dismissed {
     opacity: 0.55;
   }
-  /* Collapsed cards drop their body; tighten the padding so the header row
-     reads as a compact list item. */
   .out-card.collapsed {
     padding-top: 12px;
     padding-bottom: 12px;
@@ -1174,32 +961,6 @@
     align-items: center;
     gap: 12px;
     flex-wrap: wrap;
-  }
-  .collapse-toggle {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    background: transparent;
-    border: none;
-    color: var(--secondary-text-color);
-    cursor: pointer;
-    border-radius: 6px;
-  }
-  .collapse-toggle:hover {
-    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
-    color: var(--primary-color);
-  }
-  .chevron {
-    font-size: 0.7rem;
-    line-height: 1;
-    transition: transform 0.15s ease;
-  }
-  .collapse-toggle[aria-expanded='true'] .chevron {
-    transform: rotate(90deg);
   }
   .out-title {
     display: flex;

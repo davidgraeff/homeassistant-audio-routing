@@ -115,23 +115,8 @@ a {
   color: var(--secondary-text-color);
   font-size: 0.85rem;
 }
-/* A card's title line with actions (a docs button, a toggle) beside it. */
-.card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.card-head h2 {
-  margin: 0;
-}
-.card-head .actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
+/* The card/section title line lives in styles/sections.css, with the collapse
+   toggle that goes in it. */
 /* One short line of guidance next to a card title — the alternative to a
    paragraph of instructions above the thing it describes. */
 .hint {
