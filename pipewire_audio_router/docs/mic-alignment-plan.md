@@ -16,15 +16,22 @@ no usable microphone (§4.1) or the room defeats the estimator (§5.5).
 
 ## 0. Status
 
-**Viable and largely built; one feature left in the daemon; never run against real
+**Feature-complete for the target scenario; one optimisation left; never run against real
 speakers.** The microphone path is proven on hardware, the DSP is measured, the
-orchestration runs end to end in tests, and the UI renders it. What remains in the daemon
-is **parallel excitation** (W7); **multi-position chaining** (W12) is built, which
-unblocks W6c (the chaining UI) and W8b.
+orchestration and the chain run end to end in tests, and the UI renders all of it —
+including the parts a user cannot infer from the numbers, like a speaker that moved without
+being audible. **W7 (parallel excitation) is the only unbuilt feature**, and it is a speed
+optimisation: it makes measurement time roughly independent of speaker count rather than
+enabling anything new.
 
-Verified 2026-08-11: **450 daemon tests passing / 0 failing**, `cargo clippy --all-targets`
+The gate is now **W22, live acceptance** (§14.4). Every figure in this document comes from
+unit tests, synthetic signals or the W0 microphone spike — formation cost, mute settling,
+real reconnect duration and whether §5.6's bias bites are all unmeasured — and §5.6.1 makes
+W22's cross-band split data the thing that decides W9.
+
+Verified 2026-08-12: **450 daemon tests passing / 0 failing**, `cargo clippy --all-targets`
 at exactly its 6 pre-existing warnings (2 `derivable_impls`, 4 `chunks_exact` — none from
-this work), frontend `npm run check` **160 files / 0 errors / 0 warnings**,
+this work), frontend `npm run check` **162 files / 0 errors / 0 warnings**,
 `frontend/dist` untouched.
 
 **§14 is the authoritative work-package list** — remaining first, then in flight, then
@@ -1655,14 +1662,13 @@ and the frontend's chaining UI (W6c) is now unblocked.
 | WP | Content | Depends on | Size |
 |---|---|---|---|
 | **W7** | **Parallel excitation** (§6.2): the content generator, a per-device `cal_gate` in all three relays, analytic group-delay compensation, frequency assignment plus the runtime crosstalk validation §7.1 requires. Independent of W12 | W5 | large |
-| **W6c** | Frontend: the **chaining UI** — position posting, overlap picking, per-step Δ and confidence, the error statement — and the **Outputs-page move** (§12.1), which is one `<AlignWizard …/>` tag now that the wizard is self-contained. The daemon side is done: `chain: true`, `POST measure/position`, `POST measure/finish`, and `MeasureStatus.chain` | W12 | medium |
 | **W8b** | Near-field **across sessions**: optional linking to an already-aligned set through an overlap (§1.2). No longer blocked on Δ propagation (W12 built it) — what it needs is a **store** of a finished run's aligned set with its applied delays, which nothing has | W12 | small |
 | **W9** | Chirp + matched filter — the only proper fix for §5.6's early-reflection bias, and **not a noise fix** (noise is a non-problem, §5.4.1). **Gated on W22's cross-band split data** (§5.6.1), and if built it is an *automatic escalation* or a per-member diagnostic, never a preference | W22 | medium |
 | **W22** | **Live acceptance on real speakers.** Nothing here has ever run against hardware beyond the W0 mic spike: formation cost, mute-settling time, real reconnect duration, and whether the amplitude-stability gate survives a real room are all unmeasured. **Also read the per-member cross-band splits** — they decide W9 (§5.6.1). Needs a deploy | most of the above | — |
 
 ### 14.2 In flight
 
-Nothing. **W7** is next in the daemon, **W6c** in the frontend (§14.1).
+Nothing. **W7** (parallel excitation) is the last unbuilt feature; **W22** (live acceptance) is the gate on everything else (§14.1).
 
 ### 14.3 Done
 
@@ -1688,6 +1694,7 @@ Nothing. **W7** is next in the daemon, **W6c** in the frontend (§14.1).
 | **W20** | Per-**output** level knob: the `OutOfBandMute` seam grew a level pair, a pw-sink host with a live agent is levelled and restored like AP2, and only genuinely lever-less outputs are named as setting the clip ceiling. Corrected §7's table row and §12.3.2 |
 | **W21** | The relay-vs-device equivalence experiment: six bracketed readings, three writes, reporting scale and sign with a resolution bound and no silent correction. Corrected §1.1.3 |
 | **W12** | **Multi-position chaining** (§1.1): `POST measure/position` per listening spot, the two-overlap consistency **refusal**, Δ propagation to the whole already-aligned set, provisional delays in the relay throughout and **one** write wave at the end, the global renormalisation through the §2.4.2 solver, and a per-joint error statement that withholds a total when a joint had one overlap. Steps *inside* the union hold (§12.3.1) — no formation path was added. Corrected §1.2 (a chain does not depend on capture continuity across positions), §1.1 (five things it did not say — §1.1.4) and §10.4 (a chain's residual covers the last position only) |
+| **W6c** | The chaining UI on the run page, and the wizard moved to a "Timing between speakers" card on the **Outputs** page — the source card lost the microphone entry point entirely, since one session exists process-wide. Δ propagation names the speakers that moved *without being audible*; "provisional" is stated above every number; a refused position parks rather than ends |
 | **W8a** | Near-field walk with the closure measurement. **Depends on W19** (the per-arrival level lives in `AlignState.levels`), which §14.1 did not list. Corrected §10.4 (a stationary residual cannot verify a walk), §5.3 (the closure *is* the drift fit) and §1.2 (a 15-minute deadline a walk would hit) |
 
 ### 14.4 W22 — live acceptance, step by step
