@@ -758,3 +758,70 @@ in particular **no renaming of serialized fields** — `MeasureStatus` and
 `AlignState` are consumed by the frontend, and a DTO move is exactly where a
 field name gets "tidied". `npm run check` will not catch it; only reading the
 diff will.
+
+---
+
+## 11. Where tests live
+
+Tests are 10 338 of the crate's 46 157 lines. Most of them should stay exactly
+where they are — a small `#[cfg(test)] mod tests` next to a tricky function is the
+best documentation that function will ever have. The rule is about the handful that
+had grown past that:
+
+**Extract when a test module passes ~300 lines, or when it pushes its file past
+~1500.** That was seven files; the other 80 keep their inline tests.
+
+| file | before | after | tests |
+|---|---:|---:|---|
+| `align/measure.rs` | 10092 | 7032 | `measure/tests/` — 9 files by subject |
+| `align/calibrate.rs` | 2841 | 1704 | `calibrate/tests.rs` |
+| `routing/sync_group.rs` | 2216 | 1851 | `sync_group/tests.rs` |
+| `align/levels.rs` | 2153 | 1579 | `levels/tests.rs` |
+| `align/estimator.rs` | 1501 | 953 | `estimator/tests.rs` |
+| `align/relay_delay.rs` | 1388 | 894 | `relay_delay/tests.rs` |
+| `align/group.rs` | 1125 | 810 | `group/tests.rs` |
+| `api/mod.rs` | 485 | 263 | `api/tests.rs` — by the rule below |
+
+`api/mod.rs` came in under a second rule worth keeping: **tests outweighing the
+code in a file whose job is something else.** Its 221 test lines were all
+route-table shape assertions, and removing them leaves a file that is only the
+route table.
+
+### 11.1 Mechanics
+
+A file may have a sibling directory of the same name, so nothing needs renaming to
+`mod.rs` and no `#[path]` attribute is involved:
+
+```rust
+// align/calibrate.rs
+#[cfg(test)]
+mod tests;                    // -> align/calibrate/tests.rs
+```
+
+**One `tests.rs` needs no visibility changes at all.** It is a *direct* child of
+the module under test, so `use super::*;` means what it meant inline and every
+private item stays reachable. Prefer this shape whenever one file will do.
+
+**A subject split costs `pub(super)`.** `align/measure/tests/{gate,solve,…}.rs`
+are grandchildren of `measure`, so they reach the code under test through
+`use super::super::*;` — still fine, private items included — but the shared
+fixtures now live in a *sibling* module (`tests/harness.rs`), and sharing them
+means `pub(super)` on each one (88 items and fields for measure's harness). Only
+worth it when the tests are big enough to want an index, which in practice meant
+one file out of 87.
+
+Put **every** support item in `harness.rs`, including ones only one subject uses.
+The alternative is deciding, per fixture, whether a second subject might want it
+later — 50 judgement calls with no way to be right.
+
+### 11.2 What does not work
+
+A crate-root `tests/` directory. `bridge-daemon` is a bin-only crate: integration
+tests cannot link it, and they would see only the public API while nearly
+everything is `pub(crate)`. Extraction has to stay in-crate.
+
+### 11.3 The check that matters
+
+`cargo test` must report the **same count** before and after — 450 passed / 0
+failed / 3 ignored. A dropped `mod tests;` declaration does not fail the build or
+the suite; it silently stops running those tests, and the only signal is the total.
