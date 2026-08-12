@@ -6,6 +6,7 @@
   import { askConfirm, removeOutputConfirm } from '../../lib/confirm.svelte';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../../lib/types';
   import { delaySpec, hasDelayKnob } from '../../lib/outputs/delay';
+  import { setOutputMute, setOutputVolume } from '../../lib/outputs/level';
   import { canTest, kindLabel, ptpBadge, statusBadge, testHint } from '../../lib/outputs/labels';
   import GroupTitle from '../groups/GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
@@ -326,14 +327,18 @@
     clearing = { ...clearing, [o.node_name]: false };
   }
 
-  // Per-device volume / mute for present sendspin + AirPlay-2 outputs, from the
-  // always-visible card header. No local echo of the new level: the daemon pushes
-  // a matrix frame back, and <VolumeControl>'s drag guard holds the thumb until
-  // it lands — so the value on screen is always one the daemon confirmed.
+  // Per-device volume / mute for every output kind that reports a level (sendspin,
+  // AirPlay 2, and a pw-sink host through its agent), from the always-visible card
+  // header. No local echo of the new level: the daemon pushes a matrix frame back, and
+  // <VolumeControl>'s drag guard holds the thumb until it lands — so the value on
+  // screen is always one the daemon confirmed.
+  //
+  // Which endpoint that is belongs to lib/outputs/level.ts, not here: this page picking
+  // it by kind is what sent pw-sink levels to the sendspin endpoint, where they were
+  // stored for a device that does not exist and then overwritten by the next frame.
   async function onVolume(o: OutputInfo, pct: number) {
     try {
-      if (o.kind === 'airplay2') await api.setAp2Volume(o.node_name, pct / 100);
-      else await api.setSendspinVolume(o.node_name, pct);
+      await setOutputVolume(o.node_name, pct);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -342,9 +347,11 @@
     const next = !muted[o.node_name];
     muted = { ...muted, [o.node_name]: next }; // optimistic; the matrix confirms
     try {
-      if (o.kind === 'airplay2') await api.setAp2Mute(o.node_name, next);
-      else await api.setSendspinMute(o.node_name, next);
+      await setOutputMute(o.node_name, next);
     } catch (e) {
+      // The optimistic flip has to go back: a host with no live agent answers 503,
+      // and leaving the button "muted" would claim something that never happened.
+      muted = { ...muted, [o.node_name]: !next };
       toast('error', e instanceof Error ? e.message : String(e));
     }
   }

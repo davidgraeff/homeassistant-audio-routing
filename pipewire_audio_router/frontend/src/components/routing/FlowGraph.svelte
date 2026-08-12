@@ -6,6 +6,7 @@
   import { askConfirm, removeOutputConfirm } from '../../lib/confirm.svelte';
   import type { MusicGroup, NowPlaying, RoutingNode } from '../../lib/types';
   import VolumeControl from '../ui/VolumeControl.svelte';
+  import { SENDSPIN_DEV_PREFIX, setOutputMute, setOutputVolume } from '../../lib/outputs/level';
   import RoutingHelp from './RoutingHelp.svelte';
 
   // Interactive bipartite routing graph: sources on the left, what they play on
@@ -33,8 +34,6 @@
   }
   let { groups = [] }: Props = $props();
 
-  const SENDSPIN_DEV_PREFIX = 'sendspin-dev-';
-  const AP2_DEV_PREFIX = 'ap2-dev-';
   // Virtual outputs (sendspin + AirPlay-2) carry volume/mute in-band; both are
   // driven entirely by the routing matrix over the WebSocket (no polling). RAOP
   // (AirPlay 1) is being retired and no longer exposes volume in this UI.
@@ -609,10 +608,12 @@
     forgetting = null;
   }
 
+  // The endpoint per kind lives in lib/outputs/level.ts — the graph has only a node
+  // name, and guessing "AP2 or else sendspin" here is what sent pw-sink hosts' levels
+  // to the sendspin endpoint, which stored them for a device that never connects.
   async function onVolume(nodeName: string, pct: number) {
     try {
-      if (nodeName.startsWith(AP2_DEV_PREFIX)) await api.setAp2Volume(nodeName, pct / 100);
-      else await api.setSendspinVolume(nodeName, pct);
+      await setOutputVolume(nodeName, pct);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -621,9 +622,11 @@
     const next = !muted[nodeName];
     muted = { ...muted, [nodeName]: next }; // optimistic; matrix confirms
     try {
-      if (nodeName.startsWith(AP2_DEV_PREFIX)) await api.setAp2Mute(nodeName, next);
-      else await api.setSendspinMute(nodeName, next);
+      await setOutputMute(nodeName, next);
     } catch (e) {
+      // Put the optimistic flip back: an unreachable host answers 503, and the
+      // button must not keep claiming a mute that never landed.
+      muted = { ...muted, [nodeName]: !next };
       toast('error', e instanceof Error ? e.message : String(e));
     }
   }

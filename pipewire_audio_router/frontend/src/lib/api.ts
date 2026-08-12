@@ -232,6 +232,19 @@ export const api = {
   setAp2Mute: (nodeName: string, muted: boolean) =>
     request<OpResponse>('PUT', 'api/ap2/mute', { node_name: nodeName, muted }),
 
+  // pw-sink per-host volume/mute (`pwsink-dev-*`): the *receiver host's own* master
+  // out, driven by its pwrouter-agent over the control WS (docs/receiver-agent.md §6).
+  // Volume is cubic 0.0–1.0, the scale `wpctl` and HA's `volume_level` use.
+  //
+  // Unlike sendspin/AP2 there is nothing to store for later: the host owns the value
+  // and reports it back, so a host with no live agent answers **503** rather than
+  // pretending it saved the intent — which is why these must never be reached with a
+  // `sendspin-dev-*`-shaped call (see lib/outputs/level.ts).
+  setPwsinkVolume: (nodeName: string, volume: number) =>
+    request<OpResponse>('PUT', 'api/pwsink/volume', { node_name: nodeName, volume }),
+  setPwsinkMute: (nodeName: string, muted: boolean) =>
+    request<OpResponse>('PUT', 'api/pwsink/mute', { node_name: nodeName, muted }),
+
   // Sendspin per-device static delay (ms, 0-5000; 0 clears). Map node_name -> ms.
   sendspinDelays: () => request<Record<string, number>>('GET', 'api/sendspin/delays'),
   setSendspinDelay: (nodeName: string, delayMs: number) =>

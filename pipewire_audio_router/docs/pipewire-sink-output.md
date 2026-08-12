@@ -170,3 +170,21 @@ surfaced everywhere — the routing matrix carries `volume`/`muted` for
 `pwsink-dev-*` from the agent's `HostState`, and the Outputs page and flow graph
 render a control for them. A host with no agent answering correctly shows no
 control rather than a slider that silently does nothing.
+
+> **The *write* path from the web UI was missing until 2026-08-12**, and it failed in
+> the most confusing way available: the Outputs page and the flow graph each chose the
+> endpoint themselves with `kind === 'airplay2' ? ap2 : sendspin`, so a
+> `pwsink-dev-*` name went to `PUT /api/sendspin/volume`. That endpoint *stores* a
+> level for a device that has not connected yet and answers `ok: true`, so the click
+> looked accepted — and then the next pushed matrix frame, which carries what the host
+> reports, put the old value straight back. Hence "the mute button flips itself back"
+> and "the slider moves and nothing happens", with the agent never asked for anything.
+> The read side worked throughout, which is what made it look like a daemon bug.
+>
+> The mapping now lives in `frontend/src/lib/outputs/level.ts`, once, keyed off the
+> node-name prefix: a new output kind adds one branch and both call sites get it, and
+> a missing branch is a loud mistake in one place instead of a
+> wrong-but-successful write in two. `PUT /api/pwsink/volume|mute` answers **503**
+> when no agent is connected (there is nothing to save for later), so the optimistic
+> mute flip is now also rolled back on failure rather than left claiming a mute that
+> never landed.
