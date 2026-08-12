@@ -113,12 +113,21 @@ struct ConnectFail {
     msg: String,
 }
 
-/// How long [`Ap2ServerHandle::shutdown`] waits for the task to TEARDOWN its
-/// receivers before giving up. The task's `stop()`/`disconnect()` are unbounded
-/// RTSP round trips, so a powered-off receiver could otherwise stall process exit
-/// past the container's stop-grace (which would SIGKILL us and lose the TEARDOWNs
-/// that *did* have somewhere to go).
+/// How long [`Ap2ServerHandle::shutdown`] waits for the task to TEARDOWN **all** its
+/// receivers before giving up, so a powered-off receiver cannot stall process exit past
+/// the container's stop-grace (which would SIGKILL us and lose the TEARDOWNs that *did*
+/// have somewhere to go).
+///
+/// This is the group-wide budget; [`AP2_RELEASE_TIMEOUT`] bounds each receiver within it.
 const AP2_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Per-connection budget for releasing one receiver in [`teardown`]: FLUSH + TEARDOWN +
+/// close. Deliberately **smaller than [`AP2_TEARDOWN_TIMEOUT`]**, which is the budget for
+/// the *whole* group: teardown is sequential, so a single unresponsive receiver must not
+/// consume the entire allowance and leave its groupmates un-torn-down on process exit —
+/// that would strand exactly the stale sessions this is meant to release. At 1 s, three
+/// receivers still fit inside the group budget, and a responsive one answers in ms.
+const AP2_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long a freshly-connected receiver gets to answer the post-connect
 /// `GET_PARAMETER` volume read. Deliberately short: the answer is only a UI nicety
@@ -416,8 +425,34 @@ async fn teardown(conns: Vec<(String, Connection)>, fwd_tasks: Vec<tokio::task::
     for (name, mut c) in conns {
         control.lock().await.unregister(&name);
         crate::outputs::overlay_mixer::OverlayMixer::global().clear_output_rate(&name);
-        let _ = c.stop().await;
-        let _ = c.disconnect().await; // also aborts the event-channel reader
+        // **Bounded per connection.** `stop()` (FLUSH) and `disconnect()` (TEARDOWN +
+        // close) are both RTSP round trips, and unbounded they let one unresponsive
+        // receiver hang the group task *inside* teardown — still owning `conns`, so no
+        // `Connection` is dropped, no socket is closed and no sender thread is joined.
+        // One slow receiver would then strand the whole group's resources, which is the
+        // opposite of what teardown is for.
+        //
+        // The evidence this was really happening: four sockets to the two receivers sat
+        // in CLOSE_WAIT indefinitely (2026-08-12), in two bursts of one-per-receiver that
+        // matched the two abandoned group generations. CLOSE_WAIT means the *receiver*
+        // closed and we never did — i.e. a live owner still held the fd. Dropping a
+        // `Connection` does close its socket, so bounding these awaits is what guarantees
+        // the drop is reached: on timeout we lose the graceful TEARDOWN, but `c` still
+        // falls out of scope here and the fd goes with it.
+        let released = tokio::time::timeout(AP2_RELEASE_TIMEOUT, async {
+            let _ = c.stop().await;
+            let _ = c.disconnect().await; // also aborts the event-channel reader
+        })
+        .await;
+        if released.is_err() {
+            tracing::warn!(
+                "AP2: '{name}' did not complete TEARDOWN within {:?}; closing its socket anyway \
+                 (its session may stay busy until the receiver times it out)",
+                AP2_RELEASE_TIMEOUT
+            );
+        }
+        // `c` drops here whether or not the round trips finished — closing the RTSP
+        // socket and releasing the sender/producer threads.
     }
     tracing::info!("AP2 group: senders stopped");
 }
