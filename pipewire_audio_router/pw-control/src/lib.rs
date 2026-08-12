@@ -1,5 +1,5 @@
 //! Shared PipeWire control primitives for the add-on's daemon and the
-//! receiver-side agent (docs/receiver-agent-plan.md §12).
+//! receiver-side agent (docs/receiver-agent.md §12).
 //!
 //! Both sides do the same two low-level things — encode/decode volume pods, and
 //! load a module into their *own* `pw_context` — and both had a marked copy of

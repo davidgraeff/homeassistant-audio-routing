@@ -2,7 +2,7 @@ use super::*;
 
 // ---- Receiver agents (outputs/pwsink/agent.rs) -----------------------------------
 //
-// A pw-sink output is a receiver agent (docs/receiver-agent-plan.md §3). The pairing
+// A pw-sink output is a receiver agent (docs/receiver-agent.md §3). The pairing
 // *decisions* are output operations — `/api/outputs/{n}/adopt` pairs, `/unpair`
 // revokes, `/ignore` hides — because a host asking to pair is a discovered output and
 // nothing is gained by giving it a second vocabulary. What is left here is the

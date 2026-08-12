@@ -1,5 +1,5 @@
 <script lang="ts">
-  // "Explain receiver hosts" — the document behind the second help button in the
+  // "Setup Linux/PipeWire host" — the document behind the second help button in the
   // Supported outputs header, and the place the agent binaries are downloaded
   // from. Mirrors RtpSenderDocs: the commands are built for *this* install, so
   // they can be copied without editing.
@@ -47,7 +47,7 @@
     onclick={(e) => e.stopPropagation()}
   >
     <div class="card-head">
-      <h2 id="agent-docs-title">Receiver hosts: streaming to a Linux machine</h2>
+      <h2 id="agent-docs-title">Streaming to a Linux/PipeWire machine</h2>
       <button class="ghost" type="button" onclick={onClose}>Close</button>
     </div>
 

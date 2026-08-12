@@ -260,5 +260,5 @@ it's obvious it can be removed after the deployment has booted once.
   (`discovery.rs`) gone; `pw_module.rs` stays but only serves the RTP source.
 
 ## References
-- `docs/airplay2-roadmap.md` (Phase 6 + "What dropping RAOP simplifies").
+- `docs/airplay2-output.md` (Phase 6 + "What dropping RAOP simplifies").
 - Memory: HA local add-on build-vs-pull; routing via automations.

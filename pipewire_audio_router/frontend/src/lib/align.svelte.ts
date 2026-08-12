@@ -2,7 +2,7 @@
 // the click looping through them, and who is audible at what level.
 //
 // The daemon allows exactly one session at a time, process-wide, so it cannot live in
-// a component: this module owns it and the wizard on the Outputs page renders it.
+// a component: this module owns it and the wizard, on the Alignment page, renders it.
 //
 // **Its identity is a set of speakers, not a source set** (plan §12.1, §12.3.1). It
 // used to be the other way round — a group was resolved from the sources feeding it,
@@ -315,7 +315,7 @@ function createAlign() {
      *  mode was `manual`, on the theory that a by-ear session could only have been started
      *  by the page being unmounted — true while by-ear lived on source cards, and false
      *  now that `manual` is one of the wizard's three modes (plan §1). Keeping that rule
-     *  would mean a by-ear hold, formed on the Outputs page like every other, being torn
+     *  would mean a by-ear hold, formed in the wizard like every other, being torn
      *  down by *another* page unmounting; and applying it here would tear one down the
      *  moment the user switched tabs mid-tuning. So there is exactly one way a session
      *  ends: someone asks for it to end (`stop()`, the wizard's "Stop and restore"), or the

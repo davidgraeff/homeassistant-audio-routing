@@ -246,7 +246,7 @@ methods, and (if ever wanted) `player.rs`.
 
 **Remote producers dial out.** The Pi opens a WebSocket to the daemon and pushes; the daemon
 never connects to the Pi. This is the same decision, for the same reasons, as
-[`receiver-agent-plan.md`](../pipewire_audio_router/docs/receiver-agent-plan.md) §5: nothing
+[`receiver-agent.md`](../pipewire_audio_router/docs/receiver-agent.md) §5: nothing
 has to listen on the Pi, no firewall hole, and a changed Pi address costs nothing. That
 agent's protocol file states the two properties worth copying verbatim — a `PROTOCOL_VERSION`
 checked in the first message, and **data/commands as an enum, not a passthrough**.

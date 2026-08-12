@@ -87,7 +87,7 @@ case no longer exists.** Checked:
 - **RAOP output was hard-dropped** on 2026-07-26 — `raop.rs`, the RAOP-only
   `discovery.rs` and the `/api/outputs` CRUD around it are deleted, no fallback
   path retained ([decisions.md](decisions.md) "Hard-drop RAOP, no fallback";
-  [airplay2-roadmap.md](airplay2-roadmap.md) "RAOP is already removed").
+  [airplay2-output.md](airplay2-output.md) "RAOP is already removed").
 - **Every routable output is now virtual and served by a per-device relay.**
   `build_matrix` says so in as many words ("Every output is now virtual +
   auto-discovered … audio reaches them via a group sink, not a live node here",

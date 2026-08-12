@@ -2,14 +2,14 @@
 
 How to poke a running bridge-daemon instance and the gotchas that cost
 time during bring-up. Companion to [architecture.md](architecture.md)
-(how it's built) and [airplay2-roadmap.md](airplay2-roadmap.md) (what's
+(how it's built) and [airplay2-output.md](airplay2-output.md) (what's
 done vs. planned).
 
 **Open investigations** with their own plans (measurements, hypotheses,
 decision points): [sendspin-open-items.md](sendspin-open-items.md) (open work) and the archived
 [sendspin-group-churn-plan.md](old/sendspin-group-churn-plan.md) (the investigation)
 (adding a speaker silences the group for >10 s) and
-[rtp-input-dropouts-plan.md](rtp-input-dropouts-plan.md) (Bluetooth/RTP input
+[rtp-input-dropouts.md](rtp-input-dropouts.md) (Bluetooth/RTP input
 drops out every 5–10 min for up to 2 min).
 
 ## Environment / who's who (dev setup)

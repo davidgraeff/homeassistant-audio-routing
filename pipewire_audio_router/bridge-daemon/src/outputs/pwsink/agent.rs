@@ -1,5 +1,5 @@
 //! Daemon side of the **pwrouter-agent** control plane
-//! (docs/receiver-agent-plan.md §4-§9).
+//! (docs/receiver-agent.md §4-§9).
 //!
 //! A pw-sink target *is* a paired agent (§3): the helper on the receiver dials in
 //! here, is approved once by a human, and from then on this module is the only way
@@ -871,7 +871,7 @@ async fn handle_socket(socket: WebSocket, state: crate::state::AppState) {
                         Ok(AgentMsg::ForeignSession { session }) => {
                             tracing::warn!(
                                 "host '{label}' also receives session '{session}' from another router \
-                                 (cross-talk; see receiver-agent-plan.md §7.1)"
+                                 (cross-talk; see receiver-agent.md §7.1)"
                             );
                         }
                         Ok(AgentMsg::Pong) => {}

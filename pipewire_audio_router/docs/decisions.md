@@ -14,9 +14,9 @@ and Raspberry Pi Bluetooth bridges) and the project premise, see
 [`../../docs/decisions.md`](../../docs/decisions.md). For how the daemon is
 put together, see [architecture.md](architecture.md); for what each subsystem
 delivered and what is still open, the per-subsystem records
-([airplay2-roadmap.md](airplay2-roadmap.md),
-[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md),
-[receiver-agent-plan.md](receiver-agent-plan.md),
+([airplay2-output.md](airplay2-output.md),
+[pipewire-sink-output.md](pipewire-sink-output.md),
+[receiver-agent.md](receiver-agent.md),
 [mic-alignment-plan.md](mic-alignment-plan.md),
 [sendspin-open-items.md](sendspin-open-items.md)).
 
@@ -234,7 +234,7 @@ Three consequences worth stating, because each replaced a designed mechanism:
   ([architecture.md §5.6](architecture.md#56-reachable-connected-playing--three-states-one-rule)).
 
 Evidence and the full as-built path:
-[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md).
+[pipewire-sink-output.md](pipewire-sink-output.md).
 
 ## A pw-sink target is an agent-managed host, and the agent dials out
 
@@ -272,7 +272,7 @@ ignored by `wpctl`, leaves `softVolumes` at 1.0, and is reverted within seconds
 because WirePlumber mirrors the device route onto the node. Node `Props` keeps
 one job on that host — ducking *foreign* playback streams, where being
 invisible to the user's slider is the point. Full trust model, packaging and
-spike numbers: [receiver-agent-plan.md](receiver-agent-plan.md).
+spike numbers: [receiver-agent.md](receiver-agent.md).
 
 ## Aligning speakers: measure through the running codec, and write once
 
@@ -466,7 +466,7 @@ declares the two C functions (`pw_context_load_module` /
 via a `pipewire::channel` command channel — see
 `bridge-daemon/src/pw_module.rs` and `pw/thread.rs`. (Note: RAOP outputs
 are being replaced by the in-process AP2 sender — see the AP2 decisions
-above and [airplay2-roadmap.md](airplay2-roadmap.md) — but `pw_module.rs`
+above and [airplay2-output.md](airplay2-output.md) — but `pw_module.rs`
 stays, because the RTP source and source-ducking use it too.)
 
 Sendspin outputs never had this constraint anyway — their sink node is a
@@ -880,7 +880,7 @@ Reading a receiver that is out of step:
 pw-sink's dial is the *only* lever on that path's delay, which is why it exists at
 all: `welcome` carries the value, and changing it re-sends `welcome` rather than
 adding a message type, because the agent reloads its receiver on every one by
-design (receiver-agent-plan §13.4). That works against already-deployed agents.
+design (receiver-agent §13.4). That works against already-deployed agents.
 
 ## No unbounded queues
 
@@ -975,7 +975,7 @@ The daemon used to run a membership watchdog beside `module-rtp-source`
 (`rtp_membership.rs`) that held the host's multicast membership and reloaded the
 module if the group looked lost. It is **deleted**, for three independent
 reasons, each measured during the 2026-07-28 dropout investigation
-([rtp-input-dropouts-plan.md](rtp-input-dropouts-plan.md) §4):
+([rtp-input-dropouts.md](rtp-input-dropouts.md) §4):
 
 - **Its trigger could never fire.** It required `igmp_users < 2`; the value is
   constantly 2, because the module and the keepalive are both joined.

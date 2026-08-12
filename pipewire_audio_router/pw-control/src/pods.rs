@@ -4,7 +4,7 @@
 //!
 //! * **Device `Route`** — the master volume/mute of a real device sink. This is
 //!   what `wpctl` and the desktop applet read and write, so it is what a
-//!   user-facing volume must drive (receiver-agent-plan.md §6.1: node `Props`
+//!   user-facing volume must drive (receiver-agent.md §6.1: node `Props`
 //!   writes on a device sink are invisible *and* get re-synced away by
 //!   WirePlumber).
 //! * **Node `Props`** — per-node/per-stream gain. What the daemon uses for its own

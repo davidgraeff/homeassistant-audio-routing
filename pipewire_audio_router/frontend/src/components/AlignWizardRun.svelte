@@ -8,6 +8,7 @@
   // "this is hung", and the plan is explicit that a run which cannot explain itself
   // gets blamed on the user's hand for something a doorbell did.
   import AlignRefusal from './AlignRefusal.svelte';
+  import AlignRunLog from './AlignRunLog.svelte';
   import AlignWizardChain from './AlignWizardChain.svelte';
   import AlignWizardWalk from './AlignWizardWalk.svelte';
   import { knobNoun, memberKindLabel } from '../lib/align.svelte';
@@ -195,6 +196,10 @@
       Nothing was written, so a retry costs only the time. If the estimator keeps refusing, go back to
       <strong>Mode</strong> and pick <strong>Manual</strong> — by ear, no microphone, and the speakers stay held.
     </span>
+    <!-- A refused run is the case the transcript exists for: the refusal names *what* the
+         daemon would not accept, and the transcript is the only place that says what it was
+         seeing while it decided. -->
+    <AlignRunLog reason="This run refused, so its transcript is worth keeping." />
   </div>
 {/if}
 

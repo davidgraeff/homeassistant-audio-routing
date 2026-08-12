@@ -451,7 +451,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         });
     }
 
-    // pw-sink hosts = **receiver agents** (docs/receiver-agent-plan.md §3). A host is
+    // pw-sink hosts = **receiver agents** (docs/receiver-agent.md §3). A host is
     // here because a helper on it dialled in, not because something answered an mDNS
     // browse — which is why `present` means "the agent is connected" and
     // `pwsink_streaming` still means "a receiver completed the AppleMIDI handshake"

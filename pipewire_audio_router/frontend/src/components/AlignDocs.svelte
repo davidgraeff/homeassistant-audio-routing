@@ -1,6 +1,6 @@
 <script lang="ts">
-  // "Explain speaker alignment" — the document behind the help button on the **Outputs**
-  // page's timing card, beside the wizard it describes (plan §12.1).
+  // "Explain speaker alignment" — the document behind the help button on the
+  // **Alignment** page, beside the wizard it describes (plan §12.1).
   //
   // It used to live in the Sources header and explain why alignment was *per source*: a
   // sync group was resolved from the source set feeding it, so a source card listed the
@@ -69,7 +69,8 @@
       <p>
         A microphone in one place hears the electrical delay <em>and</em> the sound's travel time together and cannot
         separate them — about 3 ms per extra metre. That is not a problem to be solved but a choice about what "aligned"
-        should mean, so it is the wizard's first question.
+        should mean, so the wizard asks it as soon as it knows which answers this phone can deliver: it checks the
+        microphone first, and the two measured modes are only offered when there is a capture to measure with.
       </p>
       <ul>
         <li>

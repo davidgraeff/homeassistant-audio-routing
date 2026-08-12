@@ -18,8 +18,8 @@
 //!
 //! The jitter buffer (`sess.latency.msec`) is a *receiver-side* concern (it sets
 //! the remote rtp-sap's target buffer), so it is not in the sender args here; it
-//! is configured on the receiving host. See docs/pipewire-sink-roadmap.md §5 and
-//! docs/pipewire-sink-spike-results.md.
+//! is configured on the receiving host. See docs/pipewire-sink-output.md §1 and
+//! docs/old/pipewire-sink-spike-results.md.
 
 use std::fmt::Write as _;
 
@@ -48,7 +48,7 @@ pub const DEFAULT_PWSINK_PORT: u16 = 5004;
 /// `L16` (RFC 3551 = big-endian), PipeWire actually puts the bytes on the wire in
 /// the configured native format — **S16LE** — and does NOT byte-swap to
 /// RFC-canonical big-endian. So the **receiver must use `audio.format=S16LE`**
-/// (S16BE gives loud byte-swapped noise). See docs/pipewire-sink-spike-results.md.
+/// (S16BE gives loud byte-swapped noise). See docs/old/pipewire-sink-spike-results.md.
 pub fn rtp_sink_module_args(node_name: &str, sess_name: &str, dest_ip: &str, port: u16, ifname: Option<&str>) -> String {
     let mut a = String::new();
     a.push_str("{ ");

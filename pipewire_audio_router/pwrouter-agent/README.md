@@ -5,7 +5,7 @@ Linux host you want the router to stream to; the host then appears in the add-on
 as an output whose volume and mute Home Assistant can drive, and whose *other*
 audio (Spotify, a browser, a game) can be ducked while an announcement plays.
 
-Design and rationale: [`../docs/receiver-agent-plan.md`](../docs/receiver-agent-plan.md).
+Design and rationale: [`../docs/receiver-agent.md`](../docs/receiver-agent.md).
 
 ## What it does — and what it deliberately cannot do
 

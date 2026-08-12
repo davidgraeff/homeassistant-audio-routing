@@ -9,7 +9,7 @@
 //! system `avahi-daemon`, deliberately absent — the daemon does mDNS in-process),
 //! so it speaks the AppleMIDI **sender** side directly. This was proven end-to-end
 //! by a Python spike against a stock receiver (clean tone, `E@440 = 0.238`); see
-//! `docs/pipewire-sink-spike-results.md` ("PROVEN" section) and the blueprint
+//! `docs/old/pipewire-sink-spike-results.md` ("PROVEN" section) and the blueprint
 //! `scratchpad/spikes/applemidi_sender.py`.
 //!
 //! # This file is a FROZEN INTERFACE (contract)

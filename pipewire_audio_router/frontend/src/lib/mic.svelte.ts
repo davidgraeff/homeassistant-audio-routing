@@ -83,15 +83,128 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   channelCount: 1,
 };
 
-/** Why the mic cannot be used at all, or `null` when it can be asked for. */
-export function preflight(): string | null {
+/** Why the microphone cannot be used, as a **kind** and not only a sentence.
+ *
+ *  The kind exists because the wizard's first step reduces the mode choice from it
+ *  (plan §1, §4.1, §4.2), and these are genuinely different statements: an insecure
+ *  context makes measuring *impossible here* with no workaround, a denied permission is
+ *  a decision the user can change, and a browser that kept echo cancellation on is a
+ *  working microphone that must still be refused. A message string cannot be branched
+ *  on, and inferring the kind by matching on that string is how a reworded sentence
+ *  silently unlocks a mode. */
+export type MicFailure =
+  /** §4.1: not a secure context, so `navigator.mediaDevices` does not exist at all. */
+  | 'insecure'
+  /** No `AudioWorkletNode`, so nothing can be captured for measurement. */
+  | 'no_worklet'
+  /** The permission was refused, or the page is not allowed to ask. */
+  | 'denied'
+  /** No usable input device, or one that exists and could not be opened. */
+  | 'no_input'
+  /** §4.2: the browser kept a processor switched on despite being asked not to. */
+  | 'processing'
+  /** The capture rate, the worklet, or the daemon's own refusal of the stream. */
+  | 'other';
+
+/** A failure that is knowable *before* asking for the microphone. */
+export interface MicBlock {
+  kind: 'insecure' | 'no_worklet';
+  message: string;
+}
+
+/** Why the mic cannot even be asked for, or `null` when it can be.
+ *
+ *  Structured rather than a bare sentence: §4.1's insecure context is the one
+ *  precondition with no workaround, and the mode picker has to be able to say so
+ *  differently from "this browser cannot capture". */
+export function preflightBlock(): MicBlock | null {
   if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-    return 'This page is not a secure context, so the browser hides the microphone entirely. Open Home Assistant over HTTPS (not http://…:8123) and try again — there is no way around this.';
+    return {
+      kind: 'insecure',
+      message:
+        'This page is not a secure context, so the browser hides the microphone entirely. Open Home Assistant over HTTPS (not http://…:8123) and try again — there is no way around this.',
+    };
   }
   if (typeof AudioWorkletNode === 'undefined') {
-    return 'This browser has no AudioWorklet support, so it cannot capture audio for measurement. Use a current Safari, Chrome or Firefox.';
+    return {
+      kind: 'no_worklet',
+      message:
+        'This browser has no AudioWorklet support, so it cannot capture audio for measurement. Use a current Safari, Chrome or Firefox.',
+    };
   }
   return null;
+}
+
+/** The same answer as a sentence, for callers that only display it. */
+export function preflight(): string | null {
+  return preflightBlock()?.message ?? null;
+}
+
+/** What the microphone check established (plan §4, and the wizard's first step).
+ *
+ *  One value, four states, so the mode picker never has to reason about `phase`,
+ *  `error` and `caveats` separately and reach a different conclusion than the mic
+ *  panel did. */
+export type MicOutcomeState =
+  /** Not asked for yet — and an insecure context is *not* this, because that is
+   *  knowable without asking. */
+  | 'unchecked'
+  /** The permission prompt / worklet load is in flight. */
+  | 'checking'
+  /** Capturing right now; `caveats` may still carry §4.2's unreported constraints. */
+  | 'working'
+  | 'failed';
+
+export interface MicOutcome {
+  state: MicOutcomeState;
+  /** Set for `failed` only. */
+  failure: MicFailure | null;
+  /** The failure's own sentence, verbatim — never re-worded by a caller. */
+  message: string | null;
+  /** §4.2 constraints the browser did not report either way. Only for `working`, and
+   *  deliberately not a failure: Safari omits all three, and refusing on silence would
+   *  rule out every iPhone. */
+  caveats: string[];
+}
+
+/** Why the two **measured** modes cannot be offered, or `null` when they can
+ *  (plan §1, §4.1, §4.2).
+ *
+ *  Returns the reason rather than a boolean because the reduction is done by
+ *  *disabling with a stated reason*: a user has to be able to see that Near field
+ *  exists and why it is unavailable at this moment. Short on purpose — it is rendered
+ *  inside the disabled option, next to the mode's own description. */
+export function measuredBlock(o: MicOutcome): string | null {
+  if (o.state === 'working') return null;
+  if (o.state === 'checking') return 'The microphone check has not finished yet.';
+  if (o.state === 'unchecked') {
+    return 'The microphone has not been checked yet. Measuring needs a live capture, so run the check on the Microphone step first.';
+  }
+  switch (o.failure) {
+    case 'insecure':
+      return 'This page is not a secure context, so the browser hides the microphone entirely. Measuring is impossible until Home Assistant is opened over HTTPS, and there is no way around it.';
+    case 'no_worklet':
+      return 'This browser cannot capture audio for measurement (no AudioWorklet), so there is nothing to measure with.';
+    case 'denied':
+      return 'The browser did not give this page the microphone, so there is nothing to measure with.';
+    case 'no_input':
+      return 'No usable microphone input, so there is nothing to measure with.';
+    case 'processing':
+      return 'The browser kept a signal processor switched on. Echo cancellation is designed to remove loudspeaker sound from a microphone signal — exactly the sound being measured — so a measured run would be wrong rather than merely noisy.';
+    default:
+      return 'The microphone capture did not come up, so there is nothing to measure with.';
+  }
+}
+
+/** A §4.2 caveat that must travel with a measured run, or `null`.
+ *
+ *  Not a block: the constraints were *asked* for and the browser simply did not report
+ *  whether it honoured them (Safari reports none of them). So the measured modes stay
+ *  available and this sentence goes with them, rather than being dropped because it is
+ *  inconvenient. */
+export function measuredCaveat(o: MicOutcome): string | null {
+  if (o.state !== 'working' || o.caveats.length === 0) return null;
+  return `This browser did not report whether it switched off ${o.caveats.join(', ')}. Measuring is still allowed — refusing on silence would rule out every iPhone — but if a run comes out inconsistent, this is the first thing to suspect. The run itself watches for the signature (a tone that fades as the capture goes on) and says so if it sees it.`;
 }
 
 /** The processor settings that matter, as the browser actually applied them.
@@ -117,6 +230,55 @@ export function refusalFor(s: AppliedSettings): string | null {
   return `The browser kept ${on.join(', ')} switched on despite being asked not to. That processing removes or reshapes the very signal being measured, so the measurement would be wrong rather than merely noisy. Try another browser, or align by ear.`;
 }
 
+/** A capture failure that knows its own kind. Thrown inside `start()` and unwrapped by
+ *  its one catch, so every exit path files the same `MicFailure` the mode picker reads. */
+class CaptureError extends Error {
+  readonly kind: MicFailure;
+  constructor(kind: MicFailure, message: string) {
+    super(message);
+    this.kind = kind;
+  }
+}
+
+/** Classify a `getUserMedia` rejection by its `name`, which is the only part of it the
+ *  spec pins down — the `message` is engine prose and differs per browser.
+ *
+ *  The distinction that matters to the wizard is "you said no" (a decision, changeable)
+ *  versus "there is no input" (equipment) versus everything else. All three block the
+ *  measured modes; they do not block them for the same reason, and telling a user to
+ *  grant a permission they already granted is worse than saying nothing. */
+function captureFailure(e: unknown): CaptureError {
+  const name = e instanceof Error ? e.name : '';
+  const own = e instanceof Error && e.message ? e.message : 'no reason given';
+  switch (name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return new CaptureError(
+        'denied',
+        'The browser did not give this page the microphone. Allow microphone access for this site (in the address-bar permission control) and start it again — or align by ear, which needs no microphone.',
+      );
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return new CaptureError(
+        'no_input',
+        'This device reports no audio input at all, so there is nothing to capture. Plug in or enable a microphone, or align by ear.',
+      );
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return new CaptureError(
+        'no_input',
+        `The microphone exists but could not be opened (${own}) — another application may be holding it. Close whatever is recording and try again.`,
+      );
+    case 'OverconstrainedError':
+      return new CaptureError(
+        'no_input',
+        'No audio input could be opened as a single mono channel with the browser’s own processing switched off, which is what a measurement needs (plan §4.2).',
+      );
+    default:
+      return new CaptureError('other', `The microphone could not be started: ${own}.`);
+  }
+}
+
 /** Settings that were asked for but not reported back — shown as a caveat. */
 export function unreported(s: AppliedSettings): string[] {
   const missing: string[] = [];
@@ -129,6 +291,9 @@ export function unreported(s: AppliedSettings): string[] {
 function createMic() {
   let phase = $state<'idle' | 'starting' | 'capturing' | 'error'>('idle');
   let error = $state<string | null>(null);
+  /** What kind of failure `error` is. Kept beside the sentence rather than derived from
+   *  it, because the wizard's mode reduction branches on this. */
+  let failure = $state<MicFailure | null>(null);
   /** Constraints the browser did not confirm either way (plan §4.2). */
   let caveats = $state<string[]>([]);
   /** Last ingest status from the daemon — the meter's source of truth, so a
@@ -201,9 +366,13 @@ function createMic() {
     });
   }
 
+  /** A capture that was running and stopped being one. Always `other`: the stream was
+   *  proven a moment ago, so this is the daemon or the network, never a permission and
+   *  never a processor. */
   function fail(reason: string) {
     teardown();
     error = reason;
+    failure = 'other';
     phase = 'error';
   }
 
@@ -277,36 +446,65 @@ function createMic() {
     get preflightError() {
       return preflight();
     },
+    /** What the check has established, in one value (see `MicOutcome`).
+     *
+     *  Composed here rather than in the wizard so the mic panel and the mode picker
+     *  cannot reach different conclusions from the same three fields. Two properties are
+     *  load-bearing:
+     *
+     *  * an **insecure context is `failed` before anything is asked for** — §4.1 is
+     *    detectable without a permission prompt, and prompting for a microphone the
+     *    browser has already hidden would be theatre;
+     *  * `working` means **capturing right now**, not "worked once". The measured modes
+     *    need a live capture (the daemon refuses with `mic_missing` otherwise), so a
+     *    capture the user has stopped must not leave a mode enabled that cannot run. */
+    get outcome(): MicOutcome {
+      const blocked = preflightBlock();
+      if (blocked) return { state: 'failed', failure: blocked.kind, message: blocked.message, caveats: [] };
+      if (phase === 'capturing') return { state: 'working', failure: null, message: null, caveats };
+      if (phase === 'starting') return { state: 'checking', failure: null, message: null, caveats: [] };
+      if (phase === 'error') return { state: 'failed', failure: failure ?? 'other', message: error, caveats: [] };
+      return { state: 'unchecked', failure: null, message: null, caveats: [] };
+    },
 
     /** Ask for the mic and start streaming. Must be called from a user gesture:
      *  both the permission prompt and (on iOS) resuming the AudioContext need one. */
     async start() {
       if (phase === 'starting' || phase === 'capturing') return;
       error = null;
+      failure = null;
       caveats = [];
       dropped = 0;
       blocksSent = 0;
       status = null;
-      const blocked = preflight();
+      const blocked = preflightBlock();
       if (blocked) {
-        error = blocked;
+        error = blocked.message;
+        failure = blocked.kind;
         phase = 'error';
         return;
       }
       phase = 'starting';
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS, video: false });
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS, video: false });
+        } catch (e) {
+          throw captureFailure(e);
+        }
         const track = stream.getAudioTracks()[0];
-        if (!track) throw new Error('the browser returned a stream with no audio track');
+        if (!track) throw new CaptureError('no_input', 'the browser returned a stream with no audio track');
         const settings = track.getSettings() as AppliedSettings;
         const refusal = refusalFor(settings);
-        if (refusal) throw new Error(refusal);
+        // §4.2's one hard refusal, and it is a *processing* failure rather than a broken
+        // microphone: the capture works perfectly and would measure the wrong thing.
+        if (refusal) throw new CaptureError('processing', refusal);
         caveats = unreported(settings);
 
         ctx = new AudioContext();
         rate = ctx.sampleRate;
         if (!ACCEPTED_RATES.includes(rate)) {
-          throw new Error(
+          throw new CaptureError(
+            'other',
             `This browser captures at ${rate} Hz; the daemon accepts 48000 or 44100 Hz. Resampling in the browser would add an unknown delay to what is being measured, so this capture is refused.`,
           );
         }
@@ -348,6 +546,7 @@ function createMic() {
       } catch (e) {
         teardown();
         error = e instanceof Error ? e.message : String(e);
+        failure = e instanceof CaptureError ? e.kind : 'other';
         phase = 'error';
       }
     },
@@ -370,6 +569,7 @@ function createMic() {
       teardown();
       phase = 'idle';
       error = null;
+      failure = null;
     },
   };
 

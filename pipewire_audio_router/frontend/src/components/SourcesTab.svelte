@@ -102,7 +102,7 @@
 
   // Nothing about speaker *timing* lives on this page any more (plan §12.1): aligning
   // means picking a set of speakers and holding them, which is a choice about speakers,
-  // so all three modes — measured, walked and by ear — are on the Outputs page. This
+  // so all three modes — measured, walked and by ear — live on the Alignment page. This
   // page therefore does not touch the alignment session at all, and that is the point:
   // there is one session process-wide, and a page that neither starts nor shows it
   // cannot tear it down either.

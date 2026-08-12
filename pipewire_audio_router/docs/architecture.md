@@ -10,9 +10,9 @@ bridge firmware) lives one level up in
 and *why* each piece is built this way lives in
 [decisions.md](decisions.md). What each subsystem delivered and what is
 still open is in the per-subsystem records —
-[airplay2-roadmap.md](airplay2-roadmap.md),
-[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md),
-[receiver-agent-plan.md](receiver-agent-plan.md),
+[airplay2-output.md](airplay2-output.md),
+[pipewire-sink-output.md](pipewire-sink-output.md),
+[receiver-agent.md](receiver-agent.md),
 [mic-alignment-plan.md](mic-alignment-plan.md),
 [sendspin-open-items.md](sendspin-open-items.md) — and how to poke a running
 instance is in [live-instance-debugging.md](live-instance-debugging.md).
@@ -338,8 +338,8 @@ Known limitation: stock `module-rtp-session` in discover mode attaches to
 *every* advertised session of the media type (the session name is never
 compared), so 2+ pw-sink targets on one LAN cross-connect. Details, and the
 `rtp.session` hook that would fix it agent-side, are in
-[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md) §4 and
-[receiver-agent-plan.md](receiver-agent-plan.md) §7.1.
+[pipewire-sink-output.md](pipewire-sink-output.md) §4 and
+[receiver-agent.md](receiver-agent.md) §7.1.
 
 ### 5.4 One mDNS browse per service type — a shared daemon can't be shared for browsing
 
@@ -439,7 +439,7 @@ differs per backend:
   Same caveat as routed pw-sink streaming: with 2+ pw-sink targets on one LAN,
   discover-mode receivers attach to *every* advertised session, so an
   announcement aimed at one can be heard by the others (the deferred
-  session-scoping decision, `docs/pipewire-sink-roadmap.md` §4).
+  session-scoping decision, `docs/pipewire-sink-output.md` §4).
 
 **"Live" means connected, not dialed.** For both dialed backends, group
 membership only says what the group *dialed*: `routing::sync_group::dialed_session_established`

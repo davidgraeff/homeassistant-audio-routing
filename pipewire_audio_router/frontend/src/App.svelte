@@ -4,6 +4,7 @@
   import Toasts from './components/Toasts.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
   import OutputsTab from './components/OutputsTab.svelte';
+  import AlignmentTab from './components/AlignmentTab.svelte';
   import MusicGroupsTab from './components/MusicGroupsTab.svelte';
   import AnnouncementsTab from './components/AnnouncementsTab.svelte';
   import SourcesTab from './components/SourcesTab.svelte';
@@ -12,14 +13,20 @@
 
   // Music groups is the primary surface: who plays together, and what they play
   // (with the low-level routing graph on the same page). Announcements is the
-  // other half of the group model. Alignment is per sync group, and a sync group
-  // is identified by its source, so it lives on Sources.
-  type Tab = 'music' | 'announcements' | 'outputs' | 'sources' | 'settings' | 'diagnostics';
+  // other half of the group model.
+  //
+  // **Alignment is a page, not a panel** (plan §12.1). It is about a *set of speakers* the
+  // user picks — never a source group — so it sits next to Outputs; and it is five wizard
+  // pages deep, ending in a report that is read rather than glanced at, so it gets the room
+  // a page has. Outputs keeps the way in and the "an alignment is holding these right now"
+  // state, because those are what someone needs while looking at their speakers.
+  type Tab = 'music' | 'announcements' | 'outputs' | 'alignment' | 'sources' | 'settings' | 'diagnostics';
   let tab = $state<Tab>('music');
   const tabs: { id: Tab; label: string }[] = [
     { id: 'music', label: 'Music groups' },
     { id: 'announcements', label: 'Announcements' },
     { id: 'outputs', label: 'Outputs' },
+    { id: 'alignment', label: 'Alignment' },
     { id: 'sources', label: 'Sources' },
     { id: 'settings', label: 'Settings' },
     { id: 'diagnostics', label: 'Diagnostics' },
@@ -46,7 +53,14 @@
   {:else if tab === 'announcements'}
     <AnnouncementsTab />
   {:else if tab === 'outputs'}
-    <OutputsTab />
+    <!-- The one cross-page navigation in the app, and it is one-way: Outputs offers to
+         align, and this owns the tab, so the page that starts an alignment does not have to
+         know it is a tab at all. -->
+    <OutputsTab onAlign={() => (tab = 'alignment')} />
+  {:else if tab === 'alignment'}
+    <!-- Closing the wizard (offered only when nothing is held and no run is in progress)
+         goes back to the speakers it is about. -->
+    <AlignmentTab onDone={() => (tab = 'outputs')} />
   {:else if tab === 'sources'}
     <SourcesTab />
   {:else if tab === 'settings'}

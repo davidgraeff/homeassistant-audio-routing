@@ -1,10 +1,13 @@
 <script lang="ts">
-  // Wizard page 1: what "aligned" is going to mean (plan §1 and §12.1).
+  // Wizard page 2: what "aligned" is going to mean (plan §1 and §12.1).
   //
-  // All three of plan §1's modes are here and all three are selectable. They are not
-  // variations on a setting — they make *different promises* about where the speakers
-  // end up aligned — so the choice is the first thing the wizard asks, and each option
+  // All three of plan §1's modes are here. They are not variations on a setting — they
+  // make *different promises* about where the speakers end up aligned — so each option
   // says what it aligns and what it costs rather than only what it does.
+  //
+  // It is page 2 rather than page 1 because the microphone step in front of it decides
+  // which of the three can be *kept*: two are measurements, and a browser with no usable
+  // capture cannot make them however clearly they are described.
   //
   // Two things this page used to get wrong, both fixed by the modes actually existing:
   //
@@ -17,6 +20,12 @@
   //     cannot be used (§4.1) or an estimator that refuses (§5.5), and it needs no
   //     microphone — but it does need a group, so it goes through the same selection and
   //     the same temporary hold (§12.3.1) as the other two.
+  //
+  // **The choice is reduced by the microphone step before it** (§4.1, §4.2). Where there
+  // is no usable capture the two measured modes are disabled *with the reason attached*
+  // and Manual is left — never hidden, because a user who cannot see that Near field
+  // exists cannot find out what would make it work. That is the same disabled-with-reason
+  // shape the old "not built yet" option used; only its content was wrong.
   import type { WizardMode } from '../lib/align.svelte';
 
   interface Props {
@@ -26,10 +35,20 @@
      *  because the promise is the same one — "aligned at the spot it was measured from" —
      *  made once per position instead of once. */
     chained: boolean;
+    /** Why the two measured modes cannot be chosen right now, or null when they can
+     *  (`measuredBlock`, from the microphone step). Rendered inside each disabled option:
+     *  a dimmed radio with no reason is indistinguishable from a broken one. */
+    measuredBlock?: string | null;
+    /** §4.2's read-back caveat, when the capture works but the browser would not say
+     *  whether it honoured the constraints. Shown *before* the measured modes are picked,
+     *  because it qualifies what they can promise. */
+    micCaveat?: string | null;
     onPick: (mode: WizardMode) => void;
     onChain: (chained: boolean) => void;
   }
-  let { mode, chained, onPick, onChain }: Props = $props();
+  let { mode, chained, measuredBlock = null, micCaveat = null, onPick, onChain }: Props = $props();
+
+  const blocked = $derived(!!measuredBlock);
 </script>
 
 <p class="lead">
@@ -38,11 +57,34 @@
   aligned.
 </p>
 
+{#if blocked}
+  <!-- Said once, above the options, and then again inside each disabled one: this is why
+       two of the three are not selectable, and it is not the user having done anything
+       wrong. -->
+  <p class="reduced">
+    <strong>Only Manual is available.</strong> {measuredBlock} Go back to <strong>Microphone</strong> to see what would
+    change that.
+  </p>
+{:else if micCaveat}
+  <p class="caveat"><strong>Measuring is available, with a caveat.</strong> {micCaveat}</p>
+{/if}
+
 <div class="modes">
-  <label class="mode" class:on={mode === 'sweet_spot'}>
-    <input type="radio" name="align-mode" value="sweet_spot" checked={mode === 'sweet_spot'} onchange={() => onPick('sweet_spot')} />
+  <label class="mode" class:on={mode === 'sweet_spot'} class:off={blocked}>
+    <input
+      type="radio"
+      name="align-mode"
+      value="sweet_spot"
+      checked={mode === 'sweet_spot'}
+      disabled={blocked}
+      onchange={() => onPick('sweet_spot')}
+    />
     <div class="body">
-      <div class="title">Multi-position <span class="badge">default · you stay put</span></div>
+      <div class="title">
+        Multi-position <span class="badge">default · you stay put</span>
+        {#if blocked}<span class="badge caution">unavailable — needs the microphone</span>{/if}
+      </div>
+      {#if blocked}<p class="why">{measuredBlock}</p>{/if}
       <p>
         Aligns the speakers you can hear from where you are standing, at <em>that</em> spot. Stand where you normally
         listen and hold the phone still.
@@ -79,10 +121,21 @@
     </div>
   </label>
 
-  <label class="mode" class:on={mode === 'near_field'}>
-    <input type="radio" name="align-mode" value="near_field" checked={mode === 'near_field'} onchange={() => onPick('near_field')} />
+  <label class="mode" class:on={mode === 'near_field'} class:off={blocked}>
+    <input
+      type="radio"
+      name="align-mode"
+      value="near_field"
+      checked={mode === 'near_field'}
+      disabled={blocked}
+      onchange={() => onPick('near_field')}
+    />
     <div class="body">
-      <div class="title">Near field <span class="badge">you walk to every speaker</span></div>
+      <div class="title">
+        Near field <span class="badge">you walk to every speaker</span>
+        {#if blocked}<span class="badge caution">unavailable — needs the microphone</span>{/if}
+      </div>
+      {#if blocked}<p class="why">{measuredBlock}</p>{/if}
       <p>
         You walk to each speaker in turn and hold the phone <em>at</em> it. That takes the room out of the measurement, so
         what gets aligned is the <em>wiring</em> — and a wire alignment is right everywhere in the house rather than at one
@@ -101,7 +154,10 @@
   <label class="mode" class:on={mode === 'manual'}>
     <input type="radio" name="align-mode" value="manual" checked={mode === 'manual'} onchange={() => onPick('manual')} />
     <div class="body">
-      <div class="title">Manual <span class="badge">by ear · no microphone</span></div>
+      <div class="title">
+        Manual <span class="badge">by ear · no microphone</span>
+        {#if blocked}<span class="badge on">the one that works here</span>{/if}
+      </div>
       <p>
         You judge it: the reference speaker and the one you are tuning play together, and you nudge the tuned one until
         its clicks sit exactly on the reference's. Aligned wherever you happen to be standing, to whatever your ears
@@ -122,12 +178,30 @@
     font-size: 0.84rem;
     color: var(--secondary-text-color);
   }
+  /* Why the choice is shorter than the documentation. Amber, not red: nothing is broken
+     — the feature is reduced to what this browser can actually deliver. */
+  .reduced,
+  .caveat {
+    margin: 0 0 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--warning-color, #ffa600) 55%, transparent);
+    background: color-mix(in srgb, var(--warning-color, #ffa600) 10%, transparent);
+    font-size: 0.82rem;
+    color: var(--secondary-text-color);
+  }
+  .reduced strong,
+  .caveat strong {
+    color: var(--primary-text-color);
+  }
   .modes {
     display: grid;
     gap: 10px;
   }
-  /* Three peers, all selectable: they are alternatives with different promises, not a
-     feature and two placeholders, so none of them is dimmed. */
+  /* Three peers, and normally all three are selectable: they are alternatives with
+     different promises, not a feature and two placeholders. The exception is the
+     microphone step having found no usable capture, and then the two measured ones are
+     dimmed *with their reason inside them* rather than removed. */
   .mode {
     display: flex;
     gap: 10px;
@@ -143,6 +217,19 @@
   .mode.on {
     border-color: var(--primary-color);
     background: color-mix(in srgb, var(--primary-color) 8%, transparent);
+  }
+  .mode.off {
+    cursor: default;
+    background: color-mix(in srgb, var(--secondary-text-color) 6%, transparent);
+  }
+  .mode.off .title {
+    color: var(--secondary-text-color);
+  }
+  /* The reason, first thing inside the disabled option — above the description of what
+     the mode would do, because it decides whether reading the rest is worth anything. */
+  .mode .why {
+    margin-top: 4px;
+    color: var(--warning-color, #b26a00);
   }
   .mode input {
     margin-top: 3px;

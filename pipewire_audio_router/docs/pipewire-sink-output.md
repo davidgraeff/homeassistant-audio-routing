@@ -9,7 +9,7 @@ almost every *specific* mechanism in the original design wrong.
 
 Read [`architecture.md`](architecture.md) for how it sits in the daemon (§5.3 this
 backend, §5.5 announcing to an unrouted output, §5.6 the three states); the
-receiver side is [`receiver-agent-plan.md`](receiver-agent-plan.md), which
+receiver side is [`receiver-agent.md`](receiver-agent.md), which
 supersedes this file wherever the two disagree about the remote host.
 
 ---
@@ -97,7 +97,7 @@ configured `module-rtp-session` host — a strong signal — so targets became d
 routable like sendspin and AP2 devices, and the approval + config-persistence
 steps were dropped. The adoption gate then arrived generically for every output
 kind, and the agent's pairing became the real gate
-([receiver-agent-plan.md](receiver-agent-plan.md) §3).
+([receiver-agent.md](receiver-agent.md) §3).
 
 **The per-device mix bus was unnecessary.** The plan built ducking out of graph
 nodes — a `module-loopback` per target carrying group music with its
@@ -145,7 +145,7 @@ attaches, so it plays whole, a moment late. Full mechanism:
   arguments; the usable hook is that every session's streams are stamped
   `rtp.session = <name>`, so the agent can identify its own and tear down or mute a
   foreign router's links. Agent-side work, still undecided between teardown and
-  mute ([receiver-agent-plan.md](receiver-agent-plan.md) §5). The single
+  mute ([receiver-agent.md](receiver-agent.md) §5). The single
   separate-room target — the primary use case — is unaffected.
 - **Same-room sample-lock via shared PTP.** v1 holds phase at *start* but the two
   hosts' sample clocks free-run; PipeWire's adaptive resampler on the receiver
@@ -161,9 +161,9 @@ attaches, so it plays whole, a moment late. Full mechanism:
   but the *join* between them (an agent controlling the master volume of the sink
   *its own* session lands in) still needs a deployed add-on that actually
   advertises a session to that agent. Details and the rest of the agent's
-  unverified list: [receiver-agent-plan.md](receiver-agent-plan.md) §7.
+  unverified list: [receiver-agent.md](receiver-agent.md) §7.
 
-**Closed since the roadmap was written:** the HA `media_player` now covers pw-sink
+**Closed since the original design:** the HA `media_player` now covers pw-sink
 outputs (`VOLUME_SET` / `VOLUME_MUTE` against the host-reported level, plus
 `SELECT_SOURCE` from the generic outputs list), and the level/mute read path is
 surfaced everywhere — the routing matrix carries `volume`/`muted` for

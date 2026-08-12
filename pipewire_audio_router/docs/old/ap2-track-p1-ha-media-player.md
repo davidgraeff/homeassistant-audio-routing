@@ -51,6 +51,6 @@ sendspin devices, and adopt the correct HA device/area so they land in the right
 - No changes under `bridge-daemon/`.
 
 ## References
-- `docs/airplay2-roadmap.md` (Phase 4 — control plane / HA adoption).
+- `docs/airplay2-output.md` (Phase 4 — control plane / HA adoption).
 - Memory: sendspin media_player adoption; sendspin volume/media_players.
 - Existing sendspin path in the media_player platform (mirror it).

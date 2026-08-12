@@ -262,7 +262,7 @@ through the restart — not one silent window.
 > `largest packet` proxy measures the *source's* audio content, not the speaker's. The
 > Bluetooth source has its own unrelated silence fault (full-rate aptX decoding to
 > zeros — see
-> [rtp-input-dropouts-plan.md](../rtp-input-dropouts-plan.md)), and the first run of this
+> [rtp-input-dropouts.md](../rtp-input-dropouts.md)), and the first run of this
 > test showed ~50 s of `3 B` immediately after the restart, which reads exactly like a
 > restart-induced outage and is not one. **Any group-churn measurement over the BT
 > source must independently confirm the source has audio for the whole window** — join

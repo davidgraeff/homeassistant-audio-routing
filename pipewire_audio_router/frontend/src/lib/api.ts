@@ -17,6 +17,7 @@ import type {
   AppSettings,
   AppSettingsUpdate,
   DuckHold,
+  MeasureLogList,
   MeasureMode,
   MeasureStatus,
   MicStatus,
@@ -28,6 +29,7 @@ import type {
   OutputInfo,
   RoutingMatrix,
   RtpSourceCfg,
+  RunDocument,
   SendspinCodec,
   SourceKind,
   SourcesResponse,
@@ -269,7 +271,7 @@ export const api = {
   // their levels and mutes. One at a time, process-wide.
   //
   // Only the *selection* entry point below is used: a session's identity is the set of
-  // speakers the user picked on the Outputs page (plan §12.1), in every mode including
+  // speakers the user picked in the alignment wizard (plan §12.1), in every mode including
   // by-ear. The daemon's other entry point (`POST /api/align/start {sources}`, "hold
   // whatever this source is playing to") has no client here on purpose — a source set
   // was the old framing, and two ways to name the one session is how two pages come to
@@ -389,6 +391,19 @@ export const api = {
   /** Abandon the run, leaving delays untouched. Any delays already written stay
    *  written (and revertable) — abandoning is not an undo. */
   measureAbandon: () => request<MeasureStatus>('DELETE', 'api/align/measure'),
+
+  /** The stored run transcripts, newest first (plan §11).
+   *
+   *  Read *before* offering a download, not instead of it: the listing is what says
+   *  whether anything was recorded at all (a daemon with no writable `/data` records
+   *  nothing) and which run the newest one is — the measurement status carries no
+   *  transcript id, so "this run's log" is only ever "the newest one", and a UI that
+   *  claimed otherwise would be guessing. */
+  measureLog: () => request<MeasureLogList>('GET', 'api/align/measure/log'),
+  /** One whole transcript, by id or `latest`. Refused (with a `Refusal`) when that run
+   *  has already been dropped by retention. */
+  measureLogRun: (run: string) =>
+    request<RunDocument>('GET', `api/align/measure/log?run=${encodeURIComponent(run)}`),
 
   // Dynamic input sources — collection CRUD (multi-source refactor). Supersedes
   // the singular /api/source/{airplay,rtp} endpoints above. The backend routes

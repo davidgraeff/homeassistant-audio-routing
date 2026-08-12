@@ -2,7 +2,7 @@
 //! over the proven native `rtp-sink` media path, and **advertise the session
 //! over mDNS** (`_pipewire-audio._udp`, via the daemon's own storm-safe `mdns-sd`
 //! — no Avahi/`module-rtp-session`, which can't run in the addon container; see
-//! docs/pipewire-sink-spike-results.md). A/B oracle for the pw-sink transport
+//! docs/old/pipewire-sink-spike-results.md). A/B oracle for the pw-sink transport
 //! (mirrors `spike/ap2.rs`).
 //!
 //! `POST /api/spike/pw-sink {"target_ip":"…","freq":440}` creates a

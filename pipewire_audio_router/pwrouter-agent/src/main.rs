@@ -1,6 +1,6 @@
 //! `pwrouter-agent` — the receiver-side helper for pw-sink targets.
 //!
-//! See docs/receiver-agent-plan.md. The helper runs in a user's session, dials
+//! See docs/receiver-agent.md. The helper runs in a user's session, dials
 //! *out* to the add-on, becomes the receiver for one router session (loading
 //! `libpipewire-module-rtp-session` itself, so the host needs no config file), and
 //! accepts a fixed command set: volume, mute, duck, unduck.

@@ -293,5 +293,5 @@ stays 1500 ms when unset.
 ## Background docs
 - `docs/airplay2-sender-multiroom-spike.md` — how the sender + libairptp path was
   proven on real hardware.
-- `docs/airplay2-roadmap.md` — the AP2 roadmap & architecture (status, phases,
+- `docs/airplay2-output.md` — the AP2 roadmap & architecture (status, phases,
   drop-RAOP plan); the authoritative source for where this work fits.

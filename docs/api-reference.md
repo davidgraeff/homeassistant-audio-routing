@@ -364,7 +364,7 @@ Everything else is fixed to match the bridge's wire format: native-endian **`S16
 > With `true` the module never rejects a packet on SSRC grounds, so a sender that
 > reboots with a fresh SSRC is picked up seamlessly. Setting it `false` *adds* the only
 > SSRC rejection path there is. See
-> [rtp-input-dropouts-plan.md §4](../pipewire_audio_router/docs/rtp-input-dropouts-plan.md)
+> [rtp-input-dropouts.md §4](../pipewire_audio_router/docs/rtp-input-dropouts.md)
 > for the measurements behind this.
 
 ### AirPlay source config (`airplay`)

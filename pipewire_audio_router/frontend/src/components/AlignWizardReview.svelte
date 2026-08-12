@@ -30,6 +30,7 @@
   import AlignChainSteps from './AlignChainSteps.svelte';
   import AlignCheck from './AlignCheck.svelte';
   import AlignRefusal from './AlignRefusal.svelte';
+  import AlignRunLog from './AlignRunLog.svelte';
   import { memberKindLabel } from '../lib/align.svelte';
   import { WALK_FEWER_CHECKS, confidenceBand, uncertaintyDominates, warningKindLabel } from '../lib/measure.svelte';
   import type { MeasureStatus, Warning } from '../lib/types';
@@ -364,6 +365,12 @@
   Writing a speaker's knob reconnects it, so expect the group to go quiet for tens of seconds afterwards while they come
   back. Nothing is written until you press Apply.
 </p>
+
+<!-- The report above is what the daemon *concluded*; the transcript is what it saw on the
+     way there, kept because this page cannot show every gate acquisition and every retry
+     without becoming unreadable. Offered here rather than only after a failure: a run whose
+     numbers look odd is exactly as worth investigating as one that refused. -->
+<AlignRunLog />
 
 <style>
   .blocked-head {

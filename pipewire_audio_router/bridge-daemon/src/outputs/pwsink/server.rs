@@ -24,7 +24,7 @@
 //! with two+ pw-sink targets on one LAN, each receiver would connect to *both*
 //! advertised sessions (cross-talk). The single-target separate-room case (the
 //! primary use case) is unaffected. Scoping which receiver binds to which session
-//! is a deliberately deferred decision (see docs/pipewire-sink-roadmap.md §4).
+//! is a deliberately deferred decision (see docs/pipewire-sink-output.md §4).
 #![allow(dead_code)] // wired into routing/sync_group.rs in the same phase
 
 use std::sync::{Arc, Weak};

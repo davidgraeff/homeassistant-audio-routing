@@ -6,26 +6,38 @@
   // nothing else. In particular it takes no group: the model §12.1 asked for is the real
   // one now, so the user *picks speakers* and the daemon forms a temporary exclusive
   // group around them (`POST /api/align/start {outputs, mode}`). The old `group` seed
-  // came from being mounted on a source card, and with the wizard on the Outputs page
+  // came from being mounted on a source card, and with the wizard on a page of its own
   // there is nothing to seed from — which is the point rather than a loss.
   //
-  // Page flow: mode → speakers → the mode's own body → review. The run's own phase drives
-  // the page forward (a run that starts moves you to the body; a proposal moves you to
-  // review), but only when the phase *changes*, so pressing Back still works.
+  // Page flow: microphone → mode → speakers → the mode's own body → review. The run's own
+  // phase drives the page forward (a run that starts moves you to the body; a proposal
+  // moves you to review), but only when the phase *changes*, so pressing Back still works.
+  //
+  // **The microphone step comes before the mode**, and that ordering is the point rather
+  // than a nicety: two of the three modes are measurements, so whether there is a usable
+  // capture decides which modes exist at all (§4.1, §4.2). Asked afterwards, a user with
+  // no microphone picks Near field, picks speakers, pays the reconnect wave that forms the
+  // hold, and *then* learns the page was served over plain HTTP. So the check happens
+  // first and the mode page is reduced from its outcome — by disabling with the reason,
+  // never by hiding, because a shorter list than the documentation describes is its own
+  // kind of lie.
   //
   // The three modes differ in exactly two places, and everything else is shared:
   //
   //   * **the body**: a stationary measurement (with the chain inside it), a walk, or the
   //     by-ear sliders;
-  //   * **the microphone**: by-ear does not use one, so the capture is not even mounted
-  //     for it — the mode exists precisely for the case where there is no usable mic
-  //     (§4.1), and asking for permission would contradict that.
+  //   * **the microphone**: by-ear does not use one, so the capture is not mounted once
+  //     that mode is chosen — the mode exists precisely for the case where there is no
+  //     usable mic (§4.1), and offering "Use microphone" on it would offer the thing that
+  //     just failed. The microphone *step* is the exception, because that is where the
+  //     failure is established.
   //
   // The microphone lives here rather than on a page, because the capture must survive
   // page changes: the analysis grid is one continuous capture, and a mic that restarted
   // mid-run has thrown away the reference frame everything measured so far shares.
   import AlignRefusal from './AlignRefusal.svelte';
   import AlignWizardManual from './AlignWizardManual.svelte';
+  import AlignWizardMic from './AlignWizardMic.svelte';
   import AlignWizardMode from './AlignWizardMode.svelte';
   import AlignWizardReview from './AlignWizardReview.svelte';
   import AlignWizardRun from './AlignWizardRun.svelte';
@@ -34,6 +46,7 @@
   import { align, isMeasured, type WizardMode } from '../lib/align.svelte';
   import { askConfirm } from '../lib/confirm.svelte';
   import { MODE_LABELS, elapsed, isRunning, measure, phaseLabel } from '../lib/measure.svelte';
+  import { measuredBlock, measuredCaveat, mic } from '../lib/mic.svelte';
   import type { MeasurePhase } from '../lib/types';
 
   interface Props {
@@ -47,15 +60,43 @@
    *  this wizard has an opinion about whose it is. */
   const holding = $derived(align.sessionActive);
 
-  type Page = 'mode' | 'speakers' | 'body' | 'review';
+  type Page = 'mic' | 'mode' | 'speakers' | 'body' | 'review';
 
-  let page = $state<Page>('mode');
-  let mode = $state<WizardMode>('sweet_spot');
+  let page = $state<Page>('mic');
+  /** The mode the user has picked. Not what the wizard acts on — see `mode`, which is this
+   *  reduced by what the microphone step found. */
+  let pick = $state<WizardMode>('sweet_spot');
   /** Measure from more than one listening position, joining them through overlap
    *  speakers (plan §1.1). Chosen on the mode page and only meaningful for
    *  multi-position; a chain with one step *is* the single-position run, which is why the
    *  daemon defaults it off rather than treating one position as a degenerate chain. */
   let chained = $state(false);
+
+  // ---- What the microphone step established, and what it costs the mode choice ----
+  //
+  // Read from the store rather than re-derived here: the same three fields drive the mic
+  // panel, and a second interpretation of them is a second policy that can disagree with
+  // what the user was just shown.
+  const outcome = $derived(mic.outcome);
+  /** Why the measured modes cannot be offered, or null. **A run in progress always wins**:
+   *  a capture that drops during `settling` must not retroactively disable the mode of the
+   *  run that is holding the group. The daemon has its own `mic_lost` refusal for that,
+   *  which says what happened — where a silently changed radio button would not. */
+  const micBlock = $derived(measure.running ? null : measuredBlock(outcome));
+  /** §4.2's read-back caveat, carried onto the mode page rather than quietly dropped. */
+  const micCaveat = $derived(measuredCaveat(outcome));
+
+  /** The mode the wizard **acts on**: the user's pick, reduced to by-ear while the
+   *  microphone step says a measurement is impossible.
+   *
+   *  Derived rather than written back into `pick`, and that is not a style choice. Forcing
+   *  the state would make the reduction permanent: the capture is mounted for measured
+   *  modes, so a `pick` overwritten with `manual` before the check has even run would
+   *  unmount — and therefore *stop* — the microphone the moment the user left this step,
+   *  seconds after proving it works. Reducing a copy leaves the default intact for the
+   *  instant the block clears, and still guarantees that nothing downstream (the hold, the
+   *  body, `measure.start`) can act on a mode this browser cannot perform. */
+  const mode = $derived<WizardMode>(micBlock && isMeasured(pick) ? 'manual' : pick);
 
   const status = $derived(measure.status);
   /** A run parked in `positioning` or `walking` is alive: it holds the group, and a chain
@@ -64,11 +105,6 @@
    *  `live` (which only says whether the *daemon* is busy this second). */
   const running = $derived(measure.running);
   const hasResult = $derived(!!status && (!!status.proposal || !!status.verification));
-  /** Does this mode drive the measurement state machine? Where it does not, `measure.*`
-   *  is never called and the microphone is never asked for. A *running* run wins over the
-   *  picker: switching the radio to by-ear mid-run must not unmount the capture the run
-   *  depends on. */
-  const measured = $derived(running || isMeasured(mode));
 
   // One poll loop for the whole run, ref-counted in the store.
   $effect(() => measure.attach());
@@ -118,7 +154,18 @@
    *  page of by-ear sliders would promise a measurement that is not happening, and
    *  "Measure" over a walk hides the fact that the user is the one doing the work. */
   const bodyName = $derived(shownMode === 'manual' ? 'Tune' : shownMode === 'near_field' ? 'Walk' : 'Measure');
+  /** Does this mode drive the measurement state machine? Where it does not, `measure.*`
+   *  is never called and the microphone is not mounted.
+   *
+   *  Read from `shownMode`, so **anything the daemon has to show wins over the picker**:
+   *  a run in progress obviously (switching the radio mid-run must not unmount the capture
+   *  it depends on), but equally a finished or refused one. That last case is not
+   *  hypothetical — with the mode reduced to by-ear by an unchecked microphone, deriving
+   *  this from the picker alone put "Align speakers by ear" above a measured proposal and
+   *  took the microphone panel away from a run that had just produced it. */
+  const measured = $derived(isMeasured(shownMode));
   const PAGES: { id: Page; name: string }[] = $derived([
+    { id: 'mic', name: 'Microphone' },
     { id: 'mode', name: 'Mode' },
     { id: 'speakers', name: 'Speakers' },
     { id: 'body', name: bodyName },
@@ -210,20 +257,32 @@
 <div class="wizard">
   <div class="head">
     <!-- The title is the mode's promise, not the feature's name: "Measure with a
-         microphone" over the by-ear sliders would be simply false. -->
-    <strong>{measured ? 'Measure the timing between speakers' : 'Align speakers by ear'}</strong>
+         microphone" over the by-ear sliders would be simply false. On the microphone step
+         no promise has been made yet — and stating one there would state the wrong one,
+         since an unchecked microphone reduces the mode to by-ear until it is proven. -->
+    <strong>
+      {#if page === 'mic' && !running}
+        Align the timing between speakers
+      {:else if measured}
+        Measure the timing between speakers
+      {:else}
+        Align speakers by ear
+      {/if}
+    </strong>
     <!-- A run's own mode wins over the picker: once something is running, the
          header must describe what is running, not what is selected. `manual` has no
          `MeasureMode`, and that is exactly why it is named separately here. -->
-    <span class="badge">
-      {#if status && status.phase !== 'idle'}
-        {MODE_LABELS[status.mode]}
-      {:else if mode === 'manual'}
-        By ear
-      {:else}
-        {MODE_LABELS[mode]}
-      {/if}
-    </span>
+    {#if (status && status.phase !== 'idle') || page !== 'mic'}
+      <span class="badge">
+        {#if status && status.phase !== 'idle'}
+          {MODE_LABELS[status.mode]}
+        {:else if mode === 'manual'}
+          By ear
+        {:else}
+          {MODE_LABELS[mode]}
+        {/if}
+      </span>
+    {/if}
     {#if status && status.phase !== 'idle'}
       <span class="badge" class:on={running} class:warn={status.phase === 'refused'}>{phaseLabel(status.phase)}</span>
     {/if}
@@ -268,14 +327,20 @@
 
   <!-- Mounted for the wizard's whole life, not per page: a capture that restarts loses the
        timing reference every earlier reading shares — and for near field that costs the
-       *user* another walk.
+       *user* another walk. Rendered here, outside the page block and in one fixed
+       position, so stepping between pages cannot remount it.
 
-       Not mounted at all for by-ear, and that is the mode's whole reason for existing
-       (plan §1, §4.1): it is the fallback for a browser that has no usable microphone, so
-       putting a "Use microphone" button on it would offer the thing that just failed.
-       `measured` is sticky while a run is in progress, so flipping the radio to by-ear
-       mid-run cannot pull the capture out from under it. -->
-  {#if measured}
+       Two conditions, for two different reasons:
+
+         * `measured` — by-ear does not use a microphone, and that is the mode's whole
+           reason for existing (plan §1, §4.1). Once it is chosen the panel goes away
+           rather than offering the thing that just failed. `measured` is sticky while a
+           run is in progress, so flipping the radio mid-run cannot pull the capture out
+           from under it;
+         * the **microphone step** — which is where a capture is established or found
+           impossible, and therefore the one page that must show the control even when the
+           selected mode is by-ear (which it will be, the moment the check fails). -->
+  {#if measured || page === 'mic'}
     <MicCapture />
   {/if}
 
@@ -306,9 +371,20 @@
   {/if}
 
   <div class="page">
-    {#if page === 'mode'}
-      <AlignWizardMode {mode} {chained} onPick={(m) => (mode = m)} onChain={(c) => (chained = c)} />
+    {#if page === 'mic'}
+      <AlignWizardMic {outcome} block={micBlock} caveat={micCaveat} />
       <div class="nav">
+        <!-- Always enabled: this step reduces the choice, it does not gate it. A browser
+             with no microphone at all still has Manual waiting on the next page, and a
+             blocked Next would strand the very user the fallback exists for. -->
+        <button class="primary" onclick={() => (page = 'mode')}>
+          {micBlock ? 'Continue without a microphone' : 'Next: mode'}
+        </button>
+      </div>
+    {:else if page === 'mode'}
+      <AlignWizardMode {mode} {chained} measuredBlock={micBlock} {micCaveat} onPick={(m) => (pick = m)} onChain={(c) => (chained = c)} />
+      <div class="nav">
+        <button class="ghost" onclick={() => (page = 'mic')}>Back</button>
         <button class="primary" onclick={() => (page = 'speakers')}>Next: speakers</button>
       </div>
     {:else if page === 'speakers'}

@@ -1,7 +1,7 @@
 //! mDNS discovery of **pw-sink targets** — remote PipeWire hosts running
 //! `libpipewire-module-rtp-session`, which advertise an RTP **audio session**
 //! over mDNS as `_pipewire-audio._udp.local.` (see
-//! docs/pipewire-sink-spike-results.md). Unlike the earlier `_workstation._tcp`
+//! docs/old/pipewire-sink-spike-results.md). Unlike the earlier `_workstation._tcp`
 //! sketch (a generic "any Linux host" signal that needed a manual approval step
 //! to weed out false positives), `_pipewire-audio._udp` is advertised *only* by
 //! a host actually set up as an RTP-session receiver — a strong enough signal

@@ -137,5 +137,5 @@ scripts/                              dev tooling (e.g. arm64 cross-build)
 - **Bridge daemon REST/WebSocket API reference**:
   [api-reference.md](api-reference.md)
 - **What's done vs. remaining** for the AirPlay-2 output:
-  [`../pipewire_audio_router/docs/airplay2-roadmap.md`](../pipewire_audio_router/docs/airplay2-roadmap.md)
+  [`../pipewire_audio_router/docs/airplay2-output.md`](../pipewire_audio_router/docs/airplay2-output.md)
 - **Empirical write-ups per experiment**: [`../pipewire_audio_router/docs/old/spikes/`](../pipewire_audio_router/docs/old/spikes/)

@@ -1,7 +1,7 @@
 //! The `libpipewire-module-rtp-session` arguments the agent loads to *become*
 //! the pw-sink receiver — the dynamic replacement for the hand-written
 //! `pipewire.conf.d/90-pwsink-receiver.conf` drop-in
-//! (docs/receiver-agent-plan.md §7).
+//! (docs/receiver-agent.md §7).
 //!
 //! Mirrors `bridge-daemon/src/pw_sink.rs`, which builds the sender-side args the
 //! same way: an SPA-JSON object string handed to `pw_context_load_module`.

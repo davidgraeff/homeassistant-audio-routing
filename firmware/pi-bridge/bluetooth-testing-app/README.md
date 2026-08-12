@@ -14,7 +14,7 @@ Open it in a browser on the LAN and you can, live:
   Pi's own count of UDP datagrams actually transmitted.
 
 It exists because of the 2026-07-28 dropout investigation
-([rtp-input-dropouts-plan.md](../../pipewire_audio_router/docs/rtp-input-dropouts-plan.md)),
+([rtp-input-dropouts.md](../../pipewire_audio_router/docs/rtp-input-dropouts.md)),
 which came down to a distinction no packet counter can make: the phone was
 streaming **full-bitrate aptX whose decoded content was pure digital silence**.
 Every layer looked healthy — packets flowing, sockets draining, transport

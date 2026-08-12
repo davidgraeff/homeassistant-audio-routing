@@ -371,7 +371,7 @@ codec it already resolved to does *not* trigger a restart.
   the fixes that shipped, §4.14 the root cause, and the corrections to conclusions that
   turned out to be wrong (§4.9-A finding 1 especially — "I grepped for the consumers and
   found none" is not the same as "there is no gate").
-- [rtp-input-dropouts-plan.md](rtp-input-dropouts-plan.md) — the *other* silence, at the
+- [rtp-input-dropouts.md](rtp-input-dropouts.md) — the *other* silence, at the
   Bluetooth A2DP boundary, which is a separate fault and still has one open question (is
   it the phone or the Pi's aptX decoder? the SBC test settles it).
 - [architecture.md](architecture.md) §4/§5.1 — the anchor + per-device-sender model these

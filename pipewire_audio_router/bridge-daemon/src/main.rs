@@ -227,7 +227,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // Paired receiver agents (outputs/pwsink/agent.rs): the token store *and* the source
     // of truth for pw-sink targets — a pw-sink output exists because a helper on
     // that host paired, not because something answered an mDNS browse
-    // (docs/receiver-agent-plan.md §3).
+    // (docs/receiver-agent.md §3).
     let agents_path = routing_path.with_file_name("agents.json");
     let agents = outputs::pwsink::agent::Agents::shared(agents_path.clone(), changes.clone());
     let agents_for_duck = agents.clone();
@@ -278,7 +278,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // 5 s (`DEFAULT_IGMP_CHECK_INTERVAL_SEC`) whether ≥30 s have passed since
         // its last packet (`DEFAULT_IGMP_DEADLINE_SEC`) and, if so, re-joins by
         // DROP+ADD_MEMBERSHIP on its own socket — no module reload, no audible gap.
-        // See docs/rtp-input-dropouts-plan.md §5.
+        // See docs/rtp-input-dropouts.md §4.
 
         // Own sendspin device online/offline (and eventual removal) from the
         // live connection state + an active TCP probe — mDNS only ever adds.
@@ -496,7 +496,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             static_dir.to_path_buf(),
         );
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        // Tell receiver agents where to dial in (docs/receiver-agent-plan.md §8).
+        // Tell receiver agents where to dial in (docs/receiver-agent.md §8).
         // After bind, so the port in the advert is one that is actually listening.
         if let Ok(addr) = listener.local_addr() {
             outputs::pwsink::agent::advertise(addr.port());

@@ -1,4 +1,4 @@
-//! The agent↔daemon wire protocol (docs/receiver-agent-plan.md §5).
+//! The agent↔daemon wire protocol (docs/receiver-agent.md §5).
 //!
 //! JSON over one WebSocket, dialled *out* by the agent — nothing listens on the
 //! receiver host. Mirrored byte-for-byte by `bridge-daemon/src/pwsink_agent.rs`;

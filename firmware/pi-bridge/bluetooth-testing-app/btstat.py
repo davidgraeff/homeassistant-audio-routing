@@ -3,7 +3,7 @@
 
 These are the signals that actually resolved the 2026-07-28 "audio disappears
 every few minutes" investigation, so they are first-class here rather than
-afterthoughts (see ../../pipewire_audio_router/docs/rtp-input-dropouts-plan.md):
+afterthoughts (see ../../pipewire_audio_router/docs/rtp-input-dropouts.md):
 
 - **A2DP byte rate** (`hciconfig hci0 -a` RX counters). The decisive measurement:
   during a dropout the phone kept sending at *full* aptX rate (~46 kB/s) while

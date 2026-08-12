@@ -18,7 +18,7 @@
 // its own that isn't in our stream at all. Our overlay duck cannot reach that, so
 // start/stop on a `pwsink-dev-*` output is mirrored to that host's agent, which
 // attenuates the foreign streams on its sink (outputs::pwsink::agent::duck_output —
-// docs/receiver-agent-plan.md §11 P3).
+// docs/receiver-agent.md §11 P3).
 //
 // The split here is between deciding and doing. [`arbiter`] is the *pure*
 // scheduler: queue-by-default, per-announcement barge-in and TTL, no audio path

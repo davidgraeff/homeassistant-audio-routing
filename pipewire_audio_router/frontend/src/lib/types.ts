@@ -394,7 +394,7 @@ export interface Interference {
 export interface AlignState {
   active: boolean;
   /** The session's identity: the selected output set for a session started from the
-   *  Outputs page — which is every session this UI starts — or the source set when one
+   *  alignment wizard — which is every session this UI starts — or the source set when one
    *  was started through `POST /api/align/start {sources}` by something else. Either
    *  way, the thing whoever started it picked. */
   sources: string[];
@@ -1100,6 +1100,54 @@ export interface NodesResponse {
   ports: unknown[];
 }
 
+// ---- Run transcripts (`GET /api/align/measure/log`, plan §11) -----------------
+//
+// The daemon writes an append-only transcript per measurement run and keeps the last
+// few, so a run can be investigated *after* it is over — which is when someone who had
+// to bring speakers online by hand wants to know what the daemon actually saw.
+//
+// The event bodies are deliberately typed as `unknown` here. A transcript is forensic,
+// not a contract a client computes with: the UI hands the file to a person, and typing
+// each event kind would invite reading numbers out of it — a second, quieter copy of the
+// estimator's own reporting that would drift from it.
+
+/** One stored run, as the listing describes it — enough to tell whether it is the run
+ *  currently on screen without fetching the whole thing. */
+export interface RunSummary {
+  id: string;
+  /** Unix seconds, from the run's own first event. */
+  started_unix: number;
+  events: number;
+  size_bytes: number;
+  /** The last event's kind: `run_finished` for a complete transcript, or whatever the
+   *  run was doing when the daemon stopped. */
+  last_kind: string;
+  /** The last event's sentence — for a finished run, its verdict. */
+  last_message: string;
+  /** The `run_started` header (mode, members, delays), when the file has one. */
+  started?: unknown;
+}
+
+export interface MeasureLogList {
+  /** Newest first. */
+  runs: RunSummary[];
+  /** How many are kept before the oldest is dropped. */
+  retained: number;
+  /** Where they live, when transcripts are enabled at all. Absent means the daemon has
+   *  nowhere to write them, which is why the listing can legitimately be empty. */
+  directory?: string;
+}
+
+/** One whole transcript, as one document — the form that can be read days later
+ *  without this UI. */
+export interface RunDocument {
+  id: string;
+  started_unix: number;
+  events: unknown[];
+  /** The run hit the per-transcript event bound, so the file is not the whole story. */
+  truncated: boolean;
+}
+
 /** A remembered AirPlay sender for one AirPlay source's receiver (the daemon's
  * `AirplayClientInfo`). Listed/managed via the per-source /clients endpoints. */
 export interface AirplayClient {
@@ -1246,7 +1294,7 @@ export interface AnnounceResponse {
 }
 
 /** One row of `GET /api/agents`: a paired receiver host, or one asking to be
- * (docs/receiver-agent-plan.md §8).
+ * (docs/receiver-agent.md §8).
  *
  * Diagnostics only — the Outputs page reads the output listings instead, where a
  * host waiting to pair appears as a discovered `pwsink` output carrying the same

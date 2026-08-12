@@ -6,7 +6,7 @@
 //! everything `!Send` (proxies, the loaded module) confined here by the compiler.
 //! Events go back to the async side over a tokio channel.
 //!
-//! What it owns (docs/receiver-agent-plan.md §4, §6, §7):
+//! What it owns (docs/receiver-agent.md §4, §6, §7):
 //!
 //! * the loaded `rtp-session` module — the receive side, so no config file;
 //! * the graph view needed to answer *"which sink plays our audio"*: our receive
@@ -532,7 +532,7 @@ impl State {
         self.reported_foreign.push(session.to_string());
         tracing::warn!(
             "another router's session '{session}' is also being received on this host; \
-             the agent leaves it alone (see receiver-agent-plan.md §7.1)"
+             the agent leaves it alone (see receiver-agent.md §7.1)"
         );
         let _ = self.events.try_send(Event::ForeignSession(session.to_string()));
     }

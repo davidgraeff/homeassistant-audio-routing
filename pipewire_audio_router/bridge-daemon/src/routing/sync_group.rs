@@ -736,7 +736,7 @@ impl GroupReconciler {
     /// session: stock `module-rtp-session` in discover mode attaches to *every*
     /// advertised session, so with 2+ pw-sink targets on one LAN an announcement aimed
     /// at one can be heard by the others (the deferred session-scoping decision, see
-    /// docs/pipewire-sink-roadmap.md §4).
+    /// docs/pipewire-sink-output.md §4).
     async fn open_pwsink_announce_session(&mut self, output: &str, deps: &AnnounceDeps<'_>) -> AnnounceTransport {
         // The receiver dials *us*, so what has to be true is that its agent is on the
         // socket to be told about the session — not that anything answered an mDNS

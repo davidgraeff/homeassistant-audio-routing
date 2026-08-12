@@ -12,7 +12,7 @@ Code: `pwrouter-agent/` (the helper), `pw-control/` (the bits both ends share) a
 the shape, the reasoning behind each part, and the findings that changed the
 design. Section numbers are stable because ~15 source files cite them.
 
-The sending half of this backend is [`pipewire-sink-roadmap.md`](pipewire-sink-roadmap.md).
+The sending half of this backend is [`pipewire-sink-output.md`](pipewire-sink-output.md).
 
 ---
 
@@ -261,7 +261,7 @@ no PipeWire restart.
 One warning to carry forward from the spike: `sess.latency.msec 100 should be an
 integer multiple of rtp.ptime 6.458`. The jitter buffer wants to be a multiple of
 ptime rather than left at the default — which is why the daemon clamps it to whole
-packet times (`pipewire-sink-roadmap.md` §1).
+packet times (`pipewire-sink-output.md` §1).
 
 ### 7.1 Session scoping is the agent's job
 

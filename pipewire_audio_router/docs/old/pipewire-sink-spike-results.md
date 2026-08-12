@@ -1,6 +1,6 @@
 # pw-sink spikes — results
 
-Bring-up spikes for the [pw-sink roadmap](pipewire-sink-roadmap.md) (stream audio
+Bring-up spikes for the [pw-sink roadmap](pipewire-sink-output.md) (stream audio
 to a remote PipeWire host via native `rtp-sink` + `rtp-sap`). Two layers:
 
 1. **Local CLI spikes** on a Fedora PipeWire desktop — validate the PipeWire

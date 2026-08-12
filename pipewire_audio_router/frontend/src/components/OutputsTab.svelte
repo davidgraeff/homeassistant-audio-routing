@@ -8,12 +8,19 @@
   import GroupTitle from './GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
-  import AlignDocs from './AlignDocs.svelte';
-  import AlignWizard from './AlignWizard.svelte';
   import { align } from '../lib/align.svelte';
   import DelaySlider from './DelaySlider.svelte';
   import VolumeControl from './VolumeControl.svelte';
   import { measure } from '../lib/measure.svelte';
+
+  interface Props {
+    /** Go to the Alignment page. The only cross-page link in the app, and it goes one way:
+     *  this page offers to align a set of speakers, App.svelte owns which page is showing.
+     *  A callback rather than a shared "current tab" store — one owner of that state is
+     *  what keeps the tab strip and the pages from disagreeing. */
+    onAlign: () => void;
+  }
+  let { onAlign }: Props = $props();
 
   // Two listings, because discovery only *offers* a device: `outputs` is what
   // the user has added (routable, exposed to Home Assistant, tunable) and
@@ -648,35 +655,36 @@
     return `asks for ${asked} ms buffer, sending ${o.sendspin_send_ahead_ms} ms ahead`;
   }
 
-  // ---- Speaker alignment (plan §12.1) --------------------------------------------
+  // ---- Speaker alignment: the way in, and the state (plan §12.1) ------------------
   //
-  // **This is alignment's only home**, all three of plan §1's modes of it — measured from
-  // where you sit, measured by walking to each speaker, or tuned by ear. The reason it is
-  // here rather than on a source card: aligning does not mean "the speakers playing this
-  // source", it means *a set of speakers the user picks*, around which the daemon forms a
-  // temporary group. The choice being made is a choice about speakers, so it belongs on
-  // the page that lists them.
+  // **The wizard itself lives on the Alignment page**, not here. What is here is what a
+  // user needs while looking at their speakers, and nothing more:
   //
-  // That also leaves exactly one entry point, which matters because there is one alignment
-  // session process-wide: a second place offering to start one is a second place that can
-  // believe it owns the one that is running. The Sources page no longer references
-  // alignment at all — not the wizard, not the by-ear sliders, not the explainer.
-  let wizardOpen = $state(false);
-  // The alignment explainer moved here with everything else (it used to sit in the Sources
-  // header, describing a per-source model that no longer exists).
-  let alignDocsOpen = $state(false);
+  //   * the way in — aligning is a choice about *a set of speakers the user picks* (never
+  //     "the speakers playing this source"), so the page that lists speakers is where the
+  //     offer belongs;
+  //   * whether an alignment is **holding** speakers right now. That hold is exclusive, so
+  //     without this the user would be looking at speakers that are silent for a reason
+  //     nothing on the page mentions;
+  //   * the offer to **revert** a measurement that was written (§9.4), which outlives the
+  //     run that wrote it and is exactly what someone wants when they decide they preferred
+  //     the old timing.
+  //
+  // The wizard is deliberately *not* also rendered here. One alignment session exists
+  // process-wide, and two places rendering the wizard are two places that can each believe
+  // they own the session that is running. The Sources page references alignment not at all.
 
-  // A measured run stays *revertable* after the wizard is closed (plan §9.4), and this is
-  // now the page it was started from — so the undo has to be reachable here. One status
-  // read on mount rather than `measure.attach()`: attaching would open the push socket and
-  // poll for as long as this page is open, on a page most visits never align from.
+  // A measured run stays *revertable* after the run is over (plan §9.4), and the undo has
+  // to be reachable from where someone notices the timing. One status read on mount rather
+  // than `measure.attach()`: attaching would open the push socket and poll for as long as
+  // this page is open, on a page most visits never align from.
   //
   // The session is read once for the same reason, and it answers a question this page could
-  // not otherwise answer at all: **are speakers held right now?** The wizard refuses to
-  // close while it is holding any, but a page reload gets around that, and an alignment
-  // hold is exclusive — so without this the user would be looking at speakers that are
-  // silent for a reason nothing on the page mentions. `refreshStatus` is one GET and takes
-  // no poll loop up (`align.attachSession` is the wizard's job).
+  // not otherwise answer at all: **are speakers held right now?** An alignment hold is
+  // exclusive, and it outlives a visit to the Alignment page — so without this the user
+  // would be looking at speakers that are silent for a reason nothing on the page mentions.
+  // `refreshStatus` is one GET and takes no poll loop up (`align.attachSession` belongs to
+  // the wizard, on its own page).
   onMount(() => {
     void measure.refreshOnce();
     void align.refreshStatus();
@@ -686,8 +694,8 @@
   const heldFor = $derived(align.sessionActive ? (align.session?.outputs ?? []) : []);
 
   /** Friendly name for a node name, the same resolution the routing graph uses (the
-   *  rename store first). The wizard needs one for every speaker it names, including
-   *  sources it never lists. */
+   *  rename store first). Needed for the two alignment notices below, which name speakers
+   *  this page may not be listing — a held or reverted speaker can be offline. */
   function alignLabel(nodeName: string): string {
     const matrix = [...$routing.matrix.outputs, ...$routing.matrix.sources];
     return (
@@ -824,7 +832,7 @@
         title="Turn a Linux machine into an output: download the agent, install it, pair it"
         onclick={() => (agentDocsOpen = true)}
       >
-        Explain receiver hosts
+        Setup Linux/PipeWire host
       </button>
     </div>
   </div>
@@ -835,11 +843,11 @@
   </p>
 </div>
 
-<!-- Speaker alignment. Its own card between the page's explanation and the output list,
-     because it is about the *set* rather than about any one output — and because the set
-     is picked inside the wizard (plan §12.1). Kept out of the loading branch so a run in
+<!-- Speaker alignment, as much of it as belongs on this page: the way in, and the state.
+     Its own card between the page's explanation and the output list, because it is about
+     the *set* rather than about any one output. Kept out of the loading branch so a run in
      progress, or an outstanding revert, is still reachable while the listings refresh. -->
-{#if outputs.length >= 2 || wizardOpen || revertScope.length || heldFor.length}
+{#if outputs.length >= 2 || revertScope.length || heldFor.length}
   <div class="card align-card">
     <div class="info-head">
       <h2>Timing between speakers</h2>
@@ -847,55 +855,37 @@
         <button
           class="ghost"
           type="button"
-          title="Why speakers on one stream drift apart, what each of the three ways of aligning them promises, and when alignment is the wrong tool"
-          onclick={() => (alignDocsOpen = true)}
+          title="Pick the speakers, then measure them with a phone — or tune them by ear if the microphone cannot be used"
+          onclick={onAlign}
         >
-          Explain speaker alignment
+          Align speakers
         </button>
-        {#if !wizardOpen}
-          <button
-            class="ghost"
-            type="button"
-            title="Pick the speakers, then measure them with a phone — or tune them by ear if the microphone cannot be used"
-            onclick={() => (wizardOpen = true)}
-          >
-            Align speakers
-          </button>
-        {/if}
       </div>
     </div>
     <p class="card-sub" style="margin-bottom:0">
-      Speakers playing one stream should land together, but each adds its own delay on the way to the cone. Pick the
-      speakers to align and the add-on takes them over for the run — whatever they are playing stops and comes back
-      afterwards — then choose how to align them: <strong>measured with a phone</strong> from where you listen,
-      <strong>measured by walking</strong> to each speaker in turn (which aligns the wiring, so it is right everywhere), or
-      <strong>by ear</strong> when the microphone cannot be used. The two measured ways
-      <strong>write nothing until you approve the proposal</strong>; by ear, each nudge goes straight to the speaker.
+      Speakers playing one stream should land together, but each adds its own delay on the way to the cone.
+      <strong>Align speakers</strong> opens its own page: it checks the microphone, asks what should end up aligned, and
+      takes the speakers you pick over for the run — whatever they are playing stops and comes back afterwards. Nothing
+      is written to a speaker until you approve it.
     </p>
 
-    {#if !wizardOpen && heldFor.length}
-      <!-- An alignment is holding speakers while the wizard is closed. That is only
-           reachable by reloading the page mid-run — the wizard does not offer to close
-           while it holds anything — but the hold is *exclusive*, so the alternative is a
-           user staring at speakers that are silent for a reason nothing mentions. -->
+    {#if heldFor.length}
+      <!-- An alignment is holding speakers right now, and this page is where that is
+           noticed: the hold is *exclusive*, so the alternative is a user staring at
+           speakers that are silent for a reason nothing mentions. It stays here rather than
+           only on the Alignment page precisely because this is the page they were looking
+           at when they wondered. -->
       <div class="held">
         <span>
           An alignment is holding {heldFor.map(alignLabel).join(', ')} right now, so nothing else plays on
           {heldFor.length === 1 ? 'it' : 'them'} until it stops.
         </span>
-        <button class="ghost" onclick={() => (wizardOpen = true)}>Show it</button>
+        <button class="ghost" onclick={onAlign}>Show it</button>
       </div>
     {/if}
 
-    {#if wizardOpen}
-      <!-- Self-contained: the wizard takes no group, because the scope is the user's own
-           choice on its Speakers page (plan §12.1) and there is nothing here to seed it
-           from. -->
-      <AlignWizard label={alignLabel} onClose={() => (wizardOpen = false)} />
-    {/if}
-
     <!-- Plan §9.4: the write is destructive to a previously-tuned setup, and the daemon
-         keeps it revertable after the run is abandoned and the wizard closed — which is
+         keeps it revertable after the run is over and the wizard left — which is
          exactly when someone decides they preferred it before. -->
     {#if revertScope.length}
       <div class="revert">
@@ -1193,9 +1183,8 @@
   <ReceiverAgentDocs onClose={() => (agentDocsOpen = false)} />
 {/if}
 
-{#if alignDocsOpen}
-  <AlignDocs onClose={() => (alignDocsOpen = false)} />
-{/if}
+<!-- The alignment explainer went with the wizard, to the page it describes. -->
+
 
 <style>
   /* Card header with help buttons — same shape as the Input-sources card on the
@@ -1217,8 +1206,9 @@
     flex-wrap: wrap;
   }
 
-  /* The alignment card. The wizard brings its own frame, so this only has to hold the
-     header, the sentence and the revert offer. */
+  /* The alignment card — the way in and the two notices. The wizard is a page of its own
+     now, so this only has to hold the header, the sentence, the live-hold line and the
+     revert offer. */
   .align-card .revert {
     display: flex;
     align-items: center;
@@ -1239,8 +1229,8 @@
     font-size: 0.78rem;
     color: var(--secondary-text-color);
   }
-  /* A live hold, with the wizard closed. Primary-coloured rather than amber: nothing is
-     wrong, something is *running* — and it is the same colour the wizard uses for itself,
+  /* A live hold, seen from the page that lists the speakers. Primary-coloured rather than
+     amber: nothing is wrong, something is *running* — and it is the colour the wizard uses,
      so "Show it" leads somewhere that looks related. */
   .align-card .held {
     display: flex;
