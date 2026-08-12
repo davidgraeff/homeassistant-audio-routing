@@ -1,5 +1,6 @@
 <script lang="ts">
   import { routing } from './lib/routing';
+  import { PAGES, route, type Page } from './lib/route.svelte';
   import ThemeToggle from './components/ui/ThemeToggle.svelte';
   import Toasts from './components/ui/Toasts.svelte';
   import ConfirmDialog from './components/ui/ConfirmDialog.svelte';
@@ -20,17 +21,21 @@
   // pages deep, ending in a report that is read rather than glanced at, so it gets the room
   // a page has. Outputs keeps the way in and the "an alignment is holding these right now"
   // state, because those are what someone needs while looking at their speakers.
-  type Tab = 'music' | 'announcements' | 'outputs' | 'alignment' | 'sources' | 'settings' | 'diagnostics';
-  let tab = $state<Tab>('music');
-  const tabs: { id: Tab; label: string }[] = [
-    { id: 'music', label: 'Music groups' },
-    { id: 'announcements', label: 'Announcements' },
-    { id: 'outputs', label: 'Outputs' },
-    { id: 'alignment', label: 'Alignment' },
-    { id: 'sources', label: 'Sources' },
-    { id: 'settings', label: 'Settings' },
-    { id: 'diagnostics', label: 'Diagnostics' },
-  ];
+  //
+  // Which page is open lives in the URL fragment (`./lib/route.svelte`), so a reload — an
+  // add-on restart, or ingress reloading the panel iframe — comes back to the page the user
+  // was on rather than to the front page.
+  const tab = $derived(route.page);
+  /** The tab bar, in `PAGES` order so the URL ids and the bar cannot drift apart. */
+  const LABELS: Record<Page, string> = {
+    music: 'Music groups',
+    announcements: 'Announcements',
+    outputs: 'Outputs',
+    alignment: 'Alignment',
+    sources: 'Sources',
+    settings: 'Settings',
+    diagnostics: 'Diagnostics',
+  };
 </script>
 
 <header class="app-header">
@@ -41,9 +46,14 @@
   <ThemeToggle />
 </header>
 
+<!-- Anchors, not buttons: these *are* links now that a page has a URL, so middle-click,
+     "open in new tab" and the browser's own link affordances work without a handler. The
+     fragment change is the navigation — nothing here writes the page state. -->
 <nav class="tabs" aria-label="Sections">
-  {#each tabs as t (t.id)}
-    <button class:active={tab === t.id} onclick={() => (tab = t.id)}>{t.label}</button>
+  {#each PAGES as id (id)}
+    <a href={route.href(id)} class:active={tab === id} aria-current={tab === id ? 'page' : undefined}>
+      {LABELS[id]}
+    </a>
   {/each}
 </nav>
 
@@ -119,19 +129,19 @@
     border-bottom: 1px solid var(--divider-color);
     overflow-x: auto;
   }
-  .tabs button {
-    background: transparent;
-    border: none;
-    border-radius: 0;
+  .tabs a {
     padding: 12px 16px;
     color: var(--secondary-text-color);
     border-bottom: 2px solid transparent;
+    text-decoration: none;
+    white-space: nowrap;
+    font-size: inherit;
+    font-family: inherit;
   }
-  .tabs button:hover {
-    box-shadow: none;
+  .tabs a:hover {
     color: var(--primary-text-color);
   }
-  .tabs button.active {
+  .tabs a.active {
     color: var(--primary-color);
     border-bottom-color: var(--primary-color);
     font-weight: 500;
