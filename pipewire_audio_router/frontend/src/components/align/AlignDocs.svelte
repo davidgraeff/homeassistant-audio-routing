@@ -100,6 +100,48 @@
     </section>
 
     <section>
+      <!-- The long form of the wizard's first step. That step now shows a verdict and five
+           one-line checks; everything a reader might want *behind* those checks is here, so
+           the step itself stays short enough to act on. -->
+      <h3>What the microphone needs</h3>
+      <p>
+        The wizard asks for the microphone before anything else, because the answer decides which modes exist: two of
+        the three are measurements. It is the browser's own microphone, streamed to the add-on, and the add-on does all
+        the analysis — so the meter and the checks on that step describe the whole path, not just that the phone has a
+        microphone.
+      </p>
+      <ul>
+        <li>
+          <strong>Home Assistant has to be open over HTTPS.</strong> On a plain <code>http://…:8123</code> address the
+          browser hides the microphone completely — there is no permission to grant and no way around it. Use the
+          <code>https://</code> address for the same instance.
+        </li>
+        <li>
+          <strong>The browser's own processing must be off.</strong> Echo cancellation is designed to remove
+          loudspeaker sound from a microphone signal, which is exactly the sound being measured, and it adapts over
+          seconds — so a run would start out plausible and decay. The same goes for automatic gain control and noise
+          suppression. All three are switched off when the capture is asked for; a browser that admits to keeping one on
+          is refused, and one that will not say either way (Safari reports none of them) is allowed with a caveat that
+          travels with the run.
+        </li>
+        <li>
+          <strong>Leave the capture running for the whole run.</strong> Every arrival is timed against one continuous
+          recording, so stopping and starting the microphone throws away the reference everything measured so far
+          shares. In Near field that means walking the house a second time.
+        </li>
+        <li>
+          <strong>Loud enough to hear, quiet enough not to clip.</strong> A clipped block is broadband, so it spoils
+          every speaker's reading at once, not just the loud one's — hence the level is set per speaker, with the
+          add-on's own verdict on each, rather than by one volume for the group.
+        </li>
+      </ul>
+      <p class="hint">
+        The microphone step cannot judge the <em>level</em> yet: nothing is playing the test click at that point, because
+        no speakers have been taken over. That verdict comes one step later, per speaker.
+      </p>
+    </section>
+
+    <section>
       <h3>The click, and why it alternates</h3>
       <p>
         Starting a session mutes the group and loops an <strong>alternating two-tone click</strong> through it: a high

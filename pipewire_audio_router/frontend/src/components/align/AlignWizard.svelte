@@ -52,9 +52,8 @@
 
   interface Props {
     label: (nodeName: string) => string;
-    onClose: () => void;
   }
-  let { label, onClose }: Props = $props();
+  let { label }: Props = $props();
 
   /** Is a session holding speakers right now? Read from the store rather than passed
    *  in: a session's identity is the *selection* it was formed over, and no page outside
@@ -270,14 +269,27 @@
 
   /** Stop everything: abandon the run and end the session, which restores levels,
    *  mutes and routing exactly as finishing by hand does — and releases the exclusive
-   *  hold, so the displaced music comes back. Available on every page, in every state,
-   *  including while the hold is still forming (plan §12.2); it never touches a speaker's knob,
-   *  so an applied write stays revertable afterwards. */
+   *  hold, so the displaced music comes back. Offered from every page, in every state a
+   *  hold exists in, including while it is still forming (plan §12.2); it never touches a
+   *  speaker's knob, so an applied write stays revertable afterwards.
+   *
+   *  It does **not** leave the page. Giving the speakers back and walking away are two
+   *  different intentions, and this is the first one — the tab bar is the second. */
   async function stopAll() {
     await measure.abandon();
     if (align.sessionActive) await align.stop();
-    onClose();
+    // The page the user was on may have described the session that just ended — the by-ear
+    // sliders have nothing to slide, a run has nothing to show. Step back to the last page
+    // that is still true, exactly as an expiry does; this used to be hidden by stopping
+    // navigating away from the wizard altogether.
+    if (!reachable(page)) page = 'speakers';
   }
+
+  /** Is the microphone panel on screen? Same condition the panel is mounted under, so the
+   *  control in the button row below cannot offer to start a capture the page is not
+   *  showing the state of. */
+  const micPanel = $derived(measured || page === 'mic');
+  const capturing = $derived(mic.phase === 'capturing');
 </script>
 
 <div class="wizard">
@@ -312,35 +324,17 @@
     {#if status && status.phase !== 'idle'}
       <span class="badge" class:on={running} class:warn={status.phase === 'refused'}>{phaseLabel(status.phase)}</span>
     {/if}
-    <span class="spacer"></span>
-    {#if running}
-      <!-- `running`, not `live`: a chain parked between positions is not doing anything
-           at this instant but is very much a run — it is holding the group and carrying
-           provisional delays — so abandoning it has to be offered there too. -->
-      <button class="ghost" disabled={measure.busy} title="Stop measuring, leave the test tone playing" onclick={() => void measure.abandon()}>
-        Stop measuring
-      </button>
-    {/if}
-    <!-- Never disabled by a forming hold: stopping has to work at every point, and
-         the daemon's stop is safe against a start that is still in flight. -->
-    <button class="danger" disabled={measure.busy} title="Stop measuring, give the speakers back and put levels, mutes and routing back to normal" onclick={() => void stopAll()}>
-      Stop and restore
-    </button>
-    {#if !running && !holding}
-      <button class="ghost" title="Leave the wizard; nothing is being held and no run is in progress" onclick={onClose}>
-        Close
-      </button>
-    {/if}
+    <!-- No buttons here. Everything actionable lives in the one row under the page, where
+         the user is already looking for what to press next; a header full of controls put
+         "Stop and restore" — the most destructive thing on the page — furthest from the
+         step it would interrupt. -->
   </div>
 
   {#if holding}
     {#if !running}
-      <!-- Closing is deliberately not offered while speakers are held: the hold is
-           exclusive, so leaving it running would leave part of the house silent with no
-           visible reason. "Stop and restore" is the way out, and it says what it does. -->
       <p class="hint">
-        These speakers are held for the alignment, so something else may have stopped playing on them. Use
-        <strong>Stop and restore</strong> to give them back.
+        These speakers are held for the alignment, so something else may have stopped playing on them.
+        <strong>Stop and restore</strong> gives them back.
       </p>
     {/if}
     <!-- …and the other way the hold ends: by itself. Shown while a run is in progress too,
@@ -382,9 +376,13 @@
            run is in progress, so flipping the radio mid-run cannot pull the capture out
            from under it;
          * the **microphone step** — which is where a capture is established or found
-           impossible, and therefore the one page that must show the control even when the
-           selected mode is by-ear (which it will be, the moment the check fails). -->
-  {#if measured || page === 'mic'}
+           impossible, and therefore the one page that must show its state even when the
+           selected mode is by-ear (which it will be, the moment the check fails).
+
+       The panel is status only; starting and stopping live in the button row below, because
+       that is where a user looks for something to press. `micPanel` is the same condition,
+       named, so the two cannot disagree about whether there is a capture to control. -->
+  {#if micPanel}
     <MicCapture />
   {/if}
 
@@ -417,25 +415,10 @@
   <div class="page">
     {#if page === 'mic'}
       <AlignWizardMic {outcome} block={micBlock} caveat={micCaveat} />
-      <div class="nav">
-        <!-- Always enabled: this step reduces the choice, it does not gate it. A browser
-             with no microphone at all still has Manual waiting on the next page, and a
-             blocked Next would strand the very user the fallback exists for. -->
-        <button class="primary" onclick={() => (page = 'mode')}>
-          {micBlock ? 'Continue without a microphone' : 'Next: mode'}
-        </button>
-      </div>
     {:else if page === 'mode'}
       <AlignWizardMode {mode} {chained} measuredBlock={micBlock} {micCaveat} onPick={(m) => (pick = m)} onChain={(c) => (chained = c)} />
-      <div class="nav">
-        <button class="ghost" onclick={() => (page = 'mic')}>Back</button>
-        <button class="primary" onclick={() => (page = 'speakers')}>Next: speakers</button>
-      </div>
     {:else if page === 'speakers'}
       <AlignWizardSpeakers {mode} chained={mode === 'sweet_spot' && chained} {label} onStart={() => void start()} />
-      <div class="nav">
-        <button class="ghost" onclick={() => (page = 'mode')}>Back</button>
-      </div>
     {:else if page === 'body'}
       <!-- Page 3 is the mode's own body (plan §12.1): the measurement run — which carries
            the chain or the walk inside it — or the by-ear sliders. -->
@@ -456,10 +439,6 @@
       {:else}
         <p class="empty">Nothing is being measured. Go back to Speakers and start a run.</p>
       {/if}
-      <div class="nav">
-        <button class="ghost" onclick={() => (page = 'speakers')}>Back</button>
-        {#if hasResult}<button class="primary" onclick={() => (page = 'review')}>Next: review</button>{/if}
-      </div>
     {:else if status}
       <AlignWizardReview
         {status}
@@ -470,10 +449,89 @@
         onDiscard={() => void measure.abandon().then(() => (page = 'speakers'))}
         onRetry={() => void start()}
       />
-      <div class="nav">
-        <button class="ghost" onclick={() => (page = 'body')}>Back to the run</button>
-      </div>
     {/if}
+  </div>
+
+  <!-- One button row for the whole wizard, and it is split by *what a button does* rather
+       than by where it happens to be declared:
+
+         * **left — this step's actions.** Things that change the world: start or stop the
+           capture, abandon a run, give the speakers back. They belong with the step, so
+           they are here rather than in the header where they used to be.
+         * **right — moving through the wizard.** Back and Next only change which page is
+           on screen, and putting them at the trailing edge keeps "what comes next" in one
+           fixed place on every step instead of shifting with the actions beside it.
+
+       Rendered once for every page rather than inside each page's branch: "Stop and
+       restore" has to be reachable from all of them, and five copies of it is five places
+       for one of them to be forgotten. -->
+  <div class="nav">
+    <div class="acts">
+      <!-- The microphone control, moved off the panel above. It is the one thing this step
+           asks the user to do, so it is a primary button in the row they are reading —
+           not a ghost button tucked into a status strip.
+
+           Hidden entirely when there is nothing to grant (no secure context, no
+           AudioWorklet): pressing it could only ever reprint the reason the panel is
+           already showing. -->
+      {#if micPanel && !mic.preflightError}
+        {#if capturing}
+          <!-- Stopping is only offered on the step that is *about* the microphone. Later
+               steps depend on the capture staying open — a restart throws away the timing
+               reference every earlier reading shares — so the button that would break the
+               run is not put next to the one that continues it. -->
+          {#if page === 'mic'}
+            <button class="ghost" title="Close the capture and release the microphone" onclick={() => mic.stop()}>
+              Stop microphone
+            </button>
+          {/if}
+        {:else}
+          <button class="mic-cta" disabled={mic.phase === 'starting'} title="Grant microphone access so the add-on can measure the speakers instead of you judging by ear" onclick={() => void mic.start()}>
+            <span class="ico" aria-hidden="true">🎤</span>
+            {mic.phase === 'starting' ? 'Starting the microphone…' : mic.error ? 'Try the microphone again' : 'Use microphone'}
+          </button>
+        {/if}
+      {/if}
+      {#if running}
+        <!-- `running`, not `live`: a chain parked between positions is not doing anything
+             at this instant but is very much a run — it is holding the group and carrying
+             provisional delays — so abandoning it has to be offered there too. -->
+        <button class="ghost" disabled={measure.busy} title="Stop measuring, leave the test tone playing" onclick={() => void measure.abandon()}>
+          Stop measuring
+        </button>
+      {/if}
+      <!-- Only once there is something to stop, which is what makes it meaningful: before
+           a hold exists it would restore nothing, and a button that does nothing on the
+           first three steps is a button nobody trusts on the fourth. Never disabled by a
+           forming hold, though — stopping has to work at every point, and the daemon's
+           stop is safe against a start that is still in flight. -->
+      {#if holding || running}
+        <button class="danger" disabled={measure.busy} title="Stop measuring, give the speakers back and put levels, mutes and routing back to normal" onclick={() => void stopAll()}>
+          Stop and restore
+        </button>
+      {/if}
+    </div>
+
+    <div class="stepper">
+      {#if page === 'mic'}
+        <!-- Always enabled: this step reduces the choice, it does not gate it. A browser
+             with no microphone at all still has Manual waiting on the next page, and a
+             blocked Next would strand the very user the fallback exists for. -->
+        <button class="primary" onclick={() => (page = 'mode')}>
+          {micBlock ? 'Continue without a microphone' : 'Next: mode'}
+        </button>
+      {:else if page === 'mode'}
+        <button class="ghost" onclick={() => (page = 'mic')}>Back</button>
+        <button class="primary" onclick={() => (page = 'speakers')}>Next: speakers</button>
+      {:else if page === 'speakers'}
+        <button class="ghost" onclick={() => (page = 'mode')}>Back</button>
+      {:else if page === 'body'}
+        <button class="ghost" onclick={() => (page = 'speakers')}>Back</button>
+        {#if hasResult}<button class="primary" onclick={() => (page = 'review')}>Next: review</button>{/if}
+      {:else}
+        <button class="ghost" onclick={() => (page = 'body')}>Back to the run</button>
+      {/if}
+    </div>
   </div>
 
   <!-- A refused action (start, apply, revert) in full: kind, sentence, member,
@@ -499,13 +557,6 @@
     gap: 8px;
     flex-wrap: wrap;
     font-size: 0.9rem;
-  }
-  .spacer {
-    flex: 1 1 auto;
-  }
-  .head button {
-    padding: 4px 10px;
-    font-size: 0.8rem;
   }
   .steps {
     display: flex;
@@ -547,11 +598,47 @@
   .page {
     margin-top: 12px;
   }
+  /* Actions leading, stepping trailing — with a divider above, so the row reads as the
+     step's footer rather than as more content. `space-between` on two groups rather than a
+     spacer element: when the row wraps on a phone the two groups stay whole, and the
+     actions stay first. */
   .nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--divider-color);
+  }
+  .acts,
+  .stepper {
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
-    margin-top: 14px;
+    align-items: center;
+  }
+  /* Deliberately louder than `.primary`: this is the one thing the microphone step asks
+     for, and it was previously a ghost button inside a status strip — where users did not
+     find it. Primary colour, the emoji as a hint at what it wants, and full-size padding
+     against the smaller controls around it. */
+  .mic-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 16px;
+    font-weight: 500;
+    background: var(--primary-color);
+    color: var(--text-on-primary);
+    box-shadow: var(--ha-card-box-shadow);
+  }
+  .mic-cta:hover:not(:disabled) {
+    background: var(--primary-color-emphasis);
+  }
+  .mic-cta .ico {
+    font-size: 1rem;
+    line-height: 1;
   }
   .empty {
     font-size: 0.84rem;

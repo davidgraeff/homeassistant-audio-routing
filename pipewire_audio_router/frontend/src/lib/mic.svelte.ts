@@ -272,7 +272,7 @@ function captureFailure(e: unknown): CaptureError {
     case 'OverconstrainedError':
       return new CaptureError(
         'no_input',
-        'No audio input could be opened as a single mono channel with the browser’s own processing switched off, which is what a measurement needs (plan §4.2).',
+        'No audio input could be opened as a single mono channel with the browser’s own processing switched off, which is what a measurement needs.',
       );
     default:
       return new CaptureError('other', `The microphone could not be started: ${own}.`);

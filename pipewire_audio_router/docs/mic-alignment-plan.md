@@ -1221,6 +1221,47 @@ the microphone control and stops the capture the user just proved works; and "is
 measured run" must derive from the mode being **shown**, not from the picker, or a measured
 proposal ends up under a by-ear heading.
 
+### 12.1.1 What the page looked like after it stopped being a card, and what that cost (2026-08-12)
+
+Four things survived the move from embedded card to page that only made sense as a card,
+and every one of them was found by a first-time user rather than by a test:
+
+- **Two ways out and no hold.** "Close" was the card's dismissal and had nothing left to
+  dismiss, while "Stop and restore" — the one destructive control on the page — sat in the
+  header on every step, including the three where no speakers are held and it would restore
+  nothing. Close is gone (the tab bar is the way out), and stopping is offered **only once
+  a hold exists**, in the button row, beside the button that continues the step it would
+  interrupt.
+- **Every step ended in buttons that meant different things and looked the same.** The row
+  is now split by what a button *does*: **actions leading** (use/stop the microphone,
+  abandon a run, give the speakers back), **stepping trailing** (Back, Next). One row,
+  rendered once for the whole wizard rather than per page, because "Stop and restore" has
+  to be reachable from all of them.
+- **"Use microphone" was a ghost button inside a status strip**, i.e. the one thing the
+  first step asks for was the least visible thing on it. It moved into the action row as a
+  primary call to action, and the strip became status-only. Every "start the microphone
+  *above*" sentence had to move with it.
+- **The introduction re-explained the wizard.** The page opened with the three modes, their
+  costs and the write-on-approve rule — all of it repeated by the step that asks about it a
+  moment later — and the microphone step then spent three screens on why it comes first.
+  Both are now two sentences; the long form lives behind **Explain speaker alignment**,
+  which is where a first-time user can find it and a second-time user can skip it. Nothing
+  user-facing cites a plan section any more (one refusal message and one paragraph did).
+
+Two rules the microphone strip now follows, both of which are about *layout* being part of
+the meaning:
+
+- **Constant height in every state.** It sits above the step the user is reading, so each
+  line it grows by pushes that step down. The same five acceptance criteria are therefore
+  always rendered — pending, met or failed — each a single clipped line with the detail in
+  its tooltip, and the meter is drawn while idle rather than appearing on start. Only a
+  failure with a sentence of its own adds a line, and that one stays until it is acted on.
+- **No level verdict on the microphone step.** `GET /api/align/mic/signal` needs the click
+  track, and on that step nothing is playing it — no hold has been formed — so the honest
+  answer is always "still collecting audio, no complete period yet": a complaint about a
+  sound nobody made. The verdict belongs where a speaker *is* clicking, which is §12.2's
+  per-speaker level phase one step later.
+
 **The session's remaining time is on screen, and its ending resets the wizard.** Both
 follow from the hold being exclusive and the timeout being an *idle* one (§1.2), and both
 are needed in **two** places — the wizard, and the Outputs page's "an alignment is holding
@@ -1506,8 +1547,10 @@ sliders. Pieces worth knowing:
   silent `addModule` rejection, not a build error;
 - a secure-context / permission pre-flight that explains the HTTPS requirement
   (§4.1) *before* asking for the mic, plus the constraint read-back (§4.2);
-- a live level meter and per-channel SNR readout — the user must be able to see that
-  the mic is working and the room is quiet enough, or every failure looks like a bug;
+- a live level meter plus the five fixed acceptance criteria of §12.1.1 — the user must be
+  able to see that the mic is working and that nothing is being lost or clipped, or every
+  later failure looks like a bug. The **per-channel SNR readout goes with the level phase**,
+  not with the meter: it needs the click track (§12.1.1);
 - the proposed delta table with confidences, "provisional" stated above every number
   during a chain, Δ propagation naming the speakers that moved *without being
   audible*, and the apply/revert buttons;

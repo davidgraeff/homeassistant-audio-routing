@@ -27,16 +27,14 @@
   import AlignDocs from './AlignDocs.svelte';
   import AlignWizard from './AlignWizard.svelte';
 
-  interface Props {
-    /** Leave the page — the wizard's own "Close", which it offers only when nothing is
-     *  held and no run is in progress. Owned by App.svelte, which owns the tab. */
-    onDone: () => void;
-  }
-  let { onDone }: Props = $props();
-
+  // No "leave the page" callback: this is a tab, so the tab bar is the way out. A wizard
+  // button that navigated to another tab was left over from the embedded card, and it
+  // competed with the one exit that matters here — "Stop and restore", which gives the
+  // speakers back rather than abandoning a hold behind the user's back.
+  //
   // Long-form detail lives in the dialog, the same split every other page uses. It moved
-  // here with the wizard: it explains the three modes and when alignment is the wrong
-  // tool, which is this page's subject and no longer the Outputs page's.
+  // here with the wizard: it explains the three modes, what the microphone needs and when
+  // alignment is the wrong tool, so the page itself can stay short.
   let docsOpen = $state(false);
 
   /** The adopted outputs, so a node name can be resolved to the user's own name for it
@@ -73,19 +71,19 @@
       </button>
     </div>
   </div>
+  <!-- Two sentences, and deliberately not a summary of the wizard: every mode, cost and
+       caveat that used to be crammed in here is explained by the step that asks about it,
+       or in the dialog behind the button above. An introduction that repeats the wizard
+       teaches the reader to skip both. -->
   <p class="card-sub" style="margin-bottom:0">
-    Speakers playing one stream should land together, but each adds its own delay on the way to the cone. Pick the
-    speakers to align and the add-on takes them over for the run — whatever they are playing stops and comes back
-    afterwards — then choose how to align them: <strong>measured with a phone</strong> from where you listen,
-    <strong>measured by walking</strong> to each speaker in turn (which aligns the wiring, so it is right everywhere), or
-    <strong>by ear</strong> when the microphone cannot be used. The two measured ways
-    <strong>write nothing until you approve the proposal</strong>; by ear, each nudge goes straight to the speaker.
+    Speakers playing one stream should land together, but each one adds its own delay on the way to the cone. Pick the
+    speakers, and the wizard below lines them up — measured with this phone's microphone, or by ear.
   </p>
 </div>
 
 <!-- No card wrapper: the wizard brings its own frame, and a frame inside a frame is what
      made this feel like a widget on the Outputs page. -->
-<AlignWizard label={alignLabel} onClose={onDone} />
+<AlignWizard label={alignLabel} />
 
 {#if docsOpen}
   <AlignDocs onClose={() => (docsOpen = false)} />

@@ -58,9 +58,8 @@
          know it is a tab at all. -->
     <OutputsTab />
   {:else if tab === 'alignment'}
-    <!-- Closing the wizard (offered only when nothing is held and no run is in progress)
-         goes back to the speakers it is about. -->
-    <AlignmentTab onDone={() => (tab = 'outputs')} />
+    <!-- No exit callback: it is a tab, so this bar is the way out. -->
+    <AlignmentTab />
   {:else if tab === 'sources'}
     <SourcesTab />
   {:else if tab === 'settings'}

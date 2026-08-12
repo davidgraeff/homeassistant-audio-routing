@@ -195,7 +195,7 @@
           // else. By-ear exists for the case where there is no usable one (plan §4.1), so
           // requiring a capture here is what made the mode unreachable in practice.
           measured && !capturing
-          ? 'Start the microphone above — the daemon refuses to measure without a capture, because it has nothing to listen to.'
+          ? 'Press "Use microphone" below — measuring is refused without a capture, because there is nothing to listen to.'
           : null,
   );
 </script>
