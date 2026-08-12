@@ -426,6 +426,33 @@ export interface AlignState {
   /** The routing this session is displacing while it holds these speakers: what
    *  the UI shows as "these speakers will stop playing what they play now". */
   displaced: RoutingLink[];
+  /** How much longer the session may sit **idle** before the daemon tears it down and
+   *  gives the speakers back — whole seconds **relative to this frame**, `null` when
+   *  nothing is running.
+   *
+   *  Relative rather than an absolute instant on purpose: the browser's clock and the
+   *  daemon's differ by an unknown amount, so the client turns this into its *own*
+   *  deadline on arrival, counts down locally, and re-syncs on the next frame.
+   *
+   *  **`0` does not mean gone.** It means the deadline has passed and the watchdog will
+   *  take the session at its next check, up to `timeout_slack_s` later — so the
+   *  disappearance is rendered when a frame says `active: false`, never by this hitting
+   *  zero.
+   *
+   *  What refreshes it is doing something *to* the run, not looking at it: soloing,
+   *  changing a level, a re-scoping start, or the deliberate `POST
+   *  /api/align/still-here`. Reading a proposal refreshes nothing, and neither does
+   *  holding the status socket open — which is the point, since a forgotten open tab is
+   *  the same hazard as a closed one. */
+  closes_in_s: number | null;
+  /** The whole idle allowance, in seconds — what `closes_in_s` counts down from. Read
+   *  from here rather than hard-coded so the sentence the UI writes ("15 minutes without
+   *  a change") cannot drift from the daemon's own number. */
+  idle_timeout_s: number;
+  /** How much *later* than `closes_in_s` the close can actually happen, because the
+   *  daemon's watchdog is a poller. This is the size of the word "about": a UI must not
+   *  count a user down to a precise second it does not have. */
+  timeout_slack_s: number;
 }
 
 /** Microphone-ingest status (`/api/align/mic`, align/mic.rs) — what the level

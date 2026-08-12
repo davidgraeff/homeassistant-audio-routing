@@ -9,6 +9,7 @@
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
   import { align } from '../lib/align.svelte';
+  import AlignHoldTimer from './AlignHoldTimer.svelte';
   import DelaySlider from './DelaySlider.svelte';
   import VolumeControl from './VolumeControl.svelte';
   import { measure } from '../lib/measure.svelte';
@@ -679,16 +680,20 @@
   // than `measure.attach()`: attaching would open the push socket and poll for as long as
   // this page is open, on a page most visits never align from.
   //
-  // The session is read once for the same reason, and it answers a question this page could
+  // The session is watched for a related reason, and it answers a question this page could
   // not otherwise answer at all: **are speakers held right now?** An alignment hold is
   // exclusive, and it outlives a visit to the Alignment page — so without this the user
   // would be looking at speakers that are silent for a reason nothing on the page mentions.
-  // `refreshStatus` is one GET and takes no poll loop up (`align.attachSession` belongs to
-  // the wizard, on its own page).
-  onMount(() => {
-    void measure.refreshOnce();
-    void align.refreshStatus();
-  });
+  //
+  // `watchSession()` rather than the old one-shot `refreshStatus()`, and it is *cheaper*
+  // than the poll loop that phrase used to warn about: it pushes over
+  // `GET /api/align/ws` and polls only while the socket is not delivering. The one-shot
+  // read was wrong in both directions on the notice below — it could not show a hold that
+  // started after this page was opened, and worse, it went on claiming one after the
+  // daemon's idle timeout had already given the speakers back. That claim is now dropped
+  // the moment the session ends, which is the whole reason the socket exists.
+  onMount(() => void measure.refreshOnce());
+  $effect(() => align.watchSession());
   const revertScope = $derived(measure.canRevert ? measure.revertScope : []);
   /** Speakers held by an alignment session right now, as this page last saw it. */
   const heldFor = $derived(align.sessionActive ? (align.session?.outputs ?? []) : []);
@@ -881,6 +886,19 @@
           {heldFor.length === 1 ? 'it' : 'them'} until it stops.
         </span>
         <button class="ghost" onclick={onAlign}>Show it</button>
+        <!-- …and when it stops by itself. Here, not only in the wizard, because this is the
+             page someone is looking at when they wonder why a room is quiet — and the
+             answer "for another twelve minutes, unless someone is using it" is most of what
+             they wanted to know. -->
+        <AlignHoldTimer compact />
+      </div>
+    {:else if align.ended}
+      <!-- The hold this page was reporting has just been released. Said once rather than
+           having the notice simply vanish, which would leave the earlier line looking like
+           it had been imagined. -->
+      <div class="held">
+        <span>{align.ended.why}</span>
+        <button class="ghost" onclick={() => align.clearEnded()}>Got it</button>
       </div>
     {/if}
 

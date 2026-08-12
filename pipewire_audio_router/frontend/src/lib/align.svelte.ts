@@ -12,7 +12,7 @@
 // `startSelection`, including by-ear, which is what stops `manual` being a special
 // case with its own entry point and its own lifecycle rules.
 
-import { api } from './api';
+import { ALIGN_WS_PATH, api, wsUrl } from './api';
 import { run } from './toast';
 import { mic } from './mic.svelte';
 import type {
@@ -113,6 +113,49 @@ export function isMeasured(mode: WizardMode): mode is MeasureMode {
   return mode !== 'manual';
 }
 
+// ---- The session's idle timeout, as something a user can see coming ----------
+//
+// The hold is exclusive, so when the daemon's idle timeout fires, speakers that were
+// held go back to normal — and a wizard still on screen is describing a session that no
+// longer exists. It bit a real multi-position run, because the step where a session
+// runs out is the *review page* and reading is silent.
+
+/** How this browser understands a session ending. */
+export type SessionEndCause =
+  /** We asked for it (`stop()`), so the toast has already said so. */
+  | 'stopped-here'
+  /** It ran out of idle time. Inferred from the last countdown we were told, so it is a
+   *  best reading rather than a claim the daemon made. */
+  | 'timed-out'
+  /** Something else ended it: another tab's Stop, or a `start` that superseded it. */
+  | 'elsewhere';
+
+export interface SessionEnd {
+  cause: SessionEndCause;
+  /** What to show. Written here rather than in a component because two pages show it
+   *  (the wizard and the Outputs page's held notice) and one wording is the point. */
+  why: string;
+}
+
+/** The remaining idle time, in the user's words — deliberately vague.
+ *
+ *  The daemon's watchdog only looks every `timeout_slack_s` (30 s), so the real close can
+ *  be that much later than the number it sent. Rendering "13:42" would promise a
+ *  precision that does not exist and invite someone to watch it, so this rounds to
+ *  whatever the slack can support and always says "about". */
+export function holdCloseLabel(seconds: number, slackSeconds: number): string {
+  if (seconds <= 0) return 'any moment now';
+  if (seconds <= slackSeconds) return 'in less than a minute';
+  const minutes = Math.round(seconds / 60);
+  if (minutes <= 1) return 'in about a minute';
+  return `in about ${minutes} minutes`;
+}
+
+/** Below this many seconds left, the indicator stops being a footnote. Two minutes is
+ *  four watchdog polls — enough that a warning is still actionable, close enough that it
+ *  is worth interrupting someone reading a proposal. */
+export const HOLD_CLOSE_WARN_S = 120;
+
 /** The session promise (`AlignMode`) a wizard mode makes. Two enums, one meaning:
  *  `sweet_spot` and `multi_position` are the same promise under the two names the
  *  daemon uses (`MeasureMode` vs `AlignMode`), so the mapping is written once here
@@ -158,6 +201,213 @@ function createAlign() {
    *  checklist of "which of my scope has been confirmed audible". */
   let verdicts = $state<Record<string, SignalCheck['verdict']>>({});
 
+  // ---- The session is pushed, with polling as the floor -----------------------
+  //
+  // The same two-channel shape `measure.svelte.ts` uses, and for a sharper reason: a
+  // session can end *without the UI doing anything at all* — the daemon's idle timeout
+  // gives the speakers back, a second tab stops it, a new `start` supersedes it — and
+  // until this browser hears about that it is showing a wizard for a session that no
+  // longer exists while the speakers it names have already gone back to normal.
+  //
+  //   * polling starts immediately on attach and keeps going;
+  //   * the socket only *earns* the right to stop it by delivering an actual state, so an
+  //     upgrade that succeeds and then says nothing changes nothing;
+  //   * a close or an error puts polling back and re-tries the socket later.
+  let socket: WebSocket | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let statusTimer: ReturnType<typeof setTimeout> | null = null;
+  let watching = 0;
+  /** True once the socket has actually delivered a state, i.e. polling is off. */
+  let pushing = $state(false);
+
+  /** Fallback poll interval. `AlignState` also carries things nothing pushes —
+   *  `interference` is appended by the announce arbiter through the hold, which has no way
+   *  back to the session's notifier — so this stays modest rather than becoming a
+   *  once-a-minute formality. */
+  const STATUS_POLL_MS = 3000;
+  /** Quiet upgrade attempt after the socket failed or dropped. Polling continues
+   *  throughout, so nobody is waiting on it. */
+  const WS_RETRY_MS = 15000;
+
+  // ---- The idle countdown, ticked locally from a pushed deadline ---------------
+  //
+  // `closes_in_s` is relative to the frame it arrived in, so the moment it arrives it is
+  // turned into a deadline on *this* clock and counted down here. A per-second push would
+  // be absurd, and an absolute daemon timestamp would be wrong by whatever the two clocks
+  // disagree by.
+  let closeDeadline = $state<number | null>(null);
+  let ticked = $state(Date.now());
+  let tick: ReturnType<typeof setInterval> | null = null;
+  /** Set while our own `stop()` is in flight, so the state it clears is not reported back
+   *  to the user as something that happened *to* them. */
+  let stopping = false;
+  let ended = $state<SessionEnd | null>(null);
+
+  function startTicking() {
+    if (tick) return;
+    tick = setInterval(() => (ticked = Date.now()), 1000);
+  }
+
+  function stopTicking() {
+    if (!tick) return;
+    clearInterval(tick);
+    tick = null;
+  }
+
+  /** Seconds left before the session is torn down, counted down locally and re-synced by
+   *  every frame. `null` when nothing is running, or when a daemon too old to send the
+   *  field is answering — in which case the UI says nothing rather than inventing one. */
+  function closesIn(): number | null {
+    if (closeDeadline === null) return null;
+    return Math.max(0, Math.round((closeDeadline - ticked) / 1000));
+  }
+
+  /** Adopt one state frame, from either channel, and notice the transitions that matter.
+   *
+   *  Every assignment to `session` goes through here. Two of them are not bookkeeping:
+   *  the local deadline is re-derived from `closes_in_s` on every frame (so a refresh
+   *  anywhere — this tab, another tab, the run itself soloing a speaker — moves the
+   *  countdown), and an `active` that has just gone false runs the reset below. */
+  function adopt(st: AlignState) {
+    const was = session?.active ?? false;
+    // How much idle time was left *this instant*, from the deadline rather than from the
+    // once-a-second tick. Taken before the deadline is dropped below, because it is what
+    // tells a session that has just vanished apart from one somebody else stopped.
+    const remainingNow = closeDeadline === null ? null : Math.max(0, Math.round((closeDeadline - Date.now()) / 1000));
+    session = st;
+    if (st.active) {
+      ended = null;
+      closeDeadline = st.closes_in_s === null || st.closes_in_s === undefined ? null : Date.now() + st.closes_in_s * 1000;
+      if (closeDeadline !== null) startTicking();
+      return;
+    }
+    closeDeadline = null;
+    stopTicking();
+    if (was) sessionClosed(st, remainingNow);
+  }
+
+  /** The session has gone. Put everything derived from it back to a state the user can
+   *  start again from, and say why — a panel that silently empties leaves someone
+   *  wondering whether they broke it.
+   *
+   *  What is **not** cleared is the two things that are the user's own choices rather than
+   *  the session's: the speaker selection (so "start again" is one click, which is the
+   *  whole point of resetting properly) and the per-speaker levels (they were chosen, not
+   *  measured — the same reasoning `stop()` has always used for them). */
+  function sessionClosed(st: AlignState, remainingNow: number | null) {
+    soloIntent = null;
+    // The verdicts described *that* hold's levels; carrying them into the next one would
+    // show a confirmation nothing has re-checked. The level slider is left where the user
+    // put it — it is their choice, and it seeds the next session.
+    verdicts = {};
+    if (stopping) {
+      // We asked for it, and `run()` has already said "volumes restored".
+      ended = null;
+      return;
+    }
+    // The countdown had run out (or was inside one watchdog poll of it): the idle timeout
+    // is the explanation. Anything else was ended somewhere else. It is an inference, not
+    // a claim the daemon made, which is why the two sentences differ in what they promise
+    // — one explains a rule, the other only reports that it happened.
+    const slack = st.timeout_slack_s ?? 30;
+    const timedOut = remainingNow !== null && remainingNow <= slack;
+    const minutes = Math.round((st.idle_timeout_s ?? 900) / 60);
+    ended = timedOut
+      ? {
+          cause: 'timed-out',
+          why:
+            `The alignment gave the speakers back on its own: nothing had changed for ${minutes} minutes, so it released them ` +
+            `and put their levels, mutes and routing back. Reading a page does not count as a change — soloing a speaker, ` +
+            `moving a level or measuring one does, and so does “Keep it open”. Everything you had picked is still selected, ` +
+            `so you can start again.`,
+        }
+      : {
+          cause: 'elsewhere',
+          why:
+            'The alignment session ended somewhere else — another tab stopped it, or a new one was started over it. The ' +
+            'speakers have their levels, mutes and routing back. Your selection is still here, so you can start again.',
+        };
+  }
+
+  async function pollStatus() {
+    try {
+      adopt(await api.alignStatus());
+    } catch {
+      /* keep the last-known state: a failed poll is not a state change */
+    }
+    scheduleStatusPoll();
+  }
+
+  function scheduleStatusPoll() {
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = watching > 0 && !pushing ? setTimeout(() => void pollStatus(), STATUS_POLL_MS) : null;
+  }
+
+  function scheduleSocketRetry() {
+    if (retry || watching === 0) return;
+    retry = setTimeout(() => {
+      retry = null;
+      openSocket();
+    }, WS_RETRY_MS);
+  }
+
+  function openSocket() {
+    if (socket || watching === 0) return;
+    let sock: WebSocket;
+    try {
+      sock = new WebSocket(wsUrl(ALIGN_WS_PATH));
+    } catch {
+      scheduleSocketRetry();
+      return;
+    }
+    socket = sock;
+    sock.onmessage = (ev) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(String(ev.data));
+      } catch {
+        return; // not a state frame; polling is still running if we never adopted one
+      }
+      // Shape-checked rather than trusted: adopting `{}` would report the session as
+      // ended, which is the one thing this channel must never get wrong.
+      if (!parsed || typeof parsed !== 'object' || typeof (parsed as AlignState).active !== 'boolean') return;
+      adopt(parsed as AlignState);
+      if (!pushing) {
+        pushing = true;
+        if (statusTimer) {
+          clearTimeout(statusTimer);
+          statusTimer = null;
+        }
+      }
+    };
+    sock.onclose = () => {
+      if (socket !== sock) return;
+      socket = null;
+      pushing = false;
+      // Straight back to polling — the session's *end* must not be missed because a
+      // proxy dropped a socket — then a quiet attempt to get the socket back.
+      void pollStatus();
+      scheduleSocketRetry();
+    };
+    // `onerror` is always followed by `onclose`, which is where the recovery lives.
+    sock.onerror = () => {};
+  }
+
+  function closeSocket() {
+    if (retry) {
+      clearTimeout(retry);
+      retry = null;
+    }
+    pushing = false;
+    if (!socket) return;
+    const sock = socket;
+    socket = null;
+    sock.onclose = null;
+    sock.onerror = null;
+    sock.onmessage = null;
+    sock.close(1000, 'no longer watching the alignment session');
+  }
+
   async function seedOffsets() {
     const next: Record<string, number> = {};
     try {
@@ -190,14 +440,14 @@ function createAlign() {
   async function refresh() {
     try {
       const [st, settings] = await Promise.all([api.alignStatus(), api.settings().catch(() => null)]);
-      session = st;
+      adopt(st);
       if (settings) sendspinDelayLive = settings.sendspin_delay_live;
       if (st.active) {
         level = st.volume;
         await seedOffsets();
       }
     } catch {
-      session = null;
+      /* keep the last-known state: a failed load is not a session ending */
     }
     loading = false;
   }
@@ -207,13 +457,15 @@ function createAlign() {
    *  Wanted because parts of `AlignState` change *without* the UI doing anything:
    *  `interference` records a doorbell or a voice-assistant turn that outranked the
    *  session's exclusive hold, and that has to be visible while it is still relevant
-   *  rather than the next time something else happens to refresh. */
+   *  rather than the next time something else happens to refresh; and the session can
+   *  end on its own, which is the state this must never be stale about.
+   *
+   *  Note it deliberately does not adopt `volume` into the slider: a frame landing
+   *  mid-drag would snap it back under the user's finger. The level the *daemon* used per
+   *  member is reported by the measurement status. */
   async function refreshStatus() {
     try {
-      // Deliberately does not adopt `volume`: this runs on a timer, and a poll
-      // landing mid-drag would snap the slider back under the user's finger. The
-      // level the *daemon* used per member is reported by the measurement status.
-      session = await api.alignStatus();
+      adopt(await api.alignStatus());
     } catch {
       /* keep last-known */
     }
@@ -305,6 +557,60 @@ function createAlign() {
       return session?.displaced ?? [];
     },
 
+    /** Seconds before the session's idle timeout gives the speakers back, ticked locally
+     *  from the deadline the daemon pushed. `null` when nothing is running.
+     *
+     *  **Reaching 0 is not the same as the session being over**: the daemon's watchdog
+     *  only looks every `closeSlack` seconds, so the end is rendered when a frame says so
+     *  (`ended`), never by this hitting zero. */
+    get closesIn(): number | null {
+      return closesIn();
+    },
+    /** How imprecise `closesIn` is (`timeout_slack_s`) — the size of the word "about". */
+    get closeSlack(): number {
+      return session?.timeout_slack_s ?? 30;
+    },
+    /** The whole idle allowance, for the sentence that explains the rule. */
+    get idleTimeout(): number {
+      return session?.idle_timeout_s ?? 900;
+    },
+    /** Is the session close enough to being handed back to be worth interrupting for? */
+    get closingSoon(): boolean {
+      const left = closesIn();
+      return left !== null && left <= HOLD_CLOSE_WARN_S;
+    },
+    /** Why the session that *was* running is gone, or null. Set only for the two endings
+     *  that happened *to* the user — an idle timeout, or something else ending it — never
+     *  for their own "Stop and restore", which the toast already reported. */
+    get ended(): SessionEnd | null {
+      return ended;
+    },
+    /** Dismiss that notice (the user has read it, or is starting again). */
+    clearEnded() {
+      ended = null;
+    },
+    /** Whether the session state is being pushed rather than polled. Presentation only —
+     *  nothing branches on it, because both channels carry the same frames. */
+    get pushing() {
+      return pushing;
+    },
+
+    /** Tell the daemon the user is still here, buying one whole fresh allowance.
+     *
+     *  **Only ever from a click.** The timeout exists so that a tab nobody is watching
+     *  cannot leave a room muted, so an open socket and a status poll deliberately count
+     *  for nothing — a forgotten *open* tab is the same hazard as a closed one. Calling
+     *  this on a timer would restore that hazard invisibly, which is why it is a button
+     *  and never an effect. */
+    async stillHere() {
+      if (!session?.active) return;
+      try {
+        adopt(await api.alignStillHere());
+      } catch (e) {
+        await run(() => Promise.reject(e));
+      }
+    },
+
     refresh,
     refreshStatus,
 
@@ -319,11 +625,38 @@ function createAlign() {
      *  down by *another* page unmounting; and applying it here would tear one down the
      *  moment the user switched tabs mid-tuning. So there is exactly one way a session
      *  ends: someone asks for it to end (`stop()`, the wizard's "Stop and restore"), or the
-     *  daemon's own idle timeout does it. */
+     *  daemon's own idle timeout does it — and the second of those is exactly why the state
+     *  is watched over a socket rather than only polled. */
     attachSession(): () => void {
       void refresh();
-      const timer = setInterval(refreshStatus, 3000);
-      return () => clearInterval(timer);
+      return ctl.watchSession();
+    },
+
+    /** Watch the session state — pushed, with polling as the floor. Ref-counted, because
+     *  the wizard and the Outputs page both want it and there is one session.
+     *
+     *  Cheaper than the poll loop it replaces, not more expensive: while the socket is
+     *  delivering, nothing is polled at all. That is what makes it reasonable on the
+     *  Outputs page, which has to answer "are speakers held right now?" for as long as
+     *  someone is looking at their speakers — and has to stop saying so the moment the
+     *  hold is released. */
+    watchSession(): () => void {
+      watching += 1;
+      if (watching === 1) {
+        void pollStatus();
+        openSocket();
+      }
+      return () => {
+        watching -= 1;
+        if (watching === 0) {
+          if (statusTimer) {
+            clearTimeout(statusTimer);
+            statusTimer = null;
+          }
+          closeSocket();
+          stopTicking();
+        }
+      };
     },
 
     /** Load the adopted outputs the picker offers. Cheap and idempotent; the picker
@@ -371,11 +704,12 @@ function createAlign() {
       if (selection.length < 2) return false;
       busy = true;
       try {
-        session = await api.alignStartOutputs(selection, sessionModeFor(mode));
-        level = session.volume;
+        const started = await api.alignStartOutputs(selection, sessionModeFor(mode));
+        adopt(started);
+        level = started.volume;
         soloIntent = null;
         await seedOffsets();
-        if (isMeasured(mode)) session = await api.alignAudible([], level);
+        if (isMeasured(mode)) adopt(await api.alignAudible([], level));
         busy = false;
         return true;
       } catch (e) {
@@ -395,7 +729,7 @@ function createAlign() {
       // The trailing signal window still holds the previous speaker's sound.
       mic.disturbSignal();
       try {
-        session = await api.alignAudible([nodeName], next);
+        adopt(await api.alignAudible([nodeName], next));
       } catch (e) {
         soloIntent = null;
         await run(() => Promise.reject(e));
@@ -421,7 +755,7 @@ function createAlign() {
       soloIntent = null;
       mic.disturbSignal();
       try {
-        session = await api.alignAudible(nodeNames, level);
+        adopt(await api.alignAudible(nodeNames, level));
       } catch (e) {
         await run(() => Promise.reject(e));
       }
@@ -433,7 +767,7 @@ function createAlign() {
       soloIntent = null;
       mic.disturbSignal();
       try {
-        session = await api.alignAudible([], level);
+        adopt(await api.alignAudible([], level));
       } catch {
         /* nothing to say: the session may already be gone, which is also silence */
       }
@@ -455,7 +789,7 @@ function createAlign() {
       level = v;
       mic.disturbSignal();
       try {
-        session = await api.alignAudible([node], v);
+        adopt(await api.alignAudible([node], v));
       } catch (e) {
         await run(() => Promise.reject(e));
       }
@@ -470,30 +804,26 @@ function createAlign() {
 
     async stop() {
       busy = true;
-      soloIntent = null;
-      // The verdicts described *this* hold's levels; carrying them into the next one
-      // would show a confirmation that nothing has re-checked. Levels are kept —
-      // they are the user's choice, not a measurement.
-      verdicts = {};
-      if (await run(() => api.alignStop(), 'Alignment finished — volumes restored')) {
-        session = {
-          active: false,
-          sources: [],
-          reference: null,
-          target: null,
-          members: [],
-          volume: level,
-          // Optimistic inactive state: the daemon's own `inactive()` reports an empty
-          // map, and no member has a session-applied level once the session is gone.
-          levels: {},
-          mode: 'manual',
-          outputs: [],
-          audible: [],
-          interference: [],
-          displaced: [],
-        };
+      // Marks this ending as *ours*, so `adopt` resets everything derived from the
+      // session without also telling the user something happened to them: `run()` below
+      // has already said what happened. Everything else about the reset — the verdicts,
+      // the solo, why levels and the selection survive — is `sessionClosed`'s, in one
+      // place, because a session ends three ways and only one of them comes through here.
+      stopping = true;
+      // `alignStop` answers with the daemon's own inactive state, so there is nothing to
+      // construct optimistically any more; a failed call leaves the last-known state and
+      // the socket (or the next poll) says what really happened.
+      let closed: AlignState | undefined;
+      try {
+        const ok = await run(async () => {
+          closed = await api.alignStop();
+          return closed;
+        }, 'Alignment finished — volumes restored');
+        if (ok && closed) adopt(closed);
+      } finally {
+        stopping = false;
+        busy = false;
       }
-      busy = false;
     },
 
     /** Drag feedback for the volume slider — readout only, no request. */
@@ -505,7 +835,7 @@ function createAlign() {
     async setLevel(v: number) {
       level = v;
       try {
-        session = await api.alignVolume(v);
+        adopt(await api.alignVolume(v));
       } catch (e) {
         await run(() => Promise.reject(e));
       }
@@ -559,7 +889,7 @@ function createAlign() {
 
   async function select(reference: string, target: string) {
     try {
-      session = await api.alignSelect(reference, target);
+      adopt(await api.alignSelect(reference, target));
     } catch (e) {
       await run(() => Promise.reject(e));
     }

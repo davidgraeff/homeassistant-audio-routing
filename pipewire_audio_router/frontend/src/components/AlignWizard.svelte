@@ -35,6 +35,7 @@
   // The microphone lives here rather than on a page, because the capture must survive
   // page changes: the analysis grid is one continuous capture, and a mic that restarted
   // mid-run has thrown away the reference frame everything measured so far shares.
+  import AlignHoldTimer from './AlignHoldTimer.svelte';
   import AlignRefusal from './AlignRefusal.svelte';
   import AlignWizardManual from './AlignWizardManual.svelte';
   import AlignWizardMic from './AlignWizardMic.svelte';
@@ -43,7 +44,7 @@
   import AlignWizardRun from './AlignWizardRun.svelte';
   import AlignWizardSpeakers from './AlignWizardSpeakers.svelte';
   import MicCapture from './MicCapture.svelte';
-  import { align, isMeasured, type WizardMode } from '../lib/align.svelte';
+  import { align, isMeasured, type SessionEnd, type WizardMode } from '../lib/align.svelte';
   import { askConfirm } from '../lib/confirm.svelte';
   import { MODE_LABELS, elapsed, isRunning, measure, phaseLabel } from '../lib/measure.svelte';
   import { measuredBlock, measuredCaveat, mic } from '../lib/mic.svelte';
@@ -121,10 +122,35 @@
   // sliders would start from zero and stream changes to firmware that cannot take them.
   //
   // `attachSession` stops nothing on teardown — see the store. Leaving this page is not
-  // consent to drop a hold; "Stop and restore" is.
+  // consent to drop a hold; "Stop and restore" is. What it *does* do is watch the session
+  // over `GET /api/align/ws` with polling as the floor, which is what makes the two things
+  // below possible at all: a countdown that is current, and an ending that arrives as an
+  // event rather than being noticed a few seconds late.
   $effect(() => align.attachSession());
 
   const interference = $derived(align.interference);
+  /** Why the session that was running is gone. Set only for an ending that happened *to*
+   *  the user — the daemon's idle timeout, or another tab — never for their own
+   *  "Stop and restore", which the toast already reported. */
+  const ended = $derived(align.ended);
+
+  // A session can end without this browser touching anything: the hold is exclusive and
+  // the daemon gives the speakers back after 15 minutes of *idleness*, which reading a
+  // review page does not interrupt. When that happens, every page past Speakers is
+  // describing something that no longer exists, so step back to the last one that is still
+  // true — and leave the notice up rather than silently emptying the panel.
+  //
+  // The review page is the deliberate exception: a proposal that was already measured is
+  // still readable and still revertable (plan §9.4), and throwing that away because the
+  // *session* expired would discard an apartment's worth of walking.
+  let lastEnded: SessionEnd | null = null;
+  $effect(() => {
+    const e = align.ended;
+    if (e === lastEnded) return;
+    lastEnded = e;
+    if (!e) return;
+    if (page === 'body') page = hasResult ? 'review' : 'speakers';
+  });
 
   // Follow the run, without pinning the user: only a *change* of phase moves the
   // page, so Back and the step buttons keep working while a run is in progress.
@@ -307,14 +333,32 @@
     {/if}
   </div>
 
-  {#if holding && !running}
-    <!-- Closing is deliberately not offered while speakers are held: the hold is
-         exclusive, so leaving it running would leave part of the house silent with no
-         visible reason. "Stop and restore" is the way out, and it says what it does. -->
-    <p class="hint">
-      These speakers are held for the alignment, so something else may have stopped playing on them. Use
-      <strong>Stop and restore</strong> to give them back.
-    </p>
+  {#if holding}
+    {#if !running}
+      <!-- Closing is deliberately not offered while speakers are held: the hold is
+           exclusive, so leaving it running would leave part of the house silent with no
+           visible reason. "Stop and restore" is the way out, and it says what it does. -->
+      <p class="hint">
+        These speakers are held for the alignment, so something else may have stopped playing on them. Use
+        <strong>Stop and restore</strong> to give them back.
+      </p>
+    {/if}
+    <!-- …and the other way the hold ends: by itself. Shown while a run is in progress too,
+         because a chain parked between positions is exactly the state that sits idle. -->
+    <AlignHoldTimer />
+  {/if}
+
+  {#if ended}
+    <!-- The session went away on its own. Said rather than silently reflected in an empty
+         panel: someone who watched their wizard reset needs to know whether they broke
+         something, and the answer is a rule they can work with next time. -->
+    <div class="ended">
+      <strong>
+        {ended.cause === 'timed-out' ? 'The alignment ran out of time' : 'The alignment session ended'}
+      </strong>
+      <p>{ended.why}</p>
+      <button class="ghost" onclick={() => align.clearEnded()}>Got it</button>
+    </div>
   {/if}
 
   <div class="steps">
@@ -526,6 +570,24 @@
     margin: 10px 0 0;
     font-size: 0.8rem;
     color: var(--error-color, #db4437);
+  }
+  /* Amber, not red, for the same reason as the interference box: nothing is broken. The
+     session did exactly what it promises to do when nobody is using it. */
+  .ended {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--warning-color, #ffa600) 55%, transparent);
+    background: color-mix(in srgb, var(--warning-color, #ffa600) 10%, transparent);
+    font-size: 0.82rem;
+  }
+  .ended p {
+    margin: 6px 0 8px;
+    color: var(--secondary-text-color);
+  }
+  .ended button {
+    padding: 3px 10px;
+    font-size: 0.78rem;
   }
   /* Amber, not red: nothing is broken — something more important happened. */
   .interference {

@@ -57,6 +57,14 @@ export function wsUrl(path: string): string {
  *  place; resolve it with `wsUrl()`, which handles HA ingress. */
 export const MEASURE_WS_PATH = 'api/align/measure/ws';
 
+/** Push channel for the alignment **session** (the speakers held, who is audible, and
+ *  how long the session has left before its idle timeout gives them back). One whole
+ *  `AlignState` on connect, then one per change — and one on **teardown**, which is the
+ *  frame this socket exists for: a session can end without the UI doing anything, and
+ *  until the UI hears about it, it is describing a session that no longer exists while
+ *  the speakers have already gone back to normal. Poll `alignStatus()` as the fallback. */
+export const ALIGN_WS_PATH = 'api/align/ws';
+
 /** Shortest name an output may be renamed to, mirroring the daemon's rule
  *  (outputs_store.rs `MIN_NAME_CHARS`) so the UI can refuse before the round trip
  *  instead of surfacing a 400. */
@@ -295,6 +303,15 @@ export const api = {
   alignSelect: (reference: string, target: string) =>
     request<AlignState>('POST', 'api/align/select', { reference, target }),
   alignVolume: (volume: number) => request<AlignState>('POST', 'api/align/volume', { volume }),
+  /** Postpone the session's idle teardown by one whole allowance, changing nothing else
+   *  (`AlignState.closes_in_s`).
+   *
+   *  **Only ever from a click.** The daemon's timeout exists so that a tab nobody is
+   *  watching cannot leave a room muted, and an open socket or a status poll therefore
+   *  counts for nothing — a forgotten *open* tab is the same hazard as a closed one. What
+   *  makes this call legitimate is that a person pressed something a second ago; calling
+   *  it on a timer would put the leak back, invisibly. */
+  alignStillHere: () => request<AlignState>('POST', 'api/align/still-here'),
   alignStop: () => request<AlignState>('DELETE', 'api/align'),
   /** Microphone-ingest status (align/mic.rs). Polled only while capturing — it
    *  feeds the level meter, and a meter fed from the *daemon* is what proves the
