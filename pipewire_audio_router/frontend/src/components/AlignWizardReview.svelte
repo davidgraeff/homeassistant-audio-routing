@@ -27,6 +27,7 @@
   //     not the sound;
   //   * `reference` is labelled as an outcome, because presenting it as a chosen
   //     reference would re-tell the story the code no longer implements.
+  import AlignChainSteps from './AlignChainSteps.svelte';
   import AlignCheck from './AlignCheck.svelte';
   import AlignRefusal from './AlignRefusal.svelte';
   import { memberKindLabel } from '../lib/align.svelte';
@@ -46,11 +47,21 @@
 
   const proposal = $derived(status.proposal);
   const verification = $derived(status.verification);
+  /** A chained run's positions. They belong on this page as much as on the run page: the
+   *  proposal below is one write over the whole house, and how that house was joined up —
+   *  which joins were checked, which were not, and what the total error can be said to
+   *  be — is exactly what the Apply decision rests on. */
+  const chain = $derived(status.chain);
   /** Run-level and proposal-level warnings are the same population; one kind is
-   *  raised once, so keying by kind merges them without repeating any. */
+   *  raised once, so keying by kind merges them without repeating any.
+   *
+   *  `chain_scope` is dropped when the chain section below is rendering: that warning's
+   *  message *is* `chain.scope_note`, printed there under a heading that says what it is
+   *  about. The same paragraph twice on one page trains the reader to skip it. */
   const warnings = $derived.by(() => {
     const seen = new Map<string, Warning>();
     for (const w of [...status.warnings, ...(proposal?.warnings ?? [])]) if (!seen.has(w.kind)) seen.set(w.kind, w);
+    if (status.chain?.steps.length) seen.delete('chain_scope');
     return [...seen.values()];
   });
 
@@ -159,6 +170,16 @@
     </tbody>
   </table>
 
+  {#if chain && chain.steps.length}
+    <h4>How this chain was joined up</h4>
+    <p class="chain-lead">
+      Each position below was aligned where it was measured from, and the positions are tied to one another only through
+      their overlap speakers. The delays in the table above are what all of that comes to after the accumulated delay was
+      taken back out — a common shift, so nothing moved relative to anything else.
+    </p>
+    <AlignChainSteps steps={chain.steps} error={chain.error} scopeNote={chain.scope_note} {label} />
+  {/if}
+
   <h4>Checks</h4>
   <div class="checks">
     <AlignCheck
@@ -216,6 +237,17 @@
 
 {#if verification}
   <h4>After writing</h4>
+  {#if verification.scope_note}
+    <!-- Before the numbers, because it changes what they are *about*: a chain can only be
+         re-measured where the phone is, so this residual covers the last position's own
+         speakers and its overlaps — not the whole house. Re-checking the rest means
+         walking the chain again. Reading a last-room residual as a whole-house verdict is
+         the easy mistake, and the daemon writes the sentence rather than the UI guessing
+         which positions were covered. -->
+    <p class="scope-note">
+      <strong>What this checked:</strong> {verification.scope_note}
+    </p>
+  {/if}
   <div class="checks">
     <AlignCheck
       name="Residual"
@@ -233,7 +265,9 @@
   </div>
   <p class="honest">
     {#if verification.passed}
-      The knobs were written and the group re-measured, and every speaker now arrives within the estimator's own precision. That
+      The knobs were written and re-measured, and {verification.scope_note
+        ? 'every speaker this re-measurement could cover'
+        : 'every speaker'} now arrives within the estimator's own precision. That
       is what was checked — not that the result is right: a reflection arriving one or two milliseconds after the direct
       sound biases the measurement while looking excellent to all of these checks, and the cross-band tolerance is a few
       milliseconds wide so that different tweeter crossovers don't trip it. If it still sounds smeared from where you
@@ -376,6 +410,25 @@
     margin: 10px 0 0;
     font-size: 0.8rem;
     color: var(--secondary-text-color);
+  }
+  .chain-lead {
+    margin: 0 0 8px;
+    font-size: 0.8rem;
+    color: var(--secondary-text-color);
+  }
+  /* Not amber: nothing is wrong. It is a scope statement, and it has to be read before
+     the residual beside it. */
+  .scope-note {
+    margin: 0 0 8px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--divider-color);
+    background: color-mix(in srgb, var(--secondary-text-color) 6%, transparent);
+    font-size: 0.8rem;
+    color: var(--secondary-text-color);
+  }
+  .scope-note strong {
+    color: var(--primary-text-color);
   }
   .actions {
     display: flex;

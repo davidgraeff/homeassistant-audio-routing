@@ -1,7 +1,7 @@
 <script lang="ts">
   // "Explain speaker alignment" — the document behind the help button in the
   // Input-sources header. Alignment lives on this page because a sync group is
-  // identified by the source feeding it (bridge-daemon/src/calibrate.rs): the
+  // identified by the source feeding it (bridge-daemon/src/align/calibrate.rs): the
   // speakers listed on a source card are exactly the ones that play off one
   // clock, and those are the ones worth aligning against each other.
   interface Props {

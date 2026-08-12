@@ -33,11 +33,15 @@
     /** The promise picked on page 1 — it travels with the session, so the hold the
      *  daemon forms is labelled with the same mode the run will make. */
     mode: MeasureMode;
+    /** Multi-position, measured from several spots (plan §1.1). Changes nothing about
+     *  what this page *does* — the scope is the whole run's either way, which is the
+     *  point of §12.3.1 — only what starting it will do next. */
+    chained: boolean;
     label: (nodeName: string) => string;
     /** Start measuring (the wizard owns the run). */
     onStart: () => void;
   }
-  let { mode, label, onStart }: Props = $props();
+  let { mode, chained, label, onStart }: Props = $props();
 
   $effect(() => {
     void align.loadOutputs();
@@ -98,9 +102,12 @@
   });
 
   // Leaving this page stops the tone — unless a run is under way, which solos members
-  // itself and must not have the audibility pulled out from under it.
+  // itself and must not have the audibility pulled out from under it. `running`, not
+  // `live`: a chain parked between positions has the set the user is about to measure
+  // made audible, and silencing that because they stepped back a page would undo the
+  // check they came here to make.
   $effect(() => () => {
-    if (!measure.live) void align.stopTone();
+    if (!measure.running) void align.stopTone();
   });
 
   async function formHold() {
@@ -381,12 +388,23 @@
   {/if}
 
   <div class="go">
-    <button class="primary" disabled={!!why || align.busy} title={why ?? 'Measure every speaker and propose delays'} onclick={onStart}>
-      Start alignment
+    <button
+      class="primary"
+      disabled={!!why || align.busy}
+      title={why ?? (chained ? 'Start the chain and ask for the first listening position' : 'Measure every speaker and propose delays')}
+      onclick={onStart}
+    >
+      {chained ? 'Start the first position' : 'Start alignment'}
     </button>
     <span class="hint">
-      Expect about four minutes for five speakers: each speaker is measured twice, and every switch waits for the tone to
-      settle before anything is accepted. Nothing is written until you approve the proposal.
+      {#if chained}
+        Nothing is measured until you say which of these speakers you can hear from where you are standing — that is the
+        first position. Each position takes about eleven seconds per speaker per pass, and the delays it works out are
+        held inside the add-on until the whole chain is finished, so no speaker reconnects in between.
+      {:else}
+        Expect about four minutes for five speakers: each speaker is measured twice, and every switch waits for the tone
+        to settle before anything is accepted. Nothing is written until you approve the proposal.
+      {/if}
     </span>
   </div>
 {/if}

@@ -8,8 +8,10 @@
   import GroupTitle from './GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
+  import AlignWizard from './AlignWizard.svelte';
   import DelaySlider from './DelaySlider.svelte';
   import VolumeControl from './VolumeControl.svelte';
+  import { measure } from '../lib/measure.svelte';
 
   // Two listings, because discovery only *offers* a device: `outputs` is what
   // the user has added (routable, exposed to Home Assistant, tunable) and
@@ -644,6 +646,40 @@
     return `asks for ${asked} ms buffer, sending ${o.sendspin_send_ahead_ms} ms ahead`;
   }
 
+  // ---- Microphone-assisted alignment (plan §12.1) --------------------------------
+  //
+  // **This is the wizard's home**, and the reason it is here rather than on a source
+  // card: a run does not align "the speakers playing this source", it aligns *a set of
+  // speakers the user picks*, and the daemon forms a temporary group around exactly that
+  // set. The choice being made is a choice about speakers, so it belongs on the page that
+  // lists them. Moving it here also removes the second entry point — there is one
+  // alignment session process-wide, and the source card no longer offers to start one
+  // (see the comment at the top of AlignPanel.svelte).
+  //
+  // Mounted as one tag because the wizard is self-contained: `group` is only a seed for
+  // the selection and there is nothing to seed it with here — the user picks the scope on
+  // the wizard's own Speakers page, which is the model §12.1 asked for.
+  let wizardOpen = $state(false);
+
+  // A measured run stays *revertable* after the wizard is closed (plan §9.4), and this is
+  // now the page it was started from — so the undo has to be reachable here. One status
+  // read on mount rather than `measure.attach()`: attaching would open the push socket and
+  // poll for as long as this page is open, on a page most visits never align from.
+  onMount(() => void measure.refreshOnce());
+  const revertScope = $derived(measure.canRevert ? measure.revertScope : []);
+
+  /** Friendly name for a node name, the same resolution the routing graph uses (the
+   *  rename store first). The wizard needs one for every speaker it names, including
+   *  sources it never lists. */
+  function alignLabel(nodeName: string): string {
+    const matrix = [...$routing.matrix.outputs, ...$routing.matrix.sources];
+    return (
+      matrix.find((n) => n.node_name === nodeName)?.display_name ??
+      outputs.find((o) => o.node_name === nodeName)?.name ??
+      nodeName
+    );
+  }
+
   // Label for a codec option, with the bandwidth trade-off spelled out — that's the
   // whole reason to pick one.
   function codecLabel(codec: string): string {
@@ -781,6 +817,59 @@
     does nothing until you <strong>add</strong> it.
   </p>
 </div>
+
+<!-- Speaker alignment. Its own card between the page's explanation and the output list,
+     because it is about the *set* rather than about any one output — and because the set
+     is picked inside the wizard (plan §12.1). Kept out of the loading branch so a run in
+     progress, or an outstanding revert, is still reachable while the listings refresh. -->
+{#if outputs.length >= 2 || wizardOpen || revertScope.length}
+  <div class="card align-card">
+    <div class="info-head">
+      <h2>Timing between speakers</h2>
+      {#if !wizardOpen}
+        <div class="info-actions">
+          <button
+            class="ghost"
+            type="button"
+            title="Hold a phone where you listen and let the add-on measure each speaker's delay instead of judging it by ear"
+            onclick={() => (wizardOpen = true)}
+          >
+            Measure with a microphone
+          </button>
+        </div>
+      {/if}
+    </div>
+    <p class="card-sub" style="margin-bottom:0">
+      Speakers playing one stream should land together, but each adds its own delay on the way to the cone. The wizard
+      plays a click on the speakers you choose, measures when each one arrives at your phone, and proposes a setting per
+      speaker — <strong>nothing is written until you approve it</strong>. The speakers you pick are taken over for the
+      run, so whatever they are playing stops and comes back afterwards. Tuning one speaker <em>by ear</em> instead lives
+      on the <strong>Sources</strong> page, on the card of the source it is playing.
+    </p>
+
+    {#if wizardOpen}
+      <!-- One tag, no `group`: there is no source here to seed a selection from, and the
+           scope is the user's choice on the wizard's own Speakers page. -->
+      <AlignWizard label={alignLabel} onClose={() => (wizardOpen = false)} />
+    {/if}
+
+    <!-- Plan §9.4: the write is destructive to a previously-tuned setup, and the daemon
+         keeps it revertable after the run is abandoned and the wizard closed — which is
+         exactly when someone decides they preferred it before. -->
+    {#if revertScope.length}
+      <div class="revert">
+        <span>A measurement wrote timing settings to {revertScope.map(alignLabel).join(', ')}.</span>
+        <button class="ghost" disabled={measure.busy} onclick={() => void measure.revert()}>
+          Revert to the settings from before
+        </button>
+        <span class="hint">
+          Every one of them goes back to what it had before that run, and each speaker whose setting changes reconnects —
+          so expect another quiet gap.
+        </span>
+      </div>
+    {/if}
+  </div>
+{/if}
 
 {#if loading}
   <div class="card"><p class="empty" style="padding:0">Loading…</p></div>
@@ -1081,6 +1170,29 @@
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+  }
+
+  /* The alignment card. The wizard brings its own frame, so this only has to hold the
+     header, the sentence and the revert offer. */
+  .align-card .revert {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--warning-color, #ffa600) 55%, transparent);
+    background: color-mix(in srgb, var(--warning-color, #ffa600) 10%, transparent);
+    font-size: 0.82rem;
+  }
+  .align-card .revert button {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+  }
+  .align-card .revert .hint {
+    font-size: 0.78rem;
+    color: var(--secondary-text-color);
   }
 
   /* ---- Section headings between the two listings ------------------------- */

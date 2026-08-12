@@ -8,12 +8,13 @@
   // "this is hung", and the plan is explicit that a run which cannot explain itself
   // gets blamed on the user's hand for something a doorbell did.
   import AlignRefusal from './AlignRefusal.svelte';
+  import AlignWizardChain from './AlignWizardChain.svelte';
   import { knobNoun, memberKindLabel } from '../lib/align.svelte';
   import {
-    PHASE_CHAIN,
     elapsed,
     gateReasonLabel,
     isLive,
+    phaseChain,
     phaseLabel,
     phaseNote,
     warningKindLabel,
@@ -25,21 +26,37 @@
     label: (nodeName: string) => string;
     /** Start another run with the same settings (after a refusal). */
     onRetry: () => void;
+    /** Post one listening position of a chain (plan §1.1). */
+    onPosition: (members: string[], overlaps: string[]) => void;
+    /** Renormalise the chain and propose the single write. */
+    onFinish: () => void;
+    /** Make exactly these members audible — how a position is previewed. */
+    onHear: (nodeNames: string[]) => void;
+    busy: boolean;
   }
-  let { status, label, onRetry }: Props = $props();
+  let { status, label, onRetry, onPosition, onFinish, onHear, busy }: Props = $props();
 
   const live = $derived(isLive(status.phase));
-  const reached = $derived(PHASE_CHAIN.indexOf(status.phase));
+  // A chained run's acquisition loop is `positioning` → `measuring` per listening spot,
+  // so the strip has to contain the phase the run is actually in — otherwise every step
+  // reads as unreached while the chain is being walked.
+  const chainPhases = $derived(phaseChain({ chained: !!status.chain, mode: status.mode }));
+  const reached = $derived(chainPhases.indexOf(status.phase));
   const gate = $derived(status.gate);
   /** Gate fill: how much of the required lock has been accumulated. */
   const gatePct = $derived(gate ? Math.min(100, Math.round((gate.periods / Math.max(1, gate.needed)) * 100)) : 0);
   /** Newest observations first — the run appends, and the recent ones are the
    *  interesting ones while it is still going. */
   const recent = $derived([...status.observations].reverse().slice(0, 12));
+  /** The doorway caveat is `chain.scope_note` *and* a `chain_scope` warning carrying the
+   *  identical sentence. It is shown once, by the chain panel, under a heading that says
+   *  what it is about — printing the same paragraph twice on one page teaches the reader
+   *  to skip it, which is the opposite of what it is for. */
+  const warnings = $derived(status.warnings.filter((w) => !(status.chain && w.kind === 'chain_scope')));
 </script>
 
 <div class="chain" aria-label="Measurement stage">
-  {#each PHASE_CHAIN as p, i (p)}
+  {#each chainPhases as p, i (p)}
     <span class="step" class:done={reached > i} class:now={status.phase === p}>{phaseLabel(p)}</span>
   {/each}
 </div>
@@ -51,6 +68,15 @@
 </div>
 {#if phaseNote(status.phase)}
   <p class="hint">{phaseNote(status.phase)}</p>
+{/if}
+
+<!-- A chained run's controls come *before* the gate and the per-speaker table: while the
+     chain is parked the only thing that matters is where the user is standing and which
+     speakers they can hear, and the table below is the detail of whatever position was
+     measured last. Kept mounted for the whole run, not only while parked, so the
+     per-position numbers stay readable while the next one is being measured. -->
+{#if status.chain}
+  <AlignWizardChain chain={status.chain} {label} {busy} onPost={onPosition} {onFinish} {onHear} />
 {/if}
 
 {#if gate}
@@ -115,9 +141,9 @@
   </tbody>
 </table>
 
-{#if status.warnings.length}
+{#if warnings.length}
   <ul class="warnings">
-    {#each status.warnings as w (w.kind)}
+    {#each warnings as w (w.kind)}
       <li><strong>{warningKindLabel(w.kind)}.</strong> {w.message}</li>
     {/each}
   </ul>

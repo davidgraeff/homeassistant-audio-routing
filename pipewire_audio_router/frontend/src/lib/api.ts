@@ -289,7 +289,7 @@ export const api = {
     request<AlignState>('POST', 'api/align/select', { reference, target }),
   alignVolume: (volume: number) => request<AlignState>('POST', 'api/align/volume', { volume }),
   alignStop: () => request<AlignState>('DELETE', 'api/align'),
-  /** Microphone-ingest status (align_mic.rs). Polled only while capturing — it
+  /** Microphone-ingest status (align/mic.rs). Polled only while capturing — it
    *  feeds the level meter, and a meter fed from the *daemon* is what proves the
    *  whole path works rather than just the browser's microphone. The capture
    *  socket itself is `wsUrl('api/align/mic/ws')`, driven by lib/mic.svelte.ts. */
@@ -301,11 +301,11 @@ export const api = {
    *  user is still adjusting speaker volume. */
   micSignal: () => request<SignalCheck>('GET', 'api/align/mic/signal'),
 
-  // Microphone-assisted alignment measurement (align_measure.rs, plan §11). One
+  // Microphone-assisted alignment measurement (align/measure.rs, plan §11). One
   // run at a time, process-wide, riding beside the by-ear session above: it needs
   // that session playing the click track on every member off one clock.
   //
-  // All five reject with a `Refusal` rather than a bare error string — use
+  // Every one of them rejects with a `Refusal` rather than a bare error string — use
   // `refusalOf(e)` on the thrown ApiError to keep the kind, the blamed member and
   // the estimator's own verdict.
   /** The whole run: phase, per-member progress, gate, observations, proposal,
@@ -318,9 +318,34 @@ export const api = {
    *  and goes back to polling if it drops. */
   measureStatus: () => request<MeasureStatus>('GET', 'api/align/measure'),
   /** Begin learning + measuring. Returns the run's first status (phase `arming`);
-   *  everything after that arrives by polling `measureStatus`. `near_field` is
-   *  refused with `mode_unsupported` by design — it is W8. */
-  measureStart: (mode: MeasureMode) => request<MeasureStatus>('POST', 'api/align/measure/start', { mode }),
+   *  everything after that arrives by polling `measureStatus`.
+   *
+   *  `chain` turns the multi-position mode into plan §1.1's **chain**: the run parks in
+   *  `positioning` and takes one `measurePosition` per listening spot, then
+   *  `measureFinish`. `false` is the single-position case — a chain with one step, which
+   *  needs none of those calls. Ignored for `near_field`, which walks instead. */
+  measureStart: (mode: MeasureMode, chain = false) =>
+    request<MeasureStatus>('POST', 'api/align/measure/start', { mode, chain }),
+  /** One listening position of a chain: `members` are the speakers to align from where
+   *  the user is standing now, `overlaps` are already-aligned speakers still audible
+   *  here (plan §1.1).
+   *
+   *  **Two overlaps rather than one** is the design intent, not a nicety: the shift this
+   *  step derives from them is applied as a common delay to *every* speaker aligned so
+   *  far and anchors everything measured afterwards, so with one overlap nothing checks
+   *  it. One is accepted and reported as reduced confidence; none is refused for every
+   *  position after the first (`overlap_missing`).
+   *
+   *  Returns immediately with the run marked busy — the measurement itself is watched
+   *  through `measureStatus`. A refusal here refuses the **step**: the chain stays
+   *  parked, everything already aligned keeps its provisional delays, and the same
+   *  position can be posted again. */
+  measurePosition: (members: string[], overlaps: string[]) =>
+    request<MeasureStatus>('POST', 'api/align/measure/position', { members, overlaps }),
+  /** "Every held speaker is aligned at some position": renormalise the whole chain (a
+   *  common shift, so no relative alignment changes) and propose **the one write**.
+   *  Refused while any held speaker is still unaligned. */
+  measureFinish: () => request<MeasureStatus>('POST', 'api/align/measure/finish'),
   /** Write the solved delays, then settle and verify. Never automatic (plan §11):
    *  the user has seen the deltas and their confidence first. Refused with the
    *  blocking check's own refusal when the proposal is blocked. */

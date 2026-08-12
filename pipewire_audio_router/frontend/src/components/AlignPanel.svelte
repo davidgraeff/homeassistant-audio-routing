@@ -1,14 +1,31 @@
 <script lang="ts">
-  // The alignment slice for one input source, rendered inside its card on the
-  // Sources page (collapsed or expanded). It shows the speakers currently
-  // playing this source — i.e. its sync group — and either starts an alignment
-  // session for them or, while one is running, the by-ear tuning controls.
+  // The **by-ear** alignment slice for one input source, rendered inside its card on the
+  // Sources page (collapsed or expanded). It shows the speakers currently playing this
+  // source — i.e. its sync group — and either starts a by-ear session for them or, while
+  // one is running, the tuning sliders. It also keeps the revert offer for a measured run
+  // (plan §9.4), which is why it watches the measurement status it no longer starts.
   //
-  // Session state is global (one at a time, server-owned): see lib/align.svelte.
+  // **The microphone wizard used to open from here and deliberately does not any more**
+  // (plan §12.1, W6c). Two reasons, and the second is the decisive one:
+  //
+  //   * a wizard run does not align "this source's speakers": the user picks an arbitrary
+  //     set of outputs and the daemon forms a temporary group around them (§12.1). A
+  //     source card is the wrong frame for that choice — it was only ever a *seed* — and
+  //     the set being picked lives on the Outputs page, where it now is;
+  //   * **there is exactly one alignment session, process-wide.** Two live entry points
+  //     into it means two places that can each believe they own it: the source card's
+  //     "Measure" button would happily open a second wizard over a session started from
+  //     the Outputs page, and the wizard's own model of "is this hold mine?" is its
+  //     *selection*, which a source card cannot see. So the second entry point is gone
+  //     rather than guarded — a guard would still have to be right about which page won.
+  //
+  // What is left here cannot start a competing session either: the by-ear button is
+  // disabled whenever any session is running that is not this group's (`align.isBlocked`),
+  // and a wizard session's identity is its selected *outputs*, which can never equal a
+  // group's *source* set — so a running wizard always reads as blocking here.
   import { align, knobNoun, memberKindLabel, sliderMax, sliderMin } from '../lib/align.svelte';
   import { measure } from '../lib/measure.svelte';
   import { routing } from '../lib/routing';
-  import AlignWizard from './AlignWizard.svelte';
 
   interface Props {
     /** The source's stable routing node name (SourceView.node_name). */
@@ -20,10 +37,6 @@
   const active = $derived(!!group && align.isActive(group));
   const blocked = $derived(!!group && align.isBlocked(group));
   const members = $derived(group?.members ?? []);
-
-  /** The microphone-assisted wizard, open on this card. Local, because only one
-   *  session can run at a time and the wizard is a slice of one. */
-  let wizardOpen = $state(false);
 
   // The measurement run's status, polled by the store. Wanted here and not only
   // inside the wizard: a run that wrote delays stays revertable after the wizard is
@@ -73,7 +86,7 @@
         class="ghost"
         disabled={align.busy || members.length < 2 || blocked}
         title={blocked
-          ? 'An alignment session is running for another source — finish it first'
+          ? 'Another alignment is running — either another source’s by-ear session, or a microphone run started from the Outputs page. Finish that one first: there is only ever one at a time.'
           : members.length < 2
             ? 'Alignment compares two speakers by ear — this source feeds only one'
             : 'Play a click on these speakers and align them by ear'}
@@ -81,22 +94,13 @@
       >
         {members.length < 2 ? 'Align (needs 2+ speakers)' : 'Align speakers'}
       </button>
-      {#if !wizardOpen}
-        <!-- Not gated on this source's speaker count: the wizard picks its own set of
-             speakers (plan §12.1), so a source playing to one speaker can still be the
-             place the user starts from — the others are chosen in there. -->
-        <button
-          class="ghost"
-          disabled={blocked}
-          title={blocked
-            ? 'An alignment session is running for another source — finish it first'
-            : 'Hold a phone where you listen and let the add-on measure the delays instead of judging them by ear'}
-          onclick={() => (wizardOpen = true)}
-        >
-          Measure with a microphone
-        </button>
-      {/if}
     </div>
+    <!-- The wizard moved, so say where it went: a button that simply disappeared is
+         indistinguishable from a feature that was removed. -->
+    <p class="hint mic">
+      Measuring the delays with a phone instead of judging them by ear now lives on the <strong>Outputs</strong> page —
+      it picks its own set of speakers rather than a source's, so it belongs where the speakers are.
+    </p>
   {:else}
     <div class="sync-row">
       <span class="sync-label on">Aligning</span>
@@ -105,22 +109,8 @@
           <span class="spk">{label(m.node_name)}</span>
         {/each}
       </span>
-      {#if !wizardOpen}
-        <button class="ghost" onclick={() => (wizardOpen = true)} title="Measure the delays with a phone instead of judging them by ear">
-          Measure with a microphone
-        </button>
-      {/if}
       <button class="danger" onclick={() => align.stop()} disabled={align.busy}>Finish</button>
     </div>
-  {/if}
-
-  <!-- One instance, outside the branches above. Starting or finishing the session
-       flips which branch draws the header row, and a wizard rendered *inside* a
-       branch would be torn down and rebuilt by that flip — which restarts the
-       microphone capture (losing the timing reference every reading shares) and
-       throws the user back to page one. -->
-  {#if wizardOpen}
-    <AlignWizard {group} {label} onClose={() => (wizardOpen = false)} />
   {/if}
 
   {#if active}
@@ -339,6 +329,12 @@
     margin-top: 4px;
     font-size: 0.78rem;
     color: var(--secondary-text-color);
+  }
+  .hint.mic {
+    margin: 6px 0 0;
+  }
+  .hint.mic strong {
+    color: var(--primary-text-color);
   }
   .revert {
     display: flex;

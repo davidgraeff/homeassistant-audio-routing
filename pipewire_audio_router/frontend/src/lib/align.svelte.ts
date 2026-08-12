@@ -7,7 +7,7 @@
 // renders the slice for its own sync group.
 //
 // A sync group is identified by its *source set* — the outputs fed by exactly
-// those sources play off one clock (see bridge-daemon/src/calibrate.rs). That's
+// those sources play off one clock (see bridge-daemon/src/align/calibrate.rs). That's
 // why alignment hangs off a source card: "these speakers are playing me right
 // now, align them against each other".
 
@@ -70,7 +70,7 @@ export function levelControl(kind: AlignMemberKind): LevelControl {
 
 /** Which way raising this kind's knob moves the speaker (plan §2.4.1).
  *
- *  Mirrors the daemon's kind → polarity mapping (`align_measure::KnobPolarity`) for
+ *  Mirrors the daemon's kind → polarity mapping (`align::measure::KnobPolarity`) for
  *  the places that have only a member kind to go on — the by-ear panel and the run's
  *  per-member progress. Where the daemon *sends* a polarity or an `effect` sentence
  *  (`ProposedDelay`), that is authoritative and this must not be used instead.
@@ -313,14 +313,22 @@ function createAlign() {
     refreshGroups,
     refreshStatus,
 
-    /** Mount hook: load, keep the group list fresh, and never leave a session
-     *  running behind a page the user navigated away from. */
+    /** Mount hook for the **by-ear** panel: load, keep the group list fresh, and never
+     *  leave a by-ear session running behind a page the user navigated away from.
+     *
+     *  The teardown is deliberately narrow: it stops a `manual` session only. There is one
+     *  session process-wide but it is no longer always this page's — the microphone wizard
+     *  lives on the Outputs page now (plan §12.1), and its session's mode is
+     *  `multi_position` / `near_field`. Stopping *any* session here would mean a user who
+     *  glanced at the Sources page mid-run came back to a measurement that had been torn
+     *  down, its provisional delays discarded, by a page that had nothing to do with it.
+     *  A by-ear session, by contrast, can only have been started from here. */
     attach(): () => void {
       void refresh();
       const timer = setInterval(refreshGroups, 5000);
       return () => {
         clearInterval(timer);
-        if (session?.active) void api.alignStop().catch(() => {});
+        if (session?.active && session.mode === 'manual') void api.alignStop().catch(() => {});
         session = null;
       };
     },
@@ -404,6 +412,31 @@ function createAlign() {
         session = await api.alignAudible([nodeName], next);
       } catch (e) {
         soloIntent = null;
+        await run(() => Promise.reject(e));
+      }
+    },
+
+    /** Play the tone on exactly this **set** of members, muting the rest — plan §12.2's
+     *  solo generalised, which is also how a chain scopes a listening position (§12.3.1).
+     *
+     *  Wanted separately from `solo()` because a position is a set, and because the
+     *  question it answers is different: not "is this speaker's level right" but "can I
+     *  actually hear all of these from where I am standing, and are the overlaps among
+     *  them?". Mutes are live, so this costs nothing and no speaker reconnects — which is
+     *  the whole reason the run holds one group and scopes positions this way.
+     *
+     *  Note the daemon does **not** drive audibility between positions itself (W12), so
+     *  whatever was last made audible stays that way until the run solos for a
+     *  measurement. `soloIntent` is cleared: what is playing is a set, not one speaker's
+     *  level being judged, and leaving the intent set would make the level slider claim
+     *  one of them. */
+    async hear(nodeNames: string[]) {
+      if (!session?.active) return;
+      soloIntent = null;
+      mic.disturbSignal();
+      try {
+        session = await api.alignAudible(nodeNames, level);
+      } catch (e) {
         await run(() => Promise.reject(e));
       }
     },

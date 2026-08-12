@@ -342,9 +342,9 @@ export interface StatusInfo {
   host: HostAssessment;
 }
 
-// ---- Latency alignment (calibrate.rs) -----------------------------------
+// ---- Latency alignment (align/calibrate.rs) ------------------------------
 
-/** What kind of speaker an alignment member is (`calibrate::MemberKind`).
+/** What kind of speaker an alignment member is (`align::calibrate::MemberKind`).
  *
  *  `pwsink` — a remote PipeWire host — is not a third flavour of the same thing:
  *  it has **no level knob and no mute** in this path, so it can neither be tuned
@@ -366,7 +366,7 @@ export interface AlignGroup {
   members: AlignMember[];
 }
 
-/** Which acoustic promise a *session* is making (align_group.rs `AlignMode`).
+/** Which acoustic promise a *session* is making (align/group.rs `AlignMode`).
  *
  *  Not the same enum as `MeasureMode` below, and deliberately so: this is the
  *  session's promise (including `manual`, which runs no measurement at all), while
@@ -433,7 +433,7 @@ export interface AlignState {
   displaced: RoutingLink[];
 }
 
-/** Microphone-ingest status (`/api/align/mic`, align_mic.rs) — what the level
+/** Microphone-ingest status (`/api/align/mic`, align/mic.rs) — what the level
  *  meter and the capture pre-flight read. Counters cover the *current* capture;
  *  a reconnect starts them over. */
 /** Whether the *level* is good enough to measure — which the meter cannot say,
@@ -479,11 +479,11 @@ export interface MicStatus {
   capacity_frames: number;
 }
 
-// ---- Microphone-assisted alignment measurement (align_measure.rs) --------
+// ---- Microphone-assisted alignment measurement (align/measure.rs) --------
 // The measurement run rides *beside* the by-ear session of `AlignState` above:
 // it needs that session playing the click track, and it solos one member at a
 // time through the same live-mute machinery. Everything here mirrors
-// bridge-daemon/src/align_measure.rs field-for-field; the plan is
+// bridge-daemon/src/align/measure.rs field-for-field; the plan is
 // docs/mic-alignment-plan.md §§5, 8-11.
 
 /** Which acoustic promise a run makes (plan §1). `near_field` is accepted by the
@@ -493,11 +493,22 @@ export interface MicStatus {
 export type MeasureMode = 'sweet_spot' | 'near_field';
 
 /** Plan §8's state machine. `proposed` is the state that parks the run waiting
- *  for the user, which is what makes `apply` an explicit step (§11). */
+ *  for the user, which is what makes `apply` an explicit step (§11).
+ *
+ *  `positioning` and `walking` are the two states in which the run is **alive but
+ *  waiting for the person holding the phone** — a chain parked between listening
+ *  positions, a walk parked between speakers. Neither is terminal: the group is still
+ *  held, the click is still playing, and a chain's aligned set is carrying provisional
+ *  delays that a second run would strand. So they must not be rendered as "finished"
+ *  (see `isRunning` in lib/measure.svelte.ts). */
 export type MeasurePhase =
   | 'idle'
   | 'arming'
   | 'learning'
+  /** Near field: parked, waiting for "I am at this speaker now". */
+  | 'walking'
+  /** Chained multi-position: parked, waiting for the next position. */
+  | 'positioning'
   | 'measuring'
   | 'solving'
   | 'proposed'
@@ -518,6 +529,28 @@ export type RefusalKind =
   | 'mic_lost'
   | 'mic_reconnected'
   | 'mode_unsupported'
+  /** Near field: the walk's two readings of its first speaker disagree by more than
+   *  clock drift can explain, so something moved and the *whole* walk is suspect. */
+  | 'closure_error'
+  /** Near field: an arrival/close call does not match where the walk is. */
+  | 'walk_out_of_order'
+  /** Near field: nobody said "I am at a speaker" before the walk's timeout. */
+  | 'walk_timeout'
+  /** Chaining: a `position`/`finish` call does not match where the chain is — an
+   *  unknown speaker, one already aligned earlier, an overlap that was never aligned,
+   *  or finishing while speakers are still unaligned. Refuses the **step**, not the
+   *  run: everything aligned so far keeps its provisional delays (plan §1.1.4). */
+  | 'chain_out_of_order'
+  /** Chaining: a step after the first named no overlap, so nothing ties this position
+   *  to the speakers already aligned (plan §1.1). */
+  | 'overlap_missing'
+  /** Chaining: the step's overlaps disagree by more than plausible geometry allows, so
+   *  the common shift this step would apply to the *whole* aligned set cannot be
+   *  trusted. Parks the chain and asks for the position again — never a dead end. */
+  | 'overlap_disagreement'
+  /** Chaining: the provisional delay line refused the value the ratchet asked for
+   *  (past `relay_delay::MAX_DELAY_MS`). */
+  | 'provisional_range'
   | 'estimator'
   | 'gate_timeout'
   /** Exclusivity was violated on a member and its reading could not be retaken: a
@@ -535,7 +568,7 @@ export type RefusalKind =
   | 'internal';
 
 /** The estimator's own verdict, when a refusal came from it
- *  (align_estimator.rs `RejectReason`). */
+ *  (align/estimator.rs `RejectReason`). */
 export type EstimatorReason =
   | 'low_snr'
   | 'ambiguous_peak'
@@ -561,7 +594,20 @@ export type WarningKind =
   | 'no_drift_fit'
   /** Exclusivity was violated during the run, even though the affected window was
    *  retaken — it explains why the run took longer than it should have. */
-  | 'interference';
+  | 'interference'
+  /** Near field's premise — the phone is *at* each speaker — is the user's to keep and
+   *  nothing can check it. Raised on every walk, not only when something looks wrong. */
+  | 'near_field_path_assumed'
+  /** A chain step was linked through **one** overlap. That single reading is applied as
+   *  a common shift to every speaker aligned so far *and* anchors everything measured
+   *  after it, with nothing to check it — so the step is the chain's weakest and the
+   *  chain's total error stops being boundable (plan §1.1). */
+  | 'one_overlap'
+  /** Every position of a chain is aligned at *its own* spot, so speakers aligned at
+   *  different positions are related only through the overlaps — approximate in the
+   *  doorway between two rooms. Raised on every chained run, because the failure it
+   *  describes looks like a perfectly good result. */
+  | 'chain_scope';
 
 export interface Warning {
   kind: WarningKind;
@@ -682,13 +728,32 @@ export interface ResidualCheck {
   passed: boolean;
 }
 
+/** Near field's closure reading: the walk's first speaker, measured again at the end.
+ *  `tolerance_ms` is a *rate* bound (a long walk earns a larger allowance), and
+ *  `caveat` states what a pass does and does not establish — show it verbatim. */
+export interface ClosureReport {
+  anchor: string;
+  error_ms: number;
+  span_periods: number;
+  span_s: number;
+  drift_ppm: number;
+  tolerance_ms: number;
+  passed: boolean;
+  caveat: string;
+}
+
 /** The checks available *before* the write. Residual only exists afterwards
  *  (see `Verification`), because it re-measures what was written. */
 export interface Checks {
   transitivity: TransitivityCheck;
-  /** Null when only one pass was usable — then there is nothing to compare. */
+  /** Null when only one pass was usable — then there is nothing to compare. Also null
+   *  for a **near-field walk**, where it would be available but vacuous (the only
+   *  member with two readings is the closure anchor, whose residual is zero by
+   *  construction): reporting an identity as a green check would be dishonest. */
   repeatability: RepeatabilityCheck | null;
   merged_peak: MergedPeakCheck;
+  /** Near field's closure. Null for multi-position, which has no walk to close. */
+  closure?: ClosureReport | null;
 }
 
 /** What `apply` would write, and the confidence behind it. */
@@ -731,6 +796,157 @@ export interface Verification {
   merged_peak: MergedPeakCheck;
   observations: MemberObservation[];
   passed: boolean;
+  /** What this verification actually covered, when that is less than "the group".
+   *  Absent for a single-position run, where every member was re-measured.
+   *
+   *  A **chain** can only be checked where the phone is, which is the *last* position:
+   *  the residual covers that position's own speakers and its overlaps, and the earlier
+   *  positions are not re-measured — re-measuring them from here would read their path
+   *  difference to this spot and report a correct chain as broken (plan §10.4). Show it
+   *  verbatim wherever the residual is shown, or the user reads a last-room result as a
+   *  whole-house one. */
+  scope_note?: string;
+}
+
+// ---- Multi-position chaining (W12, plan §1.1) ---------------------------------
+// One run, several listening spots: align what you can hear from here, walk, align the
+// next set through *overlap* speakers you can hear from both places. Two facts drive the
+// whole UI below and neither is visible in the numbers:
+//
+//   * a step's shift is applied to **every** speaker aligned so far, not just to the
+//     overlap it was measured on (that is what keeps the earlier set internally aligned
+//     and is the trick the feature rests on) — including speakers in rooms the user
+//     cannot hear from where they are standing;
+//   * nothing is **written** until `finish`. The delays live in the daemon's per-device
+//     delay line, so the speakers already sound aligned while no knob has been touched
+//     and nothing is persisted (plan §1.1.1).
+
+/** What a chained run expects the UI to do next. */
+export type ChainAction =
+  /** `POST measure/position` with the speakers audible from here plus the overlaps. */
+  | 'position'
+  /** Every held speaker is aligned somewhere: `POST measure/finish` renormalises the
+   *  chain and proposes the single write. A further position is still accepted. */
+  | 'finish'
+  /** A position is being measured; a second call would be refused. */
+  | 'busy'
+  /** The chain is over. Kept visible, because the per-step numbers are the verdict. */
+  | 'done';
+
+/** How well a step's link to the already-aligned set could be checked (plan §1.1). */
+export type OverlapConfidence =
+  /** The first position: nothing was aligned yet, so this step *defines* the frame. */
+  | 'origin'
+  /** One overlap — anchored, but that single reading moves the whole aligned set and
+   *  anchors everything after it with nothing to check it against. */
+  | 'single'
+  /** Two or more: their disagreement is an independent estimate of the joint's error. */
+  | 'checked';
+
+/** One overlap speaker as it read at the new position. */
+export interface ChainOverlap {
+  node_name: string;
+  /** Its arrival at *this* position, on this step's own scale — already including the
+   *  provisional delay it is carrying, which is what makes the chain work. */
+  arrival_ms: number;
+  /** The provisional delay it was carrying while this reading was taken. */
+  applied_ms: number;
+}
+
+/** One member's provisional delay, as the relay is applying it *right now*. Nothing
+ *  here is persisted: a daemon restart drops it and the stored config is untouched. */
+export interface ProvisionalDelay {
+  node_name: string;
+  /** What the chain's arithmetic holds, ms (exact, so a step's Δ does not accumulate
+   *  rounding). */
+  delay_ms: number;
+  /** What was actually pushed to the delay line, in whole ms — the same 1 ms
+   *  granularity the final write has. For an overlap this is *observed* rather than
+   *  assumed, because the next position measures the overlap through it. */
+  applied_ms: number;
+}
+
+/** One position of a chain, after it was measured. */
+export interface ChainStep {
+  /** 1-based, in the order the user walked. */
+  index: number;
+  /** The speakers this position aligned (the ones not already aligned). */
+  members: string[];
+  /** The already-aligned speakers this position was linked through. */
+  overlaps: ChainOverlap[];
+  confidence: OverlapConfidence;
+  /** Worst pairwise disagreement between the overlaps here, ms. Null for a first or
+   *  single-overlap step, which have nothing to compare. */
+  disagreement_ms: number | null;
+  worst_pair: [string, string] | null;
+  tolerance_ms: number;
+  /** Where the already-aligned set is judged to arrive here: the mean of the overlap
+   *  readings. Null for the first step. */
+  anchor_ms: number | null;
+  /** The common delay this step added to **every** member of the already-aligned set,
+   *  ms. Non-zero exactly when a new speaker here arrived *later* than the aligned set
+   *  does — and it goes to all of them, because a common delay preserves an aligned
+   *  set's internal alignment. The single most surprising thing the feature does. */
+  delta_ms: number;
+  /** The arrival this position was aligned at, on this step's own scale. */
+  target_ms: number;
+  spread_ms: number;
+  /** Drift fitted at *this* position; a chain has no single figure. */
+  drift_ppm: number;
+  /** Half of `disagreement_ms` — how far this joint's common shift can be out. Null
+   *  when the step had nothing to check it with, which is what makes the chain's total
+   *  unboundable (see `ChainError`). */
+  joint_error_ms: number | null;
+  /** Which capture this position was measured in. Positions may differ; no two steps'
+   *  observations are ever compared. */
+  grid_epoch: number;
+  /** The §10 checks over this position's own readings. They **block the step**. */
+  checks: Checks;
+  note: string;
+}
+
+/** What a chain's accumulated error can and cannot be said to be (plan §1.1.4).
+ *
+ *  `joint_ms` is deliberately null — not a partial sum — as soon as any joint was
+ *  linked through a single overlap: "a total that quietly left out the one joint it
+ *  could not measure would be worse than none". Never compute one client-side. */
+export interface ChainError {
+  /** True when *every* joint was checked by two overlaps. */
+  bounded: boolean;
+  joint_ms: number | null;
+  /** The daemon's sentence. Show it verbatim. */
+  message: string;
+}
+
+/** A chained run's live state (`MeasureStatus.chain`). */
+export interface ChainProgress {
+  next: ChainAction;
+  steps: ChainStep[];
+  /** Every speaker aligned so far, in the order they were aligned. */
+  aligned: string[];
+  /** Held speakers not aligned at any position yet. `finish` refuses while this is
+   *  non-empty: a speaker with no reading has nothing to write. */
+  remaining: string[];
+  /** What the relay is applying right now. Nothing is persisted. */
+  provisional: ProvisionalDelay[];
+  /** The smallest provisional delay in the aligned set, ms — the floor that ratchets
+   *  upward because every step can only *add*. `finish` subtracts it globally, which is
+   *  a common shift and therefore free. */
+  floor_ms: number;
+  /** The position being measured right now. */
+  measuring: number | null;
+  /** Times the position in flight was restarted because the capture reconnected. */
+  restarts: number;
+  /** What to do next, in the daemon's own words. */
+  prompt: string;
+  error: ChainError;
+  /** Why the last position was rejected, when it was. The chain **stays alive**: the
+   *  positions already aligned keep their provisional delays and the user can post this
+   *  position again. Cleared as soon as a position is accepted. */
+  refusal: Refusal | null;
+  /** What a chain's result is coherent *with* — the doorway caveat, stated on every
+   *  chained run rather than inferred from the numbers. Verbatim. */
+  scope_note: string;
 }
 
 /** Why the loop-phase gate is not accepting a window yet (plan §8). */
@@ -779,6 +995,10 @@ export interface MeasureStatus {
   refusal: Refusal | null;
   warnings: Warning[];
   gate?: GateProgress;
+  /** Chained multi-position only: where the chain is, what it wants next, the per-position
+   *  numbers, and what the result is *not* coherent with. Absent for a single-position run
+   *  (which is a chain with one step and needs no calls) and for a near-field walk. */
+  chain?: ChainProgress;
   /** `POST measure/apply` will be accepted (i.e. parked in `proposed`, unblocked). */
   can_apply: boolean;
   /** `POST measure/revert` has a snapshot to restore (plan §9.4). */

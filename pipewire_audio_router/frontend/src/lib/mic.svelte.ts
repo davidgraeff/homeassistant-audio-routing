@@ -55,7 +55,7 @@ const STATUS_POLL_MS = 250;
  *
  *  Plan §12.2 asked for a pre-flight faster than the measurement gate, and the
  *  daemon now has one — `PREFLIGHT_PERIODS` is deliberately *not* the gate's
- *  `GATE_MIN_PERIODS` (4), and `align_measure.rs` has a compile-time assertion
+ *  `GATE_MIN_PERIODS` (4), and `align/measure.rs` has a compile-time assertion
  *  keeping them apart. Two periods is the floor rather than a preference: the
  *  estimator only keeps a period it saw whole, so the partial period at each end is
  *  dropped and a one-period window would yield none.

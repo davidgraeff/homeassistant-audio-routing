@@ -107,9 +107,11 @@
     refresh();
     // Light poll so connect/disconnect/ban shows up without a manual reload.
     const timer = setInterval(refreshAllClients, 5000);
-    // Alignment lives on this page (a sync group is identified by its source):
-    // attach loads the session + alignable groups and, on unmount, stops any
-    // session so speakers aren't left muted with the click looping.
+    // By-ear alignment lives on this page (a sync group is identified by its source):
+    // attach loads the session + alignable groups and, on unmount, stops a *by-ear*
+    // session so speakers aren't left muted with the click looping. It deliberately
+    // leaves a microphone run alone — that one is owned by the Outputs page (plan
+    // §12.1), and tearing it down from here would discard a chain mid-walk.
     const detachAlign = align.attach();
     return () => {
       clearInterval(timer);

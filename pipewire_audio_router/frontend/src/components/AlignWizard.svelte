@@ -28,7 +28,7 @@
   import MicCapture from './MicCapture.svelte';
   import { align } from '../lib/align.svelte';
   import { askConfirm } from '../lib/confirm.svelte';
-  import { MODE_LABELS, elapsed, isLive, measure, phaseLabel } from '../lib/measure.svelte';
+  import { MODE_LABELS, elapsed, isRunning, measure, phaseLabel } from '../lib/measure.svelte';
   import type { AlignGroup, MeasureMode, MeasurePhase } from '../lib/types';
 
   interface Props {
@@ -69,9 +69,18 @@
 
   let page = $state<Page>('mode');
   let mode = $state<MeasureMode>('sweet_spot');
+  /** Measure from more than one listening position, joining them through overlap
+   *  speakers (plan §1.1). Chosen on the mode page and only meaningful for
+   *  multi-position; a chain with one step *is* the single-position run, which is why the
+   *  daemon defaults it off rather than treating one position as a degenerate chain. */
+  let chained = $state(false);
 
   const status = $derived(measure.status);
-  const live = $derived(measure.live);
+  /** A run parked in `positioning` is alive: it holds the group and carries provisional
+   *  delays nobody has written. So every question this shell asks — may it be abandoned,
+   *  may the user leave, is a run in progress — is `running`, never `live` (which only
+   *  says whether the *daemon* is busy this second). */
+  const running = $derived(measure.running);
   const hasResult = $derived(!!status && (!!status.proposal || !!status.verification));
 
   // One poll loop for the whole run, ref-counted in the store.
@@ -100,8 +109,9 @@
     if (!st || st.phase === lastPhase) return;
     lastPhase = st.phase;
     // Everything the daemon is actively doing belongs on the run page — including
-    // `settling`, which is where the gate explains a group that has gone quiet.
-    if (isLive(st.phase)) page = 'run';
+    // `settling`, which is where the gate explains a group that has gone quiet, and
+    // `positioning`, which is where a chain asks for the next listening position.
+    if (isRunning(st.phase)) page = 'run';
     else if (st.phase === 'proposed' || st.phase === 'done') page = 'review';
     else if (st.phase === 'refused') page = st.proposal ? 'review' : 'run';
   });
@@ -114,7 +124,23 @@
 
   async function start() {
     measure.clearError();
-    if (await measure.start(mode)) page = 'run';
+    // `chained` only reaches the daemon for multi-position: near field has its own
+    // acquisition (a walk) and needs no overlaps at all, and sending both would invite
+    // the reader to think the two compose.
+    if (await measure.start(mode, mode === 'sweet_spot' && chained)) page = 'run';
+  }
+
+  /** One listening position of a chain. A refusal here is the *step's*: the chain stays
+   *  parked with the reason in `status.chain.refusal` and the user can post again, so
+   *  there is nothing to unwind and no page to leave. */
+  async function position(members: string[], overlaps: string[]) {
+    measure.clearError();
+    await measure.position(members, overlaps);
+  }
+
+  async function finish() {
+    measure.clearError();
+    await measure.finish();
   }
 
   async function apply() {
@@ -150,10 +176,13 @@
          header must describe what is running, not what is selected. -->
     <span class="badge">{MODE_LABELS[status && status.phase !== 'idle' ? status.mode : mode]}</span>
     {#if status && status.phase !== 'idle'}
-      <span class="badge" class:on={live} class:warn={status.phase === 'refused'}>{phaseLabel(status.phase)}</span>
+      <span class="badge" class:on={running} class:warn={status.phase === 'refused'}>{phaseLabel(status.phase)}</span>
     {/if}
     <span class="spacer"></span>
-    {#if live}
+    {#if running}
+      <!-- `running`, not `live`: a chain parked between positions is not doing anything
+           at this instant but is very much a run — it is holding the group and carrying
+           provisional delays — so abandoning it has to be offered there too. -->
       <button class="ghost" disabled={measure.busy} title="Stop measuring, leave the test tone playing" onclick={() => void measure.abandon()}>
         Stop measuring
       </button>
@@ -163,14 +192,14 @@
     <button class="danger" disabled={measure.busy} title="Stop measuring, give the speakers back and put levels, mutes and routing back to normal" onclick={() => void stopAll()}>
       Stop and restore
     </button>
-    {#if !live && !holding}
-      <button class="ghost" title="Leave the wizard; nothing is being held and the by-ear sliders stay as they are" onclick={onClose}>
+    {#if !running && !holding}
+      <button class="ghost" title="Leave the wizard; nothing is being held and no run is in progress" onclick={onClose}>
         Close
       </button>
     {/if}
   </div>
 
-  {#if holding && !live}
+  {#if holding && !running}
     <!-- Closing is deliberately not offered while speakers are held: the hold is
          exclusive, so leaving it running would leave part of the house silent with no
          visible reason. "Stop and restore" is the way out, and it says what it does. -->
@@ -220,18 +249,26 @@
 
   <div class="page">
     {#if page === 'mode'}
-      <AlignWizardMode {mode} onPick={(m) => (mode = m)} />
+      <AlignWizardMode {mode} {chained} onPick={(m) => (mode = m)} onChain={(c) => (chained = c)} />
       <div class="nav">
         <button class="primary" onclick={() => (page = 'speakers')}>Next: speakers</button>
       </div>
     {:else if page === 'speakers'}
-      <AlignWizardSpeakers {mode} {label} onStart={() => void start()} />
+      <AlignWizardSpeakers {mode} chained={mode === 'sweet_spot' && chained} {label} onStart={() => void start()} />
       <div class="nav">
         <button class="ghost" onclick={() => (page = 'mode')}>Back</button>
       </div>
     {:else if page === 'run'}
       {#if status && status.phase !== 'idle'}
-        <AlignWizardRun {status} {label} onRetry={() => void start()} />
+        <AlignWizardRun
+          {status}
+          {label}
+          busy={measure.busy}
+          onRetry={() => void start()}
+          onPosition={(members, overlaps) => void position(members, overlaps)}
+          onFinish={() => void finish()}
+          onHear={(nodes) => void align.hear(nodes)}
+        />
       {:else}
         <p class="empty">Nothing is being measured. Go back to Speakers and start a run.</p>
       {/if}

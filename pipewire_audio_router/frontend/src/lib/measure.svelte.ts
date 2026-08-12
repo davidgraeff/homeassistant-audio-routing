@@ -1,5 +1,5 @@
 // Microphone-assisted alignment: the *run*, as the UI sees it
-// (docs/mic-alignment-plan.md §§8-11, bridge-daemon/src/align_measure.rs).
+// (docs/mic-alignment-plan.md §§8-11, bridge-daemon/src/align/measure.rs).
 //
 // The daemon runs one measurement at a time, process-wide — the same shape as the
 // by-ear session in `align.svelte.ts` — so this is a module singleton rather than
@@ -21,10 +21,12 @@
 import { MEASURE_WS_PATH, api, refusalOf, wsUrl } from './api';
 import { toast } from './toast';
 import type {
+  ChainAction,
   GateReason,
   MeasureMode,
   MeasurePhase,
   MeasureStatus,
+  OverlapConfidence,
   Refusal,
   RefusalKind,
   EstimatorReason,
@@ -54,9 +56,27 @@ const POLL_IDLE_MS = 5000;
  *  user is waiting on. */
 const WS_RETRY_MS = 15000;
 
+/** Phases in which the run is alive but the *user* is the one being waited on: a
+ *  chain parked between listening positions, a walk parked between speakers. The
+ *  daemon is idle, so these poll slowly — but the run is holding the group, playing
+ *  the click, and (for a chain) carrying provisional delays nobody has written. */
+const PARKED_IN_RUN: ReadonlySet<MeasurePhase> = new Set<MeasurePhase>(['positioning', 'walking']);
+
 /** Is the daemon working on this run right now? */
 export function isLive(phase: MeasurePhase): boolean {
   return LIVE_PHASES.has(phase);
+}
+
+/** Is there a run in progress — including one parked waiting for the person holding
+ *  the phone?
+ *
+ *  Distinct from `isLive` on purpose, and the distinction is load-bearing: a chain
+ *  parked in `positioning` looks idle to the daemon but is very much running, so
+ *  "Stop measuring" has to be offered and the audibility a position was previewed with
+ *  must not be torn down by a page change. Treating it as finished would also let a
+ *  second entry point believe it could start a run. */
+export function isRunning(phase: MeasurePhase): boolean {
+  return isLive(phase) || PARKED_IN_RUN.has(phase);
 }
 
 /** The §8 state machine, in the order the run walks it — the spine of the run
@@ -73,10 +93,23 @@ export const PHASE_CHAIN: readonly MeasurePhase[] = [
   'done',
 ];
 
+/** The same spine, with the acquisition state this run actually has. A chained run
+ *  loops `positioning` → `measuring` once per listening spot, and a walk parks in
+ *  `walking`; leaving them out made every step of a chained run look unreached,
+ *  because the current phase was not on the strip at all. */
+export function phaseChain(opts: { chained?: boolean; mode?: MeasureMode }): readonly MeasurePhase[] {
+  const extra: MeasurePhase | null = opts.mode === 'near_field' ? 'walking' : opts.chained ? 'positioning' : null;
+  if (!extra) return PHASE_CHAIN;
+  const at = PHASE_CHAIN.indexOf('measuring');
+  return [...PHASE_CHAIN.slice(0, at), extra, ...PHASE_CHAIN.slice(at)];
+}
+
 const PHASE_LABELS: Record<MeasurePhase, string> = {
   idle: 'Not measuring',
   arming: 'Arming',
   learning: 'Learning levels',
+  walking: 'Waiting at a speaker',
+  positioning: 'Waiting for a position',
   measuring: 'Measuring',
   solving: 'Solving',
   proposed: 'Proposal ready',
@@ -98,6 +131,8 @@ const PHASE_NOTES: Partial<Record<MeasurePhase, string>> = {
   learning: 'Finding a playback level each speaker can be heard at over the room.',
   measuring:
     'Each speaker is soloed in turn and measured twice. Every switch waits for the tone to settle, so this is the long part — about 11 seconds per speaker per pass.',
+  positioning:
+    'Nothing is being measured: the chain is waiting for you to say which speakers you can hear from where you are standing now. Everything aligned so far is holding its delay in the meantime.',
   solving: "Turning the arrivals into a setting for each speaker's own timing knob.",
   writing: "Writing each speaker's knob — an advance for Sendspin, a delay for AirPlay 2 and PipeWire hosts.",
   settling:
@@ -139,6 +174,16 @@ const REFUSAL_KINDS: Record<RefusalKind, string> = {
   mic_lost: 'The microphone went away',
   mic_reconnected: 'The microphone reconnected too often',
   mode_unsupported: 'That mode is not available yet',
+  closure_error: 'The walk did not close',
+  walk_out_of_order: 'That is not where the walk is',
+  walk_timeout: 'The walk was not continued',
+  // The four chaining kinds. Every one of them refuses a *step*, not the run: the
+  // headline says so, so a user who reads nothing else does not conclude that an
+  // apartment's worth of walking has been thrown away.
+  chain_out_of_order: 'This position does not fit the chain',
+  overlap_missing: 'This position needs an overlap speaker',
+  overlap_disagreement: 'The overlap speakers disagree — this position was not accepted',
+  provisional_range: 'The chain has run past the delay line’s range',
   estimator: 'The estimator refused to answer',
   gate_timeout: 'Never got a stable signal',
   interference: 'Something more important played on a speaker',
@@ -177,6 +222,9 @@ const WARNING_KINDS: Record<WarningKind, string> = {
   mic_reconnected: 'The microphone reconnected',
   no_drift_fit: 'Clock drift could not be fitted',
   interference: 'Something else played during the run',
+  near_field_path_assumed: 'The phone was assumed to be at each speaker',
+  one_overlap: 'One position was linked through a single overlap',
+  chain_scope: 'Each position is aligned at its own spot',
 };
 
 export function warningKindLabel(kind: WarningKind): string {
@@ -187,6 +235,42 @@ export const MODE_LABELS: Record<MeasureMode, string> = {
   sweet_spot: 'Multi-position',
   near_field: 'Near field',
 };
+
+// ---- Chaining, as presentation only (plan §1.1) -----------------------------
+//
+// Nothing below decides anything. In particular there is no client-side arithmetic
+// over a chain's per-joint errors: the daemon withholds a total as soon as one joint
+// was linked through a single overlap, and a UI that helpfully summed the joints it
+// *did* have would put back exactly the number §1.1.4 refuses to print.
+
+/** What the next call is, in the user's words. */
+const CHAIN_ACTIONS: Record<ChainAction, string> = {
+  position: 'Waiting for the next listening position',
+  finish: 'Every speaker is aligned somewhere',
+  busy: 'Measuring this position',
+  done: 'The chain is finished',
+};
+
+export function chainActionLabel(action: ChainAction): string {
+  return CHAIN_ACTIONS[action];
+}
+
+/** A step's link strength, as a badge. */
+const OVERLAP_CONFIDENCE: Record<OverlapConfidence, string> = {
+  origin: 'first position — nothing to link to',
+  single: '1 overlap — unchecked',
+  checked: 'checked against itself',
+};
+
+export function overlapConfidenceLabel(confidence: OverlapConfidence): string {
+  return OVERLAP_CONFIDENCE[confidence];
+}
+
+/** Why one overlap is weaker than two, in one sentence — used wherever a
+ *  single-overlap step or a single-overlap *selection* is shown, so the penalty is
+ *  visible before the step is posted rather than only afterwards. */
+export const ONE_OVERLAP_PENALTY =
+  'One overlap anchors this position, but nothing checks it: that single reading is applied as a common shift to every speaker aligned so far and anchors every position after it, so a reflection on it would move the whole chain unnoticed. It also costs the run its error total — a chain with one such joint reports none at all.';
 
 /** How firm one member's number is, from its standard error.
  *
@@ -385,6 +469,12 @@ function createMeasure() {
     get live() {
       return !!status && isLive(status.phase);
     },
+    /** Is a run in progress at all — including one parked waiting for the user to walk
+     *  to the next position? This, not `live`, is what a second entry point has to
+     *  consult before offering to start anything (see `isRunning`). */
+    get running() {
+      return !!status && isRunning(status.phase);
+    },
     get canApply() {
       return !!status?.can_apply;
     },
@@ -443,13 +533,33 @@ function createMeasure() {
       };
     },
 
+    /** One status read, without taking the poll loop up.
+     *
+     *  For a page that wants to know whether a *previous* run left something revertable
+     *  (plan §9.4) without watching a run it is not showing: `attach()` would open the
+     *  push socket and poll forever on a page nobody is aligning from. */
+    async refreshOnce() {
+      try {
+        adopt(await api.measureStatus());
+      } catch {
+        /* keep the last-known status: a failed read is not a state change */
+      }
+    },
+
     /** Clear the last action's error, e.g. when the user changes something. */
     clearError() {
       actionRefusal = null;
       actionError = null;
     },
 
-    start: (mode: MeasureMode) => act(() => api.measureStart(mode)),
+    start: (mode: MeasureMode, chain = false) => act(() => api.measureStart(mode, chain)),
+    /** One listening position of a chain (plan §1.1). A refusal is the *step's*, not the
+     *  run's — `status.chain.refusal` carries it and the chain stays parked — so this
+     *  keeps the same `act()` path as everything else and the caller does not have to
+     *  treat "refused" as the end of anything. */
+    position: (members: string[], overlaps: string[]) => act(() => api.measurePosition(members, overlaps)),
+    /** Renormalise the chain and propose the single write. */
+    finish: () => act(() => api.measureFinish()),
     apply: () => act(() => api.measureApply()),
     revert: () => act(() => api.measureRevert()),
     abandon: () => act(() => api.measureAbandon()),

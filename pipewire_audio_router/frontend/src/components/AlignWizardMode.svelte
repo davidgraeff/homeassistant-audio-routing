@@ -10,9 +10,15 @@
 
   interface Props {
     mode: MeasureMode;
+    /** Multi-position only: measure from several listening spots and join them through
+     *  overlap speakers (plan §1.1). A sub-choice of the mode rather than a fourth mode,
+     *  because the promise is the same one — "aligned at the spot it was measured from" —
+     *  made once per position instead of once. */
+    chained: boolean;
     onPick: (mode: MeasureMode) => void;
+    onChain: (chained: boolean) => void;
   }
-  let { mode, onPick }: Props = $props();
+  let { mode, chained, onPick, onChain }: Props = $props();
 </script>
 
 <p class="lead">
@@ -30,10 +36,35 @@
         Aligns the speakers you can hear from where you are standing, at <em>that</em> spot. Stand where you normally
         listen and hold the phone still.
       </p>
-      <p class="hint">
-        Measuring a second position and joining the two through a shared speaker is not built yet, so today this aligns
-        one position — which is the same thing with one step.
-      </p>
+      <!-- The chain choice lives inside the mode it belongs to, so it cannot be read as
+           a fourth promise. Only offered when the mode is selected: a disabled control
+           under an unselected radio reads as "not available". -->
+      {#if mode === 'sweet_spot'}
+        <div class="sub-choice">
+          <label class="opt" class:on={!chained}>
+            <input type="radio" name="align-chain" checked={!chained} onchange={() => onChain(false)} />
+            <span>
+              <strong>One position</strong>
+              <span class="hint">
+                Every speaker is measured from where the phone is sitting. Right for one room, and for speakers that are
+                all audible from one seat.
+              </span>
+            </span>
+          </label>
+          <label class="opt" class:on={chained}>
+            <input type="radio" name="align-chain" checked={chained} onchange={() => onChain(true)} />
+            <span>
+              <strong>Several positions, joined up</strong>
+              <span class="hint">
+                For a house where no single spot hears everything: align what you can hear, walk to the next room, and
+                name one or two speakers you can hear from <em>both</em> — those links are what tie the rooms together.
+                Each room ends up aligned at its own spot, so the transition between two rooms is approximate; nothing
+                is written until the last position is done.
+              </span>
+            </span>
+          </label>
+        </div>
+      {/if}
     </div>
   </label>
 
@@ -112,5 +143,38 @@
   }
   .body p.hint {
     font-size: 0.78rem;
+  }
+  /* Indented under the mode it qualifies, and visibly nested rather than a sibling. */
+  .sub-choice {
+    display: grid;
+    gap: 6px;
+    margin: 8px 0 0;
+    padding-left: 10px;
+    border-left: 2px solid color-mix(in srgb, var(--primary-color) 35%, transparent);
+  }
+  .opt {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin: 0;
+    padding: 6px 9px;
+    border: 1px solid var(--divider-color);
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.84rem;
+  }
+  .opt.on {
+    border-color: var(--primary-color);
+    background: color-mix(in srgb, var(--primary-color) 8%, transparent);
+  }
+  .opt input {
+    margin-top: 3px;
+    flex: 0 0 auto;
+  }
+  .opt .hint {
+    display: block;
+    margin-top: 3px;
+    font-size: 0.78rem;
+    color: var(--secondary-text-color);
   }
 </style>
