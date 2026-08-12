@@ -29,6 +29,13 @@
 //!   counterpart of the two knobs above: it is the *only* lever on that path's
 //!   delay, so it both delays a target that runs early and — dialled down —
 //!   trims the 100 ms the module would otherwise take.
+//! - **`align_band_split`** — a per-output *measured* band split in ms
+//!   ([`BandSplit`]), keyed by node name. The odd one out here: not a knob the user
+//!   turns but a **calibration** the microphone alignment measured, and the only
+//!   entry in this file that is written by a measurement rather than by a choice.
+//!   It lives here because it is per-output persistent latency data like everything
+//!   else, and because a delay solve and this are read together
+//!   (`api/measure.rs::measure_deps`).
 //!
 //! Mirrors the other `/data` stores: no `options.json` seeding, the file is
 //! authoritative and created on first mutation; a missing file means defaults.
@@ -123,12 +130,55 @@ struct SyncConfig {
     /// ⇒ [`SendspinCodec::Auto`].
     #[serde(default)]
     sendspin_codec: BTreeMap<String, SendspinCodec>,
+    /// Per-output **band-split calibration** for microphone alignment, keyed by node
+    /// name (see [`BandSplit`]). Absent ⇒ uncalibrated, and the alignment
+    /// transitivity check keeps its wider tolerance for that output.
+    #[serde(default)]
+    align_band_split: BTreeMap<String, BandSplit>,
     /// Per-AP2-device LEARNED capability cache (Hz), keyed by AP2 node name: the
     /// last successfully-negotiated rate, or 44100 if a 48 kHz SETUP was rejected.
     /// Absent ⇒ untested (Auto optimistically tries 48 kHz). Persisted so we don't
     /// re-probe a known-44.1k-only receiver on every connect.
     #[serde(default)]
     ap2_rate_cap: BTreeMap<String, u32>,
+}
+
+/// One output's measured **band split**: how much later its 1.5 kHz burst arrives
+/// than its 3 kHz one, beyond the half-period the click track puts between them
+/// (docs/mic-alignment-plan.md §10.2).
+///
+/// ## Why this is worth persisting
+///
+/// It is a *fixed property of the loudspeaker* — its crossover delays the two bands
+/// differently, often by a millisecond or two and differently per model. Alignment's
+/// only instrument against the §5.6 reflection blind spot is the cross-band
+/// transitivity check, which compares members' splits; an uncalibrated mixed-model
+/// group therefore fails it for a legitimate hardware reason (hardware-observed
+/// 2026-08-12: a Home Assistant Voice PE and an ESPHome satellite disagreed by
+/// 3.45 ms in one room, with the phone next to both). Subtracting a *measured*
+/// constant turns that confound into a known quantity, which is what lets the check
+/// become **more** sensitive to reflections rather than blunter.
+///
+/// ## What makes a stored value trustworthy
+///
+/// Only that it was measured at close range: at arm's length the direct sound
+/// dominates any reflection by far more than the 0.9× that produced §5.6's numbers,
+/// which is the same reasoning near-field mode rests on. `std_error_ms` and
+/// `peak_snr_db` are stored beside the figure so a bad calibration is visible instead
+/// of silently correcting every future measurement, and `measured_at` says how old
+/// the claim is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BandSplit {
+    /// `phase_B − phase_A − half a pattern period`, in ms. Positive means the low
+    /// band arrives later than the high one.
+    pub split_ms: f64,
+    /// The estimator's standard error on the reading it came from.
+    pub std_error_ms: f64,
+    /// The weaker channel's peak SNR at the time, in dB.
+    pub peak_snr_db: f64,
+    /// Unix seconds. A speaker that was replaced keeps its node name, so the age of
+    /// the claim is part of the claim.
+    pub measured_at: u64,
 }
 
 /// Per-AP2-output sample-rate mode.
@@ -219,6 +269,7 @@ impl Default for SyncConfig {
             ap2_rate_mode: BTreeMap::new(),
             sendspin_codec: BTreeMap::new(),
             ap2_rate_cap: BTreeMap::new(),
+            align_band_split: BTreeMap::new(),
         }
     }
 }
@@ -339,6 +390,32 @@ impl SyncSettings {
             }
             Some(ms) => {
                 self.config.pwsink_jitter.insert(node_name.to_string(), ms);
+            }
+        }
+        self.persist()
+    }
+
+    // ---- alignment band-split calibration (plan §10.2) -------------------
+
+    /// One output's stored band split, or `None` when it has never been calibrated.
+    pub fn band_split(&self, node_name: &str) -> Option<BandSplit> {
+        self.config.align_band_split.get(node_name).copied()
+    }
+
+    /// Every stored band split by node name — what the transitivity check subtracts
+    /// and what the API lists.
+    pub fn band_splits(&self) -> BTreeMap<String, BandSplit> {
+        self.config.align_band_split.clone()
+    }
+
+    /// Store (or clear, when `split` is `None`) one output's band split and persist.
+    pub fn set_band_split(&mut self, node_name: &str, split: Option<BandSplit>) -> anyhow::Result<()> {
+        match split {
+            None => {
+                self.config.align_band_split.remove(node_name);
+            }
+            Some(s) => {
+                self.config.align_band_split.insert(node_name.to_string(), s);
             }
         }
         self.persist()
@@ -487,6 +564,42 @@ mod tests {
         s.set_pwsink_jitter("pwsink-dev-shop_david", None).unwrap();
         assert!(s.pwsink_jitters().is_empty());
         assert_eq!(s.pwsink_jitter_effective("pwsink-dev-shop_david"), DEFAULT_PWSINK_JITTER_MS);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A band split is a measured *property of the speaker*, so it has to outlive
+    /// restarts exactly like a delay does — and an output with no calibration must read
+    /// as absent rather than as 0 ms, which would be a claim ("this speaker has no
+    /// crossover split") the daemon never measured.
+    #[test]
+    fn a_band_split_calibration_persists_per_output_and_clears() {
+        let path = temp_path("band-split");
+        let _ = std::fs::remove_file(&path);
+        let mut s = SyncSettings::load(&path).unwrap();
+        assert!(s.band_split("sendspin-dev-voice_pe").is_none());
+        s.set_band_split(
+            "sendspin-dev-voice_pe",
+            Some(BandSplit { split_ms: 0.3, std_error_ms: 0.04, peak_snr_db: 41.0, measured_at: 1_760_000_000 }),
+        )
+        .unwrap();
+        s.set_band_split(
+            "sendspin-dev-satellite1",
+            Some(BandSplit { split_ms: 3.75, std_error_ms: 0.06, peak_snr_db: 38.0, measured_at: 1_760_000_100 }),
+        )
+        .unwrap();
+
+        let reloaded = SyncSettings::load(&path).unwrap();
+        assert_eq!(reloaded.band_splits().len(), 2);
+        let voice = reloaded.band_split("sendspin-dev-voice_pe").expect("stored");
+        assert!((voice.split_ms - 0.3).abs() < 1e-9);
+        // The evidence is stored with the figure, so a wrong calibration is visible.
+        assert!((voice.peak_snr_db - 41.0).abs() < 1e-9);
+        assert_eq!(voice.measured_at, 1_760_000_000);
+
+        let mut reloaded = reloaded;
+        reloaded.set_band_split("sendspin-dev-voice_pe", None).unwrap();
+        assert!(reloaded.band_split("sendspin-dev-voice_pe").is_none(), "clearing puts it back on the wider tolerance");
+        assert_eq!(SyncSettings::load(&path).unwrap().band_splits().len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 

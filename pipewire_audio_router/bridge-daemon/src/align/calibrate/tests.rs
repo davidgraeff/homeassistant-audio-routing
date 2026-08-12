@@ -951,7 +951,7 @@ async fn an_ap2_members_level_is_driven_for_the_session_and_restored_at_teardown
     let f = UnionFixture::new("ap2lvl", &[(spin, MemberKind::Sendspin), (ap2_node, MemberKind::Airplay2)]).await;
     // What the receiver was on before the session, known to us because something read it
     // (`note_reported_volume`) or the user set it.
-    f.ap2.lock().await.set_volume(ap2_node, 0.62).await;
+    f.ap2.lock().await.set_volume(ap2_node, 0.62);
     f.snapshot(&[(spin, 77)], &[(ap2_node, 0.62)]).await;
 
     // §12.2's slider, aimed at the AP2 member. Before W18 this moved nothing at all.
@@ -1072,7 +1072,7 @@ async fn every_teardown_path_restores_the_levels_it_changed() {
     // 1. A normal stop.
     let (spin, ap2_node) = ("sendspin-dev-tdstop", "ap2-dev-tdstop");
     let f = UnionFixture::new("tdstop", &[(spin, MemberKind::Sendspin), (ap2_node, MemberKind::Airplay2)]).await;
-    f.ap2.lock().await.set_volume(ap2_node, user_ap2).await;
+    f.ap2.lock().await.set_volume(ap2_node, user_ap2);
     f.sendspin.lock().await.set_volume(spin, user_spin).apply().await;
     f.snapshot(&[(spin, user_spin)], &[(ap2_node, user_ap2)]).await;
     f.mgr.set_audible(vec![spin.into(), ap2_node.into()], 15).await.unwrap();
@@ -1084,7 +1084,7 @@ async fn every_teardown_path_restores_the_levels_it_changed() {
     //    adoption gate, which is what makes the old session's teardown observable here.
     let (spin, ap2_node) = ("sendspin-dev-tdreform", "ap2-dev-tdreform");
     let f = UnionFixture::new("tdreform", &[(spin, MemberKind::Sendspin), (ap2_node, MemberKind::Airplay2)]).await;
-    f.ap2.lock().await.set_volume(ap2_node, user_ap2).await;
+    f.ap2.lock().await.set_volume(ap2_node, user_ap2);
     f.sendspin.lock().await.set_volume(spin, user_spin).apply().await;
     f.snapshot(&[(spin, user_spin)], &[(ap2_node, user_ap2)]).await;
     f.mgr.set_audible(vec![spin.into(), ap2_node.into()], 15).await.unwrap();
@@ -1099,7 +1099,7 @@ async fn every_teardown_path_restores_the_levels_it_changed() {
     //    teardown (a 15-minute sleep is not a test), so drive that.
     let (spin, ap2_node) = ("sendspin-dev-tdtimeout", "ap2-dev-tdtimeout");
     let f = UnionFixture::new("tdtimeout", &[(spin, MemberKind::Sendspin), (ap2_node, MemberKind::Airplay2)]).await;
-    f.ap2.lock().await.set_volume(ap2_node, user_ap2).await;
+    f.ap2.lock().await.set_volume(ap2_node, user_ap2);
     f.sendspin.lock().await.set_volume(spin, user_spin).apply().await;
     f.snapshot(&[(spin, user_spin)], &[(ap2_node, user_ap2)]).await;
     f.mgr.set_audible(vec![spin.into(), ap2_node.into()], 15).await.unwrap();

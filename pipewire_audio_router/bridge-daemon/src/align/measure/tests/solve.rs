@@ -96,7 +96,7 @@ fn transitivity_arithmetic_is_the_cross_band_difference() {
     // Directly, without the solve around it: the residual of a triangle closed
     // with edges from two different bands is |split_i − split_j|.
     let o = [obs("a", 0, 0.0, 100.0, 0.0), obs("b", 0, 1.0, 100.0, 1.0), obs("c", 0, 2.0, 100.0, -1.0)];
-    let t = transitivity(&o, &Timing::real(), TRANSITIVITY_TOL_MS);
+    let t = transitivity(&o, &Timing::real(), TRANSITIVITY_TOL_MS, no_band_splits());
     assert!((t.worst_ms - 2.0).abs() < 1e-9, "worst {}", t.worst_ms);
     let pair = t.worst_pair.expect("a worst pair");
     assert!(pair == ("b".into(), "c".into()) || pair == ("c".into(), "b".into()));

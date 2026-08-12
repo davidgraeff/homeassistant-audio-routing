@@ -452,7 +452,7 @@ fn the_accumulated_error_is_the_joints_and_is_withheld_when_a_joint_is_unmeasura
         joint_error_ms: joint,
         grid_epoch: 0,
         checks: Checks {
-            transitivity: transitivity(&[], &Timing::real(), TRANSITIVITY_TOL_MS),
+            transitivity: transitivity(&[], &Timing::real(), TRANSITIVITY_TOL_MS, no_band_splits()),
             repeatability: None,
             merged_peak: MergedPeakCheck::seam(),
             closure: None,
@@ -536,7 +536,7 @@ async fn the_chain_refuses_calls_that_do_not_match_where_it_is() {
 
     // Abandoning mid-chain gives the provisional delays back and writes nothing.
     assert!(relay.applied_ms("a") > 0.0);
-    let after = m.abandon();
+    let after = m.abandon().await;
     assert_eq!(after.phase, Phase::Idle);
     assert!(after.chain.is_none(), "abandoning clears the chain with the run");
     assert_eq!(relay.applied_ms("a"), 0.0, "a closed tab must not leave a delay line applied (plan §1.1.1)");
@@ -560,7 +560,7 @@ async fn an_unchained_run_is_not_a_chain_and_says_so() {
 
     // And a near-field walk is refused for its own reason: it needs no overlaps at all.
     let walk = Rig::new(&[("a", 0.0), ("b", 6.0)], Mode::NearField, 0.0);
-    m.abandon();
+    m.abandon().await;
     m.start(walk.deps).await.expect("started");
     let r = m.position(vec!["a".into(), "b".into()], Vec::new()).expect_err("must refuse");
     assert!(r.message.contains("one continuous capture"), "{}", r.message);

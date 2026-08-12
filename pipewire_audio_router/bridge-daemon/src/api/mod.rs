@@ -195,6 +195,14 @@ pub fn router(
         .route("/api/align/measure/finish", post(measure_finish))
         .route("/api/align/measure/apply", post(measure_apply))
         .route("/api/align/measure/revert", post(measure_revert))
+        // Per-output band-split calibration (plan §10.2): measured at the speaker,
+        // subtracted from that speaker's cross-band split so a mixed-model group is
+        // not refused for its hardware.
+        .route("/api/align/measure/split", get(measure_splits).post(measure_split_calibrate))
+        .route("/api/align/measure/split/{node_name}", delete(measure_split_clear))
+        // The persisted run transcripts (plan §11): the listing, or one whole run as
+        // one document with `?run=<id>` / `?run=latest`.
+        .route("/api/align/measure/log", get(measure_log))
         .route("/api/routing", get(routing::get_routing))
         .route("/api/routing/link", post(routing::link))
         .route("/api/routing/unlink", post(routing::unlink))

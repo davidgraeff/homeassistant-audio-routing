@@ -193,7 +193,7 @@ async fn revert_restores_only_the_members_that_were_actually_written() {
     // Plan §9.4 is one click back — but a revert that rewrites every member's
     // delay would reconnect devices that were never touched, and each reconnect
     // is tens of seconds of silence (plan §2.3).
-    let m = MeasureManager { inner: Arc::new(Mutex::new(Inner::idle())) };
+    let m = MeasureManager::with_inner(Arc::new(Mutex::new(Inner::idle())));
     {
         let mut g = m.inner.lock_recover();
         g.snapshot =
@@ -212,9 +212,9 @@ async fn revert_restores_only_the_members_that_were_actually_written() {
 /// The write survives `abandon`, so the *pointer to it* has to as well — a page
 /// reload is otherwise the end of the only route back from a destructive change
 /// (plan §9.4).
-#[test]
-fn abandoning_after_a_write_keeps_the_revert_snapshot_and_its_scope() {
-    let m = MeasureManager { inner: Arc::new(Mutex::new(Inner::idle())) };
+#[tokio::test]
+async fn abandoning_after_a_write_keeps_the_revert_snapshot_and_its_scope() {
+    let m = MeasureManager::with_inner(Arc::new(Mutex::new(Inner::idle())));
     {
         let mut g = m.inner.lock_recover();
         g.sources = vec!["src-a".to_string(), "src-b".to_string()];
@@ -224,7 +224,7 @@ fn abandoning_after_a_write_keeps_the_revert_snapshot_and_its_scope() {
     let before = m.status();
     assert_eq!(before.revert_scope.as_deref(), Some(["src-a".to_string(), "src-b".to_string()].as_slice()));
 
-    let s = m.abandon();
+    let s = m.abandon().await;
     assert!(s.can_revert, "a written delay must stay revertable after abandoning");
     assert_eq!(s.phase, Phase::Idle);
     assert_eq!(s.sources, Vec::<String>::new(), "the run itself is gone");
@@ -237,14 +237,14 @@ fn abandoning_after_a_write_keeps_the_revert_snapshot_and_its_scope() {
     assert_eq!(m.status().revert_scope, s.revert_scope);
 }
 
-#[test]
-fn a_run_with_nothing_written_has_no_revert_scope() {
-    let m = MeasureManager { inner: Arc::new(Mutex::new(Inner::idle())) };
+#[tokio::test]
+async fn a_run_with_nothing_written_has_no_revert_scope() {
+    let m = MeasureManager::with_inner(Arc::new(Mutex::new(Inner::idle())));
     m.inner.lock_recover().sources = vec!["src".to_string()];
     let s = m.status();
     assert!(!s.can_revert);
     assert_eq!(s.revert_scope, None, "`can_revert` and `revert_scope` must agree");
-    assert_eq!(m.abandon().revert_scope, None);
+    assert_eq!(m.abandon().await.revert_scope, None);
 }
 
 /// Plan §11: the status is pushed, not polled. `measure_ws` is a thin wrapper
@@ -253,7 +253,7 @@ fn a_run_with_nothing_written_has_no_revert_scope() {
 /// subscriber that is already watching.
 #[tokio::test]
 async fn the_status_notifier_fires_on_a_change_and_survives_a_reset() {
-    let m = MeasureManager { inner: Arc::new(Mutex::new(Inner::idle())) };
+    let m = MeasureManager::with_inner(Arc::new(Mutex::new(Inner::idle())));
     let mut rx = m.subscribe();
     assert!(!rx.has_changed().unwrap(), "a fresh subscriber starts level");
 
@@ -268,7 +268,7 @@ async fn the_status_notifier_fires_on_a_change_and_survives_a_reset() {
 
     // `abandon` replaces the whole state; the socket watching it must not be cut
     // off by that, or the UI would go silent exactly when the run ended.
-    m.abandon();
+    m.abandon().await;
     assert!(rx.has_changed().expect("abandon must not drop the notifier"));
     rx.changed().await.expect("the reset is itself a change");
     assert_eq!(m.status().phase, Phase::Idle);

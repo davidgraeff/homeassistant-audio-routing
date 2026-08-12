@@ -103,6 +103,7 @@ use crate::align::estimator::{
 };
 use crate::align::levels::TARGET_PEAK_SNR_DB;
 use crate::align::mic::{MicStatus, MicWindow};
+use crate::align::transcript;
 use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -254,12 +255,46 @@ const SETTLE_GRACE: Duration = Duration::from_secs(8);
 /// `current_delays`, not of the spread, see [`solve`]).
 pub const MAX_TRUSTED_SPREAD_FRACTION: f64 = 0.4;
 
-/// Tolerance for the cross-band transitivity check, in ms. See [`transitivity`]
-/// for why it cannot be tightened to the estimator's own precision (~0.05 ms):
-/// a loudspeaker's crossover genuinely delays 1.5 kHz and 3 kHz differently, and
-/// that legitimate difference is indistinguishable from the reflection bias this
-/// check is hunting.
+/// Tolerance for the cross-band transitivity check between **uncalibrated** members,
+/// in ms. See [`transitivity`] for why it cannot be tightened to the estimator's own
+/// precision (~0.05 ms): a loudspeaker's crossover genuinely delays 1.5 kHz and 3 kHz
+/// differently, and that legitimate difference is indistinguishable from the
+/// reflection bias this check is hunting.
+///
+/// **Unchanged at 3.0 despite a real run failing it at 3.45 ms** (a Home Assistant
+/// Voice PE against an ESPHome satellite, phone next to both, 2026-08-12). Raising it
+/// would have blunted the one instrument this design has against §5.6, so the
+/// hardware difference is *measured out* instead —
+/// [`CALIBRATED_TRANSITIVITY_TOL_MS`], `sync_settings::BandSplit`.
 pub const TRANSITIVITY_TOL_MS: f64 = 3.0;
+
+/// Tolerance for the cross-band check between two members whose **own band split has
+/// been calibrated** (`sync_settings::BandSplit`), in ms.
+///
+/// Half of [`TRANSITIVITY_TOL_MS`], and tighter on purpose. Once each speaker's own
+/// crossover split is subtracted, the confound that forced 3 ms is gone and what is
+/// left in a residual difference is: the codec's frequency-dependent contribution
+/// (plan §2.3.1 — real, unmeasured, and shared by members on the same wire codec, so
+/// it largely cancels in a *difference*), the estimator's ~0.05 ms, and the thing this
+/// check exists to find. §5.6's measured reflection biases were 0.89–1.72 ms, so
+/// 1.5 ms catches the documented sizes while leaving the codec room.
+///
+/// This is the direction §5.6.1 asks for: a calibrated group gets a **sharper**
+/// instrument, not a looser one. It is also why calibration is opt-in — the user who
+/// measures their speakers gets the sharper check, and a false refusal there is
+/// answered by re-measuring from another position, which a crossover cannot fake.
+pub const CALIBRATED_TRANSITIVITY_TOL_MS: f64 = 1.5;
+
+/// Largest band split that can plausibly be a *crossover* rather than a reflection or
+/// a mis-locked peak, in ms — the ceiling on what [`MeasureManager::calibrate_split`]
+/// will store.
+///
+/// §10.2 puts a crossover at "a millisecond or two"; 5 ms is generous room on top of
+/// that for the codec (§2.3.1). Beyond it, the far more likely explanations are the
+/// estimator locking onto a reflection (§5.6 measured +5.2 ms and called it excellent)
+/// or the phone not actually being at the speaker — neither of which is a constant
+/// worth subtracting from every future run.
+pub const MAX_PLAUSIBLE_SPLIT_MS: f64 = 5.0;
 
 /// Tolerance for pass-to-pass repeatability, in ms. The delay knobs are integer
 /// milliseconds (plan §2.4), so a member whose measured arrival moves by more
@@ -603,7 +638,10 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(kind: RefusalKind, message: impl Into<String>) -> Self {
+    /// `pub(crate)` because the API layer refuses in the same vocabulary: persisting a
+    /// calibration or reading a transcript can fail there, and a client must get the
+    /// same shape back as for a refusal raised inside a run.
+    pub(crate) fn new(kind: RefusalKind, message: impl Into<String>) -> Self {
         Self { kind, message: message.into(), member: None, estimator_reason: None }
     }
 
@@ -762,12 +800,77 @@ pub struct ProposedDelay {
 /// see — the honesty of this whole feature rests on that doc comment.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransitivityCheck {
+    /// The pair that decided the verdict: the one furthest *past* its own tolerance
+    /// when the check fails, and otherwise the one closest to it.
     pub worst_pair: Option<(String, String)>,
+    /// That pair's disagreement, in ms, after each member's calibrated split was
+    /// subtracted from its measured one.
     pub worst_ms: f64,
+    /// The tolerance actually applied to [`Self::worst_pair`] — narrower when both of
+    /// its members are calibrated ([`CALIBRATED_TRANSITIVITY_TOL_MS`]).
     pub tolerance_ms: f64,
     pub passed: bool,
+    /// Every member's split, measured and residual (plan §5.6.1's W22 data: the
+    /// distribution of these is the evidence that decides whether W9 is needed).
+    pub splits: Vec<MemberSplit>,
+    /// Whether *every* member in the check had a calibrated split. Decides both the
+    /// tolerance and what the refusal is allowed to claim.
+    pub all_calibrated: bool,
+    /// What to do about a failure, in one sentence. Depends on calibration, because
+    /// the decisive next step does: for uncalibrated members a genuine hardware
+    /// difference is the leading explanation and re-measuring from another position
+    /// separates it from a reflection.
+    pub advice: String,
     /// Plain-language statement of the blind spot this check does *not* close.
     pub caveat: &'static str,
+}
+
+/// One member's cross-band split, and what was subtracted from it.
+///
+/// Reported for **every** member on every run, whether or not the check passed: a
+/// calibration that is applied silently is a calibration that can be wrong without
+/// anyone noticing, and this is also exactly the distribution plan §5.6.1 wants read
+/// off a real run.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemberSplit {
+    pub node_name: String,
+    /// `phase_B − phase_A − half a period`, averaged over this member's readings.
+    pub measured_ms: f64,
+    /// The stored per-output calibration that was subtracted, if any
+    /// (`sync_settings::BandSplit::split_ms`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calibrated_ms: Option<f64>,
+    /// What the check actually compares: measured − calibrated (= measured when
+    /// uncalibrated).
+    pub residual_ms: f64,
+}
+
+impl TransitivityCheck {
+    /// The sentence a refusal appends. Named on the check rather than written out at
+    /// each of the three refusal sites so they cannot drift apart.
+    fn failure_advice(splits: &[MemberSplit], all_calibrated: bool) -> String {
+        if all_calibrated {
+            return "both speakers' own crossover splits are calibrated and have been subtracted, so this disagreement is not the \
+                    hardware: it is an early reflection pulling one arrival (plan §5.6), or the wire codec smearing the two bands \
+                    differently (§2.3.1). Move the phone away from walls and hard surfaces and measure again — a reflection moves \
+                    with the phone, and nothing else here does."
+                .to_string();
+        }
+        let uncalibrated: Vec<&str> = splits.iter().filter(|s| s.calibrated_ms.is_none()).map(|s| s.node_name.as_str()).collect();
+        format!(
+            "two things produce this and they cannot be told apart from one position. If these are **different speaker models** the \
+             likely cause is genuine hardware: a crossover delays 1.5 kHz and 3 kHz differently, by a millisecond or two, and \
+             differently per model — which is not an error and would not spoil an alignment. The other cause is an early reflection \
+             pulling one arrival, which would. **The decisive test is to measure again from a different position**: a crossover split \
+             is a fixed property of the speaker and reads the same everywhere, a reflection-induced one changes with the geometry. If \
+             it reads the same, calibrate the speakers' own splits (POST /api/align/measure/split, phone held at each speaker) — that \
+             subtracts the hardware and makes this check sharper rather than looser. Uncalibrated here: {}.",
+            match uncalibrated.is_empty() {
+                true => "none".to_string(),
+                false => uncalibrated.join(", "),
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1253,6 +1356,11 @@ pub struct MeasureStatus {
     /// page reload loses the only pointer back to a destructive change (plan §9.4).
     pub revert_scope: Option<Vec<String>>,
     pub elapsed_s: u64,
+    /// This run's transcript id (`align/transcript.rs`), when one is being recorded:
+    /// `GET /api/align/measure/log?run=<id>` is then the whole run as one document.
+    /// `None` means no run has started here, or transcripts are disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_run: Option<String>,
 }
 
 // ---------------------------------------------------------------- injection
@@ -1304,6 +1412,15 @@ pub trait SessionControl: Send + Sync {
     fn snapshot(&self) -> Fut<'_, SessionSnapshot>;
     /// Make exactly one member audible at `level`, muting every other member.
     fn solo(&self, node_name: String, level: u8) -> Fut<'_, Result<(), String>>;
+    /// Silence every member without releasing the hold or stopping the click track.
+    ///
+    /// What a **parked** run owes the room. The hold has to stay (`apply` measures
+    /// through it and writes into it), but the tick/tack must not keep looping while
+    /// the user reads a proposal, and it must fall silent even if the tab is closed —
+    /// so this is the daemon's decision, not an empty audible set posted by the panel
+    /// (plan §12.3.2's principle: the party holding the numbers decides). Resuming
+    /// needs no counterpart: every measuring step begins with [`Self::solo`].
+    fn silence(&self) -> Fut<'_, Result<(), String>>;
     /// Drain the exclusivity violations recorded since the last call (plan §12.3).
     ///
     /// Draining rather than peeking, because every entry is consumed here: one for the
@@ -1341,6 +1458,15 @@ impl SessionControl for crate::align::calibrate::AlignManager {
             // measurement run silently rewriting them would leave the manual path
             // pointing at whichever member happened to be measured last.
             self.solo(node_name, level).await.map(|_| ())
+        })
+    }
+
+    fn silence(&self) -> Fut<'_, Result<(), String>> {
+        Box::pin(async move {
+            // The session's own set-based audibility with an empty set. Its levels,
+            // its hold and its player thread are untouched, so `apply`'s verification
+            // walk can still measure through exactly the same session.
+            crate::align::calibrate::AlignManager::silence(self).await.map(|_| ())
         })
     }
 }
@@ -1409,6 +1535,15 @@ pub struct MeasureDeps {
     /// Each member's currently persisted delay, keyed by node name.
     pub current_delays: HashMap<String, u16>,
     pub send_ahead: SendAheadContext,
+    /// Each member's persisted band-split calibration in ms, keyed by node name
+    /// (`sync_settings::BandSplit::split_ms`). Subtracted before the cross-band check
+    /// compares members, so a mixed-model group is not refused for its hardware
+    /// (plan §10.2). Empty is the uncalibrated case and behaves exactly as before.
+    pub band_splits: BandSplits,
+    /// Where this run's forensic transcript goes (`align/transcript.rs`). A run opens
+    /// one file here and appends to it; `Transcripts::disabled()` records nothing,
+    /// which is what a unit test and a daemon without `/data` both get.
+    pub transcript: Arc<crate::align::transcript::Transcripts>,
     pub timing: Timing,
 }
 
@@ -1928,51 +2063,107 @@ pub fn linearise(offsets: &HashMap<String, f64>, order: &[String], pattern_ms: f
 /// The residual reduces to `|split_i − split_j|` where
 /// `split_i = phase_B(i) − phase_A(i) − 1000 ms`.
 ///
-/// **Confound, and why the tolerance is 3 ms rather than 0.1 ms.** A loudspeaker
-/// crossover genuinely delays 1.5 kHz and 3 kHz differently — often by a
-/// millisecond or two, and differently for different models. In a mixed group
-/// that legitimate difference is *indistinguishable* from a reflection bias by
-/// this check. So the tolerance is set where it catches gross per-speaker bias
-/// without refusing every mixed-model group, and a pass here is **not** proof
-/// that §5.6 did not happen. Only W9 (chirp + matched filter) can resolve the
-/// direct arrival from an early reflection properly.
-pub fn transitivity(obs: &[MemberObservation], timing: &Timing, tolerance_ms: f64) -> TransitivityCheck {
-    let pattern_ms = timing.pattern_ms;
-    let mut splits: Vec<(String, f64)> = Vec::new();
+/// **The confound, and what is now done about it.** A loudspeaker crossover
+/// genuinely delays 1.5 kHz and 3 kHz differently — often by a millisecond or two, and
+/// differently for different models. That forced a 3 ms tolerance, and a real
+/// mixed-model run still failed it: 3.45 ms between a Home Assistant Voice PE and an
+/// ESPHome satellite with the phone next to both (2026-08-12). Transitivity **blocks
+/// the write**, so that group could not be aligned at all.
+///
+/// The fix is not a wider tolerance. A crossover split is a *fixed property of the
+/// speaker*, so unlike a reflection it can be **measured once and subtracted**:
+/// `calibration` carries each output's own split (`sync_settings::BandSplit`, measured
+/// at close range by [`MeasureManager::calibrate_split`]) and this compares the
+/// **residuals**. Two consequences, both intended:
+///
+/// * an uncalibrated member behaves exactly as before, at [`TRANSITIVITY_TOL_MS`];
+/// * a pair that is calibrated on *both* sides is held to
+///   [`CALIBRATED_TRANSITIVITY_TOL_MS`], because the legitimate difference has been
+///   removed — so the check becomes **more** sensitive to §5.6's reflections rather
+///   than blunter, which is what §5.6.1 wants from this data.
+///
+/// A pass is still not proof that §5.6 did not happen: a reflection biasing *both*
+/// bands equally, or biasing every member alike, cancels here. Only W9 (chirp +
+/// matched filter) resolves the direct arrival from an early reflection properly.
+pub fn transitivity(obs: &[MemberObservation], timing: &Timing, tolerance_ms: f64, calibration: &BandSplits) -> TransitivityCheck {
     let mut by_member: HashMap<&str, Vec<f64>> = HashMap::new();
     for o in obs {
-        by_member
-            .entry(o.node_name.as_str())
-            .or_default()
-            .push(wrap_sym(o.m.phase_b_ms - o.m.phase_a_ms - timing.nominal_ab_ms(), pattern_ms));
+        by_member.entry(o.node_name.as_str()).or_default().push(member_split_ms(&o.m, timing));
     }
+    let mut splits: Vec<MemberSplit> = Vec::new();
     for o in obs {
-        if splits.iter().any(|(n, _)| n == &o.node_name) {
+        if splits.iter().any(|s| s.node_name == o.node_name) {
             continue;
         }
         let v = &by_member[o.node_name.as_str()];
-        splits.push((o.node_name.clone(), v.iter().sum::<f64>() / v.len() as f64));
+        let measured_ms = v.iter().sum::<f64>() / v.len() as f64;
+        let calibrated_ms = calibration.get(&o.node_name).copied();
+        splits.push(MemberSplit {
+            node_name: o.node_name.clone(),
+            measured_ms,
+            calibrated_ms,
+            residual_ms: measured_ms - calibrated_ms.unwrap_or(0.0),
+        });
     }
-    let mut worst = 0.0;
-    let mut worst_pair = None;
-    for (i, (a, sa)) in splits.iter().enumerate() {
-        for (b, sb) in splits.iter().skip(i + 1) {
-            let d = (sa - sb).abs();
-            if d > worst {
-                worst = d;
-                worst_pair = Some((a.clone(), b.clone()));
+    let all_calibrated = !splits.is_empty() && splits.iter().all(|s| s.calibrated_ms.is_some());
+
+    // The decisive pair is the one furthest past *its own* tolerance, not the one with
+    // the largest raw disagreement: with mixed calibration those can be different
+    // pairs, and reporting a passing pair's number next to a failing verdict would be
+    // incoherent.
+    let mut worst: Option<(f64, f64, (String, String))> = None;
+    for (i, a) in splits.iter().enumerate() {
+        for b in splits.iter().skip(i + 1) {
+            let both = a.calibrated_ms.is_some() && b.calibrated_ms.is_some();
+            let tol = match both {
+                true => tolerance_ms.min(CALIBRATED_TRANSITIVITY_TOL_MS),
+                false => tolerance_ms,
+            };
+            let d = (a.residual_ms - b.residual_ms).abs();
+            if worst.as_ref().is_none_or(|(wd, wt, _)| d - tol > wd - wt) {
+                worst = Some((d, tol, (a.node_name.clone(), b.node_name.clone())));
             }
         }
     }
+    let (worst_ms, applied_tol, worst_pair) = match worst {
+        Some((d, t, pair)) => (d, t, Some(pair)),
+        None => (0.0, tolerance_ms, None),
+    };
     TransitivityCheck {
         worst_pair,
-        worst_ms: worst,
-        tolerance_ms,
-        passed: worst <= tolerance_ms,
+        worst_ms,
+        tolerance_ms: applied_tol,
+        passed: worst_ms <= applied_tol,
+        advice: TransitivityCheck::failure_advice(&splits, all_calibrated),
+        splits,
+        all_calibrated,
         caveat: "measured as cross-band agreement, the only independent pairing a single mic position offers; a pass does \
-                 not rule out an early-reflection bias shared by both bands, and a loudspeaker crossover can fail it \
-                 legitimately (plan §5.6)",
+                 not rule out an early-reflection bias shared by both bands, and an uncalibrated loudspeaker crossover can \
+                 fail it legitimately (plan §5.6). Each member's own split can be calibrated out, which tightens it",
     }
+}
+
+/// One member's cross-band split: how much later its 1.5 kHz burst arrived than the
+/// half-period the click track puts between the two bursts (plan §5.6.1).
+///
+/// The reflection signature, and — measured at close range, where reflections are
+/// negligible — the speaker's own crossover constant. One expression, used by the
+/// transitivity check and by the calibration alike, so the stored constant and the
+/// number it is subtracted from can never be computed two different ways.
+pub fn member_split_ms(m: &MemberMeasurement, timing: &Timing) -> f64 {
+    wrap_sym(m.phase_b_ms - m.phase_a_ms - timing.nominal_ab_ms(), timing.pattern_ms)
+}
+
+/// Per-output band-split calibrations, by node name, in ms (the values of
+/// `sync_settings::BandSplit`). Empty = nothing calibrated, which is how every check
+/// that consumes it behaved before the calibration existed.
+pub type BandSplits = HashMap<String, f64>;
+
+/// The empty calibration set, for call sites that legitimately have none (a chain's
+/// aggregate placeholder, and the unit tests of the checks themselves).
+pub fn no_band_splits() -> &'static BandSplits {
+    static EMPTY: OnceLock<BandSplits> = OnceLock::new();
+    EMPTY.get_or_init(BandSplits::new)
 }
 
 /// Compare a near-field walk's two readings of its first speaker — see
@@ -2440,6 +2631,10 @@ pub struct SolveInput<'a> {
     pub observations: &'a [MemberObservation],
     pub current_delays: &'a HashMap<String, u16>,
     pub send_ahead: &'a SendAheadContext,
+    /// Each member's calibrated band split, subtracted before the cross-band check
+    /// compares them (plan §10.2). [`no_band_splits`] for "nothing calibrated", which
+    /// is what every uncalibrated group runs as.
+    pub band_splits: &'a BandSplits,
     /// Near field's closure measurement, when the arrivals came from a walk.
     ///
     /// `None` is a multi-position run, and everything about the solve is then exactly
@@ -2502,7 +2697,7 @@ pub fn solve(input: &SolveInput<'_>) -> Result<Proposal, Refusal> {
     warnings.extend(send_ahead_warning(input.send_ahead, &current_advances, &proposed_advances));
 
     let checks = Checks {
-        transitivity: transitivity(input.observations, &input.timing, TRANSITIVITY_TOL_MS),
+        transitivity: transitivity(input.observations, &input.timing, TRANSITIVITY_TOL_MS, input.band_splits),
         // Suppressed for a walk, not skipped for convenience: the closure anchor is
         // the only member with two readings and the slope was fitted from exactly
         // those two, so the check's answer is 0 ms whatever happened. See
@@ -2540,11 +2735,9 @@ pub fn solve(input: &SolveInput<'_>) -> Result<Proposal, Refusal> {
         blocked = Some(Refusal::new(
             RefusalKind::Transitivity,
             format!(
-                "the two test tones disagree by {:.2} ms about how far apart '{a}' and '{b}' are (limit {:.1} ms). \
-                 A speaker's arrival is being pulled by an early reflection, or its crossover delays the two tones \
-                 differently — either way the measured offset is not the electrical one, so nothing is written. \
-                 Move the phone away from walls and hard surfaces and measure again, or align this group by ear.",
-                checks.transitivity.worst_ms, checks.transitivity.tolerance_ms
+                "the two test tones disagree by {:.2} ms about how far apart '{a}' and '{b}' are (limit {:.1} ms), so the measured \
+                 offset is not purely the electrical one and nothing is written. {}",
+                checks.transitivity.worst_ms, checks.transitivity.tolerance_ms, checks.transitivity.advice
             ),
         ));
     }
@@ -2953,7 +3146,7 @@ pub fn solve_chain(input: &ChainSolveInput<'_>) -> Result<Proposal, Refusal> {
                 Some(w) if w.worst_ms >= t.worst_ms => Some(w),
                 _ => Some(t),
             })
-            .unwrap_or_else(|| transitivity(&[], &input.timing, TRANSITIVITY_TOL_MS)),
+            .unwrap_or_else(|| transitivity(&[], &input.timing, TRANSITIVITY_TOL_MS, no_band_splits())),
         repeatability: input.steps.iter().filter_map(|s| s.checks.repeatability.clone()).fold(
             None::<RepeatabilityCheck>,
             |acc, r| match acc {
@@ -3303,6 +3496,17 @@ struct Inner {
     /// must not be able to leave one behind.
     relay: Option<Arc<dyn RelayControl>>,
     provisional: HashMap<String, f64>,
+    /// The session this run is driving, kept here for the same reason [`Self::relay`]
+    /// is: **`abandon` has to be able to silence the room**. A cancelled run's task may
+    /// never get another chance to, and a closed tab must still stop the click track
+    /// (it keeps looping otherwise, which is what a real run got complained about).
+    /// `None` means no run ever started against this state — which is exactly the
+    /// by-ear case, and why a manual session is never silenced from here.
+    session: Option<Arc<dyn SessionControl>>,
+    /// This run's transcript (`align/transcript.rs`). Always present — a run with no
+    /// `/data` gets a disabled log rather than an `Option` every recording site would
+    /// have to unwrap.
+    log: Arc<crate::align::transcript::RunLog>,
     /// §9.4: every member's delay at session start, for one-click revert.
     snapshot: HashMap<String, (MemberKind, u16)>,
     /// Members whose delay this session actually wrote — and therefore the only
@@ -3349,6 +3553,8 @@ impl Inner {
             cmd_tx: None,
             relay: None,
             provisional: HashMap::new(),
+            session: None,
+            log: crate::align::transcript::RunLog::disabled(),
             snapshot: HashMap::new(),
             written: Vec::new(),
             revert_sources: Vec::new(),
@@ -3385,15 +3591,33 @@ impl Inner {
             can_apply: self.phase == Phase::Proposed && self.proposal.as_ref().is_some_and(|p| p.blocked.is_none()),
             can_revert: !self.written.is_empty(),
             revert_scope: (!self.written.is_empty()).then(|| self.revert_sources.clone()),
+            log_run: match self.log.id() {
+                "" => None,
+                id => Some(id.to_string()),
+            },
             elapsed_s: self.started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
         }
     }
 
     fn warn(&mut self, w: Warning) {
         if !self.warnings.iter().any(|e| e.kind == w.kind) {
+            // Inside the de-duplication, so the transcript carries each warning kind
+            // once, in the order the run raised it — the same set the status shows, with
+            // the timestamps the status cannot keep.
+            self.log.record(transcript::Event::new("warning", w.message.clone()).detail(&w));
             self.warnings.push(w);
             self.bump();
         }
+    }
+
+    /// Append one line to this run's transcript (`align/transcript.rs`).
+    ///
+    /// A method on the state rather than a free function because the log's lifetime is
+    /// the run's: a `start` opens it, `abandon` replaces it, and every recording site
+    /// already holds this lock for the state change the event describes — so the two
+    /// cannot disagree about what happened.
+    fn record(&self, ev: transcript::Event) {
+        self.log.record(ev);
     }
 
     fn note(&mut self, node_name: &str, note: Option<String>) {
@@ -3438,6 +3662,47 @@ impl Inner {
 /// The measurement orchestrator: one run at a time, process-wide.
 pub struct MeasureManager {
     inner: Arc<Mutex<Inner>>,
+    /// A band-split calibration ([`MeasureManager::calibrate_split`]) is in progress.
+    ///
+    /// Not part of [`Inner`] deliberately: `start` *replaces* `Inner`, and this flag has
+    /// to be visible across that replacement, because the hazard it guards is exactly
+    /// "a run started while one speaker was being calibrated" — both solo through the
+    /// same session, and the loser measures whatever the winner made audible.
+    split_busy: Arc<AtomicBool>,
+}
+
+impl MeasureManager {
+    fn with_inner(inner: Arc<Mutex<Inner>>) -> Self {
+        Self { inner, split_busy: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
+/// Clears [`MeasureManager::split_busy`] on every exit path, including the refusals
+/// after the flag is taken.
+struct SplitGuard<'a>(&'a AtomicBool);
+
+impl Drop for SplitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// One output's measured band split, as [`MeasureManager::calibrate_split`] reports it
+/// and as `api/measure.rs` persists it (`sync_settings::BandSplit`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SplitCalibration {
+    pub node_name: String,
+    /// `phase_B − phase_A − ½ period`, in ms: how much later this speaker renders
+    /// 1.5 kHz than 3 kHz.
+    pub split_ms: f64,
+    pub std_error_ms: f64,
+    pub peak_snr_db: f64,
+    pub second_peak_ratio: f64,
+    /// The playback level it was measured at.
+    pub level: u8,
+    /// What the number does and does not establish — shown next to it, because a
+    /// calibration that looks authoritative is worse than one that explains itself.
+    pub note: &'static str,
 }
 
 /// The process-wide orchestrator, in the same shape `align_mic` uses — it is a
@@ -3445,7 +3710,7 @@ pub struct MeasureManager {
 /// thread through `AppState`.
 pub fn shared() -> &'static MeasureManager {
     static M: OnceLock<MeasureManager> = OnceLock::new();
-    M.get_or_init(|| MeasureManager { inner: Arc::new(Mutex::new(Inner::idle())) })
+    M.get_or_init(|| MeasureManager::with_inner(Arc::new(Mutex::new(Inner::idle()))))
 }
 
 impl MeasureManager {
@@ -3532,11 +3797,18 @@ impl MeasureManager {
             }
             false => (None, None),
         };
+        // Opened before the state is replaced and before the run task exists, so the
+        // very first thing in the file is what the run was asked to do. Retention runs
+        // here too (`Transcripts::begin`), which is why the disk high-water mark is
+        // `MAX_RUNS` files and not one more.
+        let log = deps.transcript.begin();
         let status = {
             let mut inner = self.inner.lock_recover();
             // The notifier outlives the state it reports on, so an open `measure_ws`
             // sees the new run rather than being silently disconnected.
             *inner = Inner::idle_watching(inner.changes.clone());
+            inner.log = log;
+            inner.session = Some(deps.session.clone());
             inner.cmd_tx = cmd_tx;
             inner.phase = Phase::Arming;
             inner.mode = deps.mode;
@@ -3564,13 +3836,42 @@ impl MeasureManager {
             inner.started = Some(std::time::Instant::now());
             inner.cancel = cancel.clone();
             inner.running = true;
+            inner.record(
+                transcript::Event::new(
+                    "run_started",
+                    format!(
+                        "{:?} run over {} member(s){}",
+                        deps.mode,
+                        inner.members.len(),
+                        match chained {
+                            true => ", chained across positions",
+                            false => "",
+                        }
+                    ),
+                )
+                .detail(&serde_json::json!({
+                    "mode": deps.mode,
+                    "chained": chained,
+                    "sources": inner.sources,
+                    "sample_rate": inner.sample_rate,
+                    "session_level": session.level,
+                    // The knobs the proposal will be a delta from — without these the
+                    // written values in this file cannot be interpreted later.
+                    "members": inner.members.iter().map(|m| serde_json::json!({
+                        "node_name": m.node_name,
+                        "kind": m.kind,
+                        "current_delay_ms": m.current_delay_ms,
+                        "band_split_calibration_ms": deps.band_splits.get(&m.node_name),
+                    })).collect::<Vec<_>>(),
+                })),
+            );
             inner.bump();
             inner.status()
         };
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let outcome = run_measure(&deps, &inner, &cancel, cmd_rx).await;
-            finish(&inner, &cancel, outcome);
+            finish(&deps, &inner, &cancel, outcome).await;
         });
         Ok(status)
     }
@@ -3937,15 +4238,130 @@ impl MeasureManager {
             inner.cmd_tx = cmd_tx;
             inner.cancel = cancel.clone();
             inner.running = true;
+            // The run resumes on the same transcript: apply is the second half of one
+            // run, and splitting it would put the writes in a different file from the
+            // proposal they came from.
+            inner.record(transcript::Event::new("apply", "the user applied the proposal").detail(&proposal));
             inner.bump();
             inner.status()
         };
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let outcome = run_apply(&deps, &inner, &cancel, &proposal, cmd_rx).await;
-            finish(&inner, &cancel, outcome);
+            finish(&deps, &inner, &cancel, outcome).await;
         });
         Ok(status)
+    }
+
+    /// `POST /api/align/measure/split` — measure **one** output's own cross-band split
+    /// at close range, so the transitivity check can subtract it (plan §10.2).
+    ///
+    /// ## Why this exists, and why it is a separate operation
+    ///
+    /// §10.2's check compares members' `split_i = phase_B − phase_A − ½ period`. A
+    /// loudspeaker's crossover contributes to that, differently per model, which is why
+    /// the tolerance had to be 3 ms — and a real mixed-model group still failed at
+    /// 3.45 ms with the phone next to both speakers (2026-08-12), which *blocks the
+    /// write*, so the group could not be aligned at all. A crossover split is a fixed
+    /// property of the speaker, so unlike a reflection it can be measured once and
+    /// subtracted. That is what this does.
+    ///
+    /// ## What makes the reading a calibration rather than another measurement
+    ///
+    /// Only the **distance**: the user holds the phone at the speaker, where the direct
+    /// sound dominates any reflection by far more than the 0.9× that produced §5.6's
+    /// biases — the same premise near-field mode rests on, and the same one it cannot
+    /// verify. So this is refused rather than stored when the number is implausibly
+    /// large for a crossover ([`MAX_PLAUSIBLE_SPLIT_MS`]), which is the one form of
+    /// "you were not at the speaker" that is detectable from here.
+    ///
+    /// Runs inline (one solo, one gate, one reading — on the order of fifteen seconds)
+    /// and refuses while a measurement run is live, because both drive the same
+    /// session's audibility.
+    pub async fn calibrate_split(&self, deps: MeasureDeps, node_name: String, level: Option<u8>) -> Result<SplitCalibration, Refusal> {
+        {
+            let inner = self.inner.lock_recover();
+            if inner.running {
+                return Err(Refusal::new(
+                    RefusalKind::Internal,
+                    "a measurement is running; a band-split calibration solos one speaker on its own and would fight it. Finish or \
+                     abandon the run first.",
+                ));
+            }
+        }
+        if self.split_busy.swap(true, Ordering::SeqCst) {
+            return Err(Refusal::new(RefusalKind::Internal, "a band-split calibration is already running"));
+        }
+        // Named rather than `_`, so it lives to the end of the call and every refusal
+        // below clears the flag on its way out.
+        let _done = SplitGuard(&self.split_busy);
+        let session = deps.session.snapshot().await;
+        if !session.active {
+            return Err(Refusal::new(
+                RefusalKind::NoSession,
+                "no alignment session is running, so nothing is playing to measure. Start a session holding this speaker, stand next to \
+                 it, and calibrate from there.",
+            ));
+        }
+        let Some(member) = session.members.iter().find(|m| m.node_name == node_name).cloned() else {
+            return Err(Refusal::for_member(
+                RefusalKind::Internal,
+                &node_name,
+                format!("'{node_name}' is not a member of the running alignment session, so it cannot be calibrated"),
+            ));
+        };
+        let mic = deps.mic.status();
+        if !mic.connected {
+            return Err(Refusal::new(
+                RefusalKind::MicMissing,
+                "no microphone capture is connected. Open the alignment panel on the phone, start the microphone, and hold it at the \
+                 speaker.",
+            ));
+        }
+        // A throwaway state: this is not a run, so it must not overwrite the status a
+        // finished run has parked in (its proposal is still applicable). The gate, the
+        // estimator and the interference handling are the real ones.
+        let scratch = Arc::new(Mutex::new(Inner::idle()));
+        scratch.lock_recover().sample_rate = mic.sample_rate;
+        let cancel = AtomicBool::new(false);
+        let level = level.unwrap_or_else(|| session.level_for(&node_name));
+        let cfg = GateConfig::mute_settle(&deps.timing);
+        let o = match measure_member(&deps, &scratch, &cancel, &member, level, cfg, 0, 0, mic.sample_rate).await {
+            Ok(o) => o,
+            Err(StepError::Refuse(r)) | Err(StepError::RestartSet(r)) => return Err(r),
+        };
+        let split_ms = member_split_ms(&o.m, &deps.timing);
+        if split_ms.abs() > MAX_PLAUSIBLE_SPLIT_MS {
+            return Err(Refusal::for_member(
+                RefusalKind::Estimator,
+                &node_name,
+                format!(
+                    "'{node_name}' read a cross-band split of {split_ms:.2} ms, which is too large to be a crossover (limit {:.1} ms). A \
+                     crossover delays the two tones by a millisecond or two; this size is what an early reflection looks like when the \
+                     estimator locks onto it, or what happens when the phone is not actually at the speaker. Nothing was stored — hold \
+                     the phone within a hand's width of the driver, away from the wall behind it, and try again.",
+                    MAX_PLAUSIBLE_SPLIT_MS
+                ),
+            ));
+        }
+        // Appended to whatever run is parked in the state, when there is one: a
+        // calibration is nearly always the answer to a refusal, and the refusal's own
+        // transcript is where someone investigating it will be looking.
+        self.inner.lock_recover().record(
+            transcript::Event::for_member("split_calibrated", &node_name, format!("'{node_name}' band split {split_ms:.2} ms"))
+                .detail(&serde_json::json!({ "split_ms": split_ms, "observation": o, "level": level })),
+        );
+        Ok(SplitCalibration {
+            node_name,
+            split_ms,
+            std_error_ms: o.m.std_error_ms,
+            peak_snr_db: o.m.peak_snr_db,
+            second_peak_ratio: o.m.second_peak_ratio,
+            level,
+            note: "measured at close range, where the direct sound dominates a reflection — that premise is yours to keep and nothing \
+                   here can check it. Stored per output and subtracted from this speaker's split before the cross-band check compares it \
+                   with the others (plan §10.2), which also tightens that check for calibrated pairs.",
+        })
     }
 
     /// `POST /api/align/measure/revert` — plan §9.4's one click back.
@@ -3986,9 +4402,36 @@ impl MeasureManager {
     }
 
     /// `DELETE /api/align/measure` — abandon, leaving delays untouched.
-    pub fn abandon(&self) -> MeasureStatus {
+    ///
+    /// Async only because of the silencing: a cancelled run's task will never solo
+    /// anything again, so this is the last chance to stop the click track, and a closed
+    /// tab must not leave a room ticking. The session itself is **not** stopped — the
+    /// by-ear panel and `revert` both still need it.
+    pub async fn abandon(&self) -> MeasureStatus {
+        let (status, session) = self.abandon_state();
+        // Only a session this manager actually drove is silenced. A by-ear session that
+        // no run ever touched is left exactly as the user set it up — two speakers
+        // audible while they nudge one of them is the entire point of that path.
+        if let Some(session) = session {
+            if let Err(e) = session.silence().await {
+                tracing::info!("alignment: could not silence the abandoned group: {e}");
+            }
+        }
+        status
+    }
+
+    fn abandon_state(&self) -> (MeasureStatus, Option<Arc<dyn SessionControl>>) {
         let mut inner = self.inner.lock_recover();
         inner.cancel.store(true, Ordering::Relaxed);
+        let session = inner.session.clone();
+        // `abandoned` rather than a second `run_finished`: a run parked on a proposal has
+        // already written its verdict, and abandoning it is a further event rather than a
+        // correction of that one.
+        inner.record(transcript::Event::new("abandoned", "the run was abandoned by the user").detail(&serde_json::json!({
+            "phase": "cancelled",
+            "provisional_lines": inner.provisional.len(),
+            "written": inner.written,
+        })));
         // Nothing was persisted (plan §1.1.1), but a delay line left applied keeps
         // shifting that speaker for as long as the daemon runs — so a closed tab must not
         // be able to leave one behind. Dropped *before* the state is replaced, since the
@@ -4016,17 +4459,38 @@ impl MeasureManager {
             inner.revert_sources = revert_sources;
         }
         inner.bump();
-        inner.status()
+        (inner.status(), session)
     }
 }
 
-/// Park the state machine on a terminal state.
+/// Park the state machine on a terminal state, and silence the room.
 ///
 /// Skipped entirely when the run's own cancel flag is set: that flag is what
 /// `abandon` raises, and each run owns a fresh one, so a run that was abandoned
 /// (or superseded by a newer one) must not write its late verdict over the state
-/// the user is now looking at.
-fn finish(inner: &Arc<Mutex<Inner>>, cancel: &AtomicBool, outcome: Result<Phase, Refusal>) {
+/// the user is now looking at — nor silence a session that state has moved on to.
+async fn finish(deps: &MeasureDeps, inner: &Arc<Mutex<Inner>>, cancel: &AtomicBool, outcome: Result<Phase, Refusal>) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    park(inner, cancel, outcome);
+    // Every state this lands on is one the user reads rather than listens to
+    // (`Proposed`, `Done`, `Refused`), so nothing should still be audible — the hold
+    // stays, the click track keeps looping off the one clock `apply` needs, and every
+    // member is muted. Awaited here rather than spawned so that a client which
+    // abandons or re-selects the moment it sees the terminal phase cannot race us into
+    // re-silencing a session it has just taken over.
+    if let Err(e) = deps.session.silence().await {
+        // Not a refusal: the run's verdict is already recorded, and a session that
+        // cannot be silenced is one that has usually gone away by itself.
+        tracing::info!("alignment: could not silence the parked group: {e}");
+        inner.lock_recover().record(transcript::Event::new("silence_failed", format!("could not silence the parked group: {e}")));
+    }
+}
+
+/// The state half of [`finish`], separate so the state lock is released before the
+/// silencing await. Keeps its own cancel check: it is the one that guards the state.
+fn park(inner: &Arc<Mutex<Inner>>, cancel: &AtomicBool, outcome: Result<Phase, Refusal>) {
     if cancel.load(Ordering::Relaxed) {
         return;
     }
@@ -4051,8 +4515,13 @@ fn finish(inner: &Arc<Mutex<Inner>>, cancel: &AtomicBool, outcome: Result<Phase,
             if phase == Phase::Done {
                 g.message = "aligned and verified".to_string();
             }
+            g.record(transcript::Event::new("run_finished", g.message.clone()).detail(&serde_json::json!({ "phase": phase })));
         }
         Err(refusal) => {
+            g.record(refusal_event(&refusal));
+            g.record(
+                transcript::Event::new("run_finished", refusal.message.clone()).detail(&serde_json::json!({ "phase": Phase::Refused })),
+            );
             // A run that ends without a write owes its provisional delays back: the
             // proposal it was standing behind is gone, so leaving the lines applied would
             // silently misalign normal playback (plan §1.1.1). A *successful* run keeps
@@ -4067,10 +4536,24 @@ fn finish(inner: &Arc<Mutex<Inner>>, cancel: &AtomicBool, outcome: Result<Phase,
     g.bump();
 }
 
+/// A refusal as one transcript line, carrying the whole refusal as its detail (the
+/// kind, the member, and the estimator's own verdict where it came from there).
+fn refusal_event(r: &Refusal) -> transcript::Event {
+    match r.member.as_deref() {
+        Some(m) => transcript::Event::for_member("refusal", m, r.message.clone()),
+        None => transcript::Event::new("refusal", r.message.clone()),
+    }
+    .detail(r)
+}
+
 fn set_phase(inner: &Arc<Mutex<Inner>>, phase: Phase, message: impl Into<String>) {
     let mut g = inner.lock_recover();
     g.phase = phase;
     g.message = message.into();
+    // Every phase transition in the run loop goes through here, so this is the
+    // transcript's spine: the sequence of these lines *is* what the run did, and the
+    // gaps between their timestamps are where it spent its minutes.
+    g.record(transcript::Event::new("phase", g.message.clone()).detail(&serde_json::json!({ "phase": phase })));
     g.bump();
 }
 
@@ -4122,6 +4605,7 @@ async fn run_measure(
         observations: &observations,
         current_delays: &deps.current_delays,
         send_ahead: &deps.send_ahead,
+        band_splits: &deps.band_splits,
         closure,
     })?;
     let blocked = proposal.blocked.clone();
@@ -4130,6 +4614,19 @@ async fn run_measure(
         for w in &proposal.warnings {
             g.warn(w.clone());
         }
+        // The whole proposal, verbatim: the knobs, the checks with each member's
+        // measured and calibrated band split, and the refusal that blocks it if one
+        // does. This one line is what makes a run reconstructable afterwards.
+        g.record(
+            transcript::Event::new(
+                "proposal",
+                match proposal.blocked.as_ref() {
+                    None => format!("proposed: reference '{}', spread {:.2} ms", proposal.reference, proposal.spread_ms),
+                    Some(b) => format!("proposal blocked ({:?})", b.kind),
+                },
+            )
+            .detail(&proposal),
+        );
         g.proposal = Some(proposal);
         g.bump();
     }
@@ -4184,6 +4681,10 @@ async fn measure_passes(
                 restarts += 1;
                 epoch += 1;
                 let mut g = inner.lock_recover();
+                g.record(
+                    transcript::Event::new("set_restart", r.message.clone())
+                        .detail(&serde_json::json!({ "attempt": restarts, "limit": MAX_SET_RESTARTS, "grid_epoch": epoch, "refusal": r })),
+                );
                 g.warn(Warning::new(WarningKind::MicReconnected, r.message.clone()));
                 for m in &mut g.members {
                     m.passes_done = 0;
@@ -4795,6 +5296,16 @@ async fn run_chain(
         for w in &proposal.warnings {
             g.warn(w.clone());
         }
+        g.record(
+            transcript::Event::new(
+                "proposal",
+                match proposal.blocked.as_ref() {
+                    None => format!("proposed: reference '{}', {} position(s)", proposal.reference, steps.len()),
+                    Some(b) => format!("chain proposal blocked ({:?})", b.kind),
+                },
+            )
+            .detail(&proposal),
+        );
         g.proposal = Some(proposal);
         let done = chain_progress(
             ChainAction::Done,
@@ -4847,7 +5358,7 @@ fn chain_solve_step(
     let arrivals = arrivals_of(&observations, order, &deps.timing)?;
     let solution = chain_step(&ChainStepInput { aligned, arrivals: &arrivals.linear, overlaps, tolerance_ms: OVERLAP_AGREEMENT_TOL_MS })?;
     let checks = Checks {
-        transitivity: transitivity(&observations, &deps.timing, TRANSITIVITY_TOL_MS),
+        transitivity: transitivity(&observations, &deps.timing, TRANSITIVITY_TOL_MS, &deps.band_splits),
         repeatability: repeatability(&observations, &arrivals.fit, deps.timing.pattern_ms, REPEATABILITY_TOL_MS),
         merged_peak: MergedPeakCheck::seam(),
         closure: None,
@@ -4857,11 +5368,10 @@ fn chain_solve_step(
         return Err(Refusal::new(
             RefusalKind::Transitivity,
             format!(
-                "at position {index} the two test tones disagree by {:.2} ms about how far apart '{a}' and '{b}' are (limit {:.1} ms). A \
-                 speaker's arrival is being pulled by an early reflection, or its crossover delays the two tones differently — either \
-                 way the measured offset is not the electrical one. This position was not accepted; the speakers aligned at earlier \
-                 positions are untouched. Move the phone away from walls and hard surfaces and measure this position again.",
-                checks.transitivity.worst_ms, checks.transitivity.tolerance_ms
+                "at position {index} the two test tones disagree by {:.2} ms about how far apart '{a}' and '{b}' are (limit {:.1} ms), so \
+                 the measured offset is not purely the electrical one. This position was not accepted; the speakers aligned at earlier \
+                 positions are untouched. {}",
+                checks.transitivity.worst_ms, checks.transitivity.tolerance_ms, checks.transitivity.advice
             ),
         ));
     }
@@ -5089,15 +5599,31 @@ async fn run_apply(
         match deps.writer.write(m.node_name.clone(), m.kind, m.new_delay_ms).await {
             Ok(msg) => {
                 wrote += 1;
-                inner.lock_recover().mark_written(&m.node_name);
+                let mut g = inner.lock_recover();
+                // The endpoint's own reply, **verbatim**: it is what says whether the
+                // device was reconnected to pick the value up, and that is the sentence
+                // anyone reconstructing a run needs (plan §2.3).
+                g.record(transcript::Event::for_member("write", &m.node_name, msg.clone()).detail(&serde_json::json!({
+                    "kind": m.kind,
+                    "from_ms": m.current_delay_ms,
+                    "to_ms": m.new_delay_ms,
+                    "reply": msg,
+                })));
+                g.mark_written(&m.node_name);
+                drop(g);
                 tracing::info!("alignment write: {msg}");
             }
             Err(e) => {
+                inner
+                    .lock_recover()
+                    .record(transcript::Event::for_member("write_failed", &m.node_name, e.clone()).detail(
+                        &serde_json::json!({ "kind": m.kind, "from_ms": m.current_delay_ms, "to_ms": m.new_delay_ms, "error": e }),
+                    ));
                 return Err(Refusal::for_member(
                     RefusalKind::WriteFailed,
                     &m.node_name,
                     format!("writing '{}''s delay failed: {e}. Use revert to restore the delays from before this session.", m.node_name),
-                ))
+                ));
             }
         }
     }
@@ -5193,7 +5719,7 @@ async fn run_apply(
             .unwrap_or_else(|| proposal.reference.clone()),
     };
     let residual = residual(&observations, &reference, pattern_ms, RESIDUAL_TOL_MS);
-    let trans = transitivity(&observations, &deps.timing, TRANSITIVITY_TOL_MS);
+    let trans = transitivity(&observations, &deps.timing, TRANSITIVITY_TOL_MS, &deps.band_splits);
     let passed = residual.passed && trans.passed;
     let verification = Verification {
         residual: residual.clone(),
@@ -5214,17 +5740,34 @@ async fn run_apply(
     };
     {
         let mut g = inner.lock_recover();
+        g.record(
+            transcript::Event::new(
+                "verification",
+                format!(
+                    "residual {:.2} ms (limit {:.1}), cross-band {:.2} ms (limit {:.1}): {}",
+                    residual.worst_ms,
+                    residual.tolerance_ms,
+                    trans.worst_ms,
+                    trans.tolerance_ms,
+                    match passed {
+                        true => "passed",
+                        false => "failed",
+                    }
+                ),
+            )
+            .detail(&verification),
+        );
         g.verification = Some(verification);
         g.bump();
     }
     if !trans.passed {
-        let (a, b) = trans.worst_pair.unwrap_or_default();
+        let (a, b) = trans.worst_pair.clone().unwrap_or_default();
         return Err(Refusal::new(
             RefusalKind::Transitivity,
             format!(
                 "after writing, the two test tones disagree by {:.2} ms about '{a}' vs '{b}' (limit {:.1} ms), so the \
-                 delays that were written cannot be trusted — revert, move the phone away from walls, and measure again.",
-                trans.worst_ms, trans.tolerance_ms
+                 delays that were written cannot be trusted — revert and measure again. {}",
+                trans.worst_ms, trans.tolerance_ms, trans.advice
             ),
         ));
     }
@@ -5345,7 +5888,13 @@ async fn measure_member(
         // another member is kept as a warning rather than dropped on the floor.
         let mut interference: Option<String> = None;
         for i in deps.session.take_interference().await {
-            inner.lock_recover().warn(Warning::new(WarningKind::Interference, i.reason.clone()));
+            {
+                let mut g = inner.lock_recover();
+                // Recorded per occurrence, unlike the warning, which de-duplicates by
+                // kind: three doorbells during one run is a different story from one.
+                g.record(transcript::Event::for_member("interference", i.member.clone(), i.reason.clone()).detail(&i));
+                g.warn(Warning::new(WarningKind::Interference, i.reason.clone()));
+            }
             if i.member == name {
                 interference = Some(i.reason);
             }
@@ -5388,9 +5937,19 @@ async fn measure_member(
             if let Some(failed) = step.failed {
                 let mut r = failed;
                 r.member = Some(name.to_string());
+                inner.lock_recover().record(
+                    transcript::Event::for_member("gate_failed", name, r.message.clone())
+                        .detail(&serde_json::json!({ "refusal": r, "gate": step.progress })),
+                );
                 return Err(if r.kind == RefusalKind::MicReconnected { StepError::RestartSet(r) } else { StepError::Refuse(r) });
             }
             if step.restart {
+                // The reason is the whole value of recording a restart: "acquiring" for
+                // the tenth time and "the tone stopped again" are the same delay to the
+                // user and completely different diagnoses.
+                inner
+                    .lock_recover()
+                    .record(transcript::Event::for_member("gate_restart", name, step.progress.message.clone()).detail(&step.progress));
                 if pulled.reconnected {
                     return Err(StepError::RestartSet(Refusal::for_member(
                         RefusalKind::MicReconnected,
@@ -5411,8 +5970,7 @@ async fn measure_member(
                         "the estimator returned no A/B channels",
                     )));
                 };
-                inner.lock_recover().note(name, None);
-                return Ok(MemberObservation {
+                let o = MemberObservation {
                     node_name: name.to_string(),
                     pass,
                     grid_epoch,
@@ -5426,7 +5984,40 @@ async fn measure_member(
                         drift_ppm: a.drift_ppm,
                         periods_used: a.periods_used.min(b.periods_used),
                     },
-                });
+                };
+                let split_ms = member_split_ms(&o.m, timing);
+                let calibrated = deps.band_splits.get(name).copied();
+                let mut g = inner.lock_recover();
+                g.record(
+                    transcript::Event::for_member(
+                        "measurement",
+                        name,
+                        format!(
+                            "accepted pass {} of '{name}': {:.2} ms at 3 kHz, SNR {:.1} dB, cross-band split {split_ms:.2} ms{}",
+                            pass + 1,
+                            o.m.phase_a_ms,
+                            o.m.peak_snr_db,
+                            // Wherever a calibration is *applied*, it is said out loud —
+                            // a wrong calibration must be visible in the record rather
+                            // than silently correcting the numbers beside it.
+                            match calibrated {
+                                Some(c) => format!(" (calibrated {c:.2} ms, residual {:.2} ms)", split_ms - c),
+                                None => String::new(),
+                            }
+                        ),
+                    )
+                    .detail(&serde_json::json!({
+                        "observation": o,
+                        "gate": step.progress,
+                        "level": level,
+                        "split_ms": split_ms,
+                        "band_split_calibration_ms": calibrated,
+                        "residual_split_ms": calibrated.map(|c| split_ms - c),
+                    })),
+                );
+                g.note(name, None);
+                drop(g);
+                return Ok(o);
             }
         }
         tokio::time::sleep(timing.poll).await;

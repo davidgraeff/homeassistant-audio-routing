@@ -60,7 +60,7 @@ pub(crate) fn measure_deps(state: &AppState, mode: Mode, chained: bool, link_to:
     // Snapshotted before the sync-settings lock is taken: two locks in one expression
     // is how a lock-order inversion gets written.
     let adopted = crate::store::outputs::adopted_snapshot(&state.outputs);
-    let (current_delays, send_ahead) = {
+    let (current_delays, send_ahead, band_splits) = {
         let ss = state.sync_settings.lock_recover();
         let mut delays: HashMap<String, u16> = ss.sendspin_delays().into_iter().collect();
         delays.extend(ss.ap2_latencies());
@@ -80,7 +80,11 @@ pub(crate) fn measure_deps(state: &AppState, mode: Mode, chained: bool, link_to:
         let min_buffer_ms =
             state.sendspin_devices.lock_recover().iter().map(|(node_name, d)| (node_name.clone(), d.min_buffer_ms)).collect();
         let ctx = SendAheadContext { floor_ms: ss.group_lead_ms(), unreported_floor_ms: ss.opus_floor_ms(), min_buffer_ms };
-        (delays, ctx)
+        // Each output's own measured band split (plan §10.2). Only the figure travels:
+        // the SNR and the age it was stored with are for the API listing, not for the
+        // arithmetic, which subtracts one number per member and nothing else.
+        let splits = ss.band_splits().into_iter().map(|(node, s)| (node, s.split_ms)).collect();
+        (delays, ctx, splits)
     };
     MeasureDeps {
         mode,
@@ -94,6 +98,11 @@ pub(crate) fn measure_deps(state: &AppState, mode: Mode, chained: bool, link_to:
         relay: std::sync::Arc::new(crate::align::measure::LiveRelay),
         current_delays,
         send_ahead,
+        band_splits,
+        // The run's forensic transcript (`align/transcript.rs`), in /data beside the
+        // other stores. Disabled — and every run therefore unrecorded but unaffected —
+        // until `main` points it at a directory.
+        transcript: crate::align::transcript::shared(),
         timing: Timing::real(),
     }
 }
@@ -333,7 +342,165 @@ pub(crate) async fn measure_revert(State(state): State<AppState>) -> Result<Json
 /// `DELETE /api/align/measure` — abandon, leaving delays untouched.
 pub(crate) async fn measure_abandon() -> Json<MeasureStatus> {
     tracing::info!("USER ACTION: abandon the alignment measurement");
-    Json(crate::align::measure::shared().abandon())
+    // Awaited rather than spawned: abandoning also silences the group (the hold and the
+    // session stay), and the reply must not come back before the room is quiet — a
+    // client that immediately re-selects two speakers by ear would otherwise race it.
+    Json(crate::align::measure::shared().abandon().await)
+}
+
+// ---- band-split calibration (plan §10.2) ---------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct SplitCalibrateRequest {
+    /// The speaker to calibrate. The user must be standing at it, phone in hand.
+    pub(crate) node_name: String,
+    /// Playback level (0–100). Omit to use the level the session last applied to this
+    /// speaker — i.e. whatever `POST /api/align/audible` settled on while the user was
+    /// standing there watching `/api/align/mic/signal` (plan §12.2).
+    #[serde(default)]
+    pub(crate) level: Option<u8>,
+}
+
+/// One stored band-split calibration, as the listing reports it.
+#[derive(Serialize)]
+pub(crate) struct BandSplitEntry {
+    pub(crate) node_name: String,
+    pub(crate) split_ms: f64,
+    pub(crate) std_error_ms: f64,
+    pub(crate) peak_snr_db: f64,
+    /// Unix seconds. A speaker keeps its node name when it is replaced, so the age of
+    /// the claim is part of the claim.
+    pub(crate) measured_at: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct BandSplitList {
+    pub(crate) calibrations: Vec<BandSplitEntry>,
+    /// The cross-band tolerance applied between two **uncalibrated** members, in ms.
+    pub(crate) tolerance_ms: f64,
+    /// The tolerance applied when *both* members of a pair are calibrated — tighter,
+    /// because the legitimate hardware difference has been subtracted.
+    pub(crate) calibrated_tolerance_ms: f64,
+    /// Largest split that will be stored as a crossover (plan §10.2).
+    pub(crate) max_plausible_ms: f64,
+}
+
+/// `GET /api/align/measure/split` — the stored per-output band splits and the
+/// tolerances they buy.
+pub(crate) async fn measure_splits(State(state): State<AppState>) -> Json<BandSplitList> {
+    let calibrations = state
+        .sync_settings
+        .lock_recover()
+        .band_splits()
+        .into_iter()
+        .map(|(node_name, s)| BandSplitEntry {
+            node_name,
+            split_ms: s.split_ms,
+            std_error_ms: s.std_error_ms,
+            peak_snr_db: s.peak_snr_db,
+            measured_at: s.measured_at,
+        })
+        .collect();
+    Json(BandSplitList {
+        calibrations,
+        tolerance_ms: crate::align::measure::TRANSITIVITY_TOL_MS,
+        calibrated_tolerance_ms: crate::align::measure::CALIBRATED_TRANSITIVITY_TOL_MS,
+        max_plausible_ms: crate::align::measure::MAX_PLAUSIBLE_SPLIT_MS,
+    })
+}
+
+/// `POST /api/align/measure/split` — measure one speaker's own crossover band split
+/// at close range and persist it (plan §10.2).
+///
+/// The answer to a mixed-model group failing the cross-band check for its *hardware*:
+/// a crossover split is a fixed property of the speaker, so it is measured once, at
+/// arm's length where reflections are negligible, and subtracted from every future
+/// run's reading of that speaker. Takes about fifteen seconds — one solo, one gate,
+/// one reading — and refuses while a measurement run is live.
+pub(crate) async fn measure_split_calibrate(
+    State(state): State<AppState>,
+    Json(req): Json<SplitCalibrateRequest>,
+) -> Result<Json<crate::align::measure::SplitCalibration>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: calibrate '{}''s band split at close range", req.node_name);
+    let deps = measure_deps(&state, Mode::NearField, false, Vec::new());
+    let cal = crate::align::measure::shared().calibrate_split(deps, req.node_name, req.level).await.map_err(refused)?;
+    // Persisted here rather than in `align/measure.rs` for the same reason the delay
+    // writes are (plan §9.3): the store belongs to the API layer, and the measurement
+    // module never sees `AppState`.
+    let stored = crate::routing::sync_settings::BandSplit {
+        split_ms: cal.split_ms,
+        std_error_ms: cal.std_error_ms,
+        peak_snr_db: cal.peak_snr_db,
+        measured_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+    };
+    if let Err(e) = state.sync_settings.lock_recover().set_band_split(&cal.node_name, Some(stored)) {
+        return Err(refused(Refusal::new(RefusalKind::Internal, format!("measured {:.2} ms but could not store it: {e}", cal.split_ms))));
+    }
+    tracing::info!("alignment: stored '{}' band split {:.2} ms", cal.node_name, cal.split_ms);
+    Ok(Json(cal))
+}
+
+/// `DELETE /api/align/measure/split/{node_name}` — forget one speaker's calibration,
+/// which puts it back on the wider uncalibrated tolerance.
+pub(crate) async fn measure_split_clear(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+) -> (StatusCode, Json<OutputOpResponse>) {
+    tracing::info!("USER ACTION: clear '{node_name}''s band-split calibration");
+    match state.sync_settings.lock_recover().set_band_split(&node_name, None) {
+        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("'{node_name}' is uncalibrated again") })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("could not clear it: {e}") })),
+    }
+}
+
+// ---- run transcripts (plan §11) ------------------------------------------
+
+#[derive(Serialize)]
+pub(crate) struct MeasureLogList {
+    /// Newest first.
+    pub(crate) runs: Vec<crate::align::transcript::RunSummary>,
+    /// How many runs are kept before the oldest is dropped.
+    pub(crate) retained: usize,
+    /// Where they live, when transcripts are enabled at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) directory: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MeasureLogQuery {
+    /// A run id from the listing, or `latest` for the most recent one. Omitted ⇒ the
+    /// listing.
+    #[serde(default)]
+    pub(crate) run: Option<String>,
+}
+
+/// `GET /api/align/measure/log` — the persisted run transcripts (plan §11).
+///
+/// Two shapes behind one path, because the client wants exactly one of them:
+/// without `?run=` it lists the retained runs newest-first; with `?run=<id>` (or
+/// `?run=latest`) it returns that run as **one document**, which is the form that can
+/// be read days later without the UI.
+pub(crate) async fn measure_log(Query(q): Query<MeasureLogQuery>) -> Result<Response, (StatusCode, Json<Refusal>)> {
+    let store = crate::align::transcript::shared();
+    let Some(want) = q.run else {
+        return Ok(Json(MeasureLogList {
+            runs: store.list(),
+            retained: crate::align::transcript::MAX_RUNS,
+            directory: store.dir().map(|d| d.display().to_string()),
+        })
+        .into_response());
+    };
+    let id = match want.as_str() {
+        "latest" => store.list().first().map(|r| r.id.clone()),
+        other => Some(other.to_string()),
+    };
+    match id.and_then(|id| store.document(&id)) {
+        Some(doc) => Ok(Json(doc).into_response()),
+        None => Err(refused(Refusal::new(
+            RefusalKind::Internal,
+            format!("there is no stored transcript for '{want}' — only the last {} runs are kept", crate::align::transcript::MAX_RUNS),
+        ))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -474,7 +641,7 @@ pub(crate) async fn set_output_latency(
     // Apply live to the streaming session (no-op if not currently streaming —
     // the persisted value then applies on the next connect).
     let effective = clamped.unwrap_or(crate::outputs::ap2::server::AP2_RENDER_DELAY_MS as u16);
-    state.ap2_control.lock().await.set_render_delay(&node_name, effective).await;
+    state.ap2_control.lock().await.set_render_delay(&node_name, effective);
     // `latency_ms` is on the routing matrix, and the matrix is only pushed when
     // something says it changed — this used to reach the graph on the next 250 ms
     // meter tick, which no longer carries it (routing/mod.rs `Frame::Meters`).

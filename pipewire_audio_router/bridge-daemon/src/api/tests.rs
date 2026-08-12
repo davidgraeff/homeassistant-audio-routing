@@ -34,6 +34,22 @@ fn now_playing_report_and_node_routes_coexist() {
     drop(app);
 }
 
+/// The alignment measurement's own siblings under one prefix: `split` and `log` are
+/// static segments beside `apply`/`revert`/`start`, and `split/{node_name}` adds a
+/// parameter one level deeper. Same trap as the two above — a conflict panics at
+/// daemon startup, where nothing would catch it.
+#[test]
+fn the_measure_split_and_log_routes_coexist_with_the_rest() {
+    let app: Router = Router::new()
+        .route("/api/align/measure", get(|| async { "status" }).delete(|| async { "abandoned" }))
+        .route("/api/align/measure/start", post(|| async { "started" }))
+        .route("/api/align/measure/apply", post(|| async { "applied" }))
+        .route("/api/align/measure/split", get(|| async { "listed" }).post(|| async { "calibrated" }))
+        .route("/api/align/measure/split/{node_name}", delete(|| async { "cleared" }))
+        .route("/api/align/measure/log", get(|| async { "transcripts" }));
+    drop(app);
+}
+
 /// The wire shape a remote reporter sends: its port alongside the metadata
 /// fields *flattened*, not nested. The Pi's reporter is written against this.
 #[test]

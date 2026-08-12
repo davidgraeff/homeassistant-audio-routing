@@ -1327,6 +1327,33 @@ impl AlignManager {
         self.set_audible(vec![node_name], level).await
     }
 
+    /// Silence **every** member while keeping everything else the session is doing:
+    /// the exclusive hold, the click track, the levels, the reference/target pair.
+    ///
+    /// Why the hold has to stay: `apply` needs the group still held and still playing
+    /// off one clock, so a measurement run that has parked on a proposal cannot simply
+    /// stop the session. But nothing should still be *audible* while the user reads a
+    /// review page — the tick/tack looping under a page of numbers is grating, and it
+    /// was the first thing a real run got complained about (2026-08-12).
+    ///
+    /// This is the daemon's own decision rather than an empty `POST /api/align/audible`
+    /// from the panel, for the same reason silence is a per-output capability at all
+    /// (plan §12.3.2): a **closed tab** must fall silent too. Deliberately not
+    /// `note_activity` — a run parking is not the user proving they are still there,
+    /// and the session's idle watchdog should keep counting.
+    ///
+    /// Levels are re-applied unchanged, so resuming is one ordinary `solo` away.
+    pub async fn silence(&self) -> Result<AlignState, String> {
+        let (members, audible, volume, stop, state) = {
+            let mut guard = self.session.lock().await;
+            let session = guard.as_mut().ok_or("no alignment session is running")?;
+            session.audible.clear();
+            let volume = session.volume;
+            (session.members.clone(), session.audible.clone(), volume, session.stop.clone(), session.state())
+        };
+        Ok(self.apply_and_record(&members, &audible, volume, &stop, state).await)
+    }
+
     /// Set the audible members' playback level (0–100) live — and record it against exactly
     /// those members ([`AlignState::levels`]), since they are who it reaches.
     pub async fn set_level(&self, volume: u8) -> Result<AlignState, String> {
@@ -1501,9 +1528,9 @@ impl AlignManager {
                 // failure is detectable — the member goes quiet or changes level, and the gate
                 // refuses with a reason — whereas the permanent claim is silent. A detectable
                 // loss beats a silent side effect.
-                c.set_volume_transient(node, ap2_level(volume)).await;
+                c.set_volume_transient(node, ap2_level(volume));
             }
-            c.set_muted(node, !on).await;
+            c.set_muted(node, !on);
         }
         levels.into_iter().map(|(node, channel, _)| (node, channel)).collect()
     }
@@ -1592,7 +1619,7 @@ impl AlignManager {
             // restoring the mute would push a receiver to −∞ dB. The house order elsewhere is
             // level-then-mute; here it is inverted on purpose, and this comment is why.
             for (node, _, muted) in plan.iter().filter(|(_, channel, _)| *channel == SilenceChannel::Ap2InBand) {
-                c.set_muted(node, *muted).await;
+                c.set_muted(node, *muted);
             }
             for (node, level) in restore_ap2_level_plan(&session.members, &session.saved_ap2_volumes) {
                 match level {
@@ -1600,7 +1627,7 @@ impl AlignManager {
                         // Transient again: putting the user's own level back is not the user
                         // asking for it either, and claiming intent here would leave exactly
                         // the mark the drive side just avoided.
-                        c.set_volume_transient(&node, level).await;
+                        c.set_volume_transient(&node, level);
                     }
                     None => {
                         // Nothing to put back. `forget_volume` drops the desired level *and*

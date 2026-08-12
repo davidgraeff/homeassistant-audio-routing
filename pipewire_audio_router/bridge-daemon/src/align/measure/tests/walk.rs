@@ -265,7 +265,7 @@ async fn the_walk_refuses_calls_that_do_not_match_where_it_is() {
     assert!(r.message.contains("closure reading at 'a'"), "{}", r.message);
 
     // Abandoning mid-walk stops the run and writes nothing.
-    let after = m.abandon();
+    let after = m.abandon().await;
     assert_eq!(after.phase, Phase::Idle);
     assert!(after.walk.is_none(), "abandoning clears the walk with the run");
     let r = m.close().expect_err("an abandoned walk takes nothing");
@@ -386,6 +386,7 @@ fn a_walks_arrivals_feed_the_interval_solver_unchanged() {
         observations: &o,
         current_delays: &current,
         send_ahead: &ctx,
+        band_splits: no_band_splits(),
         closure: Some(closure),
     })
     .expect("accepted");
@@ -410,6 +411,7 @@ fn a_walks_arrivals_feed_the_interval_solver_unchanged() {
         observations: &o,
         current_delays: &current,
         send_ahead: &ctx,
+        band_splits: no_band_splits(),
         closure: Some(closure),
     })
     .expect_err("must refuse");

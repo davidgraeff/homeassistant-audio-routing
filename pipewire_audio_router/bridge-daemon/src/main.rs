@@ -152,6 +152,19 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     );
     let sync_settings: routing::sync_settings::SharedSyncSettings = std::sync::Arc::new(std::sync::Mutex::new(sync_settings));
 
+    // Where an alignment run's forensic transcript goes (align/transcript.rs): a
+    // bounded, append-only file per run, the last few kept. Derived from the routing
+    // path like every other store, so there is no extra flag; a directory that cannot
+    // be created leaves transcripts disabled rather than failing runs.
+    let align_runs_dir = routing_path.with_file_name("align-runs");
+    align::transcript::init(align_runs_dir.clone());
+    tracing::info!(
+        "alignment run transcripts in {} ({} kept, {} retained now)",
+        align_runs_dir.display(),
+        align::transcript::MAX_RUNS,
+        align::transcript::shared().list().len()
+    );
+
     // General app settings (announce duck default, discovery on/off), beside the
     // other /data stores. On a fresh install the discovery flag is seeded from
     // BRIDGE_DISCOVERY so an env-off is honored on first boot; after that the

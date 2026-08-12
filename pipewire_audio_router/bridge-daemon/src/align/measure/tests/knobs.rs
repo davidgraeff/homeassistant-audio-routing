@@ -216,6 +216,7 @@ fn an_advance_that_crosses_the_groups_send_ahead_high_water_mark_warns() {
         observations: &o,
         current_delays: &current,
         send_ahead: &ctx,
+        band_splits: no_band_splits(),
         closure: None,
     })
     .expect("accepted");
@@ -234,6 +235,7 @@ fn an_advance_that_crosses_the_groups_send_ahead_high_water_mark_warns() {
         observations: &o,
         current_delays: &current,
         send_ahead: &ctx,
+        band_splits: no_band_splits(),
         closure: None,
     })
     .expect("accepted");
@@ -268,6 +270,7 @@ fn an_ap2_only_group_delays_towards_the_latest_and_never_lifts_the_lead() {
         observations: &o,
         current_delays: &current,
         send_ahead: &ctx,
+        band_splits: no_band_splits(),
         closure: None,
     })
     .expect("accepted");

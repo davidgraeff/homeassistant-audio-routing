@@ -54,7 +54,15 @@ pub(super) fn obs(name: &str, pass: usize, centre: f64, phase_a: f64, band_bias:
 pub(super) fn solve_of(members: &[SessionMember], observations: &[MemberObservation], delays: &[(&str, u16)]) -> Result<Proposal, Refusal> {
     let current: HashMap<String, u16> = delays.iter().map(|(n, d)| ((*n).to_string(), *d)).collect();
     let ctx = SendAheadContext::default();
-    solve(&SolveInput { timing: Timing::real(), members, observations, current_delays: &current, send_ahead: &ctx, closure: None })
+    solve(&SolveInput {
+        timing: Timing::real(),
+        members,
+        observations,
+        current_delays: &current,
+        send_ahead: &ctx,
+        band_splits: no_band_splits(),
+        closure: None,
+    })
 }
 
 /// A session that records what is soloed. No PipeWire, no mute protocol — the
@@ -70,6 +78,9 @@ pub(super) struct FakeSession {
     /// a near-field arrival's level comes from when the request does not override
     /// it (plan §12.2).
     pub(super) levels: Arc<Mutex<HashMap<String, u8>>>,
+    /// How many times the run has silenced every member — what a parked run owes the
+    /// room, and the thing the by-ear path must never have done to it.
+    pub(super) silenced: Arc<AtomicU64>,
 }
 
 impl SessionControl for FakeSession {
@@ -96,6 +107,16 @@ impl SessionControl for FakeSession {
             // so the fake does both.
             self.levels.lock_recover().insert(node_name.clone(), level);
             *self.soloed.lock_recover() = Some(node_name);
+            Ok(())
+        })
+    }
+
+    fn silence(&self) -> Fut<'_, Result<(), String>> {
+        Box::pin(async move {
+            // The real one keeps the hold and the click track and clears the audible
+            // set; from here the observable part is that nothing is soloed any more.
+            self.silenced.fetch_add(1, Ordering::Relaxed);
+            *self.soloed.lock_recover() = None;
             Ok(())
         })
     }
@@ -135,6 +156,12 @@ pub(super) struct FakeMic {
     /// A *mechanism* under test, moving the soloed member's arrival on top of its
     /// fixed `arrivals` entry. [`NoShift`] for everything that is not W21.
     pub(super) shift: Arc<dyn ArrivalShift>,
+    /// Per-member **band split**, in ms: how much later this speaker renders the
+    /// 1.5 kHz burst than the 3 kHz one. What a loudspeaker crossover does (plan
+    /// §10.2), and the only way to exercise the calibration end to end — every other
+    /// lever here moves both bursts together, which is exactly the difference the
+    /// cross-band check is built on.
+    pub(super) band_shift_ms: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 /// How something the daemon does moves a member's arrival — the seam a test injects
@@ -172,13 +199,15 @@ impl FakeMic {
     /// The click track's shape: an 8 ms Hann-enveloped 3 kHz burst at the
     /// period start and a 1.5 kHz one at the half point, exactly as
     /// `calibrate::click_wav` lays it out — on the pattern the test is using.
-    pub(super) fn sample(&self, frame: u64, arrival_ms: f64) -> f32 {
+    ///
+    /// `band_shift_ms` delays only the low-band burst, which is what a crossover does.
+    pub(super) fn sample(&self, frame: u64, arrival_ms: f64, band_shift_ms: f64) -> f32 {
         let rate = f64::from(self.rate);
         let period = self.pattern_ms / 1000.0 * rate;
         let burst = 0.008 * rate;
         let t = (frame as f64 - arrival_ms / 1000.0 * rate).rem_euclid(period);
         let mut v = 0.0;
-        for (offset, hz) in [(0.0, 3000.0), (period / 2.0, 1500.0)] {
+        for (offset, hz) in [(0.0, 3000.0), (period / 2.0 + band_shift_ms / 1000.0 * rate, 1500.0)] {
             let k = t - offset;
             if k >= 0.0 && k <= burst {
                 let env = 0.5 - 0.5 * (TAU * k / burst).cos();
@@ -216,13 +245,14 @@ impl MicFeed for FakeMic {
         }
         let arrival =
             soloed.as_deref().map(|s| self.arrivals.lock_recover().get(s).copied().unwrap_or(0.0) + self.shift.shift_ms(s)).unwrap_or(0.0);
+        let band_shift = soloed.as_deref().and_then(|s| self.band_shift_ms.lock_recover().get(s).copied()).unwrap_or(0.0);
         // The clock offset is applied per sample from the absolute frame, so it is a
         // genuine linear phase ramp rather than a per-window constant.
         let samples = (0..frames)
             .map(|i| {
                 let f = first_frame + i as u64;
                 let drift = self.drift_ms_per_s * (f as f64 / f64::from(self.rate));
-                self.sample(f, arrival + drift)
+                self.sample(f, arrival + drift, band_shift)
             })
             .collect();
         Some(MicWindow { samples, first_frame, sample_rate: self.rate, gap: false, clipped: false })
@@ -327,6 +357,12 @@ pub(super) struct Rig {
     /// The fake capture, so a test can read its frame clock to schedule the above.
     pub(super) mic: Arc<FakeMic>,
     pub(super) levels: Arc<Mutex<HashMap<String, u8>>>,
+    /// How many times the session was silenced (see [`FakeSession::silenced`]).
+    pub(super) silenced: Arc<AtomicU64>,
+    /// Members that render nothing (see [`RelayShift::offline`]).
+    pub(super) offline: Arc<Mutex<Vec<String>>>,
+    /// Per-member crossover band split (see [`FakeMic::band_shift_ms`]).
+    pub(super) band_shift_ms: Arc<Mutex<HashMap<String, f64>>>,
     /// The provisional delay line the chain applies through (plan §1.1.1), and the
     /// thing that makes an overlap's *next* reading include the delay it is carrying.
     pub(super) relay: Arc<FakeRelay>,
@@ -340,11 +376,19 @@ pub(super) struct Rig {
 /// `relay_delay`'s tests, and the relay-vs-device *equivalence* is W21's.
 pub(super) struct RelayShift {
     pub(super) relay: Arc<FakeRelay>,
+    /// Members that render nothing at all — the "I had to bring the speakers online by
+    /// hand" case (plan §2.3.2). Mutable, because a device that comes back mid-run is
+    /// as real as one that never does.
+    pub(super) offline: Arc<Mutex<Vec<String>>>,
 }
 
 impl ArrivalShift for RelayShift {
     fn shift_ms(&self, member: &str) -> f64 {
         self.relay.applied_ms(member)
+    }
+
+    fn silent(&self, member: &str) -> bool {
+        self.offline.lock_recover().iter().any(|n| n == member)
     }
 }
 
@@ -363,6 +407,7 @@ impl Rig {
         let active = Arc::new(AtomicBool::new(true));
         let connected = Arc::new(AtomicBool::new(true));
         let levels = Arc::new(Mutex::new(HashMap::new()));
+        let silenced = Arc::new(AtomicU64::new(0));
         let arrivals: Arc<Mutex<HashMap<String, f64>>> =
             Arc::new(Mutex::new(arrivals.iter().map(|(n, _, a)| ((*n).to_string(), *a)).collect()));
         let reconnect_at = Arc::new(AtomicU64::new(0));
@@ -372,10 +417,13 @@ impl Rig {
             active: active.clone(),
             interference: Arc::new(Mutex::new(Vec::new())),
             levels: levels.clone(),
+            silenced: silenced.clone(),
         });
         // Every rig carries a line, and an unused one applies nothing — so the tests
         // that predate W12 measure exactly what they measured before.
         let relay = Arc::new(FakeRelay::new());
+        let offline: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let band_shift_ms: Arc<Mutex<HashMap<String, f64>>> = Arc::new(Mutex::new(HashMap::new()));
         let mic = Arc::new(FakeMic {
             rate: 48_000,
             pattern_ms: timing.pattern_ms,
@@ -386,7 +434,8 @@ impl Rig {
             connected: connected.clone(),
             drift_ms_per_s,
             reconnect_at: reconnect_at.clone(),
-            shift: Arc::new(RelayShift { relay: relay.clone() }),
+            shift: Arc::new(RelayShift { relay: relay.clone(), offline: offline.clone() }),
+            band_shift_ms: band_shift_ms.clone(),
         });
         let writer = Arc::new(FakeWriter::default());
         let deps = MeasureDeps {
@@ -399,14 +448,31 @@ impl Rig {
             relay: relay.clone(),
             current_delays: HashMap::new(),
             send_ahead: SendAheadContext::default(),
+            // Uncalibrated by default: every test that predates the band-split
+            // calibration measures exactly what it measured before.
+            band_splits: BandSplits::new(),
+            transcript: Arc::new(crate::align::transcript::Transcripts::disabled()),
             timing,
         };
-        Rig { deps, writer, active, connected, arrivals, reconnect_at, levels, mic, relay }
+        Rig { deps, writer, active, connected, arrivals, reconnect_at, levels, silenced, offline, band_shift_ms, mic, relay }
     }
 }
 
+/// A real, writable transcript store in a scratch directory, so a test can read back
+/// what a run actually recorded. Returns the store and its directory (the caller
+/// removes it).
+pub(super) fn scratch_transcripts(tag: &str) -> (Arc<crate::align::transcript::Transcripts>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "align-run-log-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    (Arc::new(crate::align::transcript::Transcripts::new(&dir)), dir)
+}
+
 pub(super) fn manager() -> MeasureManager {
-    MeasureManager { inner: Arc::new(Mutex::new(Inner::idle())) }
+    MeasureManager::with_inner(Arc::new(Mutex::new(Inner::idle())))
 }
 
 /// Poll the run's own status until it says what the test is waiting for. On the
@@ -651,6 +717,7 @@ pub(super) fn equiv_rig(members: &[(&str, MemberKind, u16)], target: &str, injec
         active: Arc::new(AtomicBool::new(true)),
         interference: Arc::new(Mutex::new(Vec::new())),
         levels: Arc::new(Mutex::new(HashMap::new())),
+        silenced: Arc::new(AtomicU64::new(0)),
     });
     let relay = Arc::new(FakeRelay::new());
     let writer = Arc::new(FakeWriter::default());
@@ -672,6 +739,7 @@ pub(super) fn equiv_rig(members: &[(&str, MemberKind, u16)], target: &str, injec
         drift_ms_per_s: inject.drift_ms_per_s,
         reconnect_at: Arc::new(AtomicU64::new(0)),
         shift: physics,
+        band_shift_ms: Arc::new(Mutex::new(HashMap::new())),
     });
     let deps = EquivalenceDeps {
         base: MeasureDeps {
@@ -684,6 +752,8 @@ pub(super) fn equiv_rig(members: &[(&str, MemberKind, u16)], target: &str, injec
             relay: relay.clone(),
             current_delays,
             send_ahead: SendAheadContext::default(),
+            band_splits: BandSplits::new(),
+            transcript: Arc::new(crate::align::transcript::Transcripts::disabled()),
             timing,
         },
         member: None,
