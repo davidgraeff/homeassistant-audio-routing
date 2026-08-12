@@ -61,6 +61,7 @@ written earlier:
 | Mute **and level** are per-**output** capabilities, resolved in one place and re-resolved every position | §12.3.2, W17/W20 | An agent can drop mid-walk, so two members of one kind differ; the level then has no fallback and must be *reported*, not skipped |
 | Calibration levels are **session-owned, not persisted** | §12.2, W19 | Survives a reload; a stored level is a good seed and a bad promise, since it depends on where the phone is |
 | The **merged-peak check is dropped**, not deferred | §10.3 | Expressible, but strictly less sensitive than the residual check beside it |
+| **W9 is not built yet, and will never be a user-facing toggle** | §5.6.1 | W22 can *quantify* whether §5.6 bites using data the current code already produces; and choosing between two DSP front-ends is a harder judgement than the one this feature exists to remove |
 
 ### What is not yet trustworthy
 
@@ -802,7 +803,8 @@ asserted bounds, so a future change that fixes or worsens it will be noticed.
 
 Three consequences, all load-bearing:
 
-- It is the real argument for **W9** (chirp + matched filter), which resolves the
+- It is the real argument for **W9** (chirp + matched filter) — but W9 is **gated on
+  evidence, not on argument**: see §5.6.1. W9 resolves the
   direct arrival from an early reflection instead of merging them. W9 was framed as
   a noise-driven upgrade; it is not — §5.4.1 shows noise is a non-problem. W9 is a
   *reflection* fix, and whether it is needed depends on what W3 sees in real rooms.
@@ -816,6 +818,50 @@ Three consequences, all load-bearing:
 - Near-field mode (§1) is a partial mitigation for free: at arm's length the direct
   sound dominates any reflection by far more than the 0.9× that produced these
   numbers.
+
+### 5.6.1 Decided: W9 waits for evidence, and will never be a toggle
+
+**Decided 2026-08-12.** W9 (chirp + matched filter) is the only proper fix for the blind
+spot above, and it is nonetheless **not built yet**. Three reasons, in order of weight.
+
+**A toggle would ask the user the one question this whole feature exists to remove.**
+Choosing between two DSP front-ends is a strictly harder judgement than "did that speaker
+move earlier or later", which is already beyond the ear — that is why we measure. A "use
+chirp" checkbox hands someone a decision they have no instrument to make, and no way to
+know afterwards whether they chose right.
+
+**The need can be measured with what already ships.** §10.2's cross-band transitivity
+check computes, per member, `split_i = phase_B(i) − phase_A(i) − 1000 ms` — the split
+between the 1.5 kHz and 3 kHz arrivals. That *is* the reflection signature: a merged early
+reflection biases the two bands differently, a clean direct arrival does not. So **W22
+should read the distribution of `split_i` across a real run.** Splits clustering near zero
+say reflections are not biasing much and W9 buys little; splits clustering at 1–3 ms say
+they are. That is a far cheaper experiment than implementing a chirp, and it is available
+the moment this is deployed.
+
+**The cost is not the FFT, it is the second calibration.** Every threshold here was derived
+against the 8 ms Hann burst: `MIN_PEAK_SNR_DB`, the second-peak ratio, the ~12 ms guard
+distance, §10.2's 3 ms tolerance, §1.2's closure rate bound, §1.1's 8 ms overlap tolerance.
+A chirp changes peak shape and guard distance, so all of them need re-deriving — and
+several are currently justified by *measured* numbers rather than argument. Add `rustfft`
+and FFT correlation on a 4-core Pi with a documented history of CPU starvation, and
+"optionally enabled" stops being a flag and becomes a second configuration of the
+estimator, validated against synthetic signals just like the first — which is still itself
+unvalidated against a real room.
+
+**If W22's splits say it bites**, the shape is an **automatic escalation**, not a
+preference: measure with the click track, and when the evidence points at a reflection (a
+persistently non-zero cross-band split, or a marginal second-peak ratio) switch *that
+member* to the chirp, re-measure, and report that it did so and why. The daemon decides,
+because the daemon is the only party holding the numbers — the same principle as the
+per-output silence and level channels (§12.3.2). A narrower first step is legitimate too: a
+chirp offered as an on-demand **diagnostic** on one member ("why is this speaker
+uncertain?"), outside the default path, which needs no recalibration of the run.
+
+**The argument on the other side, recorded rather than buried:** if the bias does bite,
+not having W9 ready means another development cycle before anyone can align an apartment
+properly. That is a real cost. It loses to the risk of calibrating a second signal path on
+the same unvalidated foundation as the first.
 
 ---
 
@@ -1569,10 +1615,10 @@ the user should already be looking at the fallback.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| ~~Phone denies mic in the ingress iframe~~ | **RETIRED** | W0 passed on Android 2026-08-11 (§14.1) |
+| ~~Phone denies mic in the ingress iframe~~ | **RETIRED** | W0 passed on Android 2026-08-11 (§14.5) |
 | ~~Browser ignores `echoCancellation: false`~~ | **RETIRED** for the supported target | Android honours and reports the constraint. The Safari-omission hole (§4.2) and its behavioural detector remain in the code and remain correct, but iOS is out of scope so nothing depends on them |
 | User's HA is HTTP-only | high | detect and explain; no workaround exists |
-| **Early reflection inside the analysis window biases a speaker by multiple ms, undetectably** | **high** | no refusal rule can see it (§5.6); §10.2's transitivity is the only exposure and it needs a 3 ms tolerance, so 1–2 ms of bias passes every check; near-field mode mitigates, only W9 fixes it |
+| **Early reflection inside the analysis window biases a speaker by multiple ms, undetectably** | **high**, but now *measurable*: W22 reads the per-member cross-band splits (§5.6.1), which is what decides W9 | no refusal rule can see it (§5.6); §10.2's transitivity is the only exposure and it needs a 3 ms tolerance, so 1–2 ms of bias passes every check; near-field mode mitigates, only W9 fixes it |
 | Mute settling exceeds the 3 s guard, so two speakers are briefly audible in the same band | medium | arrivals closer than the estimator's ~12 ms guard distance **merge into one peak** instead of raising `AmbiguousPeak` — a silently wrong answer, not a refusal. Needs a real group to size the guard |
 | Amplitude-stability gate reads a broadband peak, so room noise restart-loops it | medium | gate times out blaming the level; a band-limited stability measure would fix it if W0 shows it biting |
 | A member wedges and renders intermittently while the daemon reports itself clean | medium | observed on hardware (§2.3.2); diagnosed as `GateReason::Intermittent` and the remedy (reconnect the speaker) is named. The gate reports it but cannot *fix* it — an automatic reconnect-and-retry is a candidate once §2.3.2 is seen more than once |
@@ -1611,8 +1657,8 @@ and the frontend's chaining UI (W6c) is now unblocked.
 | **W7** | **Parallel excitation** (§6.2): the content generator, a per-device `cal_gate` in all three relays, analytic group-delay compensation, frequency assignment plus the runtime crosstalk validation §7.1 requires. Independent of W12 | W5 | large |
 | **W6c** | Frontend: the **chaining UI** — position posting, overlap picking, per-step Δ and confidence, the error statement — and the **Outputs-page move** (§12.1), which is one `<AlignWizard …/>` tag now that the wizard is self-contained. The daemon side is done: `chain: true`, `POST measure/position`, `POST measure/finish`, and `MeasureStatus.chain` | W12 | medium |
 | **W8b** | Near-field **across sessions**: optional linking to an already-aligned set through an overlap (§1.2). No longer blocked on Δ propagation (W12 built it) — what it needs is a **store** of a finished run's aligned set with its applied delays, which nothing has | W12 | small |
-| **W9** | Chirp + matched filter. **Re-motivated:** not a noise fix (noise is a non-problem, §5.4.1) but the only proper fix for §5.6's early-reflection bias — the one risk no check in this design can see. Conditional on what real rooms show | W3 | medium |
-| **W22** | **Live acceptance on real speakers.** Nothing here has ever run against hardware beyond the W0 mic spike: formation cost, mute-settling time, real reconnect duration, whether the amplitude-stability gate survives a real room, and whether §5.6 bites are all unmeasured. Needs a deploy | most of the above | — |
+| **W9** | Chirp + matched filter — the only proper fix for §5.6's early-reflection bias, and **not a noise fix** (noise is a non-problem, §5.4.1). **Gated on W22's cross-band split data** (§5.6.1), and if built it is an *automatic escalation* or a per-member diagnostic, never a preference | W22 | medium |
+| **W22** | **Live acceptance on real speakers.** Nothing here has ever run against hardware beyond the W0 mic spike: formation cost, mute-settling time, real reconnect duration, and whether the amplitude-stability gate survives a real room are all unmeasured. **Also read the per-member cross-band splits** — they decide W9 (§5.6.1). Needs a deploy | most of the above | — |
 
 ### 14.2 In flight
 
@@ -1622,7 +1668,7 @@ Nothing. **W7** is next in the daemon, **W6c** in the frontend (§14.1).
 
 | WP | What it delivered |
 |---|---|
-| **W0** | Device spike — passed on Android (§14.4) |
+| **W0** | Device spike — passed on Android (§14.5) |
 | **W1** | `align/mic.rs`: WS ingest, gap detection, AudioWorklet client, `MicCapture.svelte` |
 | **W2** | `align/estimator.rs`: the DSP, with the measured accuracy in §5.4.1 |
 | **W3** | `align/measure.rs`: run state machine, the loop-phase gate, §11 endpoints |
@@ -1644,7 +1690,44 @@ Nothing. **W7** is next in the daemon, **W6c** in the frontend (§14.1).
 | **W12** | **Multi-position chaining** (§1.1): `POST measure/position` per listening spot, the two-overlap consistency **refusal**, Δ propagation to the whole already-aligned set, provisional delays in the relay throughout and **one** write wave at the end, the global renormalisation through the §2.4.2 solver, and a per-joint error statement that withholds a total when a joint had one overlap. Steps *inside* the union hold (§12.3.1) — no formation path was added. Corrected §1.2 (a chain does not depend on capture continuity across positions), §1.1 (five things it did not say — §1.1.4) and §10.4 (a chain's residual covers the last position only) |
 | **W8a** | Near-field walk with the closure measurement. **Depends on W19** (the per-arrival level lives in `AlignState.levels`), which §14.1 did not list. Corrected §10.4 (a stationary residual cannot verify a walk), §5.3 (the closure *is* the drift fit) and §1.2 (a 15-minute deadline a walk would hit) |
 
-### 14.4 W0 — the device spike, step by step
+### 14.4 W22 — live acceptance, step by step
+
+Nothing below has been done. Every number elsewhere in this document comes from unit
+tests, synthetic signals or the W0 microphone spike, so this is where the design either
+holds or does not.
+
+1. **Deploy** (`scripts/deploy-dev.sh`; note the add-on pulls rather than builds when
+   `image:` is set — see the deploy notes) and open the UI over the **HTTPS** URL, since
+   §4.1's secure-context requirement is not negotiable.
+2. **Time the formation.** Selecting a union and starting gives every sendspin member a
+   reconnect (§12.3.1). Measure it: the plan asserts "tens of seconds each way" from the
+   group-churn results, and the whole union-hold decision rests on paying it once.
+3. **Time a mute settle.** §12.2's `MUTE_GUARD` is 3 s and §13 records the hazard: if a
+   group's send-ahead exceeds it, two speakers are briefly audible in the same band and
+   arrivals closer than the ~12 ms guard distance **merge** instead of raising
+   `AmbiguousPeak` — a silently wrong answer rather than a refusal.
+4. **Watch the gate in a normal room.** The amplitude-stability criterion reads a
+   *broadband* peak, so speech or clatter may restart-loop it into a timeout that blames
+   the level (§13). If that happens, a band-limited stability measure is the fix.
+5. **Run a full single-position measurement** and check the proposal reads sensibly — in
+   particular that a sendspin group aligns to its **earliest** member with *advances*
+   (§2.4.1/§2.4.2), which is the inversion no synthetic test can confirm against firmware.
+6. **Read the per-member cross-band splits** — `split_i` inside §10.2's transitivity check.
+   **This decides W9** (§5.6.1). Near zero ⇒ reflections are not biasing much and W9 stays
+   unbuilt; clustered at 1–3 ms ⇒ they are, and W9 becomes an automatic escalation. Record
+   the distribution, not a verdict.
+7. **Run the equivalence experiment** (§1.1.3, `POST /api/align/equivalence`) before
+   trusting any real write: it reports the relay-vs-device **scale and sign** with a
+   resolution bound. A sign disagreement invalidates the deferred-write scheme.
+8. **Then a chained multi-position run**, and check the two claims that only a real
+   apartment can test: that Δ propagation actually keeps the earlier rooms in step, and
+   that two overlaps agree within the 8 ms geometric tolerance (§1.1).
+9. **Confirm teardown.** Stop mid-run, let the idle timeout fire, and start a superseding
+   session — each must restore routing, levels and mutes exactly. A half-restored house is
+   much worse than a failed alignment, and this is the only place that claim is tested
+   against real devices.
+
+### 14.5 W0 — the device spike, step by step
 
 Needs a real phone; cannot be done from a shell. Run it against the **HTTPS**
 URL (the duckdns hostname through `core_nginx_proxy`), not `homeassistant.local`
