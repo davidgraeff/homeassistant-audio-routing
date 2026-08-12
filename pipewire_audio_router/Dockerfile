@@ -156,7 +156,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 
 # ---------------------------------------------------------------------------
 # pwrouter-agent — the receiver-side helper users install on the machines they
-# want to stream to (docs/receiver-agent-plan.md §10). Built for BOTH
+# want to stream to (docs/receiver-agent.md §10). Built for BOTH
 # architectures regardless of the add-on's own, because the add-on serves the
 # binaries for download and the machine on the other end is usually not the same
 # arch as the Pi.

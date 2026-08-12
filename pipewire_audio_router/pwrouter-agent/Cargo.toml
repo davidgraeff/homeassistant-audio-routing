@@ -11,13 +11,13 @@ edition = "2021"
 
 [dependencies]
 # The agent is a PipeWire *client*: it loads module-rtp-session into its own
-# context (docs/receiver-agent-plan.md §4) and reads/writes channelVolumes on the
+# context (docs/receiver-agent.md §4) and reads/writes channelVolumes on the
 # sink our receive stream feeds (§6). Same major as bridge-daemon so the shared
 # `pw-control` crate (P1) can serve both.
 pipewire = "0.10"
 anyhow = "1"
 # Volume pods, the cubic scale, and the module-load FFI, shared with the add-on's
-# bridge-daemon (docs/receiver-agent-plan.md §12). A path dep one directory *up*,
+# bridge-daemon (docs/receiver-agent.md §12). A path dep one directory *up*,
 # so it never becomes a member of this crate's workspace.
 pw-control = { path = "../pw-control" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }

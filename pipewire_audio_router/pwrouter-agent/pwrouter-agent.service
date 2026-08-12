@@ -1,6 +1,6 @@
 [Unit]
 # systemd **user** unit, not a system one: the agent controls the audio of one
-# logged-in session (docs/receiver-agent-plan.md §13.2), so it must run as that
+# logged-in session (docs/receiver-agent.md §13.2), so it must run as that
 # user and inherit their PipeWire socket via XDG_RUNTIME_DIR.
 Description=PipeWire audio router — receiver agent
 Documentation=https://github.com/davidgraeff/homeassistant-pipewire-audio-routing
