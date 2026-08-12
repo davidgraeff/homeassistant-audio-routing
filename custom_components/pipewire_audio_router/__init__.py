@@ -23,6 +23,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from . import ws_api
 from .api import (
     AnnouncementGroup,
+    DaemonStatus,
     MusicGroup,
     NowPlaying,
     NowPlayingFrame,
@@ -43,6 +44,7 @@ from .const import (
     UPDATE_INTERVAL_SECONDS,
 )
 from .frontend import async_register_card
+from .service_device import async_register_service_device
 from .voice_duck import VoiceDucker
 
 _LOGGER = logging.getLogger(__name__)
@@ -112,6 +114,10 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
         self.music_groups: list[MusicGroup] = []
         self.announcement_groups: list[AnnouncementGroup] = []
         self.expose_outputs: bool = False
+        # Which daemon build is running, refreshed each poll (best-effort — an
+        # older daemon without `/api/status` leaves this `None`). Only the service
+        # device reads it, to show a version and to notice an add-on update.
+        self.status: DaemonStatus | None = None
         # Voice-assistant ducking (voice_duck.py). Set in `async_setup_entry`
         # right after the coordinator exists, because the ducker reads the polled
         # routing/groups/outputs state this object holds. Its enabled/level/scope
@@ -157,6 +163,18 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
             self.expose_outputs = (await self.client.async_get_settings()).expose_outputs_as_media_players
         except PipewireRouterApiError as err:
             _LOGGER.debug("groups/settings unavailable: %s", err)
+        # The running build, for the service device. Secondary, and re-registering
+        # the device only when the version actually changes — an add-on update is
+        # the one thing that moves it, not every poll.
+        try:
+            status = await self.client.async_get_status()
+        except PipewireRouterApiError as err:
+            _LOGGER.debug("daemon status unavailable: %s", err)
+        else:
+            changed = self.status is None or self.status.version != status.version
+            self.status = status
+            if changed and self.config_entry is not None:
+                async_register_service_device(self.hass, self.config_entry, self)
 
     async def async_init_routing(self) -> None:
         """One-shot routing fetch so `source`/`source_list` are populated the
@@ -249,6 +267,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator.voice_duck.async_start()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    # The add-on as one service device, before the platforms add entities to it —
+    # created here rather than left to the entities so its version is right and a
+    # later add-on update refreshes it (see service_device.py).
+    async_register_service_device(hass, entry, coordinator)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_register_cleanup_service(hass)
     return True

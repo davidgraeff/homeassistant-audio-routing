@@ -26,6 +26,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import PipewireRouterCoordinator
 from .const import DEFAULT_VOICE_DUCK_LEVEL, DOMAIN
+from .service_device import service_device_info
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -54,6 +55,7 @@ class PipewireRtpPortNumber(CoordinatorEntity[PipewireRouterCoordinator], Restor
     def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_rtp_source_port"
+        self._attr_device_info = service_device_info(entry, coordinator)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -106,6 +108,7 @@ class PipewireRtpLatencyNumber(CoordinatorEntity[PipewireRouterCoordinator], Res
     def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_rtp_source_latency_msec"
+        self._attr_device_info = service_device_info(entry, coordinator)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -162,6 +165,7 @@ class PipewireVoiceDuckLevelNumber(CoordinatorEntity[PipewireRouterCoordinator],
     def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_voice_duck_level"
+        self._attr_device_info = service_device_info(entry, coordinator)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()

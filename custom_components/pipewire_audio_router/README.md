@@ -30,6 +30,26 @@ re-add the integration if the add-on moves.
 
 ## Entities
 
+Everything that isn't a speaker — voice ducking, the Bluetooth-bridge RTP
+source, and each music/announcement group — lives on **one device**, named
+*PipeWire Audio Router*, listed under the integration in Settings → Devices &
+Services. That device page is the index for this integration: Home Assistant
+groups its entities into *Controls* and *Configuration* there, shows which add-on
+build is running, and its **Visit** link opens the add-on's own web UI, which is
+where the routing matrix, the outputs and the diagnostics actually live.
+
+Per-output `media_player`s are the exception: each one joins the **real
+speaker's** device instead, so it inherits that speaker's name and area — and the
+area is what voice ducking below resolves a room against.
+
+One side effect worth knowing: Home Assistant prefixes an entity's displayed name
+with its device's name, so these read *"PipeWire Audio Router Voice assistant
+ducking"* and *"PipeWire Audio Router Everywhere"* in pickers — exactly as every
+other device's entities do (*"Satellite1 c4150c Temperature"*). The device page
+itself shows the short names. Existing entity **ids never change**; only entities
+created after this (a new group, a fresh install) get the device name in their id
+too. Rename any entity in its settings dialog to override the display name.
+
 ### Bluetooth bridge RTP source (`switch` + `number`)
 
 Two entities let you turn on and configure the RTP source that receives the

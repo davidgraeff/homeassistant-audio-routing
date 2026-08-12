@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import PipewireRouterCoordinator
 from .const import DOMAIN
+from .service_device import service_device_info
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -43,6 +44,7 @@ class PipewireRtpSourceSwitch(CoordinatorEntity[PipewireRouterCoordinator], Swit
     def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_rtp_source"
+        self._attr_device_info = service_device_info(entry, coordinator)
 
     @property
     def available(self) -> bool:
@@ -89,6 +91,7 @@ class PipewireVoiceDuckingSwitch(CoordinatorEntity[PipewireRouterCoordinator], S
     def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_voice_ducking"
+        self._attr_device_info = service_device_info(entry, coordinator)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()

@@ -14,6 +14,7 @@ from homeassistant.helpers import area_registry as ar, device_registry as dr, en
 from pytest_homeassistant_custom_component.common import MockConfigEntry, mock_restore_cache
 
 from custom_components.pipewire_audio_router.api import (
+    DaemonStatus,
     AppSettings,
     MusicGroup,
     OutputMeta,
@@ -30,6 +31,7 @@ from custom_components.pipewire_audio_router.const import (
 
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
+DAEMON_STATUS = DaemonStatus(version="0.3.0", host_model="Raspberry Pi 4 Model B", host_arch="aarch64")
 RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 SATELLITE = "assist_satellite.kitchen_voice"
 
@@ -59,6 +61,7 @@ def _patch_daemon(routing, *, outputs=None, music_groups=None, expose_outputs=Tr
     stack.enter_context(patch(f"{API}.async_get_outputs", new=AsyncMock(return_value=outputs or [])))
     stack.enter_context(patch(f"{API}.async_get_music_groups", new=AsyncMock(return_value=music_groups or [])))
     stack.enter_context(patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=DAEMON_STATUS)))
     stack.enter_context(
         patch(
             f"{API}.async_get_settings",
@@ -128,7 +131,7 @@ async def test_ducks_only_the_outputs_in_the_satellites_area(hass):
         _place_output(hass, entry, "sendspin-dev-bath", bath.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
 
         await _talk(hass, satellite, "listening")
@@ -152,7 +155,7 @@ async def test_enabled_by_default_ducks_with_no_setup_at_all(hass):
         await hass.async_block_till_done()
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, kitchen.id)
-        assert hass.states.get("switch.voice_assistant_ducking").state == "on"
+        assert hass.states.get("switch.pipewire_audio_router_voice_assistant_ducking").state == "on"
 
         await _talk(hass, satellite, "listening")
         duck.assert_awaited_once_with(["sendspin-dev-kitchen"], 0.25, VOICE_DUCK_TTL_SECONDS * 1000)
@@ -161,7 +164,7 @@ async def test_enabled_by_default_ducks_with_no_setup_at_all(hass):
 async def test_a_remembered_off_survives_a_restart(hass):
     """Someone who switched it off (still running the ducking blueprint, say) keeps
     it off — the on-by-default only applies when there is nothing remembered."""
-    mock_restore_cache(hass, [State("switch.voice_assistant_ducking", "off")])
+    mock_restore_cache(hass, [State("switch.pipewire_audio_router_voice_assistant_ducking", "off")])
     entry = _make_entry(hass)
     kitchen = ar.async_get(hass).async_get_or_create("Kitchen")
     stack, duck, _renew, _release = _patch_daemon(_matrix("sendspin-dev-kitchen"))
@@ -170,7 +173,7 @@ async def test_a_remembered_off_survives_a_restart(hass):
         await hass.async_block_till_done()
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, kitchen.id)
-        assert hass.states.get("switch.voice_assistant_ducking").state == "off"
+        assert hass.states.get("switch.pipewire_audio_router_voice_assistant_ducking").state == "off"
 
         await _talk(hass, satellite, "listening")
         duck.assert_not_awaited()
@@ -179,14 +182,14 @@ async def test_a_remembered_off_survives_a_restart(hass):
 async def test_an_unavailable_restored_state_is_not_a_choice_to_disable(hass):
     """The entity was down when HA shut down, so its restored state is
     `unavailable` — not the user's decision. It comes back on."""
-    mock_restore_cache(hass, [State("switch.voice_assistant_ducking", "unavailable")])
+    mock_restore_cache(hass, [State("switch.pipewire_audio_router_voice_assistant_ducking", "unavailable")])
     entry = _make_entry(hass)
     stack, _duck, _renew, _release = _patch_daemon(_matrix("sendspin-dev-kitchen"))
     with stack:
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        assert hass.states.get("switch.voice_assistant_ducking").state == "on"
+        assert hass.states.get("switch.pipewire_audio_router_voice_assistant_ducking").state == "on"
 
 
 async def test_responding_keeps_the_duck_and_idle_ends_it(hass):
@@ -201,7 +204,7 @@ async def test_responding_keeps_the_duck_and_idle_ends_it(hass):
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
 
         for state in ("listening", "processing", "responding"):
@@ -224,7 +227,7 @@ async def test_unavailable_satellite_releases_the_duck(hass):
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
         await _talk(hass, satellite, "listening")
         await _talk(hass, satellite, "unavailable")
@@ -249,12 +252,12 @@ async def test_music_group_scope_widens_to_every_group_member(hass):
         _place_output(hass, entry, "sendspin-dev-hall", hall.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
         await hass.services.async_call(
             "select",
             "select_option",
-            {"entity_id": "select.voice_assistant_duck_scope", "option": VOICE_DUCK_SCOPE_MUSIC_GROUP},
+            {"entity_id": "select.pipewire_audio_router_voice_assistant_duck_scope", "option": VOICE_DUCK_SCOPE_MUSIC_GROUP},
             blocking=True,
         )
 
@@ -282,9 +285,9 @@ async def test_area_scope_does_not_widen_to_the_group(hass):
         _place_output(hass, entry, "sendspin-dev-hall", hall.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
-        assert hass.states.get("select.voice_assistant_duck_scope").state == VOICE_DUCK_SCOPE_AREA
+        assert hass.states.get("select.pipewire_audio_router_voice_assistant_duck_scope").state == VOICE_DUCK_SCOPE_AREA
 
         await _talk(hass, satellite, "listening")
         duck.assert_awaited_once_with(["sendspin-dev-kitchen"], 0.25, VOICE_DUCK_TTL_SECONDS * 1000)
@@ -307,7 +310,7 @@ async def test_the_satellites_own_output_is_ducked_not_skipped(hass):
         sat_device = ent_reg.async_get(satellite).device_id
         ent_reg.async_update_entity(out_entity, device_id=sat_device, area_id=None)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
 
         await _talk(hass, satellite, "listening")
@@ -346,7 +349,7 @@ async def test_two_satellites_in_two_areas_duck_independently(hass):
             config_entry=sat_entry,
         ).entity_id
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
 
         duck.side_effect = [11, 22]
@@ -371,7 +374,7 @@ async def test_satellite_with_no_area_ducks_nothing(hass):
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, None)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
 
         await _talk(hass, satellite, "listening")
@@ -394,7 +397,7 @@ async def test_entity_area_override_beats_the_devices_area(hass):
         # Device says Kitchen, the entity override says Bathroom.
         satellite = _place_satellite(hass, kitchen.id, entity_area=bath.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
 
         await _talk(hass, satellite, "listening")
@@ -412,12 +415,12 @@ async def test_turning_the_switch_off_mid_turn_un_ducks_immediately(hass):
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
         await _talk(hass, satellite, "listening")
 
         await hass.services.async_call(
-            "switch", "turn_off", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_off", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
         release.assert_awaited_once_with(77)
 
@@ -433,12 +436,12 @@ async def test_duck_level_number_is_used_for_the_hold(hass):
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
         await hass.services.async_call(
             "number",
             "set_value",
-            {"entity_id": "number.voice_assistant_duck_level", "value": 0.1},
+            {"entity_id": "number.pipewire_audio_router_voice_assistant_duck_level", "value": 0.1},
             blocking=True,
         )
 
@@ -457,7 +460,7 @@ async def test_unloading_the_entry_releases_holds(hass):
         _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
         await _talk(hass, satellite, "listening")
 
@@ -489,7 +492,7 @@ async def test_ducks_an_ap2_output_via_its_adopted_device_area(hass):
         await hass.async_block_till_done()
         satellite = _place_satellite(hass, kitchen.id)
         await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": "switch.voice_assistant_ducking"}, blocking=True
+            "switch", "turn_on", {"entity_id": "switch.pipewire_audio_router_voice_assistant_ducking"}, blocking=True
         )
 
         await _talk(hass, satellite, "listening")

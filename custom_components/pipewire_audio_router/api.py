@@ -197,6 +197,16 @@ class AppSettings:
     expose_outputs_as_media_players: bool
 
 
+@dataclass
+class DaemonStatus:
+    """Subset of the daemon's `/api/status` used to describe the service device:
+    which build is running, and what it is running on."""
+
+    version: str
+    host_model: str | None = None
+    host_arch: str | None = None
+
+
 def _parse_routing_matrix(data: dict) -> RoutingMatrix:
     """Parse the daemon's `RoutingMatrix` JSON (routing.rs). Shared by the
     REST fetch and the WebSocket push so both stay in lock-step."""
@@ -577,6 +587,25 @@ class PipewireRouterApiClient:
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
         return AppSettings(expose_outputs_as_media_players=bool(data.get("expose_outputs_as_media_players", False)))
+
+    async def async_get_status(self) -> DaemonStatus:
+        """Which daemon build is running, and on what (`GET /api/status`).
+
+        Only the service device uses this, so it is deliberately a thin read of a
+        much larger payload (uptime, node counts, a realtime-capability verdict):
+        the device page is not a diagnostics screen, the add-on's own UI is."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/status") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        host = data.get("host") or {}
+        return DaemonStatus(
+            version=str(data.get("version") or ""),
+            host_model=host.get("cpu_model"),
+            host_arch=host.get("arch"),
+        )
 
     async def async_route_music_group(self, group_id: str, source: str) -> None:
         """Route a source to a whole music group (`POST /api/groups/music/{id}/route`)."""

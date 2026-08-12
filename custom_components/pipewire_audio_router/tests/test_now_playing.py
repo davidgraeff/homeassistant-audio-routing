@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pipewire_audio_router.api import (
+    DaemonStatus,
     AppSettings,
     MusicGroup,
     NowPlaying,
@@ -28,6 +29,7 @@ from custom_components.pipewire_audio_router.const import DOMAIN
 
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
+DAEMON_STATUS = DaemonStatus(version="0.3.0", host_model="Raspberry Pi 4 Model B", host_arch="aarch64")
 RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 
 # One AirPlay source, one output, wired together — the minimum that gives an
@@ -64,6 +66,7 @@ def _patch_daemon(routing, music_groups=()):
     stack.enter_context(patch(f"{API}.async_get_outputs", new=AsyncMock(return_value=[])))
     stack.enter_context(patch(f"{API}.async_get_music_groups", new=AsyncMock(return_value=list(music_groups))))
     stack.enter_context(patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=DAEMON_STATUS)))
     stack.enter_context(
         patch(
             f"{API}.async_get_settings",

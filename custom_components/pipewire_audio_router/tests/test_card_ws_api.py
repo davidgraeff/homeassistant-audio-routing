@@ -15,6 +15,7 @@ from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pipewire_audio_router.api import (
+    DaemonStatus,
     AppSettings,
     MusicGroup,
     PipewireRouterApiError,
@@ -26,6 +27,7 @@ from custom_components.pipewire_audio_router.const import DOMAIN
 
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
+DAEMON_STATUS = DaemonStatus(version="0.3.0", host_model="Raspberry Pi 4 Model B", host_arch="aarch64")
 RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 
 KITCHEN = RoutingNode(node_id=None, node_name="ap2-dev-kitchen", display_name="Kitchen")
@@ -52,6 +54,7 @@ def _patch_daemon(routing: RoutingMatrix, groups=()):
     stack.enter_context(patch(f"{API}.async_get_outputs", new=AsyncMock(return_value=[])))
     stack.enter_context(patch(f"{API}.async_get_music_groups", new=AsyncMock(return_value=list(groups))))
     stack.enter_context(patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=DAEMON_STATUS)))
     stack.enter_context(
         patch(
             f"{API}.async_get_settings",
