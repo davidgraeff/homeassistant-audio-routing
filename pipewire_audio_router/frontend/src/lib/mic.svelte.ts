@@ -310,13 +310,7 @@ function createMic() {
             `This browser captures at ${rate} Hz; the daemon accepts 48000 or 44100 Hz. Resampling in the browser would add an unknown delay to what is being measured, so this capture is refused.`,
           );
         }
-        // A worklet 404 is the one failure that means the *build* is wrong rather
-        // than the device, so say which URL failed.
-        try {
-          await ctx.audioWorklet.addModule(workletUrl);
-        } catch (e) {
-          throw new Error(`could not load the audio worklet from ${String(workletUrl)}: ${e instanceof Error ? e.message : String(e)}`);
-        }
+        await loadWorklet(ctx);
         await ctx.resume();
 
         ws = await connect(rate);
@@ -394,6 +388,70 @@ function createMic() {
     frame.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 4);
     ws.send(frame);
     blocksSent += 1;
+  }
+}
+
+
+/** Load the AudioWorklet module, with a diagnosis and a fallback.
+ *
+ *  `addModule()` is deliberately opaque: Chrome rejects with
+ *  `AbortError: Unable to load a worklet's module.` whether the fetch 404'd, the MIME
+ *  type was refused, a Content-Security-Policy blocked it, or the script threw while
+ *  evaluating. That single sentence is what a user sees, and it names none of them.
+ *
+ *  Observed on a real deployment behind Home Assistant ingress: the asset is served
+ *  correctly (200, `text/javascript`) and `addModule` still failed — so the message has
+ *  to distinguish "never arrived" from "arrived and was rejected", or there is nothing to
+ *  act on.
+ *
+ *  So: fetch it ourselves first to establish which half failed, then try the URL, then
+ *  fall back to a **blob** URL built from the source we just fetched. The blob is
+ *  same-origin and bypasses whatever the proxy does to the response, which is the standard
+ *  workaround for this class of failure. (A `data:` URL is *not* — Firefox rejects those,
+ *  which is why the import above needs `no-inline`.)
+ */
+async function loadWorklet(ctx: AudioContext): Promise<void> {
+  const url = String(workletUrl);
+
+  let source: string | null = null;
+  let probe = '';
+  try {
+    const resp = await fetch(url, { credentials: 'same-origin' });
+    probe = `HTTP ${resp.status} ${resp.statusText}, type ${resp.headers.get('content-type') ?? 'none'}`;
+    if (resp.ok) source = await resp.text();
+  } catch (e) {
+    probe = `the request itself failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+
+  // `credentials` is the documented knob and defaults vary by engine; being explicit
+  // costs nothing and removes one variable from the diagnosis.
+  try {
+    await ctx.audioWorklet.addModule(url, { credentials: 'same-origin' });
+    return;
+  } catch (first) {
+    if (source === null) {
+      throw new Error(
+        `could not load the audio worklet from ${url} — and fetching it directly did not work either (${probe}). ` +
+          `That points at the build or the way the add-on serves its assets, not at your microphone.`,
+      );
+    }
+    // It is there and readable, so this is the browser refusing the *response* — a MIME
+    // type it will not accept for a worklet, or a CSP. Serving the same bytes from a blob
+    // sidesteps both.
+    const blob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    try {
+      await ctx.audioWorklet.addModule(blob, { credentials: 'same-origin' });
+      return;
+    } catch (second) {
+      const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
+      throw new Error(
+        `could not load the audio worklet. The file is reachable (${probe}), so this is not a missing asset: ` +
+          `loading it from ${url} failed with "${why(first)}", and loading the same bytes from a blob URL failed with ` +
+          `"${why(second)}". That leaves the script being rejected on evaluation — try another browser and report both messages.`,
+      );
+    } finally {
+      URL.revokeObjectURL(blob);
+    }
   }
 }
 
