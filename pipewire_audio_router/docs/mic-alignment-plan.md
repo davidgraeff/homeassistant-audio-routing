@@ -29,6 +29,13 @@ infer from the numbers, like a speaker that moved without being audible. **W7
 it makes measurement time roughly independent of speaker count rather than enabling
 anything new.
 
+**A full multi-position run has now been exercised on hardware (2026-08-12)** — the first
+real use of the feature, and it earned its keep immediately. It found four things no test
+could: the worklet would not load behind HA ingress at all (§4.3), the click track kept
+looping through the review (§8), the cross-band check **blocked a legitimate mixed-model
+pair** (§10.2), and there was no record of a run to investigate afterwards (§8's
+transcript). All four are fixed. Most of W22's steps remain unrun.
+
 The gate is **W22, live acceptance** (§14.3). Every figure in this document comes
 from unit tests, synthetic signals or the W0 microphone spike — formation cost,
 mute settling, real reconnect duration, and whether §5.6's bias bites are all
@@ -554,6 +561,20 @@ phone works at all — and the binding belongs at the orchestration layer, where
 loop-phase gate lives anyway. Closing the socket does not tear down the session
 (the user may be switching modes).
 
+**The worklet will not always load, and `addModule()` will not say why (2026-08-12).** On
+the real deployment behind HA ingress it failed with Chrome's `AbortError: Unable to load a
+worklet's module.` — the same error for a 404, a refused MIME type, a CSP block, and a
+script that throws while evaluating. Checked on the instance: the asset was served
+correctly (200, `text/javascript`, right bytes), and HA's ingress view is
+`requires_auth = False`, so neither a missing file nor a cookie-less fetch explained it. The
+browser was rejecting a response it *had* fetched.
+
+Fixed by fetching the asset first — so the error can distinguish "never arrived" from
+"arrived and was rejected", with the real status — then falling back to a **blob** URL built
+from those bytes, which is same-origin and bypasses whatever the proxy did to the response.
+The fallback worked, which confirms the diagnosis. A `data:` URL is *not* a substitute:
+Firefox rejects those, which is why the import needs `no-inline` (§12).
+
 Back-pressure policy: if the send queue stalls, the client drops blocks and bumps
 the sequence number so the server sees a gap and discards the window. Never buffer
 to catch up — a stale window is worse than a missing one.
@@ -936,6 +957,22 @@ member for the matrix), sequential `2N + 4`.
 `PROPOSED` exists because `apply` is an explicit user step (§11): the machine has to
 park between solving and writing, and nothing is written without passing through it.
 
+**Parked states go silent.** Once a run parks with a proposal — or ends refused or done —
+the hold stays, because `apply` needs it, but nothing is audible. Reading a long review page
+with the click track still looping is grating, and on hardware it was. Silencing is
+daemon-side rather than a mute the UI posts, because a closed tab must fall silent too. The
+walk and positioning phases are deliberately *not* silenced (near-field level-setting needs
+the tone at the speaker), and a by-ear session is never silenced — two speakers playing is
+its whole point.
+
+**Every run writes a transcript.** Append-only JSONL per run under `/data/align-runs`: gate
+restarts with their reasons, every accepted measurement's numbers, interference, warnings,
+the proposal, each write with the endpoint's verbatim reply, the verification, refusals.
+Bounded — 6 runs / 4000 events / 512 KiB, one write syscall per event, because `/data` is a
+USB stick with no TRIM — and fetchable over HTTP. It exists because the wizard assumes a
+working system while the system is still being built: **a run whose speakers never came
+online must produce a record saying so.** Failures are the point of it, not a side case.
+
 `SETTLING` is **not observable as its own state**: the group snapshot lists
 *configured* devices, not live connections, so "wait for lock to return on every
 member" cannot be asked directly. It collapses into the per-member gate with the
@@ -1021,13 +1058,34 @@ considered and dropped.
    is *shared* — which is the discrimination §5.6 needs. This is what is implemented,
    and it blocks the write.
 
-   **But its tolerance cannot be the estimator's precision.** A loudspeaker's
-   crossover legitimately delays 1.5 kHz and 3 kHz differently, often by a
-   millisecond or two and differently per model, and in a mixed-model group that is
-   indistinguishable from a reflection. Hence `TRANSITIVITY_TOL_MS` = 3.0 — which
-   means **a pass is not proof that §5.6 did not happen.** The check is real but much
-   weaker than "mandatory cross-check" suggests, and that materially strengthens the
-   case for W9. Its per-member `split_i` values are the data W22 must read (§5.6.1).
+   **The confound, and why it stopped being a tolerance.** A loudspeaker's crossover
+   legitimately delays 1.5 kHz and 3 kHz differently, often by a millisecond or two and
+   differently per model, and in a mixed-model group that is indistinguishable from a
+   reflection. `TRANSITIVITY_TOL_MS` = 3.0 was chosen to absorb it.
+
+   **On hardware it did not (2026-08-12).** A Home Assistant Voice PE and an ESPHome
+   satellite read **3.45 ms** apart with the microphone and both speakers close together
+   in one room. And because this check *blocks the write*, the failure mode was not "a
+   weaker check" as written above — it was **a legitimate setup that could not be aligned
+   at all**.
+
+   Raising the tolerance was the wrong fix, since this is the only exposure to §5.6. The
+   crossover term is instead **measured and subtracted**: a speaker's band split is a
+   fixed property of its drivers, so it is measured once at close range (where reflections
+   are minimal — the same reasoning near field rests on), persisted per output, and the
+   check compares **residuals**. A pair with both sides calibrated gets a *tighter*
+   `CALIBRATED_TRANSITIVITY_TOL_MS` = 1.5; any pair with an uncalibrated side keeps 3.0.
+   An implausible split (>5 ms) is refused rather than stored — that is what a reflection,
+   or a phone not held at the speaker, looks like.
+
+   So the check ends up **sharper** than designed, not blunter. On a calibrated pair the
+   net sits at 1.5 ms, inside §5.6's own measured 0.89–1.72 ms band — so §5.6's "1–2 ms
+   sails through every check" is no longer unconditionally true. On an uncalibrated pair
+   it still is, and a pass is still not proof.
+
+   Every member's `split_i` is now reported whether it passes or fails, which is what
+   makes §5.6.1's instruction to W22 executable: those values previously existed only
+   inside a local variable and never left the daemon.
 
 3. **Merged peak — dropped, not deferred (§10.3).** The idea was to put every member
    on one identical burst and confirm the mic sees a *single* correlation peak rather
@@ -1111,7 +1169,28 @@ The measurement state rides the existing `/api/align` status shape where it over
 
 ### 12.1 The wizard, and where it lives
 
-**It lives on the Outputs page, not on a source card.** The panel used to live on
+**It is its own page.** *(Corrected 2026-08-12 — this section said "on the Outputs page",
+which was true for about a day.)* The review page is a dense report someone reads
+carefully, and a card inside a tab made it look like a widget. So **Alignment** is a
+top-level page; **Outputs** keeps only the entry point and the state that belongs beside a
+list of outputs — the "an alignment is holding these speakers right now" notice and the
+revert offer.
+
+**The first page is a microphone check, and it reduces the modes behind it.** Offering all
+three regardless let a user pick a measured mode and only then discover it could not work.
+The check classifies the outcome — no secure context (§4.1, the one precondition with no
+workaround), no worklet, permission denied, no input, a processor left on (§4.2),
+working-but-unreported (Safari), working-and-confirmed — and Mode offers only what that
+supports, **disabling with the reason inside each option** rather than hiding: a user must
+be able to see that near field exists and why it is unavailable here.
+
+Two implementation facts that are easy to get wrong, both found by breaking them: the
+effective mode must be **derived**, not written back into state, or selecting it unmounts
+the microphone control and stops the capture the user just proved works; and "is this a
+measured run" must derive from the mode being **shown**, not from the picker, or a measured
+proposal ends up under a by-ear heading.
+
+The history, since it explains the shape: the panel used to live on
 source cards because a group *is* its source set, and the session resolved the group
 from `sources` and required it to already exist with ≥2 present members. The model
 is inverted: the user picks *speakers*, and alignment forms a group around them.
@@ -1390,7 +1469,7 @@ user should already be looking at the fallback.
 | ~~Phone denies mic in the ingress iframe~~ | **retired** | W0 passed on Android (§14.4) |
 | ~~Browser ignores `echoCancellation: false`~~ | **retired** for the target | Android honours and reports it. The Safari-omission hole (§4.2) and its behavioural detector remain in the code and remain correct, but iOS is out of scope so nothing depends on them |
 | User's HA is HTTP-only | high | detected and explained; no workaround exists (§4.1) |
-| **An early reflection inside the analysis window biases a speaker by multiple ms, undetectably** | **high**, but now *measurable* | no refusal rule can see it (§5.6); §10.2 is the only exposure and its 3 ms tolerance lets 1–2 ms pass; near field mitigates, only W9 fixes it, and W22's cross-band splits decide whether it bites (§5.6.1) |
+| **An early reflection inside the analysis window biases a speaker by multiple ms, undetectably** | **high** uncalibrated; **reduced** on a calibrated pair | no refusal rule can see it (§5.6). §10.2 now subtracts each speaker's own crossover split and tightens a calibrated pair to 1.5 ms — inside §5.6's own measured 0.89–1.72 ms band — so the "1–2 ms passes everything" claim holds only where the pair is uncalibrated. Near field mitigates, only W9 fixes the reflection itself, and W22's splits decide whether it bites (§5.6.1) |
 | Mute settling exceeds the 3 s `MUTE_GUARD`, so two speakers are briefly audible in the same band | medium | arrivals closer than the ~12 ms guard distance **merge into one peak** instead of raising `AmbiguousPeak` — a silently wrong answer, not a refusal. Needs a real group to size the guard |
 | Amplitude-stability gate reads a broadband peak, so room noise restart-loops it | medium | the gate times out blaming the level; a band-limited stability measure is the fix if W22 shows it biting |
 | A member wedges and renders intermittently while the daemon reports itself clean | medium | observed on hardware (§2.3.2); diagnosed as `GateReason::Intermittent` with the remedy named. The gate reports it but cannot *fix* it — automatic reconnect-and-retry is a candidate once it is seen more than once |
