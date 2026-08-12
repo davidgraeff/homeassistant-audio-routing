@@ -172,6 +172,21 @@ systemctl --user start pwrouter-agent</code
       for. Plug it back in and it resumes by itself.
     </p>
 
+    <h3>Volume, from either end</h3>
+    <p class="card-sub">
+      The slider on this page drives that machine's <em>own</em> master volume — the same one its volume
+      keys and its desktop mixer move — so whoever is sitting there can turn it too, and this page
+      follows. Its tray menu has the same two controls: <strong>Volume</strong> (a submenu of levels, and
+      the mouse wheel over the icon for anything in between) and <strong>Mute</strong>, which
+      middle-clicking the icon also toggles. Neither end owns the value; both show what the machine
+      reports.
+    </p>
+    <p class="card-sub hint">
+      They appear only while something is actually routed to that machine: until then it has no stream,
+      so there is no output of its to attenuate, and a control that could not move would be worse than
+      none.
+    </p>
+
     <p class="card-sub hint">
       If the machine cannot find the add-on — a routed VLAN, or mDNS blocked — point it straight at the
       add-on's host and port instead: <code>pwrouter-agent run --daemon &lt;host&gt;:8099</code>.

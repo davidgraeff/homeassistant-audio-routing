@@ -192,6 +192,12 @@ struct NodeState {
     card_device: Option<i32>,
     /// Last known per-channel linear gains (the duck baseline source).
     channel_volumes: Vec<f32>,
+    /// Last known `Props.mute`. Only meaningful for a sink with no device route —
+    /// for a real device the route's mute is the one the user's own UI shows (§6.1) —
+    /// but reading it is what lets a *virtual* sink report a mute state at all,
+    /// instead of the daemon (and the tray) having to treat it as unknown and hide
+    /// the mute control for a lever that does work.
+    mute: Option<bool>,
     proxy: pw::node::Node,
     _listener: pw::node::NodeListener,
 }
@@ -412,7 +418,7 @@ impl State {
         }
         Some(pods::VolumeProps {
             channel_volumes: node.channel_volumes.clone(),
-            mute: None,
+            mute: node.mute,
         })
     }
 
@@ -805,6 +811,9 @@ fn on_global(
                             if !props.channel_volumes.is_empty() {
                                 entry.channel_volumes = props.channel_volumes;
                             }
+                            if props.mute.is_some() {
+                                entry.mute = props.mute;
+                            }
                         }
                         st.publish();
                     }
@@ -821,6 +830,7 @@ fn on_global(
                     device_id: None,
                     card_device: None,
                     channel_volumes: Vec::new(),
+                    mute: None,
                     proxy: node,
                     _listener: listener,
                 },

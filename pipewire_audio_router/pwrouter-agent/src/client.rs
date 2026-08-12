@@ -258,8 +258,26 @@ pub async fn run(
 /// The order matters. Persisting first means a choice survives even if the reload
 /// below fails; publishing last means the menu shows the truth rather than the
 /// optimistic value the callback already painted.
+///
+/// Volume and mute are the two that store *nothing*: the sink's level is the host's
+/// own, kept by WirePlumber across reboots and moved by the user's volume keys, so this
+/// end must never hold a second copy of it. They go straight to the PipeWire thread —
+/// the same `Cmd`s the add-on's `SetVolume`/`SetMute` produce — and the resulting graph
+/// change comes back as a `Master` event, which is what corrects the value the tray
+/// painted optimistically and what tells the add-on (§9.4).
 async fn apply_request(request: Request, config: &mut Config, handle: &Handle, desktop: &Desktop) {
     match request {
+        Request::SetVolume(volume) => {
+            tracing::debug!("volume set to {:.0}% on this machine", volume * 100.0);
+            handle.send(Cmd::SetMasterVolume(volume));
+        }
+        Request::SetMute(muted) => {
+            tracing::debug!(
+                "{} on this machine",
+                if muted { "muted" } else { "unmuted" }
+            );
+            handle.send(Cmd::SetMasterMute(muted));
+        }
         Request::SetTarget(target) => {
             if config.target_sink == target {
                 return;

@@ -415,12 +415,13 @@ Three deliberate limits:
    notification server, or no tray host each degrade to what existed before — the
    log line — and none of them can fail the agent. Which is also why the code still
    goes to the journal at `warn`.
-2. **The menu is a display, plus the settings only this machine can answer.** Every
-   status row is disabled; the only rows that do anything are Play to, Autostart and
-   "show the notification again". No unpair and no quit: those would be a second,
-   divergent way to manage a `Restart=always` unit, and a control surface competing
-   with the add-on, which is the thing that is supposed to drive this host. The two
-   settings are the exception because *nothing else can answer them*.
+2. **The menu is a display, plus the things only this machine can answer.** Every
+   status row is disabled; the only rows that do anything are volume, mute, Play to,
+   Autostart and "show the notification again". No unpair and no quit: those would be
+   a second, divergent way to manage a `Restart=always` unit, and a control surface
+   competing with the add-on, which is the thing that is supposed to drive this host.
+   Volume and mute are not a competing surface for the same reason §9.4 exists: the
+   level is the *host's own* and neither end owns it (see §8.2).
 3. **Legacy icon names** (`audio-speakers`, `dialog-password`) resolve in both
    Breeze and Adwaita (via its `Inherits=AdwaitaLegacy`), whereas the two
    `-symbolic` spellings wanted here are not present in both themes.
@@ -430,6 +431,47 @@ implement the spec, GNOME needs its AppIndicator extension — so `spike-desktop
 answers "does this session have either?" without involving the add-on, and
 `assume_sni_available` is set so a user unit that starts before the shell waits for
 the watcher instead of giving up.
+
+### 8.2 Volume and mute in the tray, and why there is no slider
+
+The menu showed the level as a disabled `Volume: 42%` row, next to the desktop's own
+volume applet, for a value this process can *write* (§6) — so it is now a control.
+It is the same lever, through the same `pw_thread::Cmd`s the add-on's `set_volume`
+produces, which is what keeps the two ends from disagreeing; the write's own graph
+event is what corrects the value the tray painted, and it goes to the add-on as an
+ordinary local change (§9.4). Nothing is stored on this side: the level belongs to
+the host, WirePlumber persists it, and a second copy here could only go stale.
+
+**A real slider is not available.** `com.canonical.dbusmenu` — the only menu
+protocol an SNI has — defines four item types (standard, separator, checkmark,
+radio). The slider Ubuntu's sound indicator used was a non-standard `x-canonical`
+extension that only Unity rendered, and drawing one properly would mean a toolkit
+window, which §8.1's "pure Rust on zbus, so the cross-build and its GLIBC floor are
+untouched" rules out. So the tray offers the two gestures the protocol *does* have,
+which are also the ones every desktop volume applet already answers to:
+
+- **the wheel over the icon** (`Tray::scroll`) in 5 % steps — the continuous control,
+  and the reason `delta`'s magnitude is ignored: hosts scale it differently (Qt hands
+  on an angle in eighths of a degree, others send ±1), so one notch has to mean one
+  step everywhere. Both orientations mean the same thing;
+- **a submenu of 10 % steps** to point straight at a level, with the *exact*
+  percentage in the submenu's own label — the radio marks the nearest step, and the
+  label is what stops that rounding from misreporting a level the wheel or the volume
+  keys left between two marks;
+- **mute** as a checkmark, and on middle click (`secondary_activate`).
+
+Both rows are **hidden when there is no lever** — not paired, not receiving, or a
+sink with neither a device route nor a node volume — because `apply_master` could
+only answer "no target sink" there, and an inert slider is worse than none. The
+tooltip keeps the percentage as text and gains the one line that makes the wheel
+discoverable at all.
+
+One read-side gap was closed on the way: `master_props`'s virtual-sink branch
+hardcoded `mute: None` while `parse_props` had been reading `Props.mute` all along,
+so a host whose stream lands in a virtual sink reported "mute unknown" — which the
+matrix faithfully passes on as *no mute control at all* (§6.1's device-route branch
+is where a real device's mute comes from, and only that path was ever exercised).
+`NodeState` now tracks it.
 
 ## 9. Safety rails
 
@@ -524,13 +566,14 @@ talking.
 | `pwrouter-agent/src/receiver.rs` | the `rtp-session` args replacing the drop-in (§7), with tests |
 | `pwrouter-agent/src/pw_thread.rs` | the service path: graph tracking, master lever, duck ramps, `resync_pin` |
 | `pwrouter-agent/src/volume.rs` | the diagnostic path (`spike-*`): snapshot, stream→sink walk, lever |
-| `pwrouter-agent/src/desktop.rs` | tray icon + pairing notification (§8.1); status is display-only, the settings are Play to and Autostart |
+| `pwrouter-agent/src/desktop.rs` | tray icon + pairing notification (§8.1); status rows are display-only, the controls are volume/mute (§8.2), Play to and Autostart |
 | `pwrouter-agent/src/autostart.rs` | the embedded systemd unit and the enable/disable pair behind both the tray switch and the CLI (§10) |
 | `pw-control/` (own workspace root) | shared with the daemon: volume/route pods, the cubic scale, and the `pw_context_load_module` FFI neither `pipewire-rs` wraps nor either side should duplicate |
 | `bridge-daemon/src/outputs/pwsink/agent.rs` | daemon side: WS endpoint, token store, per-host command channel, keepalive |
 | `bridge-daemon/src/outputs/pwsink/discovery.rs` | diagnostic only, read by nothing (§3) |
 | `bridge-daemon/src/outputs/pwsink/server.rs` | the unchanged audio path |
-| `frontend/src/components/OutputsTab.svelte` | the pairing UI: a host waiting to pair is a discovered output card carrying the code, and Add/Unpair are its decisions |
+| `frontend/src/components/outputs/OutputsTab.svelte` | the pairing UI: a host waiting to pair is a discovered output card carrying the code, and Add/Unpair are its decisions |
+| `frontend/src/lib/outputs/level.ts` | which endpoint a volume/mute change goes to, for every output kind — one place, because both call sites guessing is what made pw-sink levels silently do nothing |
 | `custom_components/pipewire_audio_router/media_player.py` | `VOLUME_SET`/`VOLUME_MUTE` for pw-sink outputs with a connected agent |
 
 ## 13. Decisions and deferrals
@@ -598,5 +641,16 @@ A daemon built from this tree plus the real agent, both on the author's desktop:
   the graph-tracking half of the service path is proven by the cross-talk detection
   above, so what remains untested is `pw_thread`'s `target_sink()` resolution on a
   live session. **First thing to check after deploying.**
+
+  Partly answered on a deployed add-on (2026-08-12): the *read* half of that
+  resolution works live — the tray and the add-on's own Outputs page both showed a
+  real level for a routed host, which only happens once `target_sink()` has resolved
+  and `master_props` has read the device route. The **write** half is still unproven:
+  the UI was sending it to the wrong endpoint (`pipewire-sink-output.md` §4), so
+  `apply_master` had never been asked to do anything on that host. Both ends now send
+  it; the write is what to watch on the next deploy.
+- **The tray's volume/mute rows and the wheel gesture** (§8.2) — the state → menu
+  logic has tests, but nothing has yet confirmed a KDE/Xfce/GNOME host actually
+  *delivers* `Scroll` and `SecondaryActivate` to us, and hosts differ on both.
 - **An audible duck of foreign streams** (P3), and **sleep/resume** (§13.4) — both
   need normal day-to-day use rather than a test rig.

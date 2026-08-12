@@ -14,14 +14,31 @@
 //!   before: the log line. Nothing here can fail the agent, and nothing here is
 //!   the *only* way to reach any information — the journal keeps printing
 //!   everything, and the add-on UI shows the same code on the host's card.
-//! * **The menu shows state; it decides only what belongs to this machine.** The
-//!   add-on drives volume and what is routed here — a tray that could unpair or quit
-//!   would be a second, divergent way to manage a systemd unit that `Restart=always`
-//!   would undo anyway, so the status rows stay disabled. What *is* local to this
-//!   machine is which of its own outputs the audio should come out of, and whether
-//!   the session starts the agent by itself; those two are settings, and they live
-//!   here rather than in the add-on because the person at this keyboard is the one
-//!   who knows which speakers they mean.
+//! * **The menu shows state; it decides only what belongs to this machine.** A tray
+//!   that could unpair or quit would be a second, divergent way to manage a systemd
+//!   unit that `Restart=always` would undo anyway, so the status rows stay disabled.
+//!   What *is* local to this machine is which of its own outputs the audio should come
+//!   out of, and whether the session starts the agent by itself; those two are
+//!   settings, and they live here rather than in the add-on because the person at this
+//!   keyboard is the one who knows which speakers they mean.
+//! * **Volume and mute are the exception, and belong here too.** They are this
+//!   machine's own master out (§6) — the same lever `pavucontrol` and the volume keys
+//!   drive, which the agent controls but never owns (§9.4) — so a tray sitting next to
+//!   the desktop's own volume applet showing a read-only percentage was a worse answer
+//!   than letting it be turned. Nothing diverges: a change from here goes through the
+//!   same `pw_thread` command the add-on's own `set_volume` uses, and the resulting
+//!   graph change is published back to the add-on like any local one.
+//!
+//! **A real slider is not on offer, and cannot be.** `com.canonical.dbusmenu` — the
+//! only menu protocol a StatusNotifierItem has — has exactly four item types
+//! (standard, separator, checkmark, radio); the slider Ubuntu's sound indicator used was
+//! a non-standard `x-canonical` extension that only Unity ever rendered, and drawing a
+//! real one would mean a toolkit window, which this crate deliberately does not have
+//! (§8.1: pure Rust on zbus, so the cross-build and its GLIBC floor stay untouched). So
+//! "slider" here is the closest thing the protocol can express: **the mouse wheel over
+//! the icon** in 5 % steps, which is the gesture every desktop volume applet already
+//! answers to, plus a submenu of 10 % steps for pointing straight at a level, with the
+//! exact current percentage in its label so the coarse steps never misreport it.
 //!
 //! Tray support on Linux is [StatusNotifierItem] over D-Bus: KDE, Xfce, Cinnamon,
 //! MATE and most WM bars implement it natively; GNOME needs the AppIndicator
@@ -55,6 +72,17 @@ type TrayHandle = Arc<OnceLock<Handle<AgentTray>>>;
 const ICON: &str = "audio-speakers";
 /// Shown instead of [`ICON`] while the item is in `NeedsAttention`.
 const ATTENTION_ICON: &str = "dialog-password";
+/// Icon on the mute row. Legacy spelling for the same reason as [`ICON`].
+const MUTE_ICON: &str = "audio-volume-muted";
+
+/// Percentage points one wheel notch over the icon moves the volume. 5 is what
+/// desktop volume applets use: fine enough to land on a level, coarse enough that a
+/// normal flick of the wheel crosses the range.
+const SCROLL_STEP_PCT: i32 = 5;
+/// Granularity of the "point straight at a level" submenu. Ten rows is as many as a
+/// menu can carry without becoming a scroll region — the wheel covers everything
+/// between them, and the submenu's label carries the exact value.
+const MENU_STEP_PCT: u32 = 10;
 
 /// What a menu row asks the agent to do.
 ///
@@ -62,10 +90,19 @@ const ATTENTION_ICON: &str = "dialog-password";
 /// owns the config file and the PipeWire thread — persists it and acts on it, then
 /// publishes the result back. One writer for the config, and the menu can never end
 /// up showing a setting that was never stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+// The shared `Set` prefix is the point: each variant is an imperative, named after the
+// `DaemonMsg`/`Cmd` it ends up as, so the three ways to change this host's state read
+// the same wherever they appear.
+#[allow(clippy::enum_variant_names)]
 pub enum Request {
     /// Pin playback to this sink (`node.name`), or `None` to follow the default.
     SetTarget(Option<String>),
+    /// Master volume of the sink our stream lands in, cubic 0.0–1.0 — the same scale
+    /// and the same lever as the add-on's `set_volume` (§6), so the two cannot
+    /// disagree about what "50 %" means.
+    SetVolume(f32),
+    SetMute(bool),
 }
 
 /// Where the pairing stands, as far as this process knows.
@@ -164,9 +201,101 @@ impl AgentTray {
         choices
     }
 
+    /// The master level, when it is ours to show and to drive.
+    ///
+    /// `None` covers three cases that all mean "there is no lever here": not paired
+    /// (nothing has told us to receive anything), not receiving (no stream, so no sink
+    /// to follow — `pw_thread::target_sink`), or a sink with neither a device route nor
+    /// a node volume. The volume rows are gated on this rather than shown-and-inert: a
+    /// control that cannot move is worse than none, and `apply_master` would only fail
+    /// with "no target sink" anyway.
+    fn level(&self) -> Option<f32> {
+        if self.pairing != Pairing::Paired {
+            return None;
+        }
+        self.host.volume
+    }
+
+    fn level_pct(&self) -> Option<u32> {
+        self.level()
+            .map(|v| (v.clamp(0.0, 1.0) * 100.0).round() as u32)
+    }
+
+    /// The levels the submenu can point straight at, loudest first, so the rows read
+    /// top-to-bottom like a fader.
+    fn level_choices() -> Vec<u32> {
+        (0..=100 / MENU_STEP_PCT)
+            .rev()
+            .map(|i| i * MENU_STEP_PCT)
+            .collect()
+    }
+
+    /// Which row the radio sits on: the choice nearest the *actual* level, since the
+    /// level is continuous (the wheel, the volume keys, `pavucontrol`) and the rows are
+    /// not. The exact figure is in the submenu's own label, so a level between two rows
+    /// is never misreported — only rounded to the nearest mark.
+    fn selected_level_choice(&self) -> usize {
+        let pct = self.level_pct().unwrap_or(0);
+        let choices = Self::level_choices();
+        choices
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, choice)| choice.abs_diff(pct))
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    /// Asks for a level, and paints it at once so the menu (or the wheel) responds
+    /// immediately. The value shown is corrected a moment later by the graph event the
+    /// write causes, which is the authority — including when the write did not land.
+    fn request_level(&mut self, pct: i32) {
+        if self.level().is_none() {
+            return;
+        }
+        let pct = pct.clamp(0, 100);
+        let volume = pct as f32 / 100.0;
+        self.host.volume = Some(volume);
+        if let Some(requests) = &self.requests {
+            let _ = requests.try_send(Request::SetVolume(volume));
+        }
+    }
+
+    /// One wheel notch's worth of change, from wherever the level is now.
+    fn nudge_level(&mut self, delta_pct: i32) {
+        let Some(pct) = self.level_pct() else { return };
+        self.request_level(pct as i32 + delta_pct);
+    }
+
+    fn request_mute(&mut self, muted: bool) {
+        if self.level().is_none() {
+            return;
+        }
+        self.host.muted = Some(muted);
+        if let Some(requests) = &self.requests {
+            let _ = requests.try_send(Request::SetMute(muted));
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        // Unknown counts as unmuted, which is what the checkmark shows: the only lever
+        // that reports no mute state is a virtual sink, and there "make it quiet" is
+        // still the intention behind the click.
+        let muted = self.host.muted == Some(true);
+        self.request_mute(!muted);
+    }
+
     /// The menu's text, in order. Split out from [`Self::menu`] because this is
     /// the part worth testing: no D-Bus, no callbacks, just state → strings.
+    ///
+    /// `with_level` keeps the volume line for the tooltip, where text is all there is,
+    /// and drops it for the menu, which renders the same value as a control instead —
+    /// two rows saying the same thing, one of them inert, is exactly the passive
+    /// readout the control replaced.
     fn status_lines(&self) -> Vec<String> {
+        self.lines(true)
+    }
+
+    fn lines(&self, with_level: bool) -> Vec<String> {
         let mut lines = Vec::new();
         lines.push(match &self.pairing {
             Pairing::Unpaired => "Not paired yet".to_string(),
@@ -204,16 +333,15 @@ impl AgentTray {
                     _ => "Idle — nothing routed here".to_string(),
                 },
             });
-            if let Some(volume) = self.host.volume {
-                let muted = if self.host.muted == Some(true) {
-                    "  (muted)"
-                } else {
-                    ""
-                };
-                lines.push(format!(
-                    "Volume: {}%{muted}",
-                    (volume * 100.0).round() as i32
-                ));
+            if with_level {
+                if let Some(pct) = self.level_pct() {
+                    let muted = if self.host.muted == Some(true) {
+                        "  (muted)"
+                    } else {
+                        ""
+                    };
+                    lines.push(format!("Volume: {pct}%{muted}"));
+                }
             }
             if self.host.ducked {
                 lines.push("Other audio is turned down for an announcement".to_string());
@@ -255,7 +383,13 @@ impl ksni::Tray for AgentTray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
-        let lines = self.status_lines();
+        let mut lines = self.status_lines();
+        // Where the wheel gesture is discoverable at all: nothing about a tray icon
+        // says it can be scrolled, and a hint in the tooltip is how the desktop's own
+        // volume applet teaches the same thing.
+        if self.level().is_some() {
+            lines.push("Scroll here to change the volume, middle-click to mute".into());
+        }
         ksni::ToolTip {
             icon_name: if self.needs_attention() {
                 ATTENTION_ICON.into()
@@ -272,11 +406,33 @@ impl ksni::Tray for AgentTray {
     // interface, and an item that ignores a click reads as broken.
     const MENU_ON_ACTIVATE: bool = true;
 
+    /// The wheel over the icon — the tray's own volume gesture, and the nearest thing
+    /// to a slider `com.canonical.dbusmenu` can be given (see the module header).
+    ///
+    /// Both orientations are treated alike: a tilt wheel is rare, and "away from me /
+    /// to the right = louder" is the only mapping either could be expected to have.
+    /// `delta`'s magnitude is deliberately ignored — hosts scale it differently (Qt
+    /// hands on an angle in eighths of a degree, others send ±1) and one notch should
+    /// mean one step everywhere.
+    fn scroll(&mut self, delta: i32, _orientation: ksni::Orientation) {
+        match delta.signum() {
+            1 => self.nudge_level(SCROLL_STEP_PCT),
+            -1 => self.nudge_level(-SCROLL_STEP_PCT),
+            _ => {}
+        }
+    }
+
+    /// Middle click toggles mute, as it does on the desktop's own volume applet. The
+    /// menu's checkmark is the discoverable form; this is the one that is quick.
+    fn secondary_activate(&mut self, _x: i32, _y: i32) {
+        self.toggle_mute();
+    }
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
+        use ksni::menu::{CheckmarkItem, MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 
         let mut items: Vec<MenuItem<Self>> = self
-            .status_lines()
+            .lines(false)
             .into_iter()
             .map(|label| {
                 StandardItem {
@@ -291,6 +447,53 @@ impl ksni::Tray for AgentTray {
 
         // Everything below the separator: the only rows that do anything.
         let mut actions: Vec<MenuItem<Self>> = Vec::new();
+
+        // This machine's master volume and mute, first because they are what a tray
+        // icon next to the desktop's volume applet is reached for. Both are hidden
+        // outright when there is no lever (`level()`), rather than shown inert.
+        if let Some(pct) = self.level_pct() {
+            let choices = Self::level_choices();
+            let options: Vec<RadioItem> = choices
+                .iter()
+                .map(|choice| RadioItem {
+                    label: match choice {
+                        0 => "0% (silent)".to_string(),
+                        _ => format!("{choice}%"),
+                    },
+                    ..Default::default()
+                })
+                .collect();
+            actions.push(
+                SubMenu {
+                    // The exact level lives here, so the 10 % rows below never have to
+                    // stand in for a value they cannot represent.
+                    label: format!("Volume: {pct}%"),
+                    submenu: vec![RadioGroup {
+                        selected: self.selected_level_choice(),
+                        select: Box::new(move |this: &mut Self, index| {
+                            let Some(choice) = Self::level_choices().get(index).copied() else {
+                                return;
+                            };
+                            this.request_level(choice as i32);
+                        }),
+                        options,
+                    }
+                    .into()],
+                    ..Default::default()
+                }
+                .into(),
+            );
+            actions.push(
+                CheckmarkItem {
+                    label: "Mute".into(),
+                    checked: self.host.muted == Some(true),
+                    icon_name: MUTE_ICON.into(),
+                    activate: Box::new(|this: &mut Self| this.toggle_mute()),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
 
         // Which of this machine's outputs the audio comes out of. Hidden only when
         // the graph has told us nothing yet — an empty picker would read as "this
@@ -697,6 +900,9 @@ impl Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The wheel and middle-click handlers are trait methods, so exercising them the
+    // way a tray host does needs the trait in scope.
+    use ksni::Tray as _;
 
     fn tray(pairing: Pairing) -> AgentTray {
         AgentTray {
@@ -753,6 +959,127 @@ mod tests {
         assert_eq!(lines[0], "Paired");
         assert!(lines.iter().any(|l| l.contains("Idle")));
         assert!(!lines.iter().any(|l| l.starts_with("Volume")));
+    }
+
+    /// A paired host with a live master lever, plus the channel its tray choices go
+    /// out on — the state every volume/mute row is gated on.
+    fn tray_with_level(volume: f32) -> (AgentTray, tokio::sync::mpsc::Receiver<Request>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::client::REQUEST_DEPTH);
+        let mut t = tray(Pairing::Paired);
+        t.host = HostState {
+            volume: Some(volume),
+            muted: Some(false),
+            sink_name: Some("alsa_output.pci-0000_00_1f.3".into()),
+            receiving: true,
+            ducked: false,
+        };
+        t.requests = Some(tx);
+        (t, rx)
+    }
+
+    #[test]
+    fn the_menu_shows_the_level_as_a_control_and_the_tooltip_as_text() {
+        // The two surfaces differ on purpose: the tooltip is text only, so it keeps the
+        // percentage; the menu renders the same value as a submenu plus a mute
+        // checkmark, and repeating it as an inert row would be the passive readout
+        // those controls replaced.
+        let (t, _rx) = tray_with_level(0.42);
+        assert!(t.status_lines().contains(&"Volume: 42%".to_string()));
+        assert!(!t.lines(false).iter().any(|l| l.starts_with("Volume")));
+        // Everything else survives the split.
+        assert!(t.lines(false).iter().any(|l| l.starts_with("Playing to")));
+    }
+
+    #[test]
+    fn the_level_rows_are_offered_only_where_there_is_a_lever() {
+        // Not receiving: `target_sink` resolves to nothing, so a slider could only
+        // fail. Not paired: nothing has asked this host to receive anything yet.
+        assert_eq!(tray(Pairing::Paired).level(), None);
+        let mut unpaired = tray(Pairing::Unpaired);
+        unpaired.host = HostState {
+            volume: Some(0.5),
+            receiving: true,
+            ..Default::default()
+        };
+        assert_eq!(unpaired.level(), None);
+        assert_eq!(tray_with_level(0.5).0.level_pct(), Some(50));
+    }
+
+    #[test]
+    fn the_level_submenu_marks_the_nearest_step_to_the_real_value() {
+        // The rows are 10 % apart and the level is continuous (wheel, volume keys,
+        // pavucontrol), so the radio rounds — and the exact figure stays in the
+        // submenu's label, which is why rounding here is safe.
+        let choices = AgentTray::level_choices();
+        assert_eq!(choices.first(), Some(&100), "loudest first, like a fader");
+        assert_eq!(choices.last(), Some(&0));
+        assert_eq!(choices.len(), 11);
+        let selected = |v: f32| choices[tray_with_level(v).0.selected_level_choice()];
+        assert_eq!(selected(0.42), 40);
+        assert_eq!(selected(0.46), 50);
+        assert_eq!(selected(1.0), 100);
+        assert_eq!(selected(0.0), 0);
+    }
+
+    /// The level one request asks for, in whole percent — compared this way rather
+    /// than against an `f32` literal, since the value is a percentage that made a
+    /// round trip through a float.
+    fn asked_pct(request: Request) -> u32 {
+        match request {
+            Request::SetVolume(volume) => (volume * 100.0).round() as u32,
+            other => panic!("expected a volume request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wheel_notch_asks_for_one_step_and_paints_it_at_once() {
+        let (mut t, mut rx) = tray_with_level(0.42);
+        t.scroll(120, ksni::Orientation::Vertical);
+        assert_eq!(asked_pct(rx.try_recv().expect("a request")), 47);
+        // Painted immediately, so a second notch steps from where the first left off
+        // instead of from a value the graph has not caught up with yet.
+        assert_eq!(t.level_pct(), Some(47));
+        // Magnitude is ignored (hosts scale `delta` differently) and a tilt wheel maps
+        // the same way as a vertical one.
+        t.scroll(-1, ksni::Orientation::Horizontal);
+        assert_eq!(asked_pct(rx.try_recv().expect("a request")), 42);
+    }
+
+    #[test]
+    fn a_host_with_no_lever_sends_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::client::REQUEST_DEPTH);
+        let mut t = tray(Pairing::Paired); // paired, but not receiving
+        t.requests = Some(tx);
+        t.scroll(120, ksni::Orientation::Vertical);
+        t.toggle_mute();
+        assert!(rx.try_recv().is_err(), "nothing to drive, nothing to send");
+    }
+
+    #[test]
+    fn the_level_never_leaves_0_100() {
+        let (mut t, mut rx) = tray_with_level(0.97);
+        t.scroll(1, ksni::Orientation::Vertical);
+        assert_eq!(asked_pct(rx.try_recv().expect("a request")), 100);
+        let (mut t, mut rx) = tray_with_level(0.02);
+        t.scroll(-1, ksni::Orientation::Vertical);
+        assert_eq!(asked_pct(rx.try_recv().expect("a request")), 0);
+    }
+
+    #[test]
+    fn mute_toggles_from_what_the_host_reports() {
+        let (mut t, mut rx) = tray_with_level(0.42);
+        t.secondary_activate(0, 0);
+        assert_eq!(rx.try_recv().expect("a request"), Request::SetMute(true));
+        assert_eq!(t.host.muted, Some(true));
+        t.secondary_activate(0, 0);
+        assert_eq!(rx.try_recv().expect("a request"), Request::SetMute(false));
+
+        // A sink that reports no mute state (a virtual sink) still gets the click: the
+        // lever works there, only the read-back is silent.
+        let (mut t, mut rx) = tray_with_level(0.42);
+        t.host.muted = None;
+        t.toggle_mute();
+        assert_eq!(rx.try_recv().expect("a request"), Request::SetMute(true));
     }
 
     #[test]
