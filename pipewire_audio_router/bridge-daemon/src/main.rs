@@ -1,5 +1,3 @@
-mod airplay_clients;
-mod airplay_source;
 mod align;
 mod announce;
 mod announce_arbiter;
@@ -14,9 +12,7 @@ mod ap2_volume;
 mod api;
 mod applemidi_sender;
 mod audio;
-mod bt_bridge_discovery;
 mod discovery_supervisor;
-mod now_playing;
 mod overlay_mixer;
 mod per_device_spike;
 mod pw;
@@ -28,13 +24,12 @@ mod pw_target_liveness;
 mod pwsink_agent;
 mod pwsink_server;
 mod routing;
-mod rtp_source;
 mod sendspin_codec;
 mod sendspin_discovery;
 mod sendspin_liveness;
 mod sendspin_server;
 mod sendspin_volume;
-mod sources_store;
+mod sources;
 mod store;
 mod sync_group;
 mod sync_settings;
@@ -140,15 +135,15 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let groups_config_path = routing_path.with_file_name("groups.json");
     crate::store::migration::migrate_raop_prefixes(routing_path, &groups_config_path);
 
-    let sources = sources_store::SourcesStore::load(sources_path)?;
+    let sources = crate::sources::SourcesStore::load(sources_path)?;
     {
         let list = sources.list();
-        let airplay = list.iter().filter(|e| matches!(e.config, sources_store::SourceConfig::Airplay(_))).count();
-        let rtp = list.iter().filter(|e| matches!(e.config, sources_store::SourceConfig::Rtp(_))).count();
+        let airplay = list.iter().filter(|e| matches!(e.config, crate::sources::SourceConfig::Airplay(_))).count();
+        let rtp = list.iter().filter(|e| matches!(e.config, crate::sources::SourceConfig::Rtp(_))).count();
         tracing::info!("sources: {} configured ({airplay} AirPlay, {rtp} RTP) in {}", list.len(), sources_path.display());
     }
     // Anti-takeover is now per-receiver: each running AirplayHandle owns its own
-    // flag (seeded from that source's stored config by airplay_source::reconcile),
+    // flag (seeded from that source's stored config by crate::sources::airplay::reconcile),
     // so there's no single process-wide flag here anymore.
     let sources = std::sync::Arc::new(std::sync::Mutex::new(sources));
 
@@ -217,7 +212,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // One backing file beside sources.json in /data holds a client list per
     // source id; loads with everyone marked disconnected.
     let airplay_clients_path = sources_path.with_file_name("airplay_clients.json");
-    let airplay_clients = airplay_clients::AirplayClientStore::load(&airplay_clients_path)?;
+    let airplay_clients = crate::sources::airplay_clients::AirplayClientStore::load(&airplay_clients_path)?;
     tracing::info!("{} remembered AirPlay client(s) in {}", airplay_clients.total_clients(), airplay_clients_path.display());
     let meters = pw::metering::MeterHub::new();
     let sendspin_control = sendspin_volume::shared();
@@ -235,19 +230,20 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // too. Kept because "that host advertises a session" is worth a log line; read
     // by nothing but its own liveness bookkeeping.
     let pw_targets: pw_target_discovery::SharedPwTargets = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-    // Discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs): Pis advertising
+    // Discovered Bluetooth→RTP bridges (sources/bt_bridge.rs): Pis advertising
     // `_pwrouter-btbridge._tcp`. These are input *senders*, so unlike the four
     // registries above they drive no audio path — they let the Sources tab offer
     // one-click adoption and a link to a bridge's diagnostics page.
-    let bt_bridges: bt_bridge_discovery::SharedBtBridges = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let bt_bridges: crate::sources::bt_bridge::SharedBtBridges =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     let (pw_state, changes, pw_cmd, xruns) = pw::thread::spawn()?;
 
-    // Per-source now-playing metadata (now_playing.rs). Purely in-memory: it
+    // Per-source now-playing metadata (sources/now_playing.rs). Purely in-memory: it
     // describes what is playing *right now*, so there is nothing worth persisting
     // across a restart — a live producer re-reports within seconds, and a stale
     // track restored from disk would be a lie.
-    let now_playing = now_playing::NowPlayingStore::new(changes.clone());
+    let now_playing = crate::sources::now_playing::NowPlayingStore::new(changes.clone());
 
     // Paired receiver agents (pwsink_agent.rs): the token store *and* the source
     // of truth for pw-sink targets — a pw-sink output exists because a helper on
@@ -560,15 +556,15 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     })
 }
 
-/// Starts the persisted sources: the native AirPlay receiver (airplay_source.rs)
+/// Starts the persisted sources: the native AirPlay receiver (sources/airplay.rs)
 /// and the RTP source (a PipeWire module). (Sendspin devices aren't started
 /// here — they're auto-discovered and grouped from the routing intent; see
 /// sync_group.rs.)
 async fn spawn_stored_sources(
     sources: &api::SharedSources,
     airplay: &api::SharedAirplay,
-    airplay_clients: &airplay_clients::AirplayClientStore,
-    now_playing: &now_playing::NowPlayingStore,
+    airplay_clients: &crate::sources::airplay_clients::AirplayClientStore,
+    now_playing: &crate::sources::now_playing::NowPlayingStore,
     pw: &pw::thread::SharedState,
     pw_cmd: pw::thread::PwCommandSender,
 ) {
@@ -583,12 +579,12 @@ async fn spawn_stored_sources(
     // supervisor. reconcile loads one module per stored RTP source and unloads
     // any orphans; a failed load is logged inside, not fatal — each can be
     // re-enabled live via the API.
-    rtp_source::reconcile(&entries, &pw_cmd, pw).await;
+    crate::sources::rtp::reconcile(&entries, &pw_cmd, pw).await;
 
     // Every configured AirPlay receiver (one per AirPlay source with a name):
     // the reconciler starts each on its own node/port/mDNS name with its own
     // per-source client registry + anti-takeover flag.
-    airplay_source::reconcile(airplay, &entries, airplay_clients, now_playing).await;
+    crate::sources::airplay::reconcile(airplay, &entries, airplay_clients, now_playing).await;
 }
 
 /// Completes on SIGTERM or SIGINT — the trigger for axum's graceful shutdown.

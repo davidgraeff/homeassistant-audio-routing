@@ -120,10 +120,10 @@ struct Inner {
     ap2_ptp: SharedAp2Ptp,
     /// Discovered pw-sink targets (pw_target_discovery.rs).
     pw_targets: crate::pw_target_discovery::SharedPwTargets,
-    /// Discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs). Unlike the
+    /// Discovered Bluetooth→RTP bridges (sources/bt_bridge.rs). Unlike the
     /// others these are not outputs and build no audio path — they annotate RTP
     /// *sources* with their sender's identity and diagnostics page.
-    bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
+    bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
     changes: ChangeNotifier,
 }
 
@@ -136,7 +136,7 @@ impl DiscoverySupervisor {
         ap2_devices: SharedAp2Devices,
         ap2_ptp: SharedAp2Ptp,
         pw_targets: crate::pw_target_discovery::SharedPwTargets,
-        bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
+        bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
         changes: ChangeNotifier,
     ) -> Self {
         Self(Arc::new(Mutex::new(Inner { running: None, devices, ap2_devices, ap2_ptp, pw_targets, bt_bridges, changes })))
@@ -160,7 +160,7 @@ impl DiscoverySupervisor {
             sendspin_discovery::spawn(&daemon, inner.devices.clone(), inner.changes.clone())?;
             ap2_discovery::spawn(&daemon, inner.ap2_devices.clone(), inner.changes.clone(), inner.ap2_ptp.clone())?;
             crate::pw_target_discovery::spawn(&daemon, inner.pw_targets.clone(), inner.changes.clone())?;
-            crate::bt_bridge_discovery::spawn(&daemon, inner.bt_bridges.clone(), inner.changes.clone())?;
+            crate::sources::bt_bridge::spawn(&daemon, inner.bt_bridges.clone(), inner.changes.clone())?;
             Ok(())
         })();
         if let Err(e) = spawned {

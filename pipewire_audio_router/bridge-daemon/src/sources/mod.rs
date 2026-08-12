@@ -1,4 +1,17 @@
-//! Persistent, runtime-managed config for the daemon's input sources.
+//! Audio **into** the graph: the source collection, and the receivers it runs.
+//!
+//! [`airplay`] is the in-process AirPlay-1/2 receiver (one per configured source,
+//! each with its own [`airplay_clients`] registry of remembered senders, bans and
+//! priorities), [`rtp`] the multicast/unicast RTP input a Bluetooth bridge feeds,
+//! [`bt_bridge`] the discovery of those bridges — which are *senders*, not
+//! outputs: they build no audio path, they annotate an RTP source with which
+//! bridge feeds it. [`now_playing`] holds what each input is currently playing,
+//! from whichever producer can say (the receiver's DMAP callbacks locally, a Pi
+//! reporter over the API remotely).
+//!
+//! This module itself is the persisted source collection *and* its reconciler: it
+//! is what starts and stops the receivers when the stored list changes, which is
+//! why it is not one of the pure `store/` modules (see `store/mod.rs`).
 //!
 //! Historically this stored *exactly one* AirPlay-receive source (a name +
 //! three knobs) and *exactly one* Bluetooth-bridge RTP source. It is now a
@@ -33,8 +46,14 @@
 //! (sendspin_discovery.rs) and grouped from the routing intent
 //! (sync_group.rs), so there's nothing per-output to persist.)
 
-use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
-use crate::rtp_source::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
+pub(crate) mod airplay;
+pub(crate) mod airplay_clients;
+pub(crate) mod bt_bridge;
+pub(crate) mod now_playing;
+pub(crate) mod rtp;
+
+use crate::sources::airplay::DEFAULT_AIRPLAY_LATENCY_MSEC;
+use crate::sources::rtp::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -86,7 +105,7 @@ impl Default for AirplaySourceConfig {
 /// `port` it listens on (must match the firmware's target) and the jitter-buffer
 /// `latency_msec` (traded up on weak-signal installs to ride out dropped
 /// packets). The rest of the wire format is fixed by the firmware — see
-/// rtp_source.rs.
+/// sources/rtp.rs.
 ///
 /// `latency_msec` has a `serde(default)` so a config file written by an older
 /// daemon (port only) still loads, defaulting to the sane 200 ms.
@@ -105,7 +124,7 @@ pub struct RtpSourceConfig {
     /// "Only one client" mode that stops a stray/second sender from corrupting
     /// the stream (needs a firmware with a stable SSRC). `serde(default)` keeps
     /// old config files — and installs with not-yet-reflashed bridges — on the
-    /// safe `true`. See rtp_source.rs.
+    /// safe `true`. See sources/rtp.rs.
     #[serde(default = "default_rtp_ignore_ssrc")]
     pub ignore_ssrc: bool,
     /// `audio.rate` the receiver decodes at — must match the sender's wire rate.

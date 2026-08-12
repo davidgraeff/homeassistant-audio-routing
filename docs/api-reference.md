@@ -267,7 +267,7 @@ device actually negotiated.
 
 Full CRUD over the router's inputs, persisted in a daemon-owned store
 (`/data/sources.json`) that starts empty on a fresh install (no `options.json`
-seeding) and is managed live here with no restart (`sources_store.rs`).
+seeding) and is managed live here with no restart (`sources.rs`).
 
 > **These endpoints replaced the singular `/api/source/rtp` and
 > `/api/source/airplay`**, which no longer exist. The router now supports **several
@@ -278,8 +278,8 @@ Two kinds exist, both running **natively in-process** — no supervised subproce
 
 | `kind` | Implementation |
 |---|---|
-| `airplay` | native embedded AirPlay/RAOP **receiver** (vendored+patched pure-Rust `shairplay`, `airplay_source.rs`) — not a `shairport-sync` subprocess |
-| `rtp` | native `libpipewire-module-rtp-source` (`rtp_source.rs`), e.g. the [Bluetooth bridge](../firmware/pi-bridge/README.md) |
+| `airplay` | native embedded AirPlay/RAOP **receiver** (vendored+patched pure-Rust `shairplay`, `sources/airplay.rs`) — not a `shairport-sync` subprocess |
+| `rtp` | native `libpipewire-module-rtp-source` (`sources/rtp.rs`), e.g. the [Bluetooth bridge](../firmware/pi-bridge/README.md) |
 
 Creating or updating a source loads/starts it immediately; deleting one unloads it.
 Sendspin, AirPlay-2 and pw-sink **outputs** are auto-discovered, not configured — see
@@ -358,7 +358,7 @@ entry. Unknown `id` → 404.
 | `rate` | sample rate, **default `48000`** — must match what the sender transmits |
 
 Everything else is fixed to match the bridge's wire format: native-endian **`S16LE`**
-(*not* RFC 3551's big-endian `L16`), stereo. See `bridge-daemon/src/rtp_source.rs`.
+(*not* RFC 3551's big-endian `L16`), stereo. See `bridge-daemon/src/sources/rtp.rs`.
 
 > **Leave `ignore_ssrc` at `true` unless you specifically want single-sender locking.**
 > With `true` the module never rejects a packet on SSRC grounds, so a sender that
@@ -422,7 +422,7 @@ and applied to the running receiver live, with no restart.
 What each source is currently playing — title, artist, album, position and cover art —
 from whichever producer can say. See
 [source-metadata-plan.md](source-metadata-plan.md) for the model and
-`bridge-daemon/src/now_playing.rs` for the implementation.
+`bridge-daemon/src/sources/now_playing.rs` for the implementation.
 
 **Keyed by source *node name*, not source id.** That is the key the routing matrix, the
 persisted routing intent and the Home Assistant integration already share, and it is what

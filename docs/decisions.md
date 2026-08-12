@@ -205,7 +205,7 @@ Samsung S23 → RTP → add-on → speakers), not a preference.
   static Avahi service file advertising `_pwrouter-btbridge._tcp` on the
   diagnostics port, with the stream parameters (`rtp_port`, `rtp_dest`,
   `rate`, `fmt`, `channels`) in TXT. The add-on browses it
-  (`bt_bridge_discovery.rs`), which buys **one-click adoption** of a bridge
+  (`sources/bt_bridge.rs`), which buys **one-click adoption** of a bridge
   with its real parameters prefilled — a typo'd port is indistinguishable
   from a bridge that isn't sending — and a **link to the bridge's
   diagnostics page**.

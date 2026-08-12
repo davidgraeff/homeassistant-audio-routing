@@ -62,7 +62,7 @@ subprocess stderr. See
 
 | Source | Node | How it gets into the graph |
 |---|---|---|
-| **AirPlay receive** | `airplay-in` | Native, in-process RAOP receiver — vendored+patched pure-Rust `shairplay` crate (`airplay_source.rs`). Decoded f32 PCM is pushed through a jitter buffer into a PipeWire producer node. |
+| **AirPlay receive** | `airplay-in` | Native, in-process RAOP receiver — vendored+patched pure-Rust `shairplay` crate (`sources/airplay.rs`). Decoded f32 PCM is pushed through a jitter buffer into a PipeWire producer node. |
 | **RTP** | `bt-bridge-rtp` (or similar) | PipeWire's `rtp-source` module, fed by the ESP32 / Pi Bluetooth bridge over RTP/UDP. Can bind a multicast group so several PipeWire hosts share one bridge stream. |
 
 The AirPlay path is the interesting one for the AP2 flow below:
@@ -467,7 +467,7 @@ not required (revisit only if a stall traces to CPU contention).
 | `libairptp` | **FIFO 55** | gPTP event loop (Sync/Follow_Up 8×/s). Timer accuracy is what makes receivers lock; a starved SCHED_OTHER loop dilated the 125 ms timer ~48×. |
 | `rt-sender` | **FIFO 50** | AP2 RTP egress, `clock_nanosleep` paced. |
 | `ap2-producer` | **FIFO 48** | AP2 ALAC encode + encrypt (`run_streamer`, own current-thread runtime). |
-| capture / producer feeder mainloops | **FIFO 45** | `pw/capture.rs` / `airplay_source.rs` PipeWire mainloops — low-impact for steady audio (that's on `data-loop`), protects the *control* path (reconnect/flush/stop) under load. |
+| capture / producer feeder mainloops | **FIFO 45** | `pw/capture.rs` / `sources/airplay.rs` PipeWire mainloops — low-impact for steady audio (that's on `data-loop`), protects the *control* path (reconnect/flush/stop) under load. |
 | `ap2-relay`, `sendspin-relay` | **FIFO 40** | Capture→sender fan-out relays. |
 
 `CAP_SYS_NICE` (`config.yaml` `privileged: [SYS_NICE]`) bypasses the
@@ -539,7 +539,7 @@ and PipeWire does the SRC in-graph on its RT thread.
   not on the steady hot path.
 - **Off-rate AirPlay senders** are the other exception: a sender that does
   not use 44.1 kHz/stereo gets a one-off linear resample in Rust at ingest
-  (`airplay_source.rs`) before the ring. The common 44.1 kHz/stereo case is
+  (`sources/airplay.rs`) before the ring. The common 44.1 kHz/stereo case is
   a zero-cost passthrough, and the steady 44.1↔48 kHz conversions are all
   in-graph — so no steady Rust resampling on the hot path.
 
@@ -577,7 +577,7 @@ flow in text.
  INGEST (airplay-in)     │ AirPlay sender (phone / Mac / PipeWire host)               │
                          │        │  RTP/RTSP over WiFi                                │
                          │        ▼                                                    │
-                         │ shairplay: recv + decrypt + ALAC/AAC decode  [tokio]        │  airplay_source.rs
+                         │ shairplay: recv + decrypt + ALAC/AAC decode  [tokio]        │  sources/airplay.rs
                          │        ▼                                                    │
                          │ jitter buffer: lock-free SPSC ring (rtrb, 150 ms) [yellow]  │
                          └─────────────────────────────────────────────────────────┘

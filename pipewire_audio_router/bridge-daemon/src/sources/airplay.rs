@@ -14,9 +14,9 @@
 //! as a routable source — outputting silence when idle. A `mem`-cheap peak
 //! level is computed inline from the received PCM for the UI meter.
 
-use crate::airplay_clients::{self, AirplayClientStore, SharedAirplayClients};
-use crate::now_playing::{MetadataUpdate, NowPlayingReporter, PlaybackState};
-use crate::sources_store::{AirplaySourceConfig, SourceConfig, SourceEntry, SourceId};
+use crate::sources::airplay_clients::{self, AirplayClientStore, SharedAirplayClients};
+use crate::sources::now_playing::{MetadataUpdate, NowPlayingReporter, PlaybackState};
+use crate::sources::{AirplaySourceConfig, SourceConfig, SourceEntry, SourceId};
 use crate::util::locks::LockRecover;
 use pipewire as pw;
 use pw::spa;
@@ -49,7 +49,7 @@ const CHANNELS: usize = 2;
 /// drift; without a cushion the producer ring underruns and you hear stutter.
 /// The producer prebuffers this much before draining and re-buffers on
 /// underrun. 150 ms rides out LAN jitter + drift while staying imperceptible
-/// for one-way audio. Stored per install (sources_store.rs) and settable via
+/// for one-way audio. Stored per install (sources.rs) and settable via
 /// `/api/sources`, so a noisy install can trade latency for fewer
 /// dropouts.
 /// Node name of the old single AirPlay source. Production names sources
@@ -194,7 +194,9 @@ pub async fn start(
     // the logs WITHOUT a preceding `USER ACTION: set AirPlay source`, the receiver
     // is being restarted by the stack (a bug) rather than by a human — that's the
     // signal distinguishing the two for the `airplay-in` cycling investigation.
-    tracing::info!("STACK: airplay_source::start — (re)starting AirPlay receiver node={node_name:?} (name={service_name:?}, port={port})");
+    tracing::info!(
+        "STACK: sources::airplay::start — (re)starting AirPlay receiver node={node_name:?} (name={service_name:?}, port={port})"
+    );
     // Fresh receiver: nothing is streaming yet, so clear any stale live flags a
     // prior handle might have left (a restart that skipped a disconnect).
     clients.reset_connected();
@@ -242,7 +244,7 @@ pub async fn start(
 /// `main.rs`/`AppState` and reconciled against the [`SourcesStore`] by
 /// [`reconcile`]. `tokio` mutex because start/stop `.await`.
 ///
-/// [`SourcesStore`]: crate::sources_store::SourcesStore
+/// [`SourcesStore`]: crate::sources::SourcesStore
 pub type SharedAirplayMap = Arc<tokio::sync::Mutex<BTreeMap<SourceId, AirplayHandle>>>;
 
 /// Reconcile the running AirPlay receivers against the stored source list:
@@ -258,7 +260,7 @@ pub async fn reconcile(
     map: &SharedAirplayMap,
     entries: &[SourceEntry],
     clients: &AirplayClientStore,
-    now_playing: &crate::now_playing::NowPlayingStore,
+    now_playing: &crate::sources::now_playing::NowPlayingStore,
 ) {
     // Desired = AirPlay entries with a non-blank label. A blank label is the
     // "knobs configured but disabled" state (matches the singular era, where an
@@ -335,11 +337,11 @@ struct Handler {
     flush: Arc<AtomicBool>,
     peak: Arc<AtomicU32>,
     /// Persistent registry of senders — updated on connect/name/disconnect for
-    /// the Sources-tab connection list (airplay_clients.rs).
+    /// the Sources-tab connection list (sources/airplay_clients.rs).
     clients: SharedAirplayClients,
     /// Live anti-takeover policy, consulted in `authorize_session`.
     prevent_takeover: SharedPreventTakeover,
-    /// Now-playing sink for this source (now_playing.rs). A sender pushes DMAP
+    /// Now-playing sink for this source (sources/now_playing.rs). A sender pushes DMAP
     /// metadata, cover art and progress as three separate RTSP `SET_PARAMETER`
     /// requests, in no guaranteed order; each lands in one callback below.
     now_playing: NowPlayingReporter,
@@ -412,11 +414,11 @@ impl AudioHandler for Handler {
         self.flush.store(true, Ordering::Relaxed);
         // The session is over, so the track is not playing any more. Clearing
         // rather than leaving it to the TTL is what stops Home Assistant showing
-        // last night's song (now_playing.rs).
+        // last night's song (sources/now_playing.rs).
         self.now_playing.clear();
     }
 
-    // --- Now-playing (now_playing.rs) ---
+    // --- Now-playing (sources/now_playing.rs) ---
     //
     // The library parses DMAP for us and offers these as no-ops; this source is
     // the richest metadata producer in the system precisely because a sender

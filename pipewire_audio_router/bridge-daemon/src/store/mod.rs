@@ -12,7 +12,7 @@
 //! The entry condition, and what makes this directory more than a filing choice:
 //! **a store may depend on nothing but [`crate::util`] and its siblings here.** No
 //! registry, no senders, no discovery. A module that needs those is not a store,
-//! it is a supervisor that persists — which is why `sources_store.rs` is *not*
+//! it is a supervisor that persists — which is why `sources/mod.rs` is *not*
 //! here (it reconciles live AirPlay and RTP handles) and neither is
 //! `sync_settings.rs` (it pushes settings into the senders on write). Keeping the
 //! rule means these files can be read, tested and reasoned about without the rest

@@ -165,7 +165,7 @@ Sendspin) so the per-chunk `mix_into` is pure sample-addition. The planned
 "pre-resample via PipeWire, cached" wasn't needed — a one-shot Rust resample
 at overlay start is simpler and is not per-quantum. (2) An off-rate AirPlay
 *ingest* sender (not 44.1 kHz/stereo) gets a one-off linear resample in
-`airplay_source.rs` before the ring; the common case is a passthrough.
+`sources/airplay.rs` before the ring; the common case is a passthrough.
 Full rules in [architecture.md](architecture.md#8-sample-rate-harmonization).
 
 ## mDNS: one shared LAN-restricted daemon, not one per browser/advertiser
@@ -589,7 +589,7 @@ pipe/stdout only), so its decoded audio never reached the graph — the source
 could never appear in the routing matrix or be routed. It's replaced by a
 **native, in-process RAOP receiver**: a pure-Rust `shairplay` crate whose
 `AudioHandler` callback hands us decoded f32 PCM, which we push through a
-jitter buffer into a PipeWire source node (`airplay_source.rs`). This removes
+jitter buffer into a PipeWire source node (`sources/airplay.rs`). This removes
 the last supervised subprocess *and* the D-Bus-system-bus + avahi requirement
 shairport-sync needed.
 

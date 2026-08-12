@@ -50,7 +50,7 @@ mdns-sd = "0.20"
 # stutter cause (RC1, docs/audio-jitter-analysis.md). Already in the build tree
 # via the vendored crates.
 libc = "0.2"
-# Lock-free SPSC ring for the AirPlay ingest jitter buffer (airplay_source.rs):
+# Lock-free SPSC ring for the AirPlay ingest jitter buffer (sources/airplay.rs):
 # the RT process callback (now RT_PROCESS, on the graph data-loop) must pop
 # without ever blocking on the decode thread — the old Mutex<VecDeque> could
 # stall the graph cycle → airplay-in xruns → stutter on every output (RC1/RC2,

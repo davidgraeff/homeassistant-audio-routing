@@ -21,8 +21,10 @@ should graduate into [`decisions.md`](decisions.md).
   §3 rows 3–13. Preceded by a standalone commit clearing the three pre-existing
   `cargo fmt` findings, so the fmt baseline is now **zero** (§4 wave 0, §9).
 - **wave 2** — `store/`, 5 files plus a new `mod.rs`. §3 rows 14–18.
+- **wave 3** — `sources/`, 6 files (`sources_store.rs` became the `mod.rs`).
+  §3 rows 19–24.
 
-**Remaining:** 37 files still flat at the crate root. Waves 3–7 (§4).
+**Remaining:** 31 files still flat at the crate root. Waves 4–7 (§4).
 
 The align wave went first, out of order (§4 lists it as wave 5), and it was not a
 leaf when it did: **eight files outside `align/` reach into it** — `api.rs`,
@@ -206,7 +208,7 @@ by subject.
 
 ## 3. Full rename table
 
-60 files, of which 23 have landed. `★` marks the two moves that change meaning
+60 files, of which 29 have landed. `★` marks the two moves that change meaning
 rather than location; everything else is pure relocation. The `mod.rs` files each
 directory needs are new files, not rows here — `align/mod.rs` was written from
 scratch (§2, "Directory module style").
@@ -231,12 +233,12 @@ scratch (§2, "Directory module style").
 | 16 ✔ | `groups_store.rs` | `store/groups.rs` |
 | 17 ✔ | `settings_store.rs` | `store/settings.rs` |
 | 18 ✔ | `raop_migration.rs` | `store/migration.rs` |
-| 19 | `sources_store.rs` | `sources/mod.rs` |
-| 20 | `airplay_source.rs` | `sources/airplay.rs` |
-| 21 | `airplay_clients.rs` | `sources/airplay_clients.rs` |
-| 22 | `rtp_source.rs` | `sources/rtp.rs` |
-| 23 | `now_playing.rs` | `sources/now_playing.rs` |
-| 24 | `bt_bridge_discovery.rs` | `sources/bt_bridge.rs` |
+| 19 ✔ | `sources_store.rs` | `sources/mod.rs` |
+| 20 ✔ | `airplay_source.rs` | `sources/airplay.rs` |
+| 21 ✔ | `airplay_clients.rs` | `sources/airplay_clients.rs` |
+| 22 ✔ | `rtp_source.rs` | `sources/rtp.rs` |
+| 23 ✔ | `now_playing.rs` | `sources/now_playing.rs` |
+| 24 ✔ | `bt_bridge_discovery.rs` | `sources/bt_bridge.rs` |
 | 25 | `overlay_mixer.rs` | `outputs/overlay_mixer.rs` |
 | 26 ✔ | `relay_delay.rs` | `align/relay_delay.rs` — §10.3, not `outputs/` |
 | 27 | `sendspin_server.rs` | `outputs/sendspin/server.rs` |

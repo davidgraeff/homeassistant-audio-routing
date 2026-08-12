@@ -169,7 +169,7 @@ can be null — identify it by the unique FIFO-55 priority, not the name.)
 
 `grep "USER ACTION"` in the daemon log marks every routing-graph/source
 mutation (link/unlink/forget/route/unroute/set-airplay-source/
-add-remove-output); a `STACK:` marker on `airplay_source::start`
+add-remove-output); a `STACK:` marker on `sources::airplay::start`
 distinguishes human actions from stack-driven churn.
 
 ## mDNS storm / high CPU

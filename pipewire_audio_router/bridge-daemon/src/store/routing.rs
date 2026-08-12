@@ -10,7 +10,7 @@
 //! endpoint isn't currently in the graph is "offline" — retained here, shown
 //! grayed in the UI, and re-linked the moment the node returns.
 //!
-//! Mirrors the other `/data` stores (sources_store.rs): no `options.json`
+//! Mirrors the other `/data` stores (sources.rs): no `options.json`
 //! seeding, starts empty, the file is authoritative and created on first
 //! mutation.
 

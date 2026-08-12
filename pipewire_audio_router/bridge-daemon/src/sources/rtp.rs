@@ -20,7 +20,7 @@
 //! firmware/bt-bridge/README.md and docs/decisions.md "Bluetooth bridge box".
 
 use crate::pw::thread::{PwCommand, PwCommandSender, SharedState};
-use crate::sources_store::{RtpSourceConfig, SourceConfig, SourceEntry, LEGACY_RTP_ID};
+use crate::sources::{RtpSourceConfig, SourceConfig, SourceEntry, LEGACY_RTP_ID};
 use crate::util::locks::LockRecover;
 use std::fmt::Write as _;
 use tokio::sync::oneshot;
@@ -31,7 +31,7 @@ pub const RTP_SOURCE_MODULE_NAME: &str = "libpipewire-module-rtp-source";
 /// Default UDP port the source listens on — matches the example in
 /// firmware/bt-bridge/README.md. The firmware's target port is itself
 /// HA-configurable, so this is only a sane default; the real value is stored
-/// per install (sources_store.rs) and settable via the API.
+/// per install (sources.rs) and settable via the API.
 pub const DEFAULT_RTP_PORT: u16 = 46000;
 
 /// Default receiver-side jitter buffer target, in milliseconds. The module's
@@ -41,7 +41,7 @@ pub const DEFAULT_RTP_PORT: u16 = 46000;
 /// jitter and stops the underruns heard as stutter, at the cost of ~100 ms
 /// extra latency — imperceptible for this one-way "phone → whole-home audio"
 /// path. This is only a sane default: like the port, the real value is stored
-/// per install (sources_store.rs) and settable via the API, so a weak-signal
+/// per install (sources.rs) and settable via the API, so a weak-signal
 /// install can trade more latency for fewer dropouts. See
 /// firmware/bt-bridge/README.md and docs/decisions.md.
 pub const DEFAULT_RTP_LATENCY_MSEC: u32 = 200;
@@ -51,7 +51,7 @@ pub const DEFAULT_RTP_LATENCY_MSEC: u32 = 200;
 /// to have several receivers each join the group and share one firmware stream:
 /// `module-rtp-source` calls IP_ADD_MEMBERSHIP when `source.ip` is a multicast
 /// address. Point the firmware's `PipeWire RTP Host` at the same group. Stored
-/// per install (sources_store.rs) and settable via the API.
+/// per install (sources.rs) and settable via the API.
 pub const DEFAULT_RTP_SOURCE_ADDR: &str = "0.0.0.0";
 
 /// Default `sess.ignore-ssrc`. `true` (module analogue of "accept all senders")
@@ -62,7 +62,7 @@ pub const DEFAULT_RTP_SOURCE_ADDR: &str = "0.0.0.0";
 /// other sender — the "Only one client" mode that stops a stray/second sender
 /// from interleaving into (corrupting) the stream. Defaults to `true` so
 /// installs with not-yet-reflashed bridges don't go silent on reboot. Stored
-/// per install (sources_store.rs), settable via API.
+/// per install (sources.rs), settable via API.
 pub const DEFAULT_RTP_IGNORE_SSRC: bool = true;
 
 /// Default sample rate. **48000** so the path stays at 48 kHz end-to-end (the
@@ -70,7 +70,7 @@ pub const DEFAULT_RTP_IGNORE_SSRC: bool = true;
 /// fixed at 44100 to match the first firmware; senders that still transmit
 /// 44100 (e.g. an ESP32 whose A2DP SBC decoder settled on 44.1 kHz) set this
 /// back to 44100 via the API so the receiver rate matches the wire. Stored per
-/// install (sources_store.rs), settable via the API.
+/// install (sources.rs), settable via the API.
 pub const DEFAULT_RTP_RATE: u32 = 48000;
 
 /// The SPA-JSON `args` object for the rtp-source module, ready to pass as the
@@ -97,7 +97,7 @@ pub fn rtp_source_module_args(node_name: &str, port: u16, latency_msec: u32, sou
 
 /// Whether a PipeWire node name belongs to an RTP-receive source this daemon
 /// manages: the bare legacy name ([`LEGACY_RTP_ID`]) or the `rtp-in-<id>` scheme
-/// [`crate::sources_store::source_node_name`] mints for every non-legacy RTP
+/// [`crate::sources::source_node_name`] mints for every non-legacy RTP
 /// source. Used to spot orphaned modules (a source that was removed) in the
 /// registry so [`reconcile`] can unload them.
 pub fn is_rtp_source_node(node_name: &str) -> bool {

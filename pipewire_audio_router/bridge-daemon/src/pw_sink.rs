@@ -5,7 +5,7 @@
 //! take a PipeWire stream), a remote PipeWire host speaks PipeWire/RTP natively,
 //! so the "sender" here is just two libpipewire modules loaded into the daemon's
 //! own context via `PwCommand::Load` (see pw/thread.rs / `pw_control::module`), exactly
-//! like the rtp-source in rtp_source.rs:
+//! like the rtp-source in sources/rtp.rs:
 //!
 //!   * **`libpipewire-module-rtp-sink`** — one per target. A real `Audio/Sink`
 //!     node whose input is fed from the graph (the group anchor's monitor, or —

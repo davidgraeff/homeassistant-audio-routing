@@ -1,6 +1,6 @@
 //! General, daemon-wide app settings — the "Settings" page's backing store.
 //!
-//! Mirrors the other `/data` stores (sources_store.rs, sync_settings.rs): no
+//! Mirrors the other `/data` stores (sources.rs, sync_settings.rs): no
 //! `options.json` seeding, every field has a `serde(default)` so an older/newer
 //! config file still loads, and the file is authoritative once written (created
 //! on the first mutation, or seeded on a fresh install — see main.rs).

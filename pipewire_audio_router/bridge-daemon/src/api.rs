@@ -1,14 +1,14 @@
 //! REST API: health check, live PipeWire registry state, and manual link
 //! creation
 
-use crate::airplay_clients::AirplayClientStore;
 use crate::ap2_discovery::SharedAp2Devices;
 use crate::ap2_ptp::SharedAp2Ptp;
 use crate::pw::thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
-use crate::rtp_source::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
 use crate::sendspin_discovery::SharedSendspinDevices;
-use crate::sources_store::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore};
+use crate::sources::airplay_clients::AirplayClientStore;
+use crate::sources::rtp::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
+use crate::sources::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore};
 use crate::store::outputs::{OutputState, SharedOutputs};
 use crate::store::routing::SharedRouting;
 use crate::store::settings::SharedSettings;
@@ -32,10 +32,10 @@ use tokio::sync::oneshot;
 /// Runtime config for the AirPlay and RTP sources.
 pub type SharedSources = Arc<Mutex<SourcesStore>>;
 
-/// The running AirPlay-receive sources (airplay_source.rs), keyed by source id —
+/// The running AirPlay-receive sources (sources/airplay.rs), keyed by source id —
 /// each a native embedded RAOP server feeding its own PipeWire source node.
 /// Phase 4: multiple concurrent receivers, reconciled against the store.
-pub type SharedAirplay = crate::airplay_source::SharedAirplayMap;
+pub type SharedAirplay = crate::sources::airplay::SharedAirplayMap;
 
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
 /// change-notification channel (routing.rs), and the command sender for runtime
@@ -48,17 +48,17 @@ pub struct AppState {
     pub pw_cmd: PwCommandSender,
     pub sources: SharedSources,
     pub airplay: SharedAirplay,
-    /// Remembered AirPlay senders (airplay_clients.rs), per-receiver — the
+    /// Remembered AirPlay senders (sources/airplay_clients.rs), per-receiver — the
     /// backing store for each source's connection list + ban/priority controls.
     /// Per-source views are taken via `.registry(id)`. Anti-takeover is now
     /// per-receiver too (each running `AirplayHandle` owns its flag), so there is
     /// no process-wide flag here anymore.
     pub airplay_clients: AirplayClientStore,
-    /// Per-source now-playing metadata (now_playing.rs) — what each input is
+    /// Per-source now-playing metadata (sources/now_playing.rs) — what each input is
     /// currently playing, from whichever producer can say: the AirPlay receiver's
     /// DMAP callbacks locally, a Pi reporter over `/api/sources/{id}/now_playing`
     /// remotely. Read into the routing socket's `now_playing` frame.
-    pub now_playing: crate::now_playing::NowPlayingStore,
+    pub now_playing: crate::sources::now_playing::NowPlayingStore,
     /// On-demand source peak meters (pw/metering.rs); taps live only while a
     /// routing-matrix WS client is connected.
     pub meters: crate::pw::metering::SharedMeters,
@@ -81,12 +81,12 @@ pub struct AppState {
     /// diagnostic that nothing here reads), their volume/mute control channel, and
     /// the pairing queue.
     pub agents: crate::pwsink_agent::SharedAgents,
-    /// Live mDNS-discovered Bluetooth→RTP bridges (bt_bridge_discovery.rs).
+    /// Live mDNS-discovered Bluetooth→RTP bridges (sources/bt_bridge.rs).
     /// Unlike the other discoveries these are *senders*, not outputs: they build
     /// no audio path, they annotate an RTP source with which bridge feeds it and
     /// offer that bridge's diagnostics page. Unconfigured ones are offered for
     /// adoption on the Sources tab.
-    pub bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
+    pub bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
     /// The daemon's single host-global AirPlay-2 PTP grandmaster (ap2_ptp.rs),
     /// reused by the AP2 tone spike (ap2_spike.rs) so it shares 319/320 rather
     /// than double-binding.
@@ -145,13 +145,13 @@ pub fn router(
     sources: SharedSources,
     airplay: SharedAirplay,
     airplay_clients: AirplayClientStore,
-    now_playing: crate::now_playing::NowPlayingStore,
+    now_playing: crate::sources::now_playing::NowPlayingStore,
     meters: crate::pw::metering::SharedMeters,
     xruns: crate::pw::profiler::SharedXruns,
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
     agents: crate::pwsink_agent::SharedAgents,
-    bt_bridges: crate::bt_bridge_discovery::SharedBtBridges,
+    bt_bridges: crate::sources::bt_bridge::SharedBtBridges,
     ap2_ptp: SharedAp2Ptp,
     routing: SharedRouting,
     outputs: SharedOutputs,
@@ -224,7 +224,7 @@ pub fn router(
         .route("/api/sources/{id}/clients/priority", post(set_source_client_priority))
         .route("/api/sources/{id}/clients/disconnect", post(disconnect_source_client))
         .route("/api/sources/{id}/policy", put(set_source_policy))
-        // Per-source now-playing metadata (now_playing.rs). Keyed by source NODE
+        // Per-source now-playing metadata (sources/now_playing.rs). Keyed by source NODE
         // NAME, not by source id: that is the key the routing matrix, the routing
         // intent and the HA integration all already share, and it is what the
         // `now_playing` WebSocket frame is keyed by — so a consumer never has to
@@ -1190,9 +1190,9 @@ async fn remove_output(State(state): State<AppState>, Path(node_name): Path<Stri
 // ---- AirPlay-receive source -----------------------------------------------
 //
 // The AirPlay-receive source is an embedded, native RAOP receiver
-// (airplay_source.rs) — not a subprocess and not a PipeWire module. Its
+// (sources/airplay.rs) — not a subprocess and not a PipeWire module. Its
 // enabled/disabled state and knobs are persisted in the sources store
-// (sources_store.rs), which starts empty on a fresh install (no options.json
+// (sources.rs), which starts empty on a fresh install (no options.json
 // seeding) and is then authoritative. Same "runtime, no restart" model as
 // /api/outputs, but backed by an in-process receiver rather than a module.
 
@@ -1202,10 +1202,10 @@ async fn remove_output(State(state): State<AppState>, Path(node_name): Path<Stri
 /// remove. `list()` returns an owned snapshot so no lock is held across await.
 async fn reconcile_sources(state: &AppState) {
     let entries = state.sources.lock_recover().list();
-    crate::rtp_source::reconcile(&entries, &state.pw_cmd, &state.pw).await;
-    crate::airplay_source::reconcile(&state.airplay, &entries, &state.airplay_clients, &state.now_playing).await;
+    crate::sources::rtp::reconcile(&entries, &state.pw_cmd, &state.pw).await;
+    crate::sources::airplay::reconcile(&state.airplay, &entries, &state.airplay_clients, &state.now_playing).await;
     // A source that no longer exists must not leave a track behind in the
-    // listings for the TTL to eventually collect (now_playing.rs).
+    // listings for the TTL to eventually collect (sources/now_playing.rs).
     let live: Vec<String> = entries.iter().map(|e| e.node_name()).collect();
     state.now_playing.retain_sources(&live);
 }
@@ -1229,7 +1229,7 @@ struct AirplayClientInfo {
 //
 // Shared by the legacy singular routes (which target `LEGACY_AIRPLAY_ID`) and
 // the per-source `/api/sources/{id}/clients/*` routes. Each operates on that
-// source's own client registry (airplay_clients.rs).
+// source's own client registry (sources/airplay_clients.rs).
 
 fn list_clients_for(state: &AppState, id: &str) -> Vec<AirplayClientInfo> {
     state
@@ -1395,7 +1395,7 @@ async fn set_source_policy(
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: policy_message(req.prevent_takeover).to_string() }))
 }
 
-// ---- Now-playing metadata (now_playing.rs) --------------------------------
+// ---- Now-playing metadata (sources/now_playing.rs) --------------------------------
 //
 // Reads are the cold-path companion to the `now_playing` WebSocket frame (a
 // consumer that just connected, or `curl`). Writes are how a *remote* producer
@@ -1412,7 +1412,7 @@ async fn list_now_playing(State(state): State<AppState>) -> Json<NowPlayingListR
 async fn get_now_playing(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
-) -> Result<Json<crate::now_playing::NowPlaying>, SourceError> {
+) -> Result<Json<crate::sources::now_playing::NowPlaying>, SourceError> {
     state
         .now_playing
         .get(&node_name)
@@ -1429,7 +1429,7 @@ async fn get_now_playing(
 async fn put_now_playing(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
-    Json(update): Json<crate::now_playing::MetadataUpdate>,
+    Json(update): Json<crate::sources::now_playing::MetadataUpdate>,
 ) -> Result<Json<OutputOpResponse>, SourceError> {
     if update.is_empty() {
         return Err(source_err(StatusCode::BAD_REQUEST, "no metadata fields supplied".to_string()));
@@ -1508,7 +1508,7 @@ async fn report_now_playing(
 
 #[derive(Serialize)]
 struct NowPlayingListResponse {
-    sources: std::collections::BTreeMap<String, crate::now_playing::NowPlaying>,
+    sources: std::collections::BTreeMap<String, crate::sources::now_playing::NowPlaying>,
 }
 
 #[derive(Deserialize)]
@@ -1519,7 +1519,7 @@ struct NowPlayingReportRequest {
     /// The metadata itself, flattened, so the body reads as one object rather than
     /// a wrapper: `{"rtp_port": 46000, "title": "…", "artist": "…"}`.
     #[serde(flatten)]
-    metadata: crate::now_playing::MetadataUpdate,
+    metadata: crate::sources::now_playing::MetadataUpdate,
 }
 
 // ---- RTP source (Bluetooth bridge firmware target) ------------------------
@@ -1534,7 +1534,7 @@ struct NowPlayingReportRequest {
 //
 // The generalized, keyed replacement for the two singular `/api/source/*` routes
 // this daemon used to expose: a collection of AirPlay + RTP input sources, each with its own
-// stable id / node name (sources_store.rs). These handlers only mutate the
+// stable id / node name (sources.rs). These handlers only mutate the
 // STORE — actually loading/unloading the PipeWire module (RTP) or starting/
 // stopping the embedded receiver (AirPlay) is done by the per-kind reconcilers
 // wired from main.rs (Phases 2 & 4). After each mutation we nudge the change
@@ -1560,7 +1560,7 @@ struct SourceView {
     rtp: Option<RtpSourceConfig>,
     /// The discovered Bluetooth bridge that feeds this RTP source, when exactly
     /// one advertises this port (and group). `null` for AirPlay sources, when no
-    /// bridge advertises, or when two do — see `bt_bridge_discovery::match_bridge`.
+    /// bridge advertises, or when two do — see `sources::bt_bridge::match_bridge`.
     bridge: Option<BridgeView>,
 }
 
@@ -1591,7 +1591,7 @@ struct BridgeView {
 }
 
 impl BridgeView {
-    fn of(b: &crate::bt_bridge_discovery::BtBridge) -> Self {
+    fn of(b: &crate::sources::bt_bridge::BtBridge) -> Self {
         Self {
             fullname: b.fullname.clone(),
             display_name: b.display_name.clone(),
@@ -1613,13 +1613,13 @@ impl BridgeView {
 ///
 /// `bridges` is the discovered-bridge set to match an RTP source against; pass an
 /// empty slice to skip (AirPlay sources never match).
-fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::bt_bridge_discovery::BtBridge]) -> SourceView {
+fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::sources::bt_bridge::BtBridge]) -> SourceView {
     let (airplay, rtp) = match &entry.config {
         SourceConfig::Airplay(a) => (Some(a.clone()), None),
         SourceConfig::Rtp(r) => (None, Some(r.clone())),
     };
     let bridge =
-        rtp.as_ref().and_then(|r| crate::bt_bridge_discovery::match_bridge(bridges.iter(), r.port, &r.source_addr)).map(BridgeView::of);
+        rtp.as_ref().and_then(|r| crate::sources::bt_bridge::match_bridge(bridges.iter(), r.port, &r.source_addr)).map(BridgeView::of);
     SourceView {
         id: entry.id.clone(),
         label: entry.label.clone(),
@@ -1707,7 +1707,7 @@ async fn list_sources(State(state): State<AppState>) -> Json<SourcesListResponse
     // Probe stale diagnostics pages first, so `bridge.diag_ok` in this very
     // response reflects a fresh check. Only when someone is looking (this
     // handler), rate-limited by `PROBE_TTL` — no background polling of Pi Zeros.
-    crate::bt_bridge_discovery::refresh_probes(&state.bt_bridges).await;
+    crate::sources::bt_bridge::refresh_probes(&state.bt_bridges).await;
 
     let entries = state.sources.lock_recover().list();
     let present = present_node_names(&state.pw);
@@ -1722,7 +1722,7 @@ async fn list_sources(State(state): State<AppState>) -> Json<SourcesListResponse
 /// Pure so the "already configured disappears from the offer list" rule is
 /// unit-tested: a bridge visible in both lists would invite the user to add a
 /// duplicate source on a port that is already taken.
-fn unmatched_bridges(bridges: &[crate::bt_bridge_discovery::BtBridge], sources: &[SourceView]) -> Vec<BridgeView> {
+fn unmatched_bridges(bridges: &[crate::sources::bt_bridge::BtBridge], sources: &[SourceView]) -> Vec<BridgeView> {
     let claimed: std::collections::HashSet<&str> = sources.iter().filter_map(|s| s.bridge.as_ref()).map(|b| b.fullname.as_str()).collect();
     bridges.iter().filter(|b| !claimed.contains(b.fullname.as_str())).map(BridgeView::of).collect()
 }
@@ -3857,8 +3857,8 @@ async fn fetch_to_file(url: &str, path: &std::path::Path) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::airplay_source::DEFAULT_AIRPLAY_LATENCY_MSEC;
-    use crate::sources_store::LEGACY_RTP_ID;
+    use crate::sources::airplay::DEFAULT_AIRPLAY_LATENCY_MSEC;
+    use crate::sources::LEGACY_RTP_ID;
 
     /// `/api/outputs/discovered` is a *static* sibling of `/api/outputs/{node_name}`
     /// (the remove route) — same segment count. axum panics on genuinely conflicting
@@ -3900,7 +3900,7 @@ mod tests {
         assert_eq!(req.rtp_port, 46000);
         assert_eq!(req.metadata.title.as_deref(), Some("Song"));
         assert_eq!(req.metadata.artist.as_deref(), Some("Artist"));
-        assert_eq!(req.metadata.state, Some(crate::now_playing::PlaybackState::Playing));
+        assert_eq!(req.metadata.state, Some(crate::sources::now_playing::PlaybackState::Playing));
         assert_eq!(req.metadata.position_ms, Some(1234));
     }
 
@@ -3982,15 +3982,15 @@ mod tests {
     }
 
     /// A discovered bridge for `rtp_entry()`'s port (47000, unicast `0.0.0.0`).
-    fn discovered_bridge(name: &str, port: u16, dest: &str, diag_ok: bool) -> crate::bt_bridge_discovery::BtBridge {
-        crate::bt_bridge_discovery::BtBridge {
+    fn discovered_bridge(name: &str, port: u16, dest: &str, diag_ok: bool) -> crate::sources::bt_bridge::BtBridge {
+        crate::sources::bt_bridge::BtBridge {
             fullname: format!("{name}._pwrouter-btbridge._tcp.local."),
             display_name: name.to_string(),
             hostname: "bridge.local.".into(),
             addr: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 178, 78))),
             diag_port: 8080,
             diag_path: "/".into(),
-            stream: crate::bt_bridge_discovery::BridgeStream {
+            stream: crate::sources::bt_bridge::BridgeStream {
                 rtp_port: port,
                 rtp_dest: dest.into(),
                 rate: 48_000,

@@ -1,5 +1,5 @@
 //! Persistent registry of AirPlay senders that have connected to the receive
-//! sources (airplay_source.rs). Drives the Sources-tab "who's/who was connected"
+//! sources (sources/airplay.rs). Drives the Sources-tab "who's/who was connected"
 //! list and the priority/ban/force-disconnect controls (name has precedence,
 //! liveness rebuilt from callbacks).
 //!
@@ -23,7 +23,7 @@
 //! everything disconnected (nothing is streaming at boot) and the flag is
 //! rebuilt from the connect/disconnect callbacks.
 
-use crate::sources_store::{SourceId, LEGACY_AIRPLAY_ID};
+use crate::sources::{SourceId, LEGACY_AIRPLAY_ID};
 use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -459,7 +459,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         (hosts, vols, mutes)
     };
     let (lat, source_labels) = {
-        use crate::sources_store::SourceConfig;
+        use crate::sources::SourceConfig;
         let sources = state.sources.lock_recover();
         let sync = state.sync_settings.lock_recover();
         // Per-source input buffer + label, keyed by node name, for every
@@ -909,7 +909,7 @@ enum Frame<'a> {
     Agents {
         agents: &'a [crate::pwsink_agent::AgentInfo],
     },
-    /// Per-source now-playing metadata (now_playing.rs), keyed by source node
+    /// Per-source now-playing metadata (sources/now_playing.rs), keyed by source node
     /// name. Its own frame rather than a field on [`Frame::Matrix`] **on purpose**:
     /// the matrix is a large, mostly-static payload keyed by a different shape, and
     /// a track changes once a song — so hanging titles and artwork revisions off it
@@ -917,7 +917,7 @@ enum Frame<'a> {
     /// (the same cost [`Frame::Meters`] exists to avoid). Sent through the same
     /// `push_if_changed` dedupe as the listings, so a quiet house costs nothing.
     NowPlaying {
-        sources: &'a BTreeMap<String, crate::now_playing::NowPlaying>,
+        sources: &'a BTreeMap<String, crate::sources::now_playing::NowPlaying>,
     },
     /// The fast lane: the only two figures that move without a graph change —
     /// keyed by node name, so the client merges them onto the matrix it already
@@ -1098,14 +1098,14 @@ mod tests {
         let mut sources = BTreeMap::new();
         sources.insert(
             "airplay-in".to_string(),
-            crate::now_playing::NowPlaying {
-                state: crate::now_playing::PlaybackState::Playing,
+            crate::sources::now_playing::NowPlaying {
+                state: crate::sources::now_playing::PlaybackState::Playing,
                 title: Some("Song".into()),
                 artist: Some("Artist".into()),
                 album: None,
                 duration_ms: Some(200_000),
                 position_ms: Some(1000),
-                position_updated_at: Some(crate::now_playing::UnixMillis(1_700_000_000_000)),
+                position_updated_at: Some(crate::sources::now_playing::UnixMillis(1_700_000_000_000)),
                 artwork: None,
             },
         );
@@ -1186,7 +1186,7 @@ mod tests {
         assert_eq!(samples.keys().collect::<Vec<_>>(), vec!["ap2-dev-dusche"]);
     }
 
-    use crate::airplay_source::AIRPLAY_NODE_NAME;
+    use crate::sources::airplay::AIRPLAY_NODE_NAME;
 
     fn link(source: &str, output: &str) -> RoutingLink {
         RoutingLink { source: source.to_string(), output: output.to_string() }

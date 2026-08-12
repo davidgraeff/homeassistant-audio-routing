@@ -455,7 +455,7 @@ The SO_REUSEPORT interaction is harmless: the module's own socket showed
 > **Done 2026-07-28.** `bridge-daemon/src/rtp_membership.rs` is removed, along with its
 > `mod` declaration and `spawn()` call in `main.rs` (replaced by a comment pointing at
 > upstream's own IGMP recovery, so the next person doesn't re-add it). `cargo check`
-> introduces no new warnings — `rtp_source::reload` stays live, since `rtp_source::
+> introduces no new warnings — `sources::rtp::reload` stays live, since `sources::rtp::
 > reconcile` calls it on the `PUT /api/source/rtp` path — and `cargo test` is
 > **126 passed / 0 failed** (the module's 3 unit tests went with it). Not yet deployed.
 

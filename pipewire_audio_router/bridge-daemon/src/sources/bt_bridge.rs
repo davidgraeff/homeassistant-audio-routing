@@ -487,7 +487,7 @@ mod tests {
     fn optional_txt_falls_back_to_the_defaults_both_ends_use() {
         let get = txt(&[("ver", "1"), ("rtp_port", "46000"), ("rtp_dest", "192.168.178.22")]);
         let (stream, path) = parse_txt(&get).unwrap();
-        assert_eq!(stream.rate, 48_000, "48 kHz is what setup_pi_bridge.py and rtp_source.rs default to");
+        assert_eq!(stream.rate, 48_000, "48 kHz is what setup_pi_bridge.py and sources/rtp.rs default to");
         assert_eq!(stream.channels, 2);
         assert_eq!(stream.format, "S16LE");
         assert_eq!(path, "/");

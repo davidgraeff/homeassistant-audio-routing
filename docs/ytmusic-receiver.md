@@ -65,7 +65,7 @@ phone never sends audio. It sends *"play video id X at position Y"*, and **we** 
 player — we resolve, fetch, decode and pace the stream, and report position and volume back
 so the app's UI stays in sync. This is closer to
 [`pw/player.rs`](../pipewire_audio_router/bridge-daemon/src/pw/player.rs) than to
-[`airplay_source.rs`](../pipewire_audio_router/bridge-daemon/src/airplay_source.rs): there is
+[`sources/airplay.rs`](../pipewire_audio_router/bridge-daemon/src/sources/airplay.rs): there is
 no incoming PCM to buffer.
 
 ### Design pillars
@@ -81,7 +81,7 @@ no incoming PCM to buffer.
 
 **Why a dedicated RTP port rather than mixing into `bt-bridge-rtp`:** each RTP source
 carries its own `rate`
-([`RtpSourceConfig`](../pipewire_audio_router/bridge-daemon/src/sources_store.rs)). YouTube
+([`RtpSourceConfig`](../pipewire_audio_router/bridge-daemon/src/sources.rs)). YouTube
 audio is natively **48 kHz** (Opus) and the router's graph runs at 48 kHz, so a dedicated
 source at 48000 avoids a resample on the sender *and* in the router, while Bluetooth keeps
 its 44100. It also makes the two independently routable, which is what you actually want.
