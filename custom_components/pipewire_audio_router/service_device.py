@@ -1,20 +1,25 @@
 """The add-on itself, as one Home Assistant *service* device.
 
-Everything this integration exposes that isn't a speaker — voice ducking, the
-Bluetooth-bridge RTP source, the music/announcement groups — used to be a loose
-pile of entities under the config entry, findable only by someone who already knew
-what to look for. Home Assistant has no page for "the settings of an integration"
-and no description field to explain an entity with, but it does have a device page,
-and that page is the one place it will group entities by category, carry a version,
-and offer a link out. So: one service device per config entry, and the service
-entities attach to it.
+The add-on's *settings* — voice ducking, the Bluetooth-bridge RTP source — used to
+be a loose pile of entities under the config entry, findable only by someone who
+already knew what to look for. Home Assistant has no page for "the settings of an
+integration" and no description field to explain an entity with, but it does have a
+device page, and that page is the one place it will group entities by category,
+carry a version, and offer a link out. So: one service device per config entry,
+with the settings on it.
 
-Two deliberate exclusions:
+Three deliberate exclusions, all for the same reason — a device prefixes its
+entities' displayed names, which is right for a setting and wrong for a speaker:
 
 * **Per-output `media_player`s stay on the real speaker's device**
   (`media_player.device_info`). That link is what gives them the speaker's name and
   area — and the area is what voice ducking resolves against, so re-homing them
   here would break ducking to make a list look tidier.
+* **Group `media_player`s stay standalone.** They are the add-on's own construct,
+  so by that logic they belonged here, but they are also the entities people
+  actually call by name in a media card or a script: joining made "Everywhere" read
+  "PipeWire Audio Router Everywhere", and a group created afterwards would have
+  carried that into its entity_id.
 * **No `via_device`.** Showing the speakers as "connected via" the router reads
   nicely in the device tree, but that field would have to be written onto device
   rows the ESPHome and MusicCast integrations own.

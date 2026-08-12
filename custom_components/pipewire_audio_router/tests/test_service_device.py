@@ -119,25 +119,21 @@ async def test_an_add_on_update_refreshes_the_version(hass):
     assert _service_device(hass, entry).sw_version == "0.4.0"
 
 
-async def test_every_service_entity_lives_on_the_device(hass):
-    """The config entities and the group media_players are the add-on's own, not
-    any speaker's — so they are all on the one device, which is what makes the
-    device page a usable index of the integration."""
+async def test_the_settings_live_on_the_device(hass):
+    """Exactly the six settings, and nothing else. This is what makes the device
+    page a usable index: one place listing everything about the add-on that isn't a
+    speaker or a group."""
     entry = _make_entry(hass)
-    groups = [MusicGroup(id="downstairs", name="Downstairs", members=["sendspin-dev-kitchen"])]
-    announcements = [
-        AnnouncementGroup(id="everywhere", name="Everywhere", targets=["sendspin-dev-kitchen"], priority=5, duck=0.2)
-    ]
-    with _patch_daemon(music_groups=groups, announcement_groups=announcements):
+    with _patch_daemon():
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
     device = _service_device(hass, entry)
     ent_reg = er.async_get(hass)
     # Compared by unique-id suffix rather than entity_id: how Home Assistant builds
-    # an entity_id from a device + entity name has changed between releases (see
-    # `test_a_group_does_not_opt_into_device_prefixed_naming`), and this test is
-    # about *which* entities are on the device, not what they ended up called.
+    # an entity_id from a device + entity name has changed between releases, and
+    # this test is about *which* entities are on the device, not what they ended up
+    # called.
     ours = {
         e.unique_id.removeprefix(f"{entry.entry_id}_")
         for e in er.async_entries_for_device(ent_reg, device.id, include_disabled_entities=True)
@@ -149,31 +145,30 @@ async def test_every_service_entity_lives_on_the_device(hass):
         "rtp_source_latency_msec",
         "voice_duck_level",
         "voice_duck_scope",
-        "mg_downstairs",
-        "ag_everywhere",
     }
 
 
-async def test_a_group_does_not_opt_into_device_prefixed_naming(hass):
-    """A group's name is the user's ("Everywhere"), not a description of a thing on
-    a device, so these entities keep `has_entity_name = False`.
-
-    That is all we control. Home Assistant 2026.8 prefixes the *friendly name* with
-    the device name for every entity that has a device, `has_entity_name` or not
-    (`entity_registry._async_get_full_entity_name`), where 2026.2 — which the pinned
-    test environment runs — did not. So a group reads "PipeWire Audio Router
-    Everywhere" on a current instance; asserting either spelling here would only
-    pin this suite to one Home Assistant release."""
+async def test_a_group_stays_off_the_device_to_keep_its_name(hass):
+    """Groups are the add-on's own construct and belonged on the device by that
+    logic, but they are also the entities people actually call — in a media card, in
+    `tts.speak`, in a script. Home Assistant prefixes an entity's displayed name
+    with its device's, so joining made "Everywhere" read "PipeWire Audio Router
+    Everywhere", and a group created afterwards would have taken that into its
+    entity_id too. The user's own name for a group wins over tidiness."""
     entry = _make_entry(hass)
     groups = [MusicGroup(id="downstairs", name="Downstairs", members=["sendspin-dev-kitchen"])]
-    with _patch_daemon(music_groups=groups):
+    announcements = [
+        AnnouncementGroup(id="everywhere", name="Everywhere", targets=["sendspin-dev-kitchen"], priority=5, duck=0.2)
+    ]
+    with _patch_daemon(music_groups=groups, announcement_groups=announcements):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
     ent_reg = er.async_get(hass)
-    group = ent_reg.async_get(ent_reg.async_get_entity_id("media_player", DOMAIN, f"{entry.entry_id}_mg_downstairs"))
-    assert group is not None and group.has_entity_name is False
-    assert group.original_name == "Downstairs"
+    for kind, group_id, expected in (("mg", "downstairs", "Downstairs"), ("ag", "everywhere", "Everywhere")):
+        entity_id = ent_reg.async_get_entity_id("media_player", DOMAIN, f"{entry.entry_id}_{kind}_{group_id}")
+        assert ent_reg.async_get(entity_id).device_id is None
+        assert hass.states.get(entity_id).attributes["friendly_name"] == expected
 
 
 async def test_an_output_stays_on_its_speakers_device(hass):

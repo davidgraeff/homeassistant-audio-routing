@@ -42,7 +42,6 @@ from homeassistant.util import dt as dt_util
 from . import PipewireRouterCoordinator
 from .api import AnnouncementGroup, MusicGroup, NowPlaying, RoutingMatrix, RoutingNode
 from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NONE
-from .service_device import service_device_info
 
 # Must match the bridge-daemon's node-name prefixes exactly — no shared source
 # of truth across the Rust/Python boundary, just this comment. The
@@ -794,10 +793,6 @@ class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _Sourc
         super().__init__(coordinator)
         self._group_id = group_id
         self._attr_unique_id = f"{entry.entry_id}_mg_{group_id}"
-        # A group is the add-on's own construct — it has no speaker to belong to,
-        # so it lives on the service device. `has_entity_name = False` above means
-        # the group's own name is the friendly name, un-prefixed.
-        self._attr_device_info = service_device_info(entry, coordinator)
 
     def _group(self) -> MusicGroup | None:
         return next((g for g in self.coordinator.music_groups if g.id == self._group_id), None)
@@ -906,8 +901,6 @@ class AnnouncementGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator],
         super().__init__(coordinator)
         self._group_id = group_id
         self._attr_unique_id = f"{entry.entry_id}_ag_{group_id}"
-        # Same as a music group: the add-on's own construct, so the service device.
-        self._attr_device_info = service_device_info(entry, coordinator)
 
     def _group(self) -> AnnouncementGroup | None:
         return next((g for g in self.coordinator.announcement_groups if g.id == self._group_id), None)

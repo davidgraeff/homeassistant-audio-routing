@@ -30,25 +30,29 @@ re-add the integration if the add-on moves.
 
 ## Entities
 
-Everything that isn't a speaker — voice ducking, the Bluetooth-bridge RTP
-source, and each music/announcement group — lives on **one device**, named
-*PipeWire Audio Router*, listed under the integration in Settings → Devices &
-Services. That device page is the index for this integration: Home Assistant
-groups its entities into *Controls* and *Configuration* there, shows which add-on
-build is running, and its **Visit** link opens the add-on's own web UI, which is
-where the routing matrix, the outputs and the diagnostics actually live.
+The add-on's **settings** — voice ducking and the Bluetooth-bridge RTP source —
+live on one device named *PipeWire Audio Router*, listed under the integration in
+Settings → Devices & Services. That device page is the index for this integration:
+Home Assistant groups its entities into *Controls* and *Configuration* there, shows
+which add-on build is running and on what hardware, and its **Visit** link opens
+the add-on's own web UI, which is where the routing matrix, the outputs and the
+diagnostics actually live.
 
-Per-output `media_player`s are the exception: each one joins the **real
-speaker's** device instead, so it inherits that speaker's name and area — and the
-area is what voice ducking below resolves a room against.
+The `media_player`s deliberately stay off it, because a device prefixes its
+entities' displayed names and that is wrong for a speaker:
 
-One side effect worth knowing: Home Assistant prefixes an entity's displayed name
-with its device's name, so these read *"PipeWire Audio Router Voice assistant
-ducking"* and *"PipeWire Audio Router Everywhere"* in pickers — exactly as every
-other device's entities do (*"Satellite1 c4150c Temperature"*). The device page
-itself shows the short names. Existing entity **ids never change**; only entities
-created after this (a new group, a fresh install) get the device name in their id
-too. Rename any entity in its settings dialog to override the display name.
+- **per-output** players join the **real speaker's** device instead, inheriting its
+  name and area — and the area is what voice ducking below resolves a room against;
+- **group** players stay standalone, so a group keeps the name you gave it
+  (*"Everywhere"*, not *"PipeWire Audio Router Everywhere"*) in media cards,
+  `tts.speak` targets and scripts.
+
+So the six settings entities read *"PipeWire Audio Router Voice assistant
+ducking"* and the like in pickers — the same shape as every other device's entities
+(*"Satellite1 c4150c Temperature"*), with short names on the device page itself.
+Existing entity **ids never change**; only settings entities created after this (a
+fresh install) get the device name in their id too. Rename any entity in its
+settings dialog to override the display name.
 
 ### Bluetooth bridge RTP source (`switch` + `number`)
 
