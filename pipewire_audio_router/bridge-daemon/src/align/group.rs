@@ -18,13 +18,13 @@
 //!
 //! ## How the group is formed, and why it is formed this way
 //!
-//! Grouping in this daemon is *derived*, not declared: `routing/sync_group.rs` groups every
+//! Grouping in this daemon is *derived*, not declared: `routing/sync_group/mod.rs` groups every
 //! output that shares a source set, and one group == one sync anchor == one clock.
 //! So "form a group around an arbitrary output set" means one thing only — make those
 //! outputs share a source set that nothing else does.
 //!
 //! It is done with an **in-memory intent override** ([`GroupReconciler::set_align_hold`],
-//! `routing/sync_group.rs`), not by editing the routing store:
+//! `routing/sync_group/mod.rs`), not by editing the routing store:
 //!
 //! - every intent link whose output is held is dropped for the duration, so no music
 //!   source reaches it (the *displacement*);

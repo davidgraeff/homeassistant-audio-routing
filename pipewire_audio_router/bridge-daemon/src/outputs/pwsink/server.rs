@@ -25,7 +25,7 @@
 //! advertised sessions (cross-talk). The single-target separate-room case (the
 //! primary use case) is unaffected. Scoping which receiver binds to which session
 //! is a deliberately deferred decision (see docs/pipewire-sink-output.md §4).
-#![allow(dead_code)] // wired into routing/sync_group.rs in the same phase
+#![allow(dead_code)] // wired into routing/sync_group/mod.rs in the same phase
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -37,7 +37,7 @@ use crate::util::node_names::{PWSINK_DEV_PREFIX, PWSINK_SESSION_PREFIX};
 /// One target this group streams to: the virtual output node name
 /// (`pwsink-dev-<slug>`) plus the concrete control port the daemon binds +
 /// advertises for its session (data port = `control_port + 1`). The port is
-/// allocated by the reconciler (routing/sync_group.rs) so ports never collide across
+/// allocated by the reconciler (routing/sync_group/mod.rs) so ports never collide across
 /// groups.
 #[derive(Clone, Debug)]
 pub struct PwSinkMember {

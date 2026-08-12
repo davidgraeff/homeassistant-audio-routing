@@ -295,7 +295,7 @@ fn build_matrix(
     }
 
     // Every output is now virtual + auto-discovered (sendspin + AP2 devices) —
-    // audio reaches them via a group sink (routing/sync_group.rs), not a live node here.
+    // audio reaches them via a group sink (routing/sync_group/mod.rs), not a live node here.
 
     // Union of every output name to show: present ∪ discovered devices ∪ intent
     // ∪ adopted — then narrowed to the adopted ones, the only routable outputs.
@@ -599,7 +599,7 @@ pub(crate) fn node_id_for(state: &RegistryState, node_name: &str) -> Option<u32>
 }
 
 /// The set of sources feeding `output` in the intent (unique, sorted). Shared
-/// with routing/sync_group.rs, which keys sync groups by this source-set.
+/// with routing/sync_group/mod.rs, which keys sync groups by this source-set.
 pub(crate) fn source_set_of<'a>(intent: &'a [RoutingLink], output: &str) -> std::collections::BTreeSet<&'a str> {
     intent.iter().filter(|l| l.output == output).map(|l| l.source.as_str()).collect()
 }
@@ -638,7 +638,7 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
 /// After the RAOP output path was removed, every routable output is *virtual*
 /// (sendspin/AP2 devices with no live PipeWire node), so `node_id_for(output)`
 /// returns `None` and this loop no-ops for them — their audio path is built by
-/// routing/sync_group.rs from a group anchor, not by a direct link here. The loop is
+/// routing/sync_group/mod.rs from a group anchor, not by a direct link here. The loop is
 /// kept (rather than deleted) so a future real-node output would still be
 /// direct-linked, and it stays a cheap no-op for the current output kinds.
 pub async fn reconcile(pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting) {
@@ -707,7 +707,7 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
     // effect promptly, not only on the next PipeWire registry event.
     let _ = state.changes.send(());
     // Every output is now virtual (sendspin/AP2): its audio path is built by
-    // routing/sync_group.rs from a group anchor, not a direct link here. If the output
+    // routing/sync_group/mod.rs from a group anchor, not a direct link here. If the output
     // has no live PipeWire node (the normal case), there's nothing to link now —
     // the reconcilers woken above build the path.
     let ids = {

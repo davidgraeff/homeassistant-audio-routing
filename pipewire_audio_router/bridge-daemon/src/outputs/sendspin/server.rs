@@ -154,7 +154,7 @@ fn set_relay_realtime_priority() {}
 /// `Supervisor::stop`.
 ///
 /// It does **not** own the sink node it captures from: that's the shared sync
-/// anchor created and destroyed by routing/sync_group.rs, whose lifetime is independent
+/// anchor created and destroyed by routing/sync_group/mod.rs, whose lifetime is independent
 /// of this server (the server can be restarted — e.g. when the dialed-device set
 /// changes — without disturbing the anchor or the RAOP outputs also fed from
 /// it). Only the capture/discovery/advertise/accept resources are torn down here.
@@ -287,7 +287,7 @@ impl Drop for SendspinServerHandle {
         // sender and closes the relay's channel → the relay thread exits.
         // `client_manager`'s Drop stops every reconnect loop; `_advertisement`'s
         // Drop unregisters mDNS. The sink node is the shared anchor owned by
-        // routing/sync_group.rs — not destroyed here.
+        // routing/sync_group/mod.rs — not destroyed here.
     }
 }
 

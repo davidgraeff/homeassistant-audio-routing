@@ -178,7 +178,7 @@ impl AnnounceCoordinator {
 
     /// Outputs with an announcement playing or queued — see
     /// [`AnnounceScheduler::outputs_in_flight`]. Read by the on-demand transport
-    /// lease (routing/sync_group.rs) so a session isn't handed back before its clip's turn.
+    /// lease (routing/sync_group/mod.rs) so a session isn't handed back before its clip's turn.
     pub fn outputs_in_flight(&self) -> std::collections::BTreeSet<String> {
         self.inner.lock().unwrap().sched.outputs_in_flight()
     }

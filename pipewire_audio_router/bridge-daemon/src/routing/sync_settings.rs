@@ -1,5 +1,5 @@
 //! Persistent latency/sync tuning knobs for the grouping reconciler
-//! (routing/sync_group.rs) — the user-facing dials for "make the group as snappy as
+//! (routing/sync_group/mod.rs) — the user-facing dials for "make the group as snappy as
 //! possible, but keep everyone playing together".
 //!
 //! Two things live here, both keyed by stable name so they survive restarts,

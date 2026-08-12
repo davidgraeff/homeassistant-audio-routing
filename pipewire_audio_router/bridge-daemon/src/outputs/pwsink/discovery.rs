@@ -12,7 +12,7 @@
 //! Like sendspin/ap2 discovery, a discovered target does **not** get a PipeWire
 //! node here — it is a *virtual* routing output `pwsink-dev-<slug>`; the audio
 //! path (a per-target AppleMIDI/RTP sender fed from the group anchor's monitor —
-//! outputs/pwsink/server.rs) is built by the grouping reconciler (routing/sync_group.rs) from the
+//! outputs/pwsink/server.rs) is built by the grouping reconciler (routing/sync_group/mod.rs) from the
 //! routing intent.
 //!
 //! ## Presence

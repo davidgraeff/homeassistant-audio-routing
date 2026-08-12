@@ -37,7 +37,7 @@ pub const PWSINK_DEV_PREFIX: &str = "pwsink-dev-";
 pub const PWSINK_SESSION_PREFIX: &str = "pwrouter-";
 
 /// Node-name prefix for a **sync anchor** sink — one real `support.null-audio-sink`
-/// per set of co-routed outputs, created by routing/sync_group.rs. It is the shared
+/// per set of co-routed outputs, created by routing/sync_group/mod.rs. It is the shared
 /// clock/timeline for a group: the sendspin server captures from it, so every
 /// device in the group plays the same audio off one clock. Like the sendspin
 /// group sink, it's internal plumbing — NOT matched by the matrix's output

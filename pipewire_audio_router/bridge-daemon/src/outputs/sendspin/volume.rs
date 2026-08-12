@@ -2,7 +2,7 @@
 //!
 //! Unlike AirPlay outputs — real PipeWire `raop-sink` nodes whose volume the
 //! matrix drives through `node_id` — sendspin devices are *virtual* outputs fed
-//! by a shared group sink (routing/sync_group.rs), so there's no per-device
+//! by a shared group sink (routing/sync_group/mod.rs), so there's no per-device
 //! PipeWire volume to set. Sendspin instead carries volume in-band: the server
 //! sends a `server/command` player `Volume` message to a specific client
 //! (`ServerSender::send_player_command`).

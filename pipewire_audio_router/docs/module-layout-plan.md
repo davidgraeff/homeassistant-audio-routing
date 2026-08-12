@@ -27,7 +27,7 @@ one commit, each compiling and testing green on its own.
 | `store/` | file-backed JSON with no live handles — routing, outputs, groups, settings, the one-shot raop→ap2 migration |
 | `sources/` | audio into the graph: the AirPlay receiver + its client registry, RTP, now-playing, BT-bridge discovery. `mod.rs` *is* the source collection and its reconciler |
 | `outputs/` | three backends (`sendspin/`, `ap2/`, `pwsink/`) plus the shared overlay mixer and the listing model |
-| `routing/` | the matrix and its handlers (`mod.rs`), `sync_group.rs`, `sync_settings.rs` |
+| `routing/` | the matrix and its handlers (`mod.rs`), `routing/sync_group/mod.rs`, `sync_settings.rs` |
 | `announce/` | announcement delivery (`mod.rs`) and the pure scheduling decisions (`arbiter.rs`) |
 | `align/` | the manual and mic-assisted alignment cluster |
 | `api/` | the route table (`mod.rs`) plus one module per resource |
@@ -257,7 +257,7 @@ had grown past that:
 |---|---:|---:|---|
 | `align/measure/mod.rs` | 10092 | 7032 | `measure/tests/` — 9 files by subject |
 | `align/calibrate.rs` | 2841 | 1704 | `calibrate/tests.rs` |
-| `routing/sync_group.rs` | 2216 | 1851 | `sync_group/tests.rs` |
+| `routing/sync_group/mod.rs` | 2216 | 1851 | `sync_group/tests.rs` |
 | `align/levels.rs` | 2153 | 1579 | `levels/tests.rs` |
 | `align/estimator.rs` | 1501 | 953 | `estimator/tests.rs` |
 | `align/relay_delay.rs` | 1388 | 894 | `relay_delay/tests.rs` |
@@ -316,7 +316,7 @@ the suite; it silently stops running those tests, and the only signal is the tot
 lines**, the largest in the crate by a factor of nearly four, and it grew ~3.9k
 lines *during* this refactor (multi-position chaining plus the relay-vs-device
 equivalence experiment). The rest of the cluster is defensible at its size:
-`routing/sync_group.rs` 1851, `align/calibrate.rs` 1704, `align/levels.rs` 1579.
+`routing/sync_group/mod.rs` 1851, `align/calibrate.rs` 1704, `align/levels.rs` 1579.
 The growth rate is the argument — a file that adds 4k lines in a week will not
 get easier to split later.
 

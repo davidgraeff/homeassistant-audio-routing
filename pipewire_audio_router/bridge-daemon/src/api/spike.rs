@@ -266,7 +266,7 @@ pub(crate) async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap
 ///
 /// Each target needs a per-device sender to *consume* its overlay, so the handler
 /// first ensures one exists — including opening an **on-demand AP2 session** for a
-/// receiver with nothing routed into it (routing/sync_group.rs) — and reports any target
+/// receiver with nothing routed into it (routing/sync_group/mod.rs) — and reports any target
 /// nothing can carry instead of dropping the clip silently.
 #[derive(Deserialize)]
 pub(crate) struct AgAnnounceRequest {

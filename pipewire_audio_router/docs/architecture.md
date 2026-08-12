@@ -63,7 +63,7 @@ map of the source:
 | `store/` | — | file-backed JSON with no live handles. Membership rule: a module belongs here only if its sole dependency is `util/locks` |
 | `sources/` | §3 | the source collection *and* its reconciler, plus the AirPlay receiver, its client registry, RTP, now-playing, BT-bridge discovery |
 | `outputs/` | §4, §5 | `sendspin/`, `ap2/`, `pwsink/`, the shared `overlay_mixer.rs` and the `listing.rs` model |
-| `routing/` | §4 | the matrix and its handlers, `sync_group.rs`, `sync_settings.rs` |
+| `routing/` | §4 | the matrix and its handlers, `routing/sync_group/mod.rs`, `sync_settings.rs` |
 | `announce/` | §5.5, §9 | announcement delivery and the pure scheduling decisions (`arbiter.rs`) |
 | `align/` | §11 | the manual and mic-assisted alignment cluster |
 | `api/` | §9 | the route table plus one module per resource. A **leaf**: nothing in the crate depends on it |
@@ -142,7 +142,7 @@ backends** (Sendspin and AirPlay-2). It was validated on hardware by the
 Sendspin overhaul and AP2 was aligned onto it.
 
 - **One steady PCM source per group** = the group's
-  `support.null-audio-sink` **anchor** (`routing/sync_group.rs`, keyed
+  `support.null-audio-sink` **anchor** (`routing/sync_group/mod.rs`, keyed
   `sync-grp-<hash>` by source-set). It is a **QUANT-1024 steady clock
   driver** and does the graph-native mix + resample. A *standalone
   per-device* null-sink is **not** a steady driver — it produced ~1 glitch
@@ -171,7 +171,7 @@ duck/overlay (`announce/arbiter.rs` / `announce/mod.rs`).
 ### The `OutputBackend` seam (target end-state)
 
 Historically "output" was scattered node-name-prefix `if`s across
-`routing/mod.rs`, `api/`, `routing/sync_group.rs`, `media_player.py`. The intended
+`routing/mod.rs`, `api/`, `routing/sync_group/mod.rs`, `media_player.py`. The intended
 convergence is a single trait so each backend stops touching five files
 and "drop RAOP" becomes a clean delete:
 
@@ -187,7 +187,7 @@ trait OutputBackend {
 }
 ```
 
-`routing/sync_group.rs::reconcile` would iterate backends and, per group, create
+`routing/sync_group/mod.rs::reconcile` would iterate backends and, per group, create
 one `PerDeviceSender` per member off the group's `Arc<SharedTimeline>` +
 anchor capture. With RAOP gone there are exactly two impls —
 `SendspinBackend`, `Ap2Backend` — and no follower-sink exceptions.
@@ -207,7 +207,7 @@ routing intent through the adopted set:
 - `routing/mod.rs::build_matrix` — an unadopted device isn't in the matrix, so
   it can't be routed **and** the HA integration (which builds its
   `media_player` entities from that listing) never sees it;
-- `routing/sync_group.rs::reconcile` — intent whose output isn't adopted is
+- `routing/sync_group/mod.rs::reconcile` — intent whose output isn't adopted is
   dormant, so no group forms and no stream/session is ever opened to it;
 - `api/outputs.rs` — `/api/outputs` returns the adopted ones,
   `/api/outputs/discovered` the rest (the Outputs page's second list).
@@ -397,7 +397,7 @@ announced to?" reduces to "does it have a running sender?", and the answer
 differs per backend:
 
 - **Sendspin: connection always, audio on demand.** An ungrouped device keeps an
-  **idle sender** (`routing/sync_group.rs`, `IdleSender`) on its own silent
+  **idle sender** (`routing/sync_group/mod.rs`, `IdleSender`) on its own silent
   `null-audio-sink`, so an announcement (or a volume command) never pays a cold
   dial. But the connection carries **no audio** while idle
   (`StreamPolicy::WhenAnnounced`): the device isn't in a group, so it gets no
@@ -674,7 +674,7 @@ flow in text.
  PIPEWIRE GRAPH          ┌──────────────────────────────────────────────────────────┐
  (data-loop, FIFO 83)    │ "airplay-in" producer node — RT_PROCESS drains ring        │
                          │   → F32LE 44.1 kHz   (mainloop thread FIFO 45)              │
-                         │        ▼   (routing/sync_group.rs links airplay-in INTO the anchor) │
+                         │        ▼   (routing/sync_group/mod.rs links airplay-in INTO the anchor) │
                          │ ANCHOR support.null-audio-sink  (one per source-set)        │
                          │   · MIX inputs · resample 44.1→48 kHz · QUANT-1024 driver   │
                          │        ▼                                                    │

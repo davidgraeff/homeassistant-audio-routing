@@ -104,7 +104,7 @@ pub struct AppState {
     pub discovery: crate::supervisor::DiscoverySupervisor,
     /// Latency-alignment session manager (align/calibrate.rs) for the alignment panel.
     pub align: crate::align::calibrate::AlignManager,
-    /// Live sync-group layout (routing/sync_group.rs) — used to restart a group's
+    /// Live sync-group layout (routing/sync_group/mod.rs) — used to restart a group's
     /// sendspin stream when a static-delay change needs it to take effect.
     pub groups: crate::routing::sync_group::SharedGroups,
     /// Named music/announcement groups (store/groups.rs) — the MG/AG data model.

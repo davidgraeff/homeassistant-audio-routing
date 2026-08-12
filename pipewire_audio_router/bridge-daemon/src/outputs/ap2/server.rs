@@ -12,7 +12,7 @@
 //!
 //! Capture is the same anchor-monitor source the sendspin per-device path uses
 //! (48 kHz / S16 / stereo); `LiveAudioDecoder` resamples 48k→44.1k internally.
-#![allow(dead_code)] // wired into routing/sync_group.rs in the same phase
+#![allow(dead_code)] // wired into routing/sync_group/mod.rs in the same phase
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};

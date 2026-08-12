@@ -247,7 +247,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 
     // mDNS auto-discovery (sendspin devices + AirPlay-2 receivers), runtime
     // toggleable from the Settings page (supervisor.rs). Discovery only
-    // populates the shared registries — the grouping reconciler (routing/sync_group.rs)
+    // populates the shared registries — the grouping reconciler (routing/sync_group/mod.rs)
     // builds the audio path from the routing intent. Whether discovery runs comes
     // from the persisted settings flag. The supervisor is held for the process
     // lifetime (serve never returns in practice) so the daemons stay alive.
@@ -454,7 +454,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             }
         });
 
-        // On-demand AP2 announce sessions (routing/sync_group.rs): an unrouted receiver gets
+        // On-demand AP2 announce sessions (routing/sync_group/mod.rs): an unrouted receiver gets
         // a temporary sender so an announcement can reach it, kept on a short lease
         // afterwards. This tick hands the receiver's single AirPlay session back once
         // the lease runs out. Slow on purpose (nothing is time-critical) and
@@ -552,7 +552,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
 /// Starts the persisted sources: the native AirPlay receiver (sources/airplay.rs)
 /// and the RTP source (a PipeWire module). (Sendspin devices aren't started
 /// here — they're auto-discovered and grouped from the routing intent; see
-/// routing/sync_group.rs.)
+/// routing/sync_group/mod.rs.)
 async fn spawn_stored_sources(
     sources: &state::SharedSources,
     airplay: &state::SharedAirplay,
