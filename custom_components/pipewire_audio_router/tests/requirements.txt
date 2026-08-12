@@ -1,0 +1,16 @@
+# The one place the Home Assistant version under test is chosen.
+#
+# pytest-homeassistant-custom-component bundles a specific homeassistant release
+# plus the pytest plugins these tests rely on (the `enable_custom_integrations`
+# fixture, asyncio_mode=auto from pytest.ini). Both CI (.github/workflows/ci.yml)
+# and the local container runner (scripts/test-custom-components.sh) install
+# exactly this, so "passes locally" and "passes in CI" mean the same thing.
+#
+# Keep it matched to the Home Assistant the add-on is actually used with —
+# entity naming, registry behaviour and deprecations move between releases, so a
+# stale pin makes tests assert what production no longer does. See
+# docs/addon_maintenance.md for how to check and bump it.
+#
+# 0.13.355 -> homeassistant==2026.8.1, Requires-Python >=3.14 (an older Python
+# makes pip refuse the pin — keep the runners on 3.14+).
+pytest-homeassistant-custom-component==0.13.355

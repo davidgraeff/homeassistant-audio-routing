@@ -171,11 +171,14 @@ async def test_sendspin_device_adopts_matching_ha_device_name_and_area(hass):
     assert dev_reg.async_get(device.id).area_id == area.id
 
 
-def _esphome_speaker(hass, mac: str, name: str, area: str | None = None) -> dr.DeviceEntry:
+def _esphome_speaker(hass, mac: str, name: str, area: str | None = None, domain: str = "esphome") -> dr.DeviceEntry:
     """An ESPHome device as that integration registers it: a full-MAC connection,
     a name, optionally an area — and, deliberately, *no* entity whose id carries
-    the mDNS hostname, so only the MAC-suffix fallback can find it."""
-    esphome_entry = MockConfigEntry(domain="esphome", data={})
+    the mDNS hostname, so only the MAC-suffix fallback can find it.
+
+    `domain` exists so a test can add a *second* integration's row for the same
+    speaker, which is what a shared MAC looks like since HA 2026.8."""
+    esphome_entry = MockConfigEntry(domain=domain, data={})
     esphome_entry.add_to_hass(hass)
     dev_reg = dr.async_get(hass)
     device = dev_reg.async_get_or_create(
@@ -221,23 +224,21 @@ async def test_sendspin_device_adopts_by_mac_suffix_when_the_hostname_matches_no
 
 
 async def test_mac_suffix_match_prefers_the_live_duplicate_registration(hass):
-    """Two registry devices can share one MAC — ESPHome sub-devices, or a stale
-    duplicate left by re-adding a speaker (the real instance has exactly this:
-    two `Satellite1 c4150c` devices on one MAC, 31 entities and 2). Same physical
-    box, so this is not ambiguity: the one carrying entities wins.
+    """Several registry devices can share one MAC, and since Home Assistant 2026.8
+    keys devices per config entry that is the *normal* case: every integration that
+    talks to the speaker gets its own row. The real instance has two
+    `Satellite1 c4150c` devices on one MAC, with 31 entities and 2.
 
-    Driven at the function level on purpose — `async_get_or_create` de-duplicates
-    by connection, so the public API cannot produce this state. It arrives from
-    storage, where the registry's connection index keeps only the last entry while
-    both stay in `devices`."""
+    Same physical box, so this is not ambiguity — but only one of those rows is
+    worth adopting, and the useful one is the one carrying entities (the other is a
+    near-empty duplicate whose area and name may never have been set)."""
     live = _esphome_speaker(hass, "98:a3:16:c4:15:0c", "Satellite1 c4150c", area="Küche")
     ent_reg = er.async_get(hass)
     for suffix in ("temperature", "humidity"):
         ent_reg.async_get_or_create("sensor", "esphome", f"98:A3:16:C4:15:0C-{suffix}", device_id=live.id)
-    dev_reg = dr.async_get(hass)
-    # The leftover: same MAC, no entities. Inserted directly, see the docstring.
-    stale = dr.DeviceEntry(connections={(dr.CONNECTION_NETWORK_MAC, "98:a3:16:c4:15:0c")}, name="Satellite1 c4150c")
-    dev_reg.devices[stale.id] = stale
+    # A second integration's row for the same speaker: same MAC, no entities.
+    other = _esphome_speaker(hass, "98:A3:16:C4:15:0C", "Satellite1 c4150c", domain="music_assistant")
+    assert other.id != live.id, "expected one device row per config entry"
 
     found = _find_ha_device_by_mac_suffix(hass, "satellite1_c4150c_c4150c")
 

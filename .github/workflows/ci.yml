@@ -119,18 +119,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      # pytest-homeassistant-custom-component bundles a specific Home Assistant
-      # release + the pytest plugins the tests rely on (the
-      # `enable_custom_integrations` fixture, asyncio_mode=auto from pytest.ini).
-      # Pinned for reproducible CI: 0.13.346 -> homeassistant==2026.7.2 and
-      # Requires-Python >=3.14 (so setup-python must be 3.14, not 3.13 — an
-      # older Python makes pip refuse the pin). Bump this pin and the Python
-      # version together when targeting a newer HA. (hacs.json declares a
-      # 2024.1.0 floor, but that predates Python 3.14, so it isn't testable here.)
+      # The Home Assistant under test is pinned in
+      # custom_components/pipewire_audio_router/tests/requirements.txt — the same
+      # file scripts/test-custom-components.sh builds its image from, so local
+      # and CI runs agree. That pin needs Python >=3.14 (setup-python above), and
+      # bumping it is documented in docs/addon_maintenance.md. (hacs.json declares
+      # a 2024.1.0 floor, but that predates Python 3.14, so it isn't testable here.)
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install 'pytest-homeassistant-custom-component==0.13.346'
+          pip install -r custom_components/pipewire_audio_router/tests/requirements.txt
           # The integration depends on the `frontend` component (it serves the
           # dashboard card), and that component imports `hass_frontend` when it
           # sets up — without this wheel every test that loads a config entry

@@ -58,6 +58,10 @@ setup flow, are in each component's own README linked above.
   and more), not preferences.
 - [**docs/api-reference.md**](docs/api-reference.md) — the bridge
   daemon's REST/WebSocket API.
+- [**docs/addon_maintenance.md**](docs/addon_maintenance.md) — keeping up
+  with Home Assistant: which HA version the tests run against and how to
+  bump it, what past bumps broke, and the commands for testing and
+  deploying against the real instance.
 - [**tests/**](tests/) — the runnable scripts backing those write-ups;
   nothing here is "verified" without one. All of it — the Rust daemon
   (rustfmt/clippy/tests), the web UI (svelte-check/build), the HA

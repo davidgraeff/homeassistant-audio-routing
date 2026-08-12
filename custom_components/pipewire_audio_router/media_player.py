@@ -34,7 +34,6 @@ from homeassistant.helpers import (
     entity_platform,
     entity_registry as er,
 )
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
@@ -112,10 +111,12 @@ def _find_ha_device_by_mac_suffix(hass: HomeAssistant, hostname: str) -> dr.Devi
     hex digits over the devices of one household — and we still refuse to guess
     between two *different* MACs.
 
-    Several registry devices legitimately share one MAC (ESPHome sub-devices, or a
-    stale duplicate left by re-adding a speaker). They are the same physical box,
-    so that is not ambiguity: take the one carrying the most entities, which is
-    the live registration rather than the leftover."""
+    Several registry devices legitimately share one MAC — since HA 2026.8 devices
+    are keyed per config entry, so every integration that talks to the speaker has
+    its own row (ESPHome sub-devices and re-added speakers do it too). They are the
+    same physical box, so that is not ambiguity: take the one carrying the most
+    entities, which is the row with a real name and area rather than a near-empty
+    duplicate."""
     suffix = _mac_suffix(hostname)
     if suffix is None:
         return None
@@ -562,27 +563,30 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _S
             return PWSINK_DEV_PREFIX
         return None
 
-    @property
-    def device_info(self) -> DeviceInfo | None:
-        """Merge this media_player into the matched Home Assistant device, so it
-        is grouped under the real speaker and inherits its name + area. `None`
-        when unmatched (kept standalone). We reuse the device's own existing
-        identity — its full-MAC connection(s) if it has any (sendspin's ESPHome
-        device, some AV gear), else its integration identifiers (MusicCast /
-        HomeKit devices keyed that way) — never reconstruct one, which is what
-        makes HA merge this entity into that exact device."""
+    async def async_added_to_hass(self) -> None:
+        """Attach this media_player to the matched Home Assistant device, so it is
+        grouped under the real speaker and inherits its name + area.
+
+        Done by writing the entity registry's `device_id` — the same thing the UI's
+        "assign entity to a device" does — and *not* by returning `DeviceInfo` from
+        this entity. That used to work: declaring the speaker's own identity (its
+        full-MAC connection, or its integration identifiers for MusicCast/HomeKit
+        gear keyed that way) made Home Assistant merge us into that exact device.
+        Home Assistant 2026.8 keys the device registry per config entry
+        (`DeviceRegistryItems.get_entry(..., config_entry_id=…)`), so the same
+        declaration now *creates a second device row* with the same MAC instead —
+        leaving the output with no name and no area, which silently costs voice
+        ducking the room.
+
+        Only set when the entity has no device yet, so a user who moved it (or
+        detached it deliberately) keeps their choice across restarts."""
+        await super().async_added_to_hass()
         if self._ha_device is None:
-            return None
-        mac_connections = {
-            (conn_type, conn_value)
-            for conn_type, conn_value in self._ha_device.connections
-            if conn_type == dr.CONNECTION_NETWORK_MAC
-        }
-        if mac_connections:
-            return DeviceInfo(connections=mac_connections)
-        if self._ha_device.identifiers:
-            return DeviceInfo(identifiers=set(self._ha_device.identifiers))
-        return None
+            return
+        ent_reg = er.async_get(self.hass)
+        entry = ent_reg.async_get(self.entity_id)
+        if entry is not None and entry.device_id is None:
+            ent_reg.async_update_entity(self.entity_id, device_id=self._ha_device.id)
 
     def _output(self) -> RoutingNode | None:
         """This output's routing-matrix entry (the authoritative existence +

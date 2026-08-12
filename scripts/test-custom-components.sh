@@ -21,15 +21,26 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="pw-router-test-hass"
 
-echo "=== building test image $IMAGE (cached) ==="
-docker build -t "$IMAGE" - <<'DOCKERFILE'
-# Full python:3.13 (not -slim): HA's dependency tree occasionally needs a
+# The Home Assistant under test comes from the same pin CI uses — not from
+# "whatever pip resolves today", which silently froze this image on a
+# months-old HA while CI moved on, so a test could pass here and assert
+# behaviour production had already changed. Passed as a build arg so bumping the
+# pin rebuilds the layer.
+PIN_FILE="$REPO_ROOT/custom_components/pipewire_audio_router/tests/requirements.txt"
+PHCC="$(grep -oE 'pytest-homeassistant-custom-component==[0-9.]+' "$PIN_FILE")"
+[ -n "$PHCC" ] || { echo "no pytest-homeassistant-custom-component pin in $PIN_FILE" >&2; exit 1; }
+
+echo "=== building test image $IMAGE ($PHCC, cached) ==="
+docker build -t "$IMAGE" --build-arg PHCC="$PHCC" - <<'DOCKERFILE'
+# Full python:3.14 (not -slim): HA's dependency tree occasionally needs a
 # compiler for a wheel; the full image ships the build tooling, avoiding flaky
-# installs. pytest-homeassistant-custom-component pins the compatible
-# homeassistant, so pip resolves the two together (the integration's own
-# manifest requirements are empty).
-FROM python:3.13
-RUN pip install --no-cache-dir pytest-homeassistant-custom-component homeassistant
+# installs. 3.14 because pytest-homeassistant-custom-component requires it —
+# on an older Python pip quietly resolves a far older release instead of
+# refusing. It pins the compatible homeassistant, so pip resolves the two
+# together (the integration's own manifest requirements are empty).
+FROM python:3.14
+ARG PHCC
+RUN pip install --no-cache-dir "$PHCC"
 # The integration depends on the `frontend` component (it serves + registers the
 # dashboard card), and that component imports `hass_frontend` when it sets up —
 # so without this package every test that loads a config entry fails on
