@@ -130,6 +130,7 @@ use crate::announce::arbiter::ReservationId;
 use crate::pw::thread::ChangeNotifier;
 use crate::routing::sync_group::SharedGroups;
 use crate::store::routing::{RoutingLink, SharedRouting};
+use crate::util::locks::LockRecover;
 use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -244,6 +245,13 @@ pub struct Interference {
 /// (`align/calibrate/mod.rs` enforces that), and the two reporters — the announce path and the
 /// overlay mixer — need a cheap, lock-light "is this output reserved?" that does not
 /// reach into the reconciler or the arbiter.
+/// Every access goes through [`LockRecover`], never `unwrap()`, and that is not
+/// defensive habit: since `RoutingNode::held` landed, this mutex is read on **every
+/// routing-matrix frame**. A panic anywhere else in the process poisons it, and
+/// `unwrap()` would then turn a poisoned registry into a dead routing WebSocket —
+/// taking the matrix, the graph and the Outputs page down over a lock that guards one
+/// `Option`. Recovering reads a possibly-stale slot instead, which is the right trade
+/// for a "which speakers are held" hint.
 #[derive(Default)]
 pub struct HoldRegistry {
     inner: Mutex<Option<LiveHold>>,
@@ -292,13 +300,13 @@ impl HoldRegistry {
     /// Record the hold. Replaces any previous one (a stale entry would keep
     /// reserving outputs nothing is aligning).
     fn open(&self, id: ReservationId, held: HoldLabels) {
-        *self.inner.lock().unwrap() = Some(LiveHold { id, held, formed: Instant::now(), interference: Vec::new() });
+        *self.inner.lock_recover() = Some(LiveHold { id, held, formed: Instant::now(), interference: Vec::new() });
     }
 
     /// Forget the hold, if `id` is still the live one. Id-guarded so a late teardown
     /// cannot clear a *newer* session's hold.
     fn close(&self, id: ReservationId) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock_recover();
         if guard.as_ref().is_some_and(|h| h.id == id) {
             *guard = None;
         }
@@ -308,12 +316,12 @@ impl HoldRegistry {
     /// lifecycle test asserts on); no production reader yet.
     #[allow(dead_code)]
     pub fn holder(&self) -> Option<ReservationId> {
-        self.inner.lock().unwrap().as_ref().map(|h| h.id)
+        self.inner.lock_recover().as_ref().map(|h| h.id)
     }
 
     /// Is `output` currently held for alignment?
     pub fn is_reserved(&self, output: &str) -> bool {
-        self.inner.lock().unwrap().as_ref().is_some_and(|h| h.held.contains_key(output))
+        self.inner.lock_recover().as_ref().is_some_and(|h| h.held.contains_key(output))
     }
 
     /// Every held output (empty when nothing is aligning).
@@ -323,14 +331,14 @@ impl HoldRegistry {
     /// the whole frame, where a per-output [`Self::is_reserved`] could see a release
     /// land mid-build and emit a frame in which only some of the held rows say so.
     pub fn reserved(&self) -> BTreeSet<String> {
-        self.inner.lock().unwrap().as_ref().map(|h| h.held.keys().cloned().collect()).unwrap_or_default()
+        self.inner.lock_recover().as_ref().map(|h| h.held.keys().cloned().collect()).unwrap_or_default()
     }
 
     /// Report that something outranked the hold on `member`. A no-op when `member`
     /// is not held, so callers on the hot-ish paths (a duck hold, an admitted
     /// barge-in) can report unconditionally without first asking.
     pub fn note(&self, member: &str, cause: InterferenceCause) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock_recover();
         let Some(hold) = guard.as_mut() else { return };
         // The label comes from the hold, not from the caller: `note` is called from the
         // announce scheduler and the overlay mixer, neither of which can reach the
@@ -359,7 +367,7 @@ impl HoldRegistry {
     /// reports, so a hold that has been superseded can never consume — or be
     /// confused by — another session's.
     pub fn take_interference(&self, id: ReservationId) -> Vec<Interference> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock_recover();
         match guard.as_mut() {
             Some(hold) if hold.id == id => std::mem::take(&mut hold.interference),
             _ => Vec::new(),
@@ -369,7 +377,7 @@ impl HoldRegistry {
     /// Peek without draining — for the status endpoint, which must not steal a
     /// report the state machine has not seen yet.
     pub fn interference(&self, id: ReservationId) -> Vec<Interference> {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock_recover();
         match guard.as_ref() {
             Some(hold) if hold.id == id => hold.interference.clone(),
             _ => Vec::new(),
