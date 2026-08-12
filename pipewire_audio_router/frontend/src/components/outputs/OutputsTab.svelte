@@ -6,7 +6,7 @@
   import { askConfirm, removeOutputConfirm } from '../../lib/confirm.svelte';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../../lib/types';
   import { delaySpec, hasDelayKnob } from '../../lib/outputs/delay';
-  import { setOutputMute, setOutputVolume } from '../../lib/outputs/level';
+  import { levelCaps, setOutputMute, setOutputVolume } from '../../lib/outputs/level';
   import { canTest, kindLabel, ptpBadge, statusBadge, syncBadge, testHint } from '../../lib/outputs/labels';
   import GroupTitle from '../groups/GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
@@ -51,19 +51,19 @@
     new Map($routing.matrix.outputs.map((o) => [o.node_name, o.volume == null ? null : Math.round(o.volume * 100)])),
   );
 
-  /** Does the daemon have a level it can drive for this output?
+  /** What the daemon says it can drive per output — its own answer (`level_caps`),
+   *  not this page's guess.
    *
-   *  `volume`/`muted` are reported exactly when it can (sendspin and AP2 in-band,
-   *  pw-sink through the receiver agent) and are null when it cannot — an agent-less
-   *  host, or a sink with neither a device route nor node volume. Either is enough:
-   *  a member whose level was never reported can still be *set*, which is why
-   *  <VolumeControl> keeps the slider live and only changes its tooltip. Deliberately
-   *  kind-agnostic, so the next output kind gets its control the moment the daemon
-   *  reports state instead of needing this file edited. */
-  const levelControl = $derived(
-    new Set($routing.matrix.outputs.filter((o) => o.volume != null || o.muted != null).map((o) => o.node_name)),
-  );
-  const hasLevelControl = (nodeName: string) => levelControl.has(nodeName);
+   *  It used to be inferred from `volume`/`muted` being non-null, which is the question
+   *  "has a level arrived?" — a near-miss that held only because sendspin and AirPlay 2
+   *  always report some mute. Kind-agnostic either way, and now also independent of
+   *  whether a level has ever been read: a receiver that has never told us its volume
+   *  still has a knob. See `lib/outputs/level.ts`. */
+  const caps = $derived(new Map($routing.matrix.outputs.map((o) => [o.node_name, levelCaps(o)])));
+  const hasLevelControl = (nodeName: string) => {
+    const c = caps.get(nodeName);
+    return !!c && (c.volume || c.mute);
+  };
 
   // Outputs a speaker-timing measurement holds right now (`RoutingNode.held`), from
   // the same live matrix as the levels above. That hold is *exclusive*: while it is up
@@ -750,6 +750,8 @@
               <VolumeControl
                 percent={liveVol.get(o.node_name) ?? null}
                 muted={muted[o.node_name] ?? false}
+                canVolume={caps.get(o.node_name)?.volume ?? true}
+                canMute={caps.get(o.node_name)?.mute ?? true}
                 onVolume={(pct) => onVolume(o, pct)}
                 onMute={() => onMute(o)}
               />

@@ -24,8 +24,16 @@
     onMute: () => void;
     /** Disable the whole control (e.g. output offline). */
     disabled?: boolean;
+    /** Is there a volume knob to drag / a mute to toggle? Both default to true, which is
+     *  every case but one: a PipeWire host whose sink has no device route reports a volume
+     *  and no mute, so it gets the slider and no mute button. A button that cannot work is
+     *  worse than an absent one — it looks like the write failed silently, which is exactly
+     *  how the pw-sink volume bug read. Both false renders nothing at all; the caller is
+     *  expected not to mount this then. */
+    canVolume?: boolean;
+    canMute?: boolean;
   }
-  let { percent, muted, onVolume, onMute, disabled = false }: Props = $props();
+  let { percent, muted, onVolume, onMute, disabled = false, canVolume = true, canMute = true }: Props = $props();
 
   const known = $derived(percent != null);
 
@@ -53,27 +61,34 @@
 </script>
 
 <div class="vol-control">
-  <button
-    class="mute"
-    class:on={muted}
-    aria-pressed={muted}
-    title={muted ? 'Unmute' : 'Mute'}
-    {disabled}
-    onclick={onMute}
-  >{muted ? '🔇' : '🔊'}</button>
-  <input
-    class="vol-slider"
-    type="range"
-    min="0"
-    max="100"
-    step="1"
-    disabled={disabled || muted}
-    value={local}
-    oninput={onInput}
-    title={known
-      ? `Volume ${local}%`
-      : "Volume unknown — the receiver didn't report its level; move to set"}
-  />
+  {#if canMute}
+    <button
+      class="mute"
+      class:on={muted}
+      aria-pressed={muted}
+      title={muted ? 'Unmute' : 'Mute'}
+      {disabled}
+      onclick={onMute}
+    >{muted ? '🔇' : '🔊'}</button>
+  {/if}
+  {#if canVolume}
+    <input
+      class="vol-slider"
+      type="range"
+      min="0"
+      max="100"
+      step="1"
+      disabled={disabled || muted}
+      value={local}
+      oninput={onInput}
+      title={known
+        ? `Volume ${local}%`
+        : "Volume unknown — the receiver didn't report its level; move to set"}
+    />
+  {:else}
+    <!-- Mute-only: say why the slider is missing rather than leaving a gap. -->
+    <span class="no-slider" title="This output's own volume cannot be set from here — only its mute">no volume control</span>
+  {/if}
 </div>
 
 <style>
@@ -137,6 +152,15 @@
   .vol-slider:disabled {
     opacity: 0.4;
     cursor: default;
+  }
+  .no-slider {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.72rem;
+    color: var(--secondary-text-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .mute {
     flex: none;

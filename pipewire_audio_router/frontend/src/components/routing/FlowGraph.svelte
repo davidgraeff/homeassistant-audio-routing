@@ -6,7 +6,7 @@
   import { askConfirm, removeOutputConfirm } from '../../lib/confirm.svelte';
   import type { MusicGroup, NowPlaying, RoutingNode } from '../../lib/types';
   import VolumeControl from '../ui/VolumeControl.svelte';
-  import { SENDSPIN_DEV_PREFIX, setOutputMute, setOutputVolume } from '../../lib/outputs/level';
+  import { SENDSPIN_DEV_PREFIX, hasAnyLevelControl, levelCaps, setOutputMute, setOutputVolume } from '../../lib/outputs/level';
   import RoutingHelp from './RoutingHelp.svelte';
 
   // Interactive bipartite routing graph: sources on the left, what they play on
@@ -39,13 +39,13 @@
   // (AirPlay 1) is being retired and no longer exposes volume in this UI.
   /** Does the daemon have a level it can drive for this node?
    *
-   *  `volume`/`muted` are reported exactly when it can — sendspin and AP2 in-band,
-   *  pw-sink through the receiver agent — and null when it cannot (no agent, or a sink
-   *  with no volume lever). Sources report neither, so this also excludes them without
-   *  naming prefixes, which is what the old `isVirtual` name-prefix test was really for.
-   *  Kind-agnostic on purpose: enumerating prefixes here is what hid the control from
-   *  every pw-sink host the daemon could already drive. */
-  const hasLevel = (n: RoutingNode) => n.volume != null || n.muted != null;
+   *  The daemon's own answer (`level_caps`), per output and per moment — it is the only
+   *  party that knows whether a receiver agent is on the other end. Sources carry no caps,
+   *  so this excludes them without naming prefixes, which is what the old `isVirtual`
+   *  name-prefix test was really for. Never derived from the kind: enumerating prefixes
+   *  here is what hid the control from every pw-sink host the daemon could already drive,
+   *  and inferring it from `volume != null` asked "has a level arrived?" instead. */
+  const hasLevel = (n: RoutingNode) => hasAnyLevelControl(n);
 
   /** Expert view: bypass groups and wire individual speakers. */
   let showSpeakers = $state(false);
@@ -843,13 +843,16 @@
                           >
                         {/if}
                       </span>
-                      <!-- Capability, not kind: `volume`/`muted` are populated exactly
-                           when the daemon can drive that output, so this also excludes
-                           sources (which report neither) without naming prefixes. -->
+                      <!-- Capability, not kind, and per knob: the daemon reports which of
+                           the two it can drive (`level_caps`), so a host that answers for
+                           its volume and not its mute gets the slider without a dead
+                           button. Sources carry no caps, so they are excluded here too. -->
                       {#if m.present && hasLevel(m)}
                         <VolumeControl
                           percent={m.volume == null ? null : Math.round(m.volume * 100)}
                           muted={muted[m.node_name] ?? false}
+                          canVolume={levelCaps(m).volume}
+                          canMute={levelCaps(m).mute}
                           onVolume={(pct) => onVolume(m.node_name, pct)}
                           onMute={() => onMute(m.node_name)}
                         />

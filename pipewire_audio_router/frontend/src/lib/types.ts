@@ -51,21 +51,34 @@ export interface RoutingNode {
   /** Current volume 0.0–1.0, pushed live over the routing WS so the slider syncs
    * (including physical changes a device reports).
    *
-   * **This field is the capability contract the UI gates on.** It is populated
-   * exactly when the daemon can drive that output's level — sendspin and AirPlay 2
-   * in-band, a pw-sink host through the receiver agent — and `null`/absent when it
-   * genuinely cannot: an agent-less host, a sink with neither a device route nor node
-   * volume, or a source. So render a volume control iff `volume != null || muted !=
-   * null`; do **not** test the output kind. Enumerating kinds is what previously hid
-   * the control from every pw-sink host the daemon could already drive.
+   * **A value, not a capability.** `null`/absent means "not known" — never read it as
+   * "not possible": an AirPlay 2 receiver whose level has never been read still has a
+   * perfectly good in-band knob. What may be driven is `level_caps`, and neither
+   * question may be answered from the output's kind (enumerating kinds is what hid the
+   * control from every pw-sink host the daemon could already drive).
    *
-   * `null` on an output that *does* have a control means "level not reported yet, but
-   * settable" — <VolumeControl> keeps the slider live and only changes its tooltip. */
+   * The two were the same test until `level_caps` existed, and it worked only because
+   * sendspin and AirPlay 2 always report *some* mute — so `volume != null || muted !=
+   * null` happened to coincide with "has a knob". It stays the fallback for a daemon
+   * older than `level_caps`; see `lib/outputs/level.ts`, which owns both questions.
+   *
+   * <VolumeControl> keeps the slider live for an unknown level and only changes its
+   * tooltip — never a fabricated 100 %, since these are dB scales. */
   volume?: number | null;
-  /** Current mute state, same capability contract as `volume` above. Deliberately
-   * `null` rather than `false` when unknown: a missing agent reading as "unmuted"
-   * would put a mute button on screen that silently does nothing. */
+  /** Current mute state — a value, same as `volume` above. Deliberately `null` rather
+   * than `false` when unknown: a missing agent reading as "unmuted" would put a mute
+   * button on screen that silently does nothing. */
   muted?: boolean | null;
+  /** Outputs only: **which level knobs the daemon can actually drive on this output
+   * right now**, resolved per output rather than per kind, and re-resolved as agents
+   * come and go. Absent for sources and for real PipeWire nodes.
+   *
+   * This is the capability contract — gate controls on it (through
+   * `hasAnyLevelControl`, which also handles an older daemon that does not send it).
+   * The daemon is the only party that can answer: for sendspin and AirPlay 2 the knobs
+   * are part of the protocol, and for a PipeWire host they are its receiver agent's,
+   * which is a live question. */
+  level_caps?: LevelCaps | null;
   /** Outputs only: the diagnosed reason this output can't carry audio right now;
    * absent when nothing is known to be wrong. Turns "not connected" from a state
    * you have to guess about into one with a stated cause. AirPlay 2 only so far. */
@@ -89,6 +102,19 @@ export interface RoutingNode {
    * page is open (profiling is armed on demand); absent for virtual outputs and
    * when profiling is off. A rising value marks where dropouts originate. */
   xruns?: number | null;
+}
+
+/** Which of an output's two level knobs the daemon can drive right now
+ *  (`routing::LevelCaps`).
+ *
+ *  Two flags rather than one, because they are independent in practice: a PipeWire host
+ *  whose sink has no device route reports a volume through the node's properties and no
+ *  mute at all, so it is levellable while its mute is out of reach. (Alignment can still
+ *  *silence* such a member through its own relay — a different question, and the reason
+ *  nothing in the UI should ever say a speaker cannot be silenced.) */
+export interface LevelCaps {
+  volume: boolean;
+  mute: boolean;
 }
 
 export interface RoutingLink {
