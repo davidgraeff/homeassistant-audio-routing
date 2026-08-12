@@ -12,6 +12,8 @@ PAUSE are not exposed for the same reason.
 from __future__ import annotations
 
 import logging
+import re
+from collections import Counter
 from datetime import datetime
 
 import voluptuous as vol
@@ -82,6 +84,76 @@ def _esphome_hostname(node_name: str) -> str | None:
     return None
 
 
+def _mac_suffix(hostname: str) -> str | None:
+    """The trailing MAC fragment ESPHome appends to a default node name — the last
+    three bytes as six hex digits, e.g. `home_assistant_voice_093ca8` → `093ca8`.
+
+    `None` when the name doesn't end in one, which is the point: a hand-named
+    speaker (`sendspin-dev-kitchen`) must not be matched against some unrelated
+    device whose MAC happens to end in `kitchen`-looking hex."""
+    match = re.search(r"(?:^|[_-])([0-9a-f]{6})$", hostname.lower())
+    return match.group(1) if match else None
+
+
+def _find_ha_device_by_mac_suffix(hass: HomeAssistant, hostname: str) -> dr.DeviceEntry | None:
+    """Fallback correlation: the device whose MAC ends in the hostname's trailing
+    MAC fragment.
+
+    Needed because the hostname-substring match below is only as good as the
+    device's mDNS name matching its ESPHome node name, and that is not guaranteed:
+    a speaker can advertise its MAC fragment *twice* (`satellite1-c4150c-c4150c`
+    for the node `satellite1_c4150c`), at which point no entity id contains the
+    string we derived and the output silently adopts nothing — no device, no area,
+    so voice ducking finds no targets in that room.
+
+    The MAC is the identity that actually holds: the daemon's node name ends in
+    the same three bytes the ESPHome device registers as its
+    `CONNECTION_NETWORK_MAC`. Matching on those is narrower than it looks — six
+    hex digits over the devices of one household — and we still refuse to guess
+    between two *different* MACs.
+
+    Several registry devices legitimately share one MAC (ESPHome sub-devices, or a
+    stale duplicate left by re-adding a speaker). They are the same physical box,
+    so that is not ambiguity: take the one carrying the most entities, which is
+    the live registration rather than the leftover."""
+    suffix = _mac_suffix(hostname)
+    if suffix is None:
+        return None
+
+    dev_reg = dr.async_get(hass)
+    by_mac: dict[str, list[dr.DeviceEntry]] = {}
+    for device in dev_reg.devices.values():
+        for conn_type, value in device.connections:
+            if conn_type != dr.CONNECTION_NETWORK_MAC:
+                continue
+            mac = value.replace(":", "").replace("-", "").lower()
+            if mac.endswith(suffix):
+                by_mac.setdefault(mac, []).append(device)
+
+    if len(by_mac) != 1:
+        if len(by_mac) > 1:
+            _LOGGER.warning(
+                "sendspin hostname %r matched %d different MACs (%s); not linking (ambiguous)",
+                hostname,
+                len(by_mac),
+                ", ".join(sorted(by_mac)),
+            )
+        return None
+
+    candidates = next(iter(by_mac.values()))
+    ent_reg = er.async_get(hass)
+    counts = Counter(entity.device_id for entity in ent_reg.entities.values())
+    # `device.id` as the final tiebreak so the choice is stable across restarts.
+    device = max(candidates, key=lambda d: (counts[d.id], d.id))
+    _LOGGER.debug(
+        "sendspin hostname %r matched no entity id; linked by MAC suffix %r to %s",
+        hostname,
+        suffix,
+        device.name_by_user or device.name,
+    )
+    return device
+
+
 def _find_ha_device(hass: HomeAssistant, node_name: str) -> dr.DeviceEntry | None:
     """Correlate a sendspin output to the Home Assistant device that represents
     the same physical speaker, so the media_player can adopt HA's name and area
@@ -95,6 +167,10 @@ def _find_ha_device(hass: HomeAssistant, node_name: str) -> dr.DeviceEntry | Non
     device carries the speaker's genuine full-MAC connection. So we match on the
     whole hostname (not a truncated MAC), resolve it to that device, and later
     link via the device's real connections.
+
+    When that finds nothing, fall back to the hostname's trailing MAC fragment
+    (`_find_ha_device_by_mac_suffix`) — the mDNS name and the ESPHome node name do
+    not always agree, and the MAC does.
 
     Returns the matched device, or `None` if there's no match — or, defensively,
     if more than one distinct device matches (ambiguous → don't guess)."""
@@ -123,7 +199,10 @@ def _find_ha_device(hass: HomeAssistant, node_name: str) -> dr.DeviceEntry | Non
                 len(device_ids),
                 hostname,
             )
-        return None
+            # Ambiguous is a different failure from absent: two devices really do
+            # claim this hostname, so a MAC match would be guessing between them.
+            return None
+        return _find_ha_device_by_mac_suffix(hass, hostname)
     return dr.async_get(hass).async_get(next(iter(device_ids)))
 
 

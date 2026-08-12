@@ -26,6 +26,7 @@ from custom_components.pipewire_audio_router.api import (
     RtpSourceState,
 )
 from custom_components.pipewire_audio_router.const import DOMAIN
+from custom_components.pipewire_audio_router.media_player import _find_ha_device_by_mac_suffix
 
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
@@ -165,6 +166,104 @@ async def test_sendspin_device_adopts_matching_ha_device_name_and_area(hass):
     # own built-in "… Media Player" on the same device).
     assert state.attributes["friendly_name"] == "Home Assistant Voice Badezimmer Audio Routing"
     assert dev_reg.async_get(device.id).area_id == area.id
+
+
+def _esphome_speaker(hass, mac: str, name: str, area: str | None = None) -> dr.DeviceEntry:
+    """An ESPHome device as that integration registers it: a full-MAC connection,
+    a name, optionally an area — and, deliberately, *no* entity whose id carries
+    the mDNS hostname, so only the MAC-suffix fallback can find it."""
+    esphome_entry = MockConfigEntry(domain="esphome", data={})
+    esphome_entry.add_to_hass(hass)
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get_or_create(
+        config_entry_id=esphome_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, mac)},
+        name=name,
+    )
+    if area is not None:
+        dev_reg.async_update_device(device.id, area_id=ar.async_get(hass).async_get_or_create(area).id)
+    return device
+
+
+async def _setup_with_output(hass, node_name: str, display_name: str):
+    entry = _make_entry(hass)
+    routing = RoutingMatrix(
+        sources=[],
+        outputs=[RoutingNode(node_id=None, node_name=node_name, display_name=display_name, configured=False)],
+        links=[],
+    )
+    with _patch_daemon(routing):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry
+
+
+async def test_sendspin_device_adopts_by_mac_suffix_when_the_hostname_matches_nothing(hass):
+    """A speaker whose mDNS name repeats its MAC fragment (`satellite1-c4150c-c4150c`
+    for the ESPHome node `satellite1_c4150c`) leaves the daemon with a hostname no
+    entity id contains. The trailing MAC fragment still identifies the device, so
+    the output adopts it — otherwise that room has no area and voice ducking there
+    silently finds no targets."""
+    device = _esphome_speaker(hass, "98:a3:16:c4:15:0c", "Satellite1 c4150c", area="Küche")
+
+    entry = await _setup_with_output(hass, "sendspin-dev-satellite1_c4150c_c4150c", "satellite1-c4150c-c4150c")
+
+    ent_reg = er.async_get(hass)
+    entity_id = ent_reg.async_get_entity_id(
+        "media_player", DOMAIN, f"{entry.entry_id}_out_sendspin-dev-satellite1_c4150c_c4150c"
+    )
+    assert entity_id is not None
+    assert ent_reg.async_get(entity_id).device_id == device.id
+    assert dr.async_get(hass).async_get(device.id).area_id == ar.async_get(hass).async_get_area_by_name("Küche").id
+
+
+async def test_mac_suffix_match_prefers_the_live_duplicate_registration(hass):
+    """Two registry devices can share one MAC — ESPHome sub-devices, or a stale
+    duplicate left by re-adding a speaker (the real instance has exactly this:
+    two `Satellite1 c4150c` devices on one MAC, 31 entities and 2). Same physical
+    box, so this is not ambiguity: the one carrying entities wins.
+
+    Driven at the function level on purpose — `async_get_or_create` de-duplicates
+    by connection, so the public API cannot produce this state. It arrives from
+    storage, where the registry's connection index keeps only the last entry while
+    both stay in `devices`."""
+    live = _esphome_speaker(hass, "98:a3:16:c4:15:0c", "Satellite1 c4150c", area="Küche")
+    ent_reg = er.async_get(hass)
+    for suffix in ("temperature", "humidity"):
+        ent_reg.async_get_or_create("sensor", "esphome", f"98:A3:16:C4:15:0C-{suffix}", device_id=live.id)
+    dev_reg = dr.async_get(hass)
+    # The leftover: same MAC, no entities. Inserted directly, see the docstring.
+    stale = dr.DeviceEntry(connections={(dr.CONNECTION_NETWORK_MAC, "98:a3:16:c4:15:0c")}, name="Satellite1 c4150c")
+    dev_reg.devices[stale.id] = stale
+
+    found = _find_ha_device_by_mac_suffix(hass, "satellite1_c4150c_c4150c")
+
+    assert found is not None and found.id == live.id
+
+
+async def test_mac_suffix_match_refuses_two_different_macs(hass):
+    """Six hex digits are near-unique in one household but not guaranteed: two
+    devices whose MACs both end in the fragment means we don't know which speaker
+    this is, so nothing is adopted."""
+    _esphome_speaker(hass, "98:a3:16:c4:15:0c", "Satellite1 c4150c", area="Küche")
+    _esphome_speaker(hass, "aa:bb:cc:c4:15:0c", "Some other gadget", area="Büro")
+
+    await _setup_with_output(hass, "sendspin-dev-satellite1_c4150c_c4150c", "satellite1-c4150c-c4150c")
+
+    reg_entry = er.async_get(hass).async_get("media_player.satellite1_c4150c_c4150c")
+    assert reg_entry is not None and reg_entry.device_id is None
+
+
+async def test_hand_named_speaker_is_not_matched_by_mac_suffix(hass):
+    """A hostname with no trailing MAC fragment must not be MAC-matched at all —
+    `sendspin-dev-kitchen` has no six-hex tail, so there is nothing to compare and
+    the output stays standalone rather than adopting some unrelated device."""
+    _esphome_speaker(hass, "98:a3:16:c4:15:0c", "Satellite1 c4150c", area="Küche")
+
+    await _setup_with_output(hass, "sendspin-dev-kitchen", "kitchen")
+
+    reg_entry = er.async_get(hass).async_get("media_player.kitchen")
+    assert reg_entry is not None and reg_entry.device_id is None
 
 
 async def test_sendspin_device_without_matching_ha_device_keeps_derived_name(hass):
