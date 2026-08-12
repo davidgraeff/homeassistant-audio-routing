@@ -131,7 +131,7 @@ use crate::pw::thread::ChangeNotifier;
 use crate::routing::sync_group::SharedGroups;
 use crate::store::routing::{RoutingLink, SharedRouting};
 use crate::util::locks::LockRecover;
-use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
+use crate::util::node_names::OutputKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -800,18 +800,17 @@ pub fn validate_selection(outputs: &[String], adopted: &BTreeSet<String>) -> Res
 /// The alignment member kind of an output, by its stable-name prefix, or `None` for
 /// a kind that cannot be an alignment member.
 pub fn member_kind(output: &str) -> Option<MemberKind> {
-    if output.starts_with(SENDSPIN_DEV_PREFIX) {
-        Some(MemberKind::Sendspin)
-    } else if output.starts_with(AP2_DEV_PREFIX) {
-        Some(MemberKind::Airplay2)
-    } else if output.starts_with(PWSINK_DEV_PREFIX) {
-        // Admitted since W15. It has a delay knob (with a hard 15 ms floor, plan
-        // §1.1.2) but **no level knob**, so it constrains the other members instead of
-        // being tuned — reported by `ExclusiveHold::level_constraint`, never silently
-        // skipped, and never mis-typed as sendspin.
-        Some(MemberKind::PwSink)
-    } else {
-        None
+    // One arm per output kind, so a new kind is a compile error here — which is the right
+    // place for it: whether something can be an alignment member is a decision, and the
+    // `else { None }` this replaced would have made it silently "no".
+    match OutputKind::of(output) {
+        Some(OutputKind::Sendspin) => Some(MemberKind::Sendspin),
+        Some(OutputKind::Airplay2) => Some(MemberKind::Airplay2),
+        // Admitted since W15. It has a delay knob (with a hard 15 ms floor, plan §1.1.2),
+        // and its *level* is its host agent's — resolved per position by
+        // `calibrate::level_plan`, never assumed from this kind (W20).
+        Some(OutputKind::PwSink) => Some(MemberKind::PwSink),
+        None => None,
     }
 }
 

@@ -175,6 +175,26 @@ Historically "output" was scattered node-name-prefix `if`s across
 convergence is a single trait so each backend stops touching five files
 and "drop RAOP" becomes a clean delete:
 
+**First slice, built 2026-08-12 — `util::node_names::OutputKind`.** The trait is still the
+target, but the *classification* half of it exists now, because the prefix chains were not
+merely untidy: every one ended in an `else` that guessed, and three bugs came out of that
+(a pw-sink volume write routed to the sendspin endpoint, which stored it and answered `ok`;
+the matrix reporting no level for hosts it could already drive; the alignment wizard
+answering "is there a level knob?" from a kind table of its own). `OutputKind::of(node)`
+returns `Option<OutputKind>` and every decision site now `match`es it **with no wildcard
+arm**, so a fourth output kind is a compile error in exactly the places that have to decide
+something about it. The kind's own `label()` supplies the API's wire string, so the enum and
+the strings the frontend matches on cannot drift.
+
+Its companion is `routing::LevelCaps`, published per output on the matrix
+(`RoutingNode.level_caps`): **what the daemon can actually drive right now**, resolved per
+output rather than per kind — a PipeWire host's level is its receiver agent's, which comes
+and goes while the page is open. That distinction (`volume: null` = *unknown*,
+`level_caps.volume: false` = *impossible*) is what consumers previously had to guess at, and
+it is a capability only the daemon can compute. What is still kind-shaped, and the next slice
+of the seam: three volume/mute endpoint pairs with three different scales, which is why
+`lib/outputs/level.ts` and `media_player.py` each still carry a dispatch table.
+
 ```rust
 trait OutputBackend {
     fn prefix(&self) -> &'static str;          // "ap2-dev-", "sendspin-dev-"

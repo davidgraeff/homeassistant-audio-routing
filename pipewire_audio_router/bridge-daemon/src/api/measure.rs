@@ -9,6 +9,7 @@ use super::*;
 // deltas and their confidence before anything is written.
 
 use crate::align::measure::{DelayWriter, MeasureDeps, MeasureStatus, Mode, Refusal, RefusalKind, SendAheadContext, Timing};
+use crate::util::node_names::OutputKind;
 
 /// Writes one member's delay knob **through the existing endpoint handlers**.
 ///
@@ -619,17 +620,34 @@ pub(crate) async fn set_output_latency(
     Path(node_name): Path<String>,
     Json(req): Json<SetOutputLatencyRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    if node_name.starts_with(PWSINK_DEV_PREFIX) {
-        return set_pwsink_jitter(state, node_name, req.latency_ms).await;
-    }
-    if !node_name.starts_with(AP2_DEV_PREFIX) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse {
-                ok: false,
-                message: format!("'{node_name}' has no playout-delay knob (AirPlay 2 and PipeWire hosts do)"),
-            }),
-        );
+    // Matched, not chained: sendspin has this knob too and it lives on its own endpoint
+    // (`PUT /api/sendspin/delay`, because it is an *advance* and costs a reconnect), so
+    // the refusal has to name where to go rather than claim the speaker has no knob.
+    match OutputKind::of(&node_name) {
+        Some(OutputKind::PwSink) => return set_pwsink_jitter(state, node_name, req.latency_ms).await,
+        Some(OutputKind::Airplay2) => {}
+        Some(OutputKind::Sendspin) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OutputOpResponse {
+                    ok: false,
+                    message: format!(
+                        "'{node_name}' is a {} — its timing knob is an *advance*, not a playout delay, and it is set \
+                         through PUT /api/sendspin/delay",
+                        OutputKind::Sendspin.human()
+                    ),
+                }),
+            )
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OutputOpResponse {
+                    ok: false,
+                    message: format!("'{node_name}' has no playout-delay knob (AirPlay 2 receivers and PipeWire hosts do)"),
+                }),
+            )
+        }
     }
     let clamped = req.latency_ms.map(|ms| ms.min(crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS));
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_latency(&node_name, clamped) {

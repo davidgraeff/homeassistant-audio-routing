@@ -44,6 +44,92 @@ pub const PWSINK_SESSION_PREFIX: &str = "pwrouter-";
 /// classification, so it never appears as its own column.
 pub const SYNC_GRP_PREFIX: &str = "sync-grp-";
 
+/// Which backend carries a **virtual output**, resolved from its node name.
+///
+/// The node name is the only identity every layer shares — the matrix, the API, the
+/// stores, the frontend and the HA integration all key on it — so "what kind of output is
+/// this?" has to be answerable from it. It was, by a chain of
+/// `if name.starts_with(SENDSPIN_DEV_PREFIX) … else if … else`, written out at a dozen
+/// call sites. **Every one of those chains ends in an `else` that is a guess**, and that
+/// is not a theoretical objection: three bugs came out of it.
+///
+/// * A `pwsink-dev-*` name fell through to the sendspin arm of the frontend's volume
+///   dispatch, which *stored* the level as an intent for a device that will never connect
+///   and answered `ok: true` — the "mute flips back on its own" report.
+/// * The routing matrix's `volume`/`muted` chains had no pw-sink arm at all, so a host the
+///   daemon could already drive showed no control.
+/// * The alignment wizard answered "is there a level knob?" from a kind table of its own
+///   and got both AP2 and pw-sink wrong, in opposite directions.
+///
+/// Matching on this enum makes the same mistake a **compile error**: adding a kind breaks
+/// every `match` that has to decide something per kind, which is exactly the set of places
+/// that need looking at. So prefer
+///
+/// ```ignore
+/// match OutputKind::of(node_name) {
+///     Some(OutputKind::Sendspin) => …,
+///     Some(OutputKind::Airplay2) => …,
+///     Some(OutputKind::PwSink)   => …,
+///     None => …, // not a virtual output — a real PipeWire node, a source, a group sink
+/// }
+/// ```
+///
+/// over any chain of `starts_with`, and **never write a `_ =>` arm**: a wildcard puts the
+/// silent `else` back.
+///
+/// It classifies *virtual outputs* only. `SENDSPIN_NODE_PREFIX` (a real sink node) and the
+/// internal plumbing prefixes are deliberately `None`, and code that builds or strips a
+/// name still uses the constants directly — that is a name-construction question, not a
+/// which-kind one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OutputKind {
+    /// An ESPHome/sendspin speaker ([`SENDSPIN_DEV_PREFIX`]).
+    Sendspin,
+    /// An AirPlay-2 receiver ([`AP2_DEV_PREFIX`]).
+    Airplay2,
+    /// A remote PipeWire host reached over RTP ([`PWSINK_DEV_PREFIX`]).
+    PwSink,
+}
+
+impl OutputKind {
+    /// Every kind, for tests and for iterating capabilities. Ordered as the UI lists them.
+    pub const ALL: [Self; 3] = [Self::Sendspin, Self::Airplay2, Self::PwSink];
+
+    /// This kind's node-name prefix — the inverse of [`Self::of`].
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            Self::Sendspin => SENDSPIN_DEV_PREFIX,
+            Self::Airplay2 => AP2_DEV_PREFIX,
+            Self::PwSink => PWSINK_DEV_PREFIX,
+        }
+    }
+
+    /// The kind of a virtual output, or `None` for anything else (a real PipeWire node, a
+    /// source, a group sink, an internal plumbing node).
+    pub fn of(node_name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| node_name.starts_with(k.prefix()))
+    }
+
+    /// The wire string the API and the frontend use (`OutputInfo::kind`). Kept here so a
+    /// rename cannot drift between the listing that writes it and the pages that match it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sendspin => "sendspin",
+            Self::Airplay2 => "airplay2",
+            Self::PwSink => "pwsink",
+        }
+    }
+
+    /// The kind in a sentence, for a message a user reads.
+    pub const fn human(self) -> &'static str {
+        match self {
+            Self::Sendspin => "sendspin speaker",
+            Self::Airplay2 => "AirPlay 2 receiver",
+            Self::PwSink => "PipeWire host",
+        }
+    }
+}
+
 /// Turns an output's display name into something safe to use as a PipeWire
 /// object name and (later) an HA entity-id fragment: lowercase,
 /// spaces/punctuation collapsed to underscores.
@@ -59,5 +145,31 @@ mod tests {
     fn slugify_collapses_punctuation_and_spaces() {
         assert_eq!(slugify("Pioneer VSX-934"), "pioneer_vsx_934");
         assert_eq!(slugify("Dusche"), "dusche");
+    }
+
+    #[test]
+    fn classifies_every_virtual_output_kind_by_its_prefix() {
+        assert_eq!(OutputKind::of("sendspin-dev-kitchen"), Some(OutputKind::Sendspin));
+        assert_eq!(OutputKind::of("ap2-dev-dusche"), Some(OutputKind::Airplay2));
+        assert_eq!(OutputKind::of("pwsink-dev-desk"), Some(OutputKind::PwSink));
+    }
+
+    /// The `None` cases are the point of the type: a real node, a source or internal
+    /// plumbing must not be classified as *some* output kind, which is what the old
+    /// `else` arms did.
+    #[test]
+    fn everything_that_is_not_a_virtual_output_is_none() {
+        for name in ["sendspin-out-kitchen", "sync-grp-abc", "airplay-in", "alsa_output.pci-0000_00_1f.3", "", "ap2-dev"] {
+            assert_eq!(OutputKind::of(name), None, "{name} should not classify as an output kind");
+        }
+    }
+
+    /// `prefix` and `of` are inverses, so a kind added to one and forgotten in the other
+    /// fails here rather than in production.
+    #[test]
+    fn prefix_and_of_are_inverses() {
+        for kind in OutputKind::ALL {
+            assert_eq!(OutputKind::of(&format!("{}whatever", kind.prefix())), Some(kind));
+        }
     }
 }

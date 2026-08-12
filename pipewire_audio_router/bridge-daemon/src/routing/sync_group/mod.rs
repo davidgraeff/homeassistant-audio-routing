@@ -40,11 +40,18 @@ use crate::routing::{self, node_id_for};
 use crate::store;
 use crate::store::routing::{RoutingLink, SharedRouting};
 use crate::util::locks::LockRecover;
-use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SYNC_GRP_PREFIX};
+use crate::util::node_names::{OutputKind, AP2_DEV_PREFIX, SYNC_GRP_PREFIX};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+
+/// "AirPlay 2 receiver" / "PipeWire host" / … for a message, or a neutral word when the
+/// name is not a virtual output at all. Only for the arms that should be unreachable: they
+/// have to say *something*, and it must not be the wrong kind's story.
+fn kind_or_output(kind: Option<OutputKind>) -> &'static str {
+    kind.map_or("output", OutputKind::human)
+}
 
 #[derive(Default)]
 pub struct GroupReconciler {
@@ -252,17 +259,29 @@ impl GroupReconciler {
         // that happened to be unrouted before the session would do exactly that.
         let intent = self.effective_intent(intent);
         if !routing::source_set_of(&intent, output).is_empty() {
-            return AnnounceTransport::Unavailable(if output.starts_with(AP2_DEV_PREFIX) {
-                "routed, but its AirPlay-2 sender isn't streaming (receiver unreachable, or still connecting)".into()
-            } else {
-                "routed, but no receiver has connected to its session yet (its module-rtp-session must initiate the handshake)".into()
+            return AnnounceTransport::Unavailable(match OutputKind::of(output) {
+                Some(OutputKind::Airplay2) => {
+                    "routed, but its AirPlay-2 sender isn't streaming (receiver unreachable, or still connecting)".into()
+                }
+                Some(OutputKind::PwSink) => {
+                    "routed, but no receiver has connected to its session yet (its module-rtp-session must initiate the handshake)".into()
+                }
+                // Unreachable while `supports_on_demand_announce` gates the caller, and
+                // spelled out anyway: the `else` this replaced would have told a sendspin
+                // owner about a module-rtp-session handshake their speaker does not have.
+                other => format!("routed, but nothing is carrying audio to this {}", kind_or_output(other)),
             });
         }
 
-        if output.starts_with(AP2_DEV_PREFIX) {
-            self.open_ap2_announce_session(output, deps).await
-        } else {
-            self.open_pwsink_announce_session(output, deps).await
+        match OutputKind::of(output) {
+            Some(OutputKind::Airplay2) => self.open_ap2_announce_session(output, deps).await,
+            Some(OutputKind::PwSink) => self.open_pwsink_announce_session(output, deps).await,
+            // Same gate as above; a kind that reaches here has no on-demand path, and
+            // saying so beats dialing it as if it were a pw-sink host.
+            other => AnnounceTransport::Unavailable(format!(
+                "no on-demand announcement session can be opened for this {}",
+                kind_or_output(other)
+            )),
         }
     }
 

@@ -15,7 +15,7 @@
 use crate::state::AppState;
 use crate::store::outputs::OutputState;
 use crate::util::locks::LockRecover;
-use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
+use crate::util::node_names::{OutputKind, AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use airplay_core::features::Features;
 use serde::Serialize;
 
@@ -58,7 +58,9 @@ pub(crate) struct OutputInfo {
     /// name again" control to clear, so it can offer that honestly instead of
     /// showing a button that does nothing.
     pub(crate) renamed: bool,
-    /// `"sendspin"` or `"airplay2"` — for the Type column / badge.
+    /// The output kind's wire string, for the Type column / badge. Always
+    /// [`OutputKind::label`] rather than a literal, so the enum and the string the
+    /// frontend matches on cannot drift apart.
     pub(crate) kind: &'static str,
     /// Node/device is live right now.
     pub(crate) present: bool,
@@ -304,7 +306,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             (us / 1000) as u32
         };
         outputs.push(OutputInfo {
-            kind: "sendspin",
+            kind: OutputKind::Sendspin.label(),
             present,
             configured: false, // sendspin devices are always auto-discovered
             state: adoption(&node_name),
@@ -409,7 +411,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             (mode, ss.ap2_effective_rate(&node_name))
         };
         outputs.push(OutputInfo {
-            kind: "airplay2",
+            kind: OutputKind::Airplay2.label(),
             present,
             configured: false, // AP2 receivers are always auto-discovered
             state: adoption(&node_name),
@@ -481,7 +483,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         let host_state = agent_rows.iter().find(|row| row.node_name == node_name).and_then(|row| row.state.clone());
         let streaming = crate::outputs::pwsink::sender_liveness::PwSinkLiveness::global().get(&node_name).map(|s| s.established);
         outputs.push(OutputInfo {
-            kind: "pwsink",
+            kind: OutputKind::PwSink.label(),
             present: connected,
             configured: false, // a pairing, not a hand-written config
             state: adoption(&node_name),

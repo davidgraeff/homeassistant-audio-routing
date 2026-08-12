@@ -85,14 +85,23 @@ pub struct AnnounceDeps<'a> {
 /// the caller to report. The dialed backends (AP2, pw-sink) are handled before this
 /// — they have the on-demand path.
 pub(crate) fn no_transport_reason(output: &str) -> String {
-    if output.starts_with(SENDSPIN_DEV_PREFIX) {
+    match OutputKind::of(output) {
         // Either it's offline, or it hasn't been added on the Outputs page — an
         // unadopted sendspin speaker gets no idle sender, and there's no on-demand
         // path for one (a fresh sendspin connection takes tens of seconds to start
         // rendering, so a "test tone" over it would arrive far too late to help).
-        "sendspin device has no sender running for it — it's offline, or not added on the Outputs page yet".into()
-    } else {
-        "output has no per-device sender (only sendspin, AirPlay-2 and PipeWire targets can be announced to individually)".into()
+        Some(OutputKind::Sendspin) => {
+            "sendspin device has no sender running for it — it's offline, or not added on the Outputs page yet".into()
+        }
+        // A dialed backend reaching this point means its on-demand session could not be
+        // opened, which `open_*_announce_session` reports in its own words; this is the
+        // fallback sentence, and naming the kind keeps it from claiming the wrong cause.
+        Some(kind @ (OutputKind::Airplay2 | OutputKind::PwSink)) => {
+            format!("no session to this {} could be opened for the announcement", kind.human())
+        }
+        None => {
+            "output has no per-device sender (only sendspin, AirPlay-2 and PipeWire targets can be announced to individually)".into()
+        }
     }
 }
 
@@ -121,7 +130,16 @@ pub(crate) fn next_free_pwsink_ports(taken: impl IntoIterator<Item = u16>, n: us
 /// Whether `output` is one of the dialed backends that can get a transport opened
 /// on demand for an announcement (AP2 receivers, pw-sink targets).
 pub(crate) fn supports_on_demand_announce(output: &str) -> bool {
-    output.starts_with(AP2_DEV_PREFIX) || output.starts_with(PWSINK_DEV_PREFIX)
+    // Exhaustive rather than an `||` of the two kinds that qualify: a new dialed backend
+    // must decide whether it has an on-demand path, and a boolean expression would answer
+    // "no" for it without anyone noticing.
+    match OutputKind::of(output) {
+        Some(OutputKind::Airplay2) | Some(OutputKind::PwSink) => true,
+        // A fresh sendspin connection takes tens of seconds to render, so opening one for
+        // an announcement would deliver it long after it mattered.
+        Some(OutputKind::Sendspin) => false,
+        None => false,
+    }
 }
 
 /// **Is a session to `output` actually up right now?** — i.e. is audio dropped at
@@ -147,24 +165,35 @@ pub(crate) fn supports_on_demand_announce(output: &str) -> bool {
 /// the graph, the Outputs page and the announce arbiter all judge delivery by the
 /// same rule.
 pub fn dialed_session_established(output: &str, ap2_connected: &HashSet<String>) -> Option<bool> {
-    if output.starts_with(AP2_DEV_PREFIX) {
-        return Some(ap2_connected.contains(output));
+    match OutputKind::of(output) {
+        Some(OutputKind::Airplay2) => Some(ap2_connected.contains(output)),
+        Some(OutputKind::PwSink) => {
+            Some(crate::outputs::pwsink::sender_liveness::PwSinkLiveness::global().get(output).is_some_and(|s| s.established))
+        }
+        // Not "no session": *the question does not apply*. A sendspin device always has a
+        // sender reading its overlay while it is adopted, so `Some(false)` here would make
+        // the graph stop animating every sendspin wire.
+        Some(OutputKind::Sendspin) | None => None,
     }
-    if output.starts_with(PWSINK_DEV_PREFIX) {
-        return Some(crate::outputs::pwsink::sender_liveness::PwSinkLiveness::global().get(output).is_some_and(|s| s.established));
-    }
-    None
 }
 
 /// The private silent sink backing an on-demand announce session for `output`.
 /// Shares [`IDLE_SINK_PREFIX`] with the sendspin idle sinks (so routing ignores it
 /// the same way) and keeps a per-kind marker, so the kinds can't collide.
 pub(crate) fn announce_sink_name(output: &str) -> String {
-    if let Some(slug) = output.strip_prefix(AP2_DEV_PREFIX) {
-        format!("{IDLE_SINK_PREFIX}ap2-{slug}")
-    } else if let Some(slug) = output.strip_prefix(PWSINK_DEV_PREFIX) {
-        format!("{IDLE_SINK_PREFIX}pwsink-{slug}")
-    } else {
-        format!("{IDLE_SINK_PREFIX}{output}")
-    }
+    // Exhaustive, but the markers stay exactly as they were: this string names a live
+    // PipeWire sink, and renaming it for tidiness would be a behaviour change for nothing.
+    // A new kind has to pick its own marker here, which is the point — two kinds sharing
+    // the `else` branch would collide on one sink whenever their slugs matched.
+    let marker = match OutputKind::of(output) {
+        Some(OutputKind::Airplay2) => "ap2-",
+        Some(OutputKind::PwSink) => "pwsink-",
+        // Not reached today (sendspin has no on-demand path, see
+        // `supports_on_demand_announce`) and named rather than lumped in with "not an
+        // output", so that adding the path is a one-word change here.
+        Some(OutputKind::Sendspin) => "sendspin-",
+        None => "",
+    };
+    let slug = OutputKind::of(output).and_then(|k| output.strip_prefix(k.prefix())).unwrap_or(output);
+    format!("{IDLE_SINK_PREFIX}{marker}{slug}")
 }

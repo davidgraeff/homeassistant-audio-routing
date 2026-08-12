@@ -54,7 +54,7 @@ use crate::state::AppState;
 use crate::store;
 use crate::store::routing::{RoutingLink, SharedRouting};
 use crate::util::locks::LockRecover;
-use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
+use crate::util::node_names::{OutputKind, AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -62,6 +62,54 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::sync::oneshot;
+
+/// Which level knobs the daemon can drive on one output **right now** — the capability
+/// half of [`RoutingNode::volume`] / [`RoutingNode::muted`], which carry only values.
+///
+/// Two booleans rather than one, because they are genuinely independent: a pw-sink host
+/// whose sink has no device route reports `channel_volumes` through the node's `Props` with
+/// `mute: None`, so it is levellable while its mute is not reachable at all (the alignment
+/// session then silences it through the relay instead — see
+/// `align::calibrate::SilenceChannel`, which is the same question asked with a fallback).
+///
+/// Deliberately **not** derived from the output's kind. See [`level_caps`].
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LevelCaps {
+    /// A volume write can be expected to land: sendspin/AP2 in band, a pw-sink host while
+    /// its agent reports a level.
+    pub volume: bool,
+    /// A mute write can be expected to land. Note this is the *output's own* mute, not
+    /// alignment's ability to silence it — the relay can silence anything.
+    pub mute: bool,
+}
+
+/// What the daemon can drive on one output, resolved **per output**.
+///
+/// The kind decides only where to look. For the two in-band backends the knobs are part of
+/// the protocol, so they exist whether or not a level has ever been read — which is exactly
+/// the case that made "is `volume` present?" the wrong test. For a pw-sink host the answer
+/// is the receiver agent's, changes while the daemon is running, and is read from what the
+/// host reports: `Some(level)` *is* the capability, the same rule
+/// `align::calibrate::level_plan` uses through the `OutOfBandMute` seam.
+fn level_caps(
+    node_name: &str,
+    pwsink_volumes: &std::collections::HashMap<String, f32>,
+    pwsink_mutes: &std::collections::HashMap<String, bool>,
+) -> Option<LevelCaps> {
+    match OutputKind::of(node_name) {
+        // In-band on the sendspin protocol and in-band over RTSP: both knobs always exist
+        // for a device we have adopted, present or not (a write to an absent sendspin device
+        // is stored as its desired level and applied when it connects).
+        Some(OutputKind::Sendspin) | Some(OutputKind::Airplay2) => Some(LevelCaps { volume: true, mute: true }),
+        Some(OutputKind::PwSink) => Some(LevelCaps {
+            volume: pwsink_volumes.contains_key(node_name),
+            mute: pwsink_mutes.contains_key(node_name),
+        }),
+        // Sources, group sinks, real PipeWire nodes: not this API's business. A real node's
+        // volume is PipeWire's own and is set through the graph, not here.
+        None => None,
+    }
+}
 
 #[derive(Serialize, Clone)]
 pub struct RoutingNode {
@@ -104,18 +152,37 @@ pub struct RoutingNode {
     /// tracks levels through [`Frame::Meters`] instead. It stays here so that
     /// `GET /api/routing` is a complete cold read.
     peak: f32,
-    /// Current volume (0.0–1.0) for outputs whose volume the daemon tracks
-    /// out-of-band. Presently sendspin devices only — their in-band volume
-    /// (outputs/sendspin/volume.rs) is pushed here so the UI slider syncs live over this
-    /// WebSocket (including a physical volume change the device reports). `None`
-    /// for sources/offline entries.
+    /// Current volume (0.0–1.0) as the daemon last knew it — pushed here so a UI slider
+    /// syncs live over this WebSocket, including a physical change the device reports.
+    ///
+    /// **`None` means "not known", not "not possible".** For sendspin and AP2 it means no
+    /// level has been heard or set yet; for a pw-sink host it means its agent is not
+    /// reporting one. Whether there is a knob at all is [`Self::level_caps`] — do not infer
+    /// it from this field being present, and never from the output's kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     volume: Option<f32>,
-    /// Current mute state for outputs whose mute the daemon tracks out-of-band
-    /// (sendspin + AP2) — pushed live over this WebSocket like `volume`. `None`
-    /// for sources.
+    /// Current mute state, same "known vs possible" rule as [`Self::volume`]: `None` is
+    /// unknown, and deliberately not `false` — a missing agent reading as "unmuted" would
+    /// put a mute button on screen that silently does nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     muted: Option<bool>,
+    /// Outputs only: **which of the two level knobs this daemon can actually drive right
+    /// now**, resolved per output rather than per kind. `None` for sources and for
+    /// non-output nodes.
+    ///
+    /// Published because the alternative is every consumer guessing, and each of them
+    /// guessing differently: the frontend gated its volume control on the *kind* (hiding it
+    /// from every pw-sink host the agent could already drive), and the alignment wizard
+    /// kept a second kind table that had both AP2 and pw-sink wrong. A capability is the
+    /// daemon's answer — it is the only party that knows whether an agent is on the other
+    /// end — so it is sent rather than reconstructed.
+    ///
+    /// The distinction this exists to make is **unknown vs unsupported**. Those were the
+    /// same value while `volume`/`muted` were the only fields: a control could only be
+    /// gated on "did a level arrive?", which is a different question and happened to give
+    /// the right answer only because sendspin and AP2 always report *some* mute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level_caps: Option<LevelCaps>,
     /// Estimated buffering (ms) this node contributes to the end-to-end path —
     /// the jitter/playout buffer configured for it, NOT a measured figure.
     /// Sources: the ingest jitter buffer (RTP `sess.latency.msec` / AirPlay
@@ -202,21 +269,23 @@ fn node_latency_ms(node_name: &str, lat: &LatencyConfig) -> Option<u32> {
     if let Some(ms) = lat.source_latencies.get(node_name) {
         return Some(*ms);
     }
-    if node_name.starts_with(SENDSPIN_DEV_PREFIX) {
-        let extra = lat.sendspin_delays.get(node_name).copied().unwrap_or(0);
-        return Some(lat.group_lead_ms + u32::from(extra));
-    }
-    if node_name.starts_with(AP2_DEV_PREFIX) {
-        return Some(lat.ap2_delays.get(node_name).map(|ms| u32::from(*ms)).unwrap_or(lat.ap2_default_ms));
-    }
-    if node_name.starts_with(PWSINK_DEV_PREFIX) {
+    match OutputKind::of(node_name) {
+        Some(OutputKind::Sendspin) => {
+            let extra = lat.sendspin_delays.get(node_name).copied().unwrap_or(0);
+            Some(lat.group_lead_ms + u32::from(extra))
+        }
+        Some(OutputKind::Airplay2) => {
+            Some(lat.ap2_delays.get(node_name).map(|ms| u32::from(*ms)).unwrap_or(lat.ap2_default_ms))
+        }
         // The receiver's jitter buffer is the whole of what we configure on this
         // path. The rest of its budget (our capture quantum, the remote host's own
         // sink buffer) is real but not ours to know, so it is left out rather than
         // guessed — the same rule the other kinds follow.
-        return Some(lat.pwsink_jitters.get(node_name).map(|ms| u32::from(*ms)).unwrap_or(lat.pwsink_default_ms));
+        Some(OutputKind::PwSink) => {
+            Some(lat.pwsink_jitters.get(node_name).map(|ms| u32::from(*ms)).unwrap_or(lat.pwsink_default_ms))
+        }
+        None => None,
     }
-    None
 }
 
 fn is_output_node(node_name: &str) -> bool {
@@ -362,42 +431,34 @@ fn build_matrix(
                 // manually configured anymore (the RAOP store is gone).
                 configured: false,
                 display_name,
-                // Virtual outputs (sendspin + AP2) carry their in-band volume/mute
-                // here so the UI syncs live over the routing WS.
-                volume: if name.starts_with(SENDSPIN_DEV_PREFIX) {
-                    // `None` when unknown, exactly like AP2 below: the sendspin
-                    // store holds levels the device *reported* (`client/state`) or
-                    // the user set, so an absent entry means we have never heard a
-                    // level for this speaker. Reporting 1.0 there fabricated full
-                    // scale — the one thing the volume control must never show,
-                    // since these are dB scales where the top is near-max power.
-                    sendspin_volumes.get(&name).map(|v| *v as f32 / 100.0)
-                } else if name.starts_with(AP2_DEV_PREFIX) {
-                    // AP2 volume is device-authoritative: `None` (unknown) when we
-                    // haven't read it from the receiver and the user hasn't set it —
-                    // the UI then shows no level rather than a fabricated 100 %.
-                    ap2_volumes.get(&name).copied()
-                } else if name.starts_with(PWSINK_DEV_PREFIX) {
-                    // Same contract as the two above, via the agent's control lane
-                    // (`outputs::pwsink::agent::DaemonMsg::SetVolume`, already used by
-                    // `PUT /api/pwsink/volume`). Only the *read* side was missing, which
-                    // is why the UI showed no control for a host it could already drive.
-                    pwsink_volumes.get(&name).copied()
-                } else {
-                    None
+                // The *values*, where they are known; `level_caps` below says whether there
+                // is a knob at all. One match per question rather than a chain of
+                // `starts_with` with an `else` that guesses: a fourth output kind now fails
+                // to compile here instead of silently reporting no level.
+                volume: match OutputKind::of(&name) {
+                    // `None` when unknown: the sendspin store holds levels the device
+                    // *reported* (`client/state`) or the user set, so an absent entry means
+                    // we have never heard a level for this speaker. Reporting 1.0 there
+                    // fabricated full scale — the one thing a volume control must never
+                    // show, since these are dB scales where the top is near-max power.
+                    Some(OutputKind::Sendspin) => sendspin_volumes.get(&name).map(|v| *v as f32 / 100.0),
+                    // AP2 volume is device-authoritative: unknown until we have read it
+                    // from the receiver or the user has set it.
+                    Some(OutputKind::Airplay2) => ap2_volumes.get(&name).copied(),
+                    // The host's own master level, as its agent reports it over the control
+                    // lane (`DaemonMsg::SetVolume` drives the same lever).
+                    Some(OutputKind::PwSink) => pwsink_volumes.get(&name).copied(),
+                    None => None,
                 },
-                muted: if name.starts_with(SENDSPIN_DEV_PREFIX) {
-                    Some(sendspin_mutes.get(&name).copied().unwrap_or(false))
-                } else if name.starts_with(AP2_DEV_PREFIX) {
-                    Some(ap2_mutes.get(&name).copied().unwrap_or(false))
-                } else if name.starts_with(PWSINK_DEV_PREFIX) {
-                    // `None` — not `Some(false)` — when the host reports no mute state:
-                    // a missing agent must not read as "unmuted", or the UI would offer
-                    // a mute button that silently does nothing.
-                    pwsink_mutes.get(&name).copied()
-                } else {
-                    None
+                muted: match OutputKind::of(&name) {
+                    Some(OutputKind::Sendspin) => Some(sendspin_mutes.get(&name).copied().unwrap_or(false)),
+                    Some(OutputKind::Airplay2) => Some(ap2_mutes.get(&name).copied().unwrap_or(false)),
+                    // `None` — not `Some(false)` — when the host reports no mute state: a
+                    // missing agent must not read as "unmuted".
+                    Some(OutputKind::PwSink) => pwsink_mutes.get(&name).copied(),
+                    None => None,
                 },
+                level_caps: level_caps(&name, pwsink_volumes, pwsink_mutes),
                 latency_ms: node_latency_ms(&name, lat),
                 xruns: xruns.get(&name).copied(),
                 last_error: crate::outputs::ap2::health::Ap2Health::global().get(&name),
@@ -430,6 +491,9 @@ fn build_matrix(
                 peak,
                 volume: None,
                 muted: None,
+                // A source's level is PipeWire's own, set through the graph rather than by
+                // this API — so "no capability", not "capability unknown".
+                level_caps: None,
                 latency_ms,
                 xruns: node_xruns,
                 // Outputs-only: a source has no receiver to refuse us, and an alignment
@@ -1322,6 +1386,104 @@ mod tests {
             &std::collections::HashMap::new(),
             held,
         )
+    }
+
+    /// As [`matrix_with`], with what a pw-sink host's agent reports about its level —
+    /// which is what decides that host's capability, per output and per moment.
+    fn matrix_with_pwsink_levels(
+        adopted: &[&str],
+        volumes: &[(&str, f32)],
+        mutes: &[(&str, bool)],
+    ) -> RoutingMatrix {
+        let empty_names: std::collections::BTreeSet<String> = adopted.iter().map(|s| s.to_string()).collect();
+        let volumes: std::collections::HashMap<String, f32> = volumes.iter().map(|(n, v)| (n.to_string(), *v)).collect();
+        let mutes: std::collections::HashMap<String, bool> = mutes.iter().map(|(n, m)| (n.to_string(), *m)).collect();
+        build_matrix(
+            &RegistryState::default(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &empty_names,
+            &std::collections::HashMap::new(),
+            &BTreeMap::new(),
+            &crate::pw::metering::MeterHub::default(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &volumes,
+            &mutes,
+            &std::collections::HashSet::new(),
+            &LatencyConfig {
+                source_latencies: std::collections::HashMap::new(),
+                group_lead_ms: 0,
+                sendspin_delays: std::collections::BTreeMap::new(),
+                ap2_delays: std::collections::BTreeMap::new(),
+                ap2_default_ms: 0,
+                pwsink_jitters: std::collections::BTreeMap::new(),
+                pwsink_default_ms: 0,
+            },
+            &std::collections::HashMap::new(),
+            &std::collections::BTreeSet::new(),
+        )
+    }
+
+    fn caps_of(m: &RoutingMatrix, node: &str) -> Option<LevelCaps> {
+        m.outputs.iter().chain(m.sources.iter()).find(|n| n.node_name == node).expect("node in matrix").level_caps
+    }
+
+    /// **The bug this field exists to prevent.** An AirPlay 2 receiver whose level has
+    /// never been read has `volume: None` — and a knob all the same, in band over RTSP. A
+    /// UI that gated its control on "did a level arrive?" hid a working control; one that
+    /// gated on the *kind* hid the pw-sink control and offered a dead AP2 one. Only a
+    /// per-output capability answers this, and only the daemon can compute it.
+    #[test]
+    fn an_unknown_level_is_not_an_absent_capability() {
+        let m = matrix_with_pwsink_levels(&["ap2-dev-dusche", "sendspin-dev-kitchen"], &[], &[]);
+        for node in ["ap2-dev-dusche", "sendspin-dev-kitchen"] {
+            let caps = caps_of(&m, node).unwrap_or_else(|| panic!("{node} must report its capability"));
+            assert!(caps.volume && caps.mute, "{node}'s knobs are in-band, so they exist before any level is known");
+        }
+        // ...and the *values* are still honestly absent.
+        let ap2 = m.outputs.iter().find(|n| n.node_name == "ap2-dev-dusche").unwrap();
+        assert_eq!(ap2.volume, None, "an unread level must not be fabricated");
+    }
+
+    /// A pw-sink host's answer is its agent's, so it is per output and per moment: the
+    /// same kind reports both capabilities, one, or neither. The `mute`-without-`volume`
+    /// case is real — a sink with no device route reports `channel_volumes` through the
+    /// node's `Props` with no mute — and it is why these are two booleans.
+    #[test]
+    fn a_pwsink_hosts_capability_is_whatever_its_agent_reports() {
+        let m = matrix_with_pwsink_levels(
+            &["pwsink-dev-both", "pwsink-dev-level_only", "pwsink-dev-silent"],
+            &[("pwsink-dev-both", 0.4), ("pwsink-dev-level_only", 0.5)],
+            &[("pwsink-dev-both", false)],
+        );
+        assert_eq!(caps_of(&m, "pwsink-dev-both"), Some(LevelCaps { volume: true, mute: true }));
+        assert_eq!(caps_of(&m, "pwsink-dev-level_only"), Some(LevelCaps { volume: true, mute: false }));
+        // No agent answering at all: not tunable and not mutable *by its own knob* — the
+        // alignment relay can still silence it, which is a different question.
+        assert_eq!(caps_of(&m, "pwsink-dev-silent"), Some(LevelCaps { volume: false, mute: false }));
+    }
+
+    /// Every adopted output says *something* about its knobs, so a consumer never has to
+    /// fall back to guessing from the kind — which is the failure mode `OutputKind` and
+    /// this field exist to remove.
+    #[test]
+    fn every_output_kind_reports_a_capability_and_sources_report_none() {
+        let adopted: Vec<String> = OutputKind::ALL.iter().map(|k| format!("{}test", k.prefix())).collect();
+        let names: Vec<&str> = adopted.iter().map(String::as_str).collect();
+        let m = matrix_with_pwsink_levels(&names, &[], &[]);
+        assert_eq!(m.outputs.len(), OutputKind::ALL.len());
+        for out in &m.outputs {
+            assert!(out.level_caps.is_some(), "{} must state its capability", out.node_name);
+        }
+        // A source's level is PipeWire's own; the field is absent rather than all-false,
+        // and absent from the wire entirely.
+        let json = serde_json::to_value(&m.outputs[0]).unwrap();
+        assert!(json.get("level_caps").is_some(), "an output's capability must reach the wire: {json}");
     }
 
     /// A rename has to reach the matrix, not just the Outputs page: this listing is
