@@ -3,7 +3,7 @@
 Every input the router carries already knows what it is playing, and the router shows none
 of it. A phone streaming over AirPlay sends title, artist, album, cover art and progress; a
 phone on the Bluetooth bridge sends title/artist/album/duration over AVRCP; the
-[YouTube Music receiver](pi-ytmusic-receiver-plan.md) resolves a track it could describe.
+[YouTube Music receiver](../../../docs/ytmusic-receiver.md) resolves a track it could describe.
 All of it is discarded today.
 
 This plan makes **now-playing a first-class per-source property of the daemon**, fed by
