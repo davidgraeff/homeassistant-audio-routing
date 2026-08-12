@@ -208,14 +208,14 @@ pub type SharedOutputs = Arc<Mutex<OutputsStore>>;
 /// Convenience: lock and snapshot the adopted set. Used on the hot-ish paths
 /// (matrix snapshot, reconcile pass) so no guard is held across an await.
 pub fn adopted_snapshot(outputs: &SharedOutputs) -> BTreeSet<String> {
-    use crate::locks::LockRecover;
+    use crate::util::locks::LockRecover;
     outputs.lock_recover().adopted().clone()
 }
 
 /// Convenience: lock and snapshot the user-chosen names, for the same reason as
 /// [`adopted_snapshot`] — the matrix build holds no guard across an await.
 pub fn names_snapshot(outputs: &SharedOutputs) -> BTreeMap<String, String> {
-    use crate::locks::LockRecover;
+    use crate::util::locks::LockRecover;
     outputs.lock_recover().names().clone()
 }
 

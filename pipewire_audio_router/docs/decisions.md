@@ -322,7 +322,7 @@ disturbance to audio already flowing through the other outputs. Because
 declares the two C functions (`pw_context_load_module` /
 `pw_impl_module_destroy`) itself and calls them on its PipeWire thread
 via a `pipewire::channel` command channel — see
-`bridge-daemon/src/pw_module.rs` and `pw_thread.rs`. (Note: RAOP outputs
+`bridge-daemon/src/pw_module.rs` and `pw/thread.rs`. (Note: RAOP outputs
 are being replaced by the in-process AP2 sender — see the AP2 decisions
 above and [airplay2-roadmap.md](airplay2-roadmap.md) — but `pw_module.rs`
 stays, because the RTP source and source-ducking use it too.)
@@ -330,7 +330,7 @@ stays, because the RTP source and source-ducking use it too.)
 Sendspin outputs never had this constraint anyway — their sink node is a
 plain `create_object` node (the native protocol method that *is* in
 `pw_core_methods`), not a loaded module. The daemon now creates it natively
-on its PipeWire thread (`pw_thread.rs`'s `CreateSinkNode`); see "Sendspin
+on its PipeWire thread (`pw/thread.rs`'s `CreateSinkNode`); see "Sendspin
 sink adapter rewritten in Rust, embedded in bridge-daemon" below.
 
 ## Link mutation is native `pipewire-rs`, not a `pw-link` subprocess
@@ -349,7 +349,7 @@ registry state, not by matching subprocess stderr for `"File exists"`.
 Combined with native volume (`Props`/`channelVolumes`) and native announce
 playback (`pw::stream`), the daemon now speaks one native PipeWire API
 with no `pw-link`/`pw-cat`/`wpctl`/`ffmpeg` subprocesses left. See
-`bridge-daemon/src/pw_thread.rs`, `routing.rs`, `volume.rs`, `player.rs`.
+`bridge-daemon/src/pw/thread.rs`, `routing.rs`, `volume.rs`, `pw/player.rs`.
 
 ## Source & sendspin processes are daemon-supervised, not spawned by `run.sh`
 
@@ -498,9 +498,9 @@ into the same shared library Music Assistant depends on; not something
 to patch around for a packaging win.)
 
 **Fix**: replaced the `ffmpeg` subprocess with `symphonia`
-(`decode.rs`), a pure-Rust decoder with zero system dependencies —
+(`audio/decode.rs`), a pure-Rust decoder with zero system dependencies —
 probes the format from content (mp3/wav/aac/ogg/flac all work
-unmodified) and decodes to a `SampleBuffer<i16>`, which `wav.rs` (then shared
+unmodified) and decodes to a `SampleBuffer<i16>`, which `audio/wav.rs` (then shared
 with the since-removed Wyoming path) turns into a WAV. Removing `ffmpeg` from the
 Dockerfile and adding the `symphonia` crate (`features = ["all"]` — the
 cost of enabling every codec is a bit more compiled Rust in our own
@@ -547,11 +547,11 @@ derisked by actually building and testing it, not by re-estimating it.
 (`sendspin_server.rs`), pinning the fork by commit hash (`sendspin = { git =
 "...", rev = "..." }` — unreviewed/unmerged, so pinned to an exact commit,
 not a branch). This also picks up the two shellouts the Python adapter still
-had: sink-node creation now goes through `pw_thread.rs`'s
+had: sink-node creation now goes through `pw/thread.rs`'s
 `CreateSinkNode`/`DestroySinkNode` (the native equivalent of `pw-cli
 create-node`, alongside the existing `Load`/`CreateLinks` commands there),
-and continuous capture is native PipeWire (`sendspin_capture.rs`, mirroring
-`player.rs`'s stream setup but `Direction::Input` with
+and continuous capture is native PipeWire (`pw/capture.rs`, mirroring
+`pw/player.rs`'s stream setup but `Direction::Input` with
 `STREAM_CAPTURE_SINK`) instead of a `pw-record` subprocess. No longer
 daemon-supervised as an external process — and once the AirPlay source went
 native too (below), `supervisor.rs` was removed entirely.

@@ -11,10 +11,10 @@
 //! that stays offline past a grace window is removed from the registry — so a
 //! genuinely-gone device still disappears, just not on a transient blip.
 
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::sendspin_volume::SharedSendspinControl;
+use crate::util::locks::LockRecover;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

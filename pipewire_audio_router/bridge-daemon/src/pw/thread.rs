@@ -25,7 +25,7 @@
 //! the shared snapshot, then hand a `CreateLinks`/`DestroyLinks` command here
 //! to execute where the proxies live.
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use pipewire as pw;
 use pipewire::link::Link;
 use pipewire::properties::PropertiesBox;
@@ -82,7 +82,7 @@ pub enum PwCommand {
     /// Turn per-node xrun profiling on/off. On `true`, bind the `module-profiler`
     /// global and start populating the shared xrun map; on `false`, drop the
     /// subscription (so an idle install with the routing UI closed pays nothing —
-    /// profiler.rs). Fire-and-forget: the routing WS toggles it on the first/last
+    /// pw/profiler.rs). Fire-and-forget: the routing WS toggles it on the first/last
     /// matrix watcher, mirroring the peak-meter gating. No-op if the profiler
     /// global isn't present (module not loaded).
     SetProfiling(bool),
@@ -149,9 +149,9 @@ pub type ChangeNotifier = tokio::sync::broadcast::Sender<()>;
 
 /// Spawns the PipeWire thread and returns the shared state handle, its change
 /// notifier, the command sender, and the shared xrun map (populated by the
-/// profiler while profiling is enabled — profiler.rs) immediately; the thread
+/// profiler while profiling is enabled — pw/profiler.rs) immediately; the thread
 /// connects and starts populating the state in the background.
-pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender, crate::profiler::SharedXruns)> {
+pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender, crate::pw::profiler::SharedXruns)> {
     let state: SharedState = Arc::new(Mutex::new(RegistryState::default()));
     // Capacity is a lag buffer, not a queue depth requirement: subscribers
     // only ever care about "something changed, re-fetch the snapshot," so
@@ -159,7 +159,7 @@ pub fn spawn() -> anyhow::Result<(SharedState, ChangeNotifier, PwCommandSender, 
     // is fine — this is not an event log.
     let (changes, _) = tokio::sync::broadcast::channel(16);
     let (cmd_tx, cmd_rx) = pw::channel::channel::<PwCommand>();
-    let xruns = crate::profiler::new_xruns();
+    let xruns = crate::pw::profiler::new_xruns();
     let state_for_thread = state.clone();
     let changes_for_thread = changes.clone();
     let xruns_for_thread = xruns.clone();
@@ -175,7 +175,7 @@ fn run(
     state: SharedState,
     changes: ChangeNotifier,
     cmd_rx: pw::channel::Receiver<PwCommand>,
-    xruns: crate::profiler::SharedXruns,
+    xruns: crate::pw::profiler::SharedXruns,
 ) -> anyhow::Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -191,9 +191,9 @@ fn run(
     let changes_remove = changes.clone();
     // The `module-profiler` global's id, learned from the registry, so the
     // `SetProfiling` command can bind it on demand. And the live subscription
-    // (profiler.rs) while profiling is on — both `!Send`, on this thread only.
+    // (pw/profiler.rs) while profiling is on — both `!Send`, on this thread only.
     let profiler_id: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
-    let profiler_listener: Rc<RefCell<Option<crate::profiler::ProfilerListener>>> = Rc::new(RefCell::new(None));
+    let profiler_listener: Rc<RefCell<Option<crate::pw::profiler::ProfilerListener>>> = Rc::new(RefCell::new(None));
     let profiler_id_add = profiler_id.clone();
     let profiler_id_remove = profiler_id.clone();
     let profiler_listener_remove = profiler_listener.clone();
@@ -323,7 +323,7 @@ fn run(
                     return; // already profiling
                 }
                 match *profiler_id.borrow() {
-                    Some(id) => match crate::profiler::subscribe(&registry_for_cmds, id, xruns_for_cmds.clone()) {
+                    Some(id) => match crate::pw::profiler::subscribe(&registry_for_cmds, id, xruns_for_cmds.clone()) {
                         Some(listener) => {
                             *profiler_listener.borrow_mut() = Some(listener);
                             tracing::debug!("profiling enabled (bound profiler global {id})");

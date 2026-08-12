@@ -6,7 +6,7 @@
 // chime announcements, and it adds no dependency. If higher quality is ever
 // wanted for music-grade overlays, swap this for a windowed-sinc resampler.
 
-/// The capture/overlay target rate (matches `sendspin_capture::SAMPLE_RATE`).
+/// The capture/overlay target rate (matches `pw::capture::SAMPLE_RATE`).
 pub const TARGET_RATE: u32 = 48_000;
 
 /// Convert interleaved S16LE PCM at `src_rate`/`src_channels` to 48 kHz stereo

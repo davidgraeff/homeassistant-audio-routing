@@ -23,8 +23,8 @@
 //! everything disconnected (nothing is streaming at boot) and the flag is
 //! rebuilt from the connect/disconnect callbacks.
 
-use crate::locks::LockRecover;
 use crate::sources_store::{SourceId, LEGACY_AIRPLAY_ID};
+use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

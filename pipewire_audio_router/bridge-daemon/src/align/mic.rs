@@ -41,7 +41,7 @@
 //! — a sequence gap inside the window, and clipping inside the window (plan §5.5
 //! refuses to measure on either).
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Json;

@@ -3,7 +3,7 @@
 //! the Bluetooth bridge firmware's audio stream (firmware/bt-bridge/).
 //!
 //! Loaded into the bridge daemon's *own* PipeWire context at runtime (see
-//! `pw_control::module` / pw_thread.rs), exactly like a RAOP sink — enable/disable and
+//! `pw_control::module` / pw/thread.rs), exactly like a RAOP sink — enable/disable and
 //! re-point the listen port live via `/api/sources`, no restart. Unlike the
 //! AirPlay-receive source (a `shairport-sync` subprocess), this is a native
 //! PipeWire module, so it goes through `PwCommand::Load`/`Unload`, not the
@@ -19,9 +19,9 @@
 //! The rate must match what the sender transmits. See
 //! firmware/bt-bridge/README.md and docs/decisions.md "Bluetooth bridge box".
 
-use crate::locks::LockRecover;
-use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
+use crate::pw::thread::{PwCommand, PwCommandSender, SharedState};
 use crate::sources_store::{RtpSourceConfig, SourceConfig, SourceEntry, LEGACY_RTP_ID};
+use crate::util::locks::LockRecover;
 use std::fmt::Write as _;
 use tokio::sync::oneshot;
 

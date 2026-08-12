@@ -2,7 +2,7 @@
 //! into WAV, using `symphonia`. See docs/decisions.md "Decoding announce
 //! audio: `symphonia`, not an `ffmpeg` subprocess".
 
-use crate::wav::build_wav;
+use crate::audio::wav::build_wav;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
@@ -42,7 +42,7 @@ pub async fn decode_file_to_pcm_48k_stereo(path: &Path) -> anyhow::Result<Vec<u8
             hint.with_extension(ext);
         }
         let (pcm, rate, channels) = decode_stream_to_pcm(mss, hint)?;
-        Ok(crate::resample::to_48k_stereo_s16le(&pcm, rate, channels))
+        Ok(crate::audio::resample::to_48k_stereo_s16le(&pcm, rate, channels))
     })
     .await?
 }
@@ -126,7 +126,7 @@ mod tests {
     /// asset being replaced with something symphonia can't read.
     #[tokio::test]
     async fn embedded_test_announcement_decodes() {
-        let mp3 = include_bytes!("../assets/test-announcement.mp3");
+        let mp3 = include_bytes!("../../assets/test-announcement.mp3");
         let wav = decode_bytes_to_wav(mp3, "mp3").await.expect("decode embedded test announcement");
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");

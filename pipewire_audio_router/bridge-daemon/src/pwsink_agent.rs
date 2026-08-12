@@ -27,9 +27,9 @@
 //! session (§13.2), so two users on one machine are two independent targets, and a
 //! renamed host keeps its pairing.
 
-use crate::config::{slugify, PWSINK_DEV_PREFIX};
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
+use crate::util::locks::LockRecover;
+use crate::util::node_names::{slugify, PWSINK_DEV_PREFIX};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -927,7 +927,7 @@ async fn pump_until_closed(stream: &mut futures_util::stream::SplitStream<WebSoc
 /// ## Mute and level are asked separately because they really are separate
 ///
 /// [`HostState`] carries them as two independent `Option`s, and the agent fills them from
-/// one probe that can genuinely answer one and not the other: `pw_thread::master_props`
+/// one probe that can genuinely answer one and not the other: `pw::thread::master_props`
 /// falls back to the sink **node**'s `Props` when the sink has no device route (a virtual
 /// sink), and that path reports `channel_volumes` with `mute: None`. Such a host is
 /// levellable out of band while its *mute* still needs the relay. Both answers are also

@@ -64,7 +64,7 @@ The consequence that shapes everything else: **DIAL/Lounge is a control plane on
 phone never sends audio. It sends *"play video id X at position Y"*, and **we** are the
 player — we resolve, fetch, decode and pace the stream, and report position and volume back
 so the app's UI stays in sync. This is closer to
-[`player.rs`](../pipewire_audio_router/bridge-daemon/src/player.rs) than to
+[`pw/player.rs`](../pipewire_audio_router/bridge-daemon/src/pw/player.rs) than to
 [`airplay_source.rs`](../pipewire_audio_router/bridge-daemon/src/airplay_source.rs): there is
 no incoming PCM to buffer.
 

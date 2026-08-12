@@ -28,10 +28,10 @@
 //! `/api/outputs`). A host that is up but has no session is honestly reported as
 //! present-but-not-streaming rather than either "offline" or "playing".
 
-use crate::locks::LockRecover;
+use crate::pw::thread::ChangeNotifier;
 use crate::pw_sink_liveness::PwSinkLiveness;
 use crate::pw_target_discovery::SharedPwTargets;
-use crate::pw_thread::ChangeNotifier;
+use crate::util::locks::LockRecover;
 use std::time::{Duration, Instant};
 
 /// How often to re-evaluate every target.

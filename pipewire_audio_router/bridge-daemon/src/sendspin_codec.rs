@@ -45,7 +45,7 @@
 // ONE format, the block size is a property of the group, so the timeline is stamped
 // once per emitted block and every member stays sample-coincident.
 
-use crate::sendspin_capture::{CHANNELS, SAMPLE_RATE};
+use crate::pw::capture::{CHANNELS, SAMPLE_RATE};
 
 /// Bytes per interleaved frame at the capture format (S16LE stereo).
 const BYTES_PER_FRAME: usize = 2 * CHANNELS as usize;

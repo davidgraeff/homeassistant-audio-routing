@@ -103,7 +103,7 @@ use crate::align::estimator::{
 };
 use crate::align::levels::TARGET_PEAK_SNR_DB;
 use crate::align::mic::{MicStatus, MicWindow};
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -5715,7 +5715,7 @@ pub const EQUIV_STEP_MS: u16 = 20;
 // The property the docs above claim, asserted rather than trusted: if the wire codec's
 // frame size ever changes, §1.1.2 item 2's confound is silently back in the numbers.
 const _: () = assert!(
-    EQUIV_STEP_MS as usize * (crate::sendspin_capture::SAMPLE_RATE as usize / 1000) == crate::sendspin_codec::OPUS_FRAME_FRAMES,
+    EQUIV_STEP_MS as usize * (crate::pw::capture::SAMPLE_RATE as usize / 1000) == crate::sendspin_codec::OPUS_FRAME_FRAMES,
     "the equivalence step must be exactly one Opus frame, or a relay-side delay moves the codec's window phase and the device's does not"
 );
 

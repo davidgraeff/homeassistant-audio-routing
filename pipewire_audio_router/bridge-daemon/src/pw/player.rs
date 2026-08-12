@@ -6,10 +6,10 @@
 //! `tokio::task::spawn_blocking`. PipeWire's client types are `!Send` and must
 //! stay on one thread — a dedicated blocking thread satisfies that naturally,
 //! and keeps announce playback fully isolated from the long-lived registry/
-//! command thread (pw_thread.rs).
+//! command thread (pw/thread.rs).
 //!
 //! Only 16-bit PCM is handled, which is all this daemon ever produces —
-//! everything converges on `wav::build_wav` at 16-bit (decode.rs via
+//! everything converges on `audio::wav::build_wav` at 16-bit (audio/decode.rs via
 //! symphonia, align/calibrate.rs for the click track).
 
 use pipewire as pw;
@@ -209,7 +209,7 @@ pub fn play_loop_to_target(target_node_id: u32, wav_bytes: &[u8], stop: Arc<Atom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::build_wav;
+    use crate::audio::wav::build_wav;
 
     #[test]
     fn parses_our_own_wav() {

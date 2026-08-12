@@ -17,9 +17,9 @@
 
 use crate::ap2_discovery::{self, SharedAp2Devices};
 use crate::ap2_ptp::SharedAp2Ptp;
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
 use crate::sendspin_discovery::{self, SharedSendspinDevices};
+use crate::util::locks::LockRecover;
 use mdns_sd::{IfKind, ServiceDaemon};
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::{Arc, Mutex, OnceLock};

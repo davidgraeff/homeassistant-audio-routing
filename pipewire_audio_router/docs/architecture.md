@@ -28,7 +28,7 @@ Threading model, top to bottom:
 - **The PipeWire thread.** PipeWire's core types aren't `Send`, so all
   graph work (registry listening *and* mutation) happens on one dedicated
   thread. Other threads talk to it over a `pipewire::channel` command
-  channel (`pw_thread.rs`): `Load`/`Unload` a module, `CreateSinkNode`/
+  channel (`pw/thread.rs`): `Load`/`Unload` a module, `CreateSinkNode`/
   `DestroySinkNode`, `CreateLinks`/destroy a link. Registry events flow
   back out to the rest of the daemon.
 - **The tokio async runtime.** The axum REST/WS server, mDNS discovery,
@@ -100,7 +100,7 @@ Sendspin overhaul and AP2 was aligned onto it.
   per-device* null-sink is **not** a steady driver — it produced ~1 glitch
   / 60 s (QUANT-0 dropouts) — so every group member is fed from the *one*
   anchor monitor. Do **not** give each device its own sink.
-- **One capture from `anchor.monitor` per backend group** (`sendspin_capture.rs`,
+- **One capture from `anchor.monitor` per backend group** (`pw/capture.rs`,
   a graph-clock-paced `RT_PROCESS` stream) produces **S16LE** at the group's
   wire rate — Sendspin at **48 kHz** (`spawn`), AP2 at its **negotiated rate**
   (`spawn_with_rate`: 48 kHz when every member accepts it, else 44.1 kHz with
@@ -467,7 +467,7 @@ not required (revisit only if a stall traces to CPU contention).
 | `libairptp` | **FIFO 55** | gPTP event loop (Sync/Follow_Up 8×/s). Timer accuracy is what makes receivers lock; a starved SCHED_OTHER loop dilated the 125 ms timer ~48×. |
 | `rt-sender` | **FIFO 50** | AP2 RTP egress, `clock_nanosleep` paced. |
 | `ap2-producer` | **FIFO 48** | AP2 ALAC encode + encrypt (`run_streamer`, own current-thread runtime). |
-| capture / producer feeder mainloops | **FIFO 45** | `sendspin_capture.rs` / `airplay_source.rs` PipeWire mainloops — low-impact for steady audio (that's on `data-loop`), protects the *control* path (reconnect/flush/stop) under load. |
+| capture / producer feeder mainloops | **FIFO 45** | `pw/capture.rs` / `airplay_source.rs` PipeWire mainloops — low-impact for steady audio (that's on `data-loop`), protects the *control* path (reconnect/flush/stop) under load. |
 | `ap2-relay`, `sendspin-relay` | **FIFO 40** | Capture→sender fan-out relays. |
 
 `CAP_SYS_NICE` (`config.yaml` `privileged: [SYS_NICE]`) bypasses the
@@ -477,7 +477,7 @@ they are best-effort/non-fatal without it (dev box).
 ## 8. Sample-rate harmonization
 
 **All resampling happens at the PipeWire level — never in a Rust hot
-path.** `sendspin_capture::spawn_with_rate` sets the capture stream's rate
+path.** `pw::capture::spawn_with_rate` sets the capture stream's rate
 and PipeWire does the SRC in-graph on its RT thread.
 
 - **Internal bus (anchor + `SharedTimeline` + `OverlayMixer` + announce

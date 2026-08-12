@@ -25,8 +25,8 @@ use airplay_core::stream::{PtpMode, StreamConfig, TimingProtocol};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::ap2_volume::{Ap2Command, SharedAp2Control};
-use crate::locks::LockRecover;
 use crate::sync_settings::SharedSyncSettings;
+use crate::util::locks::LockRecover;
 
 /// Depth of the per-group volume-command channel (ap2_volume.rs → this task).
 /// Volume/mute changes are rare and tiny; a small buffer is ample.
@@ -139,7 +139,7 @@ pub struct Ap2ServerHandle {
     /// capture channel → the relay's `blocking_recv` returns `None` → the relay
     /// thread exits. `Option` only so [`Self::shutdown`] can close it *before*
     /// awaiting the TEARDOWNs rather than after.
-    capture: Option<crate::sendspin_capture::CaptureHandle>,
+    capture: Option<crate::pw::capture::CaptureHandle>,
     /// The RT relay thread; exits on its own once `capture` closes the channel.
     _relay: std::thread::JoinHandle<()>,
 }
@@ -306,7 +306,7 @@ async fn try_connect_once(
     // Live PCM feed at the group's capture rate (PipeWire resampled the anchor to
     // `rate` in-graph). Register it BEFORE starting so the capture-forward loop fills
     // the decoder during start_live's prefill (else it starts starved).
-    let (sender, decoder) = LiveAudioDecoder::create_pair(rate, crate::sendspin_capture::CHANNELS as u8, AP2_FEED_FRAMES);
+    let (sender, decoder) = LiveAudioDecoder::create_pair(rate, crate::pw::capture::CHANNELS as u8, AP2_FEED_FRAMES);
     senders.lock().unwrap().push((node_name.to_string(), sender));
     // start_streaming_live spawns the RT sender + producer threads. On failure: stop
     // the connection (join those threads, bounded) AND drop the feed we just
@@ -360,7 +360,7 @@ pub fn start(
     // Capture at the group's negotiated rate: PipeWire resamples the 48 kHz anchor
     // to `rate` in-graph (its own RT thread), so no Rust-side SRC — a 48 kHz group
     // is passthrough, a 44.1 kHz group is PipeWire-downsampled.
-    let (capture, mut pcm_rx) = crate::sendspin_capture::spawn_with_rate("ap2", sink_node_id, rate)
+    let (capture, mut pcm_rx) = crate::pw::capture::spawn_with_rate("ap2", sink_node_id, rate)
         .map_err(|e| anyhow::anyhow!("failed to start capture for AP2 group: {e}"))?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let senders: Arc<Mutex<Vec<(String, LiveFrameSender)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -393,7 +393,7 @@ pub fn start(
             // unchanged; only the content is older. `delay_buf` is reused like `mix_buf`,
             // and with no alignment running the call is one relaxed atomic load.
             let delayer = crate::align::relay_delay::RelayDelay::global();
-            let delay_fmt = crate::align::relay_delay::PcmFormat::new(rate, crate::sendspin_capture::CHANNELS);
+            let delay_fmt = crate::align::relay_delay::PcmFormat::new(rate, crate::pw::capture::CHANNELS);
             let mut mix_buf: Vec<u8> = Vec::new();
             let mut delay_buf: Vec<u8> = Vec::new();
             while let Some(pcm) = pcm_rx.blocking_recv() {
@@ -409,7 +409,7 @@ pub fn start(
                     let mixed: &[u8] = if mixer.mix_into(name, &pcm, &mut mix_buf) { &mix_buf } else { &pcm };
                     let src: &[u8] = if delayer.delay_into(name, delay_fmt, mixed, &mut delay_buf) { &delay_buf } else { mixed };
                     buf.extend(src.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
-                    let _ = s.try_send(LivePcmFrame { samples: buf, channels: crate::sendspin_capture::CHANNELS as u8, sample_rate: rate });
+                    let _ = s.try_send(LivePcmFrame { samples: buf, channels: crate::pw::capture::CHANNELS as u8, sample_rate: rate });
                 }
             }
             tracing::debug!("ap2 relay thread exiting");

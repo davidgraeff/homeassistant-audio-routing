@@ -12,7 +12,7 @@
 //! (Sendspin device "outputs" are virtual — audio reaches them via a group
 //! sink — so there's no per-device node to tap here.)
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use pipewire as pw;
 use pw::spa;
 use spa::pod::Pod;

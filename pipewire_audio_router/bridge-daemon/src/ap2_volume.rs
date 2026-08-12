@@ -20,7 +20,7 @@
 //! the receiver's event channel), so the matrix shows the desired/last-set level
 //! rather than a physical change made on the receiver itself.
 
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};

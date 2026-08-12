@@ -131,7 +131,7 @@ a control plane — and takes over creating the receive side.
 **Why a client-side module load works** (spike S1): the agent runs its own
 `pw_context` and loads `libpipewire-module-rtp-session` into it, exactly as
 `bridge-daemon` already loads `rtp-sink`/`rtp-source` into its own context
-(`pw_module.rs` + `pw_thread.rs`). The nodes a module creates in a client context
+(`pw_module.rs` + `pw/thread.rs`). The nodes a module creates in a client context
 are ordinary graph nodes, so WirePlumber routes the receive stream to the default
 sink just as the drop-in does — with the module's lifetime bound to the agent
 process instead of to the PipeWire daemon's config.
@@ -332,7 +332,7 @@ Three decisions worth keeping:
 * **Coming back is not automatic either, and has to be handled.** `dont-reconnect`
   means the stream was destroyed rather than moved, so nothing would reattach on its
   own — the pin would decay into permanent silence the first time a USB interface was
-  unplugged. `pw_thread::resync_pin` watches for the chosen sink appearing and
+  unplugged. `pw::thread::resync_pin` watches for the chosen sink appearing and
   reloads the module then. It acts on the *transition* only: reloading whenever a
   present-but-unattached pin is seen would spin on every graph change if the attach
   keeps failing.

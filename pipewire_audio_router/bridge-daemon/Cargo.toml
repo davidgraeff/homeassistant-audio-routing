@@ -32,7 +32,7 @@ anyhow = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Serve the built Svelte frontend (frontend/dist) as static files.
 tower-http = { version = "0.7", features = ["fs"] }
-# Pure-Rust decode for announce clips (decode.rs) — replaces an ffmpeg
+# Pure-Rust decode for announce clips (audio/decode.rs) — replaces an ffmpeg
 # subprocess that pulled ~250-300MB of unrelated GPU/video-transcoding
 # system dependencies into the runtime image for what was only ever
 # "decode a short spoken-word clip." "all" enables every bundled codec/

@@ -33,7 +33,7 @@
 //! Mirrors the other `/data` stores: no `options.json` seeding, the file is
 //! authoritative and created on first mutation; a missing file means defaults.
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

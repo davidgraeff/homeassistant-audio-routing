@@ -287,7 +287,7 @@ pub const HEADROOM_FRAMES: u64 = 8_192;
 const SIZING_RATE: u32 = 48_000;
 
 /// The channel count a ring is sized for (every relay captures stereo:
-/// `sendspin_capture::CHANNELS`).
+/// `pw::capture::CHANNELS`).
 const SIZING_CHANNELS: u16 = 2;
 
 /// The interleaved PCM format a relay is feeding this line, so the delay can be

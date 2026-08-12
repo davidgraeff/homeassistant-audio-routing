@@ -3,7 +3,7 @@
 //! subprocess.
 //!
 //! One instance per `SendspinOutput`: creates the sink node natively
-//! (`pw_thread::PwCommand::CreateSinkNode`), captures from it natively
+//! (`pw::thread::PwCommand::CreateSinkNode`), captures from it natively
 //! (`sendspin_capture`), and runs an embedded `sendspin` server role —
 //! `ServerListener` for inbound dial-in plus `ClientManager` for discovering
 //! and dialing devices that only run their own embedded server (e.g. Home
@@ -29,7 +29,7 @@
 //! keep-or-switch policy and cost ~1.5 Mbit/s per idle device, which also kept
 //! the device out of WiFi power-save.
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use sendspin::protocol::messages::{AudioFormatSpec, ClientHello, ClientSyncState, ConnectionReason, Message, StreamPlayerConfig};
 use sendspin::server::{Advertisement, ClientEvent, ClientManager, Group, ServerSender, SharedTimeline, SharesTimeline};
 use sendspin::{Clock, DefaultClock, ServerConnection, ServerListener};
@@ -161,7 +161,7 @@ fn set_relay_realtime_priority() {}
 pub struct SendspinServerHandle {
     _advertisement: Advertisement,
     client_manager: ClientManager,
-    _capture: crate::sendspin_capture::CaptureHandle,
+    _capture: crate::pw::capture::CaptureHandle,
     /// The live per-device groups (client_id → its single-member group on the
     /// shared timeline), shared with the accept loop, the event loop, the
     /// membership task and the relay. Held here so a *deliberate* teardown can
@@ -578,7 +578,7 @@ pub async fn start_server_per_device(
 ) -> anyhow::Result<SendspinServerHandle> {
     let node_name = server_name.to_string();
 
-    let (capture_handle, mut pcm_rx) = crate::sendspin_capture::spawn("sendspin", sink_node_id)
+    let (capture_handle, mut pcm_rx) = crate::pw::capture::spawn("sendspin", sink_node_id)
         .map_err(|e| anyhow::anyhow!("failed to start capture for '{node_name}': {e}"))?;
 
     // One clock shared by the timeline and the dial manager, so the timestamps
@@ -616,8 +616,8 @@ pub async fn start_server_per_device(
         // parameters in the format fields below, which the client turns into a
         // synthetic header itself. Set before any member joins, so every
         // `stream/start` carries it.
-        sample_rate: crate::sendspin_capture::SAMPLE_RATE,
-        channels: crate::sendspin_capture::CHANNELS as u8,
+        sample_rate: crate::pw::capture::SAMPLE_RATE,
+        channels: crate::pw::capture::CHANNELS as u8,
         bit_depth: 16,
         codec_header: crate::sendspin_codec::codec_header_base64(codec),
     });
@@ -775,8 +775,7 @@ pub async fn start_server_per_device(
                 // relaxed atomic load per device per block while no alignment run is
                 // active, which is always unless one is in progress.
                 let delayer = crate::align::relay_delay::RelayDelay::global();
-                let delay_fmt =
-                    crate::align::relay_delay::PcmFormat::new(crate::sendspin_capture::SAMPLE_RATE, crate::sendspin_capture::CHANNELS);
+                let delay_fmt = crate::align::relay_delay::PcmFormat::new(crate::pw::capture::SAMPLE_RATE, crate::pw::capture::CHANNELS);
                 // Reused across chunks AND across devices within a chunk so the
                 // per-device overlay mix allocates at most once (only relevant
                 // while an announcement is overlaying; the plain-music path never
@@ -981,8 +980,8 @@ fn report_format_support(
 fn wire_format_for(codec: &str) -> AudioFormatSpec {
     AudioFormatSpec {
         codec: codec.to_string(),
-        channels: crate::sendspin_capture::CHANNELS as u8,
-        sample_rate: crate::sendspin_capture::SAMPLE_RATE,
+        channels: crate::pw::capture::CHANNELS as u8,
+        sample_rate: crate::pw::capture::SAMPLE_RATE,
         bit_depth: 16,
     }
 }
@@ -1309,7 +1308,7 @@ mod tests {
                     .map(|(codec, ch)| AudioFormatSpec {
                         codec: (*codec).to_string(),
                         channels: *ch,
-                        sample_rate: crate::sendspin_capture::SAMPLE_RATE,
+                        sample_rate: crate::pw::capture::SAMPLE_RATE,
                         bit_depth: 16,
                     })
                     .collect(),

@@ -31,15 +31,15 @@
 //! it), creates new anchors, and restarts a group's sendspin server / AP2 senders
 //! when their dialed set (or the AP2 wire rate) changes.
 
-use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SYNC_GRP_PREFIX};
-use crate::locks::LockRecover;
 use crate::overlay_mixer::OverlayMixer;
+use crate::util::locks::LockRecover;
+use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SYNC_GRP_PREFIX};
 /// Connected receiver hosts, `node_name → label`, as
 /// `pwsink_agent::Agents::connected_targets` reports them. A pw-sink target exists
 /// because an agent is on the socket (plan §3) — mDNS is not consulted, and cannot
 /// be: its node names lack the `_<user>` half that routing intent carries.
 type PwsinkHosts = std::collections::BTreeMap<String, String>;
-use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
+use crate::pw::thread::{PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
 use crate::sendspin_discovery::{SendspinDevice, SharedSendspinDevices};
@@ -1686,7 +1686,7 @@ impl GroupReconciler {
                 );
                 (codec, lead)
             };
-            let suffix = dev.strip_prefix(crate::config::SENDSPIN_DEV_PREFIX).unwrap_or(dev);
+            let suffix = dev.strip_prefix(crate::util::node_names::SENDSPIN_DEV_PREFIX).unwrap_or(dev);
             let sink_node_name = format!("{IDLE_SINK_PREFIX}{suffix}");
             let (tx, rx) = oneshot::channel();
             if pw_cmd.send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx }).is_err() {

@@ -4,16 +4,16 @@
 use crate::airplay_clients::AirplayClientStore;
 use crate::ap2_discovery::SharedAp2Devices;
 use crate::ap2_ptp::SharedAp2Ptp;
-use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
-use crate::locks::LockRecover;
 use crate::outputs_store::{OutputState, SharedOutputs};
-use crate::pw_thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
+use crate::pw::thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
 use crate::routing_store::SharedRouting;
 use crate::rtp_source::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::settings_store::SharedSettings;
 use crate::sources_store::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore};
+use crate::util::locks::LockRecover;
+use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use airplay_core::features::Features;
 use axum::{
     body::{Body, Bytes},
@@ -39,7 +39,7 @@ pub type SharedAirplay = crate::airplay_source::SharedAirplayMap;
 
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
 /// change-notification channel (routing.rs), and the command sender for runtime
-/// module load/unload (pw_thread.rs). Existing handlers extract just the piece
+/// module load/unload (pw/thread.rs). Existing handlers extract just the piece
 /// they need via `FromRef` — they don't need to know this type grew more fields.
 #[derive(Clone)]
 pub struct AppState {
@@ -59,13 +59,13 @@ pub struct AppState {
     /// DMAP callbacks locally, a Pi reporter over `/api/sources/{id}/now_playing`
     /// remotely. Read into the routing socket's `now_playing` frame.
     pub now_playing: crate::now_playing::NowPlayingStore,
-    /// On-demand source peak meters (metering.rs); taps live only while a
+    /// On-demand source peak meters (pw/metering.rs); taps live only while a
     /// routing-matrix WS client is connected.
-    pub meters: crate::metering::SharedMeters,
-    /// Per-node xrun counts from the PipeWire profiler (profiler.rs), written by
+    pub meters: crate::pw::metering::SharedMeters,
+    /// Per-node xrun counts from the PipeWire profiler (pw/profiler.rs), written by
     /// the PipeWire thread while profiling is armed and read into the routing
     /// snapshot. Empty when the routing UI is closed.
-    pub xruns: crate::profiler::SharedXruns,
+    pub xruns: crate::pw::profiler::SharedXruns,
     /// Count of open routing-matrix WebSockets. The first arms profiling
     /// (`PwCommand::SetProfiling(true)`), the last disarms it — same "pay only
     /// while watched" gating as the peak meters.
@@ -146,8 +146,8 @@ pub fn router(
     airplay: SharedAirplay,
     airplay_clients: AirplayClientStore,
     now_playing: crate::now_playing::NowPlayingStore,
-    meters: crate::metering::SharedMeters,
-    xruns: crate::profiler::SharedXruns,
+    meters: crate::pw::metering::SharedMeters,
+    xruns: crate::pw::profiler::SharedXruns,
     sendspin_devices: SharedSendspinDevices,
     ap2_devices: SharedAp2Devices,
     agents: crate::pwsink_agent::SharedAgents,
@@ -422,8 +422,8 @@ async fn static_fallback(Extension(assets): Extension<Arc<StaticAssets>>, uri: U
 
 #[derive(Serialize)]
 struct NodesResponse {
-    nodes: Vec<crate::pw_thread::NodeInfo>,
-    ports: Vec<crate::pw_thread::PortInfo>,
+    nodes: Vec<crate::pw::thread::NodeInfo>,
+    ports: Vec<crate::pw::thread::PortInfo>,
 }
 
 async fn list_nodes(State(pw_state): State<SharedState>) -> Json<NodesResponse> {
@@ -437,7 +437,7 @@ async fn list_nodes(State(pw_state): State<SharedState>) -> Json<NodesResponse> 
 /// project's own test scripts) is responsible for pairing FL/FR etc.
 ///
 /// Created natively via `Core::create_object` on the PipeWire thread (see
-/// pw_thread.rs) — the port names are resolved to object ids against the live
+/// pw/thread.rs) — the port names are resolved to object ids against the live
 /// registry here, then handed over as a `CreateLinks` command.
 #[derive(Deserialize)]
 struct CreateLinkRequest {
@@ -2351,7 +2351,7 @@ async fn spike_ap2_start(State(state): State<AppState>, Json(req): Json<Ap2Spike
     // Forces file mode (live is the synthetic sine only).
     let voice = req.clip.as_deref() == Some("voice");
     let (live, file_wav) = if voice {
-        match crate::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3").await {
+        match crate::audio::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3").await {
             Ok(wav) => (false, Some(wav)),
             Err(e) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("decode test clip: {e}") }))
@@ -2546,25 +2546,25 @@ struct AgAnnounceResponse {
 /// Acquire the announce audio as 48k/S16/stereo PCM from one of test/tone/url.
 async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String> {
     if req.test {
-        let wav = crate::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3")
+        let wav = crate::audio::decode::decode_bytes_to_wav(include_bytes!("../assets/test-announcement.mp3"), "mp3")
             .await
             .map_err(|e| format!("decode test clip: {e}"))?;
-        let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("test clip not a PCM WAV")?;
-        return Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch));
+        let (rate, ch, pcm) = crate::audio::wav::read_pcm16(&wav).ok_or("test clip not a PCM WAV")?;
+        return Ok(crate::audio::resample::to_48k_stereo_s16le(pcm, rate, ch));
     }
     if req.tone {
         // The calibration click (align/calibrate.rs) — already 16-bit PCM WAV, so no
         // decode step; just standardize to the announce mix format.
         let wav = crate::align::calibrate::click_wav();
-        let (rate, ch, pcm) = crate::wav::read_pcm16(&wav).ok_or("tone clip not a PCM WAV")?;
-        return Ok(crate::resample::to_48k_stereo_s16le(pcm, rate, ch));
+        let (rate, ch, pcm) = crate::audio::wav::read_pcm16(&wav).ok_or("tone clip not a PCM WAV")?;
+        return Ok(crate::audio::resample::to_48k_stereo_s16le(pcm, rate, ch));
     }
     match &req.url {
         Some(url) => {
             let path = std::env::temp_dir().join("ag-announce-fetch");
             let _ = tokio::fs::remove_file(&path).await;
             fetch_to_file(url, &path).await.map_err(|e| format!("fetch: {e}"))?;
-            let pcm = crate::decode::decode_file_to_pcm_48k_stereo(&path).await.map_err(|e| format!("decode: {e}"));
+            let pcm = crate::audio::decode::decode_file_to_pcm_48k_stereo(&path).await.map_err(|e| format!("decode: {e}"));
             let _ = tokio::fs::remove_file(&path).await;
             pcm
         }
@@ -3057,7 +3057,7 @@ struct StatusInfo {
     /// Persisted routing links (by stable name).
     routes: usize,
     /// Host capability / weak-system assessment (CPU, RAM, RT scheduling).
-    host: crate::host_assessment::HostAssessment,
+    host: crate::util::host_assessment::HostAssessment,
 }
 
 async fn get_status(State(state): State<AppState>) -> Json<StatusInfo> {
@@ -3073,7 +3073,7 @@ async fn get_status(State(state): State<AppState>) -> Json<StatusInfo> {
         ap2_receivers,
         sendspin_devices,
         routes,
-        host: crate::host_assessment::assess(),
+        host: crate::util::host_assessment::assess(),
     })
 }
 

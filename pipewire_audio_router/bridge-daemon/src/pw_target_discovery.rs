@@ -28,9 +28,9 @@
 //! back as targets, so any instance whose label starts with the session prefix
 //! (or is the spike session) is skipped.
 
-use crate::config::{slugify, PWSINK_DEV_PREFIX, PWSINK_SESSION_PREFIX};
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
+use crate::util::locks::LockRecover;
+use crate::util::node_names::{slugify, PWSINK_DEV_PREFIX, PWSINK_SESSION_PREFIX};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

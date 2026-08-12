@@ -14,7 +14,7 @@
 //! seeding, starts empty, the file is authoritative and created on first
 //! mutation.
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

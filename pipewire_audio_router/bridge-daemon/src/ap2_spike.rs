@@ -116,7 +116,7 @@ fn tone_wav(freq_hz: f32, secs: f32, rate: u32) -> Vec<u8> {
         pcm.extend_from_slice(&b); // L
         pcm.extend_from_slice(&b); // R
     }
-    crate::wav::build_wav(&pcm, rate, 16, 2)
+    crate::audio::wav::build_wav(&pcm, rate, 16, 2)
 }
 
 /// What the start endpoint reports back.

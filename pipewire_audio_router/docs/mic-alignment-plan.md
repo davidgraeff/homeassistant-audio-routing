@@ -373,7 +373,7 @@ Two practical costs this section originally glossed over:
   t=1.0 s, amplitude 0.5.
 - `start()` (`align/calibrate.rs:213`) resolves the group, snapshots sendspin volumes,
   and loops the WAV into the group's **sync anchor** via
-  `player::play_loop_to_target(anchor, …)` (`player.rs:79`).
+  `pw::player::play_loop_to_target(anchor, …)` (`pw/player.rs:79`).
 - `apply_audibility()` (`align/calibrate.rs:319`) solos the reference + target and mutes
   everyone else — sendspin via the protocol mute (`sendspin_volume.rs:293`, a live
   transient push, no reconnect), AP2 via `ap2_volume::set_muted`.
@@ -1490,7 +1490,7 @@ and the final real write.
     though pw-sink had no mute at all; that is wrong. `pwsink_agent.rs` carries
     `DaemonMsg::SetVolume { volume }` and `SetMute { muted }`, `Agents::set_volume` /
     `set_mute` return `false` when the host is not connected, the agent implements both
-    (`pwrouter-agent/src/client.rs:461/465` → `pw_thread::apply_master`), and
+    (`pwrouter-agent/src/client.rs:461/465` → `pw::thread::apply_master`), and
     `api.rs:1954/1972` already drive them in production. `HostState` reports `volume` and
     `muted` back, so a value can be snapshotted and restored.
 

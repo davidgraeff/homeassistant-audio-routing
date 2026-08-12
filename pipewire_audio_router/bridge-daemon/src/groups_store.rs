@@ -13,7 +13,7 @@
 //! Mirrors the other `/data` stores (settings_store/routing_store): `serde`
 //! defaults so an older/newer file still loads, file authoritative once written.
 
-use crate::config::slugify;
+use crate::util::node_names::slugify;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

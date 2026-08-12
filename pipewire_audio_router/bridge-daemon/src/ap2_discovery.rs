@@ -14,9 +14,9 @@
 //! receivers are AirPlay-2-capable.
 
 use crate::ap2_ptp::SharedAp2Ptp;
-use crate::config::{slugify, AP2_DEV_PREFIX};
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
+use crate::util::locks::LockRecover;
+use crate::util::node_names::{slugify, AP2_DEV_PREFIX};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

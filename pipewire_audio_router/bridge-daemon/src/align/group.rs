@@ -31,7 +31,7 @@
 //! - one synthetic link [`ALIGN_HOLD_SOURCE`] → each held output is injected, so the
 //!   reconciler materialises exactly one group with exactly those members and gives it
 //!   an anchor. [`ALIGN_HOLD_SOURCE`] is not a real node, so nothing is linked *into*
-//!   that anchor and it is silent until `player::play_loop_to_target` writes the click
+//!   that anchor and it is silent until `pw::player::play_loop_to_target` writes the click
 //!   into it — which is also what pumps every per-device relay.
 //!
 //! The reason it is an override rather than a store edit is the restore guarantee:
@@ -127,10 +127,10 @@
 
 use crate::align::calibrate::{AlignMember, MemberKind};
 use crate::announce_arbiter::ReservationId;
-use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
 use crate::routing_store::{RoutingLink, SharedRouting};
 use crate::sync_group::SharedGroups;
+use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};

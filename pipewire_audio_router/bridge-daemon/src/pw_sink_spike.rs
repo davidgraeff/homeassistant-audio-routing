@@ -13,10 +13,10 @@
 //! The receiver plays it via a static `rtp-source` (proven) or auto-discovery.
 //! `DELETE /api/spike/pw-sink` tears everything down. One at a time.
 
-use crate::locks::LockRecover;
+use crate::pw::thread::{PwCommand, PwCommandSender, SharedState};
 use crate::pw_sink;
-use crate::pw_thread::{PwCommand, PwCommandSender, SharedState};
 use crate::routing::node_id_for;
+use crate::util::locks::LockRecover;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,7 +83,7 @@ fn tone_wav(freq_hz: f32, secs: f32, rate: u32) -> Vec<u8> {
         pcm.extend_from_slice(&b);
         pcm.extend_from_slice(&b);
     }
-    crate::wav::build_wav(&pcm, rate, 16, 2)
+    crate::audio::wav::build_wav(&pcm, rate, 16, 2)
 }
 
 /// Poll until `node_name` is present in the live registry (or give up).
@@ -206,7 +206,7 @@ pub async fn start(
     let player = tokio::task::spawn_blocking({
         let stop_flag = stop_flag.clone();
         move || {
-            if let Err(e) = crate::player::play_loop_to_target(anchor_id, &wav, stop_flag) {
+            if let Err(e) = crate::pw::player::play_loop_to_target(anchor_id, &wav, stop_flag) {
                 tracing::warn!("pw-sink spike tone player ended: {e}");
             }
         }

@@ -6,7 +6,7 @@
 //! graph — the AirPlay source could never appear in the routing matrix or be
 //! routed. `shairplay` (pure Rust, spike-validated) hands us decoded f32 PCM
 //! via a callback; we push it through a bounded ring buffer into a PipeWire
-//! producer stream (mirrors player.rs's playback stream, but long-lived and
+//! producer stream (mirrors pw/player.rs's playback stream, but long-lived and
 //! fed live instead of from a WAV).
 //!
 //! The producer node is created as soon as the AirPlay source is *configured*
@@ -15,9 +15,9 @@
 //! level is computed inline from the received PCM for the UI meter.
 
 use crate::airplay_clients::{self, AirplayClientStore, SharedAirplayClients};
-use crate::locks::LockRecover;
 use crate::now_playing::{MetadataUpdate, NowPlayingReporter, PlaybackState};
 use crate::sources_store::{AirplaySourceConfig, SourceConfig, SourceEntry, SourceId};
+use crate::util::locks::LockRecover;
 use pipewire as pw;
 use pw::spa;
 use shairplay::{Ap1Encryption, AudioFormat, AudioHandler, AudioSession, RaopServer, SessionDecision, SessionInfo};

@@ -19,7 +19,7 @@
 //! carrying audio — so a handshake completing has to push a frame, not wait for
 //! some unrelated registry event.
 
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 

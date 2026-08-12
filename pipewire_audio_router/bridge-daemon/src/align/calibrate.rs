@@ -225,7 +225,7 @@ pub fn click_wav() -> Vec<u8> {
         pcm.extend_from_slice(&le); // FL
         pcm.extend_from_slice(&le); // FR
     }
-    crate::wav::build_wav(&pcm, RATE, 16, CHANNELS)
+    crate::audio::wav::build_wav(&pcm, RATE, 16, CHANNELS)
 }
 
 /// One burst sample: a sine at `freq` under a Hann envelope over the `n`-sample
@@ -1161,7 +1161,7 @@ impl AlignManager {
             let click = self.click.clone();
             let stop = stop.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = crate::player::play_loop_to_target(anchor, &click, stop) {
+                if let Err(e) = crate::pw::player::play_loop_to_target(anchor, &click, stop) {
                     tracing::warn!("alignment playback ended with error: {e}");
                 }
             });
@@ -2085,7 +2085,7 @@ mod tests {
         sendspin: SharedSendspinControl,
         ap2: SharedAp2Control,
         groups: SharedGroups,
-        changes: crate::pw_thread::ChangeNotifier,
+        changes: crate::pw::thread::ChangeNotifier,
         _changes_rx: tokio::sync::broadcast::Receiver<()>,
         routing: crate::routing_store::SharedRouting,
         outputs: crate::outputs_store::SharedOutputs,

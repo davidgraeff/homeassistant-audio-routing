@@ -16,9 +16,9 @@
 //! This mirrors RAOP's "devices appear in the matrix automatically" UX while
 //! honoring sendspin's group-based multi-room model.
 
-use crate::config::{slugify, SENDSPIN_DEV_PREFIX};
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
+use crate::util::locks::LockRecover;
+use crate::util::node_names::{slugify, SENDSPIN_DEV_PREFIX};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

@@ -10,7 +10,7 @@
 //! `pipewire-rs` 0.10 has no typed `Profiler` proxy and the `profile` event
 //! isn't in its safe API, so this binds the global by id via the raw registry
 //! `bind` method and attaches a raw `pw_profiler_events` object listener. All of
-//! it runs on the PipeWire thread (pw_thread.rs) — the proxy/hook are `!Send`
+//! it runs on the PipeWire thread (pw/thread.rs) — the proxy/hook are `!Send`
 //! and only ever touched there. The profile callback fires on that thread's main
 //! loop (not the RT data-loop), so writing the shared map under a std `Mutex` is
 //! fine.
@@ -21,7 +21,7 @@
 //! so an idle install with the UI closed pays nothing. While open it's one POD
 //! parse per driver cycle on the main loop.
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use pipewire as pw;
 use pw::spa::pod::deserialize::PodDeserializer;
 use pw::spa::pod::Value;

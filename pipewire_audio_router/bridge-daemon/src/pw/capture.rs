@@ -1,15 +1,15 @@
 //! Native, long-lived PCM capture from a sendspin output's sink node —
 //! replaces adapter.py's continuous `pw-record --target <node> ... -` subprocess.
 //!
-//! Mirrors player.rs's stream setup (same crate APIs, same format-negotiation
+//! Mirrors pw/player.rs's stream setup (same crate APIs, same format-negotiation
 //! pod-building) with the differences long-lived capture needs: `Direction::Input`
 //! with the `process` callback *reading* captured bytes instead of writing them,
 //! no drain-and-quit (this runs until told to stop), and a `pw::channel`-based
-//! stop command — the same cross-thread-into-the-mainloop mechanism pw_thread.rs
+//! stop command — the same cross-thread-into-the-mainloop mechanism pw/thread.rs
 //! already uses for `PwCommand`, since PipeWire's `!Send` types mean an external
 //! thread can't just call `mainloop.quit()` directly.
 //!
-//! Runs on its own dedicated OS thread (matching pw_thread.rs's own
+//! Runs on its own dedicated OS thread (matching pw/thread.rs's own
 //! `std::thread::Builder::spawn`, not `tokio::task::spawn_blocking` — this is
 //! long-lived, not one bounded task) and forwards each captured buffer's bytes
 //! through a **bounded** `tokio::sync::mpsc` channel (non-blocking `try_send`,

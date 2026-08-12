@@ -36,11 +36,11 @@
 //! being hardcoded per source/output type.
 
 use crate::api::AppState;
-use crate::config::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
-use crate::locks::LockRecover;
-use crate::pw_thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
+use crate::pw::thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
 use crate::routing_store::{self, RoutingLink, SharedRouting};
 use crate::sendspin_discovery::SendspinDevice;
+use crate::util::locks::LockRecover;
+use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -112,7 +112,7 @@ pub struct RoutingNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     latency_ms: Option<u32>,
     /// Cumulative xrun (dropped-cycle) count for this node from the PipeWire
-    /// profiler (profiler.rs) — the same figure as `pw-top`'s `ERR`. Present only
+    /// profiler (pw/profiler.rs) — the same figure as `pw-top`'s `ERR`. Present only
     /// for real graph nodes while the matrix is being watched (profiling is armed
     /// on-demand); `None` for virtual outputs (sendspin/AP2 have no graph node)
     /// and whenever profiling is off. A rising value is where dropouts originate.
@@ -241,7 +241,7 @@ fn build_matrix(
     // User-chosen output names (outputs_store.rs), keyed by node name. Wins over
     // whatever discovery reported — it is the whole point of a rename.
     output_labels: &BTreeMap<String, String>,
-    meters: &crate::metering::MeterHub,
+    meters: &crate::pw::metering::MeterHub,
     intent: &[RoutingLink],
     sendspin_volumes: &std::collections::HashMap<String, u8>,
     sendspin_mutes: &std::collections::HashMap<String, bool>,
@@ -785,7 +785,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     state.meters.watch();
     // Same "pay only while watched" gating for the profiler: the first client to
     // open the matrix arms per-node xrun profiling, the last to leave disarms it
-    // (profiler.rs / pw_thread's SetProfiling). `fetch_add` returns the previous
+    // (pw/profiler.rs / pw_thread's SetProfiling). `fetch_add` returns the previous
     // count, so `== 0` means we're the first.
     if state.profiler_watchers.fetch_add(1, Ordering::SeqCst) == 0 {
         let _ = state.pw_cmd.send(PwCommand::SetProfiling(true));
@@ -1240,7 +1240,7 @@ mod tests {
             &empty_names,
             &std::collections::HashMap::new(),
             output_labels,
-            &crate::metering::MeterHub::default(),
+            &crate::pw::metering::MeterHub::default(),
             intent,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),

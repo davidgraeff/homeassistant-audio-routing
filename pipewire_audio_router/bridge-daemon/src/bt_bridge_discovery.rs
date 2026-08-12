@@ -33,8 +33,8 @@
 //!    there before the UI offers a link, so an advert left behind by a bridge
 //!    whose app is not running never produces a dead link.
 
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
+use crate::util::locks::LockRecover;
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
 use std::net::IpAddr;

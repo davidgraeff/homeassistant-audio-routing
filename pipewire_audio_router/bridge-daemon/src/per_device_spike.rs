@@ -19,13 +19,13 @@
 //! productionization after S1). It is deliberately the smallest thing that plays
 //! audio to a real device through a per-device node.
 
-use crate::locks::LockRecover;
-use crate::pw_thread::{ChangeNotifier, PwCommand, PwCommandSender, SharedState};
+use crate::pw::thread::{ChangeNotifier, PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
 use crate::routing_store::{self, SharedRouting};
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::sendspin_server::{self, SendspinServerHandle};
 use crate::sendspin_volume::SharedSendspinControl;
+use crate::util::locks::LockRecover;
 use serde::Serialize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -125,7 +125,7 @@ pub async fn start(
     }
 
     // 2. Create the per-device sink and wait for it in the graph.
-    let suffix = device_node_name.strip_prefix(crate::config::SENDSPIN_DEV_PREFIX).unwrap_or(device_node_name);
+    let suffix = device_node_name.strip_prefix(crate::util::node_names::SENDSPIN_DEV_PREFIX).unwrap_or(device_node_name);
     let sink_node_name = format!("{PERDEV_PREFIX}{suffix}");
     let (tx, rx) = oneshot::channel();
     if pw_cmd.send(PwCommand::CreateSinkNode { node_name: sink_node_name.clone(), reply: tx }).is_err() {
@@ -370,7 +370,7 @@ fn spike_members(
     devices: &crate::sendspin_discovery::SharedSendspinDevices,
     fullnames: &std::collections::HashSet<String>,
 ) -> Vec<(String, String)> {
-    use crate::locks::LockRecover;
+    use crate::util::locks::LockRecover;
     devices
         .lock_recover()
         .values()

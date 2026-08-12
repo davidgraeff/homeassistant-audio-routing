@@ -31,8 +31,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::applemidi_sender::{AppleMidiSender, PcmChunk, SessionConfig, SessionFormat};
-use crate::config::{PWSINK_DEV_PREFIX, PWSINK_SESSION_PREFIX};
 use crate::pw_sink_liveness::{PwSinkLiveness, PwSinkStatus};
+use crate::util::node_names::{PWSINK_DEV_PREFIX, PWSINK_SESSION_PREFIX};
 
 /// One target this group streams to: the virtual output node name
 /// (`pwsink-dev-<slug>`) plus the concrete control port the daemon binds +
@@ -66,7 +66,7 @@ pub struct PwSinkServerHandle {
     senders: Vec<(String, Arc<AppleMidiSender>)>,
     /// Owned here (not by the relay) so this Drop closes the capture channel →
     /// the relay's `blocking_recv` returns `None` → the relay thread exits.
-    _capture: crate::sendspin_capture::CaptureHandle,
+    _capture: crate::pw::capture::CaptureHandle,
     /// The RT relay thread; exits on its own once `_capture` closes the channel.
     _relay: std::thread::JoinHandle<()>,
     /// Liveness poll task (publishes each sender's `status()` into
@@ -111,7 +111,7 @@ pub fn session_name_for(node_name: &str) -> String {
 /// Depth of one target's relay→sender PCM feed, in captured chunks.
 ///
 /// **Bounded on purpose** (the rule the capture channel already follows —
-/// `sendspin_capture::CAPTURE_CHANNEL_CAP`): an unbounded feed is unbounded
+/// `pw::capture::CAPTURE_CHANNEL_CAP`): an unbounded feed is unbounded
 /// latency, since every chunk queued in it is audio the receiver will hear late.
 /// At a ~21 ms quantum, 8 chunks is ~170 ms of absolute worst case, reached only
 /// while a sender thread is not running at all; steady-state occupancy is 0-1.
@@ -149,8 +149,8 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
     // Capture the anchor monitor at the fixed 48 kHz / S16 / stereo bus rate —
     // pw-sink's wire format is fixed L16/48k (applemidi_sender byte-swaps to BE),
     // so unlike AP2 there is no rate negotiation.
-    let (capture, mut pcm_rx) = crate::sendspin_capture::spawn("pwsink", sink_node_id)
-        .map_err(|e| anyhow::anyhow!("failed to start capture for pw-sink group: {e}"))?;
+    let (capture, mut pcm_rx) =
+        crate::pw::capture::spawn("pwsink", sink_node_id).map_err(|e| anyhow::anyhow!("failed to start capture for pw-sink group: {e}"))?;
 
     // One AppleMIDI sender per target, each with its own std::mpsc PCM channel the
     // relay feeds. The shared advertise daemon is fetched by AppleMidiSender when

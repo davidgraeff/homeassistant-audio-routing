@@ -752,7 +752,7 @@ Caller is responsible for pairing FL/FR etc. themselves.
 ```
 
 Created natively via `Core::create_object` on the PipeWire thread
-(`pw_thread.rs`) — the port names are resolved to object ids against the
+(`pw/thread.rs`) — the port names are resolved to object ids against the
 live registry, then a create command is handed to that thread. Idempotent:
 a link already present between the same ports is reported as success
 (`ok: true`). Failure modes: either port name not found in the registry
@@ -805,7 +805,7 @@ currently-offline endpoint are kept and reapplied when it returns.
   (in the live graph now — `false` = configured/known but offline, shown
   grayed), `configured` (manually added vs auto-discovered), and `peak`
   (a live input-level meter for sources, populated only while the matrix WS
-  is open — see `metering.rs`).
+  is open — see `pw/metering.rs`).
 - **Outputs** = live RAOP sinks + discovered sendspin devices + any
   offline endpoint with saved routing intent. **Sources** = the AirPlay
   receiver, the RTP source, and any other non-monitor output-direction node.

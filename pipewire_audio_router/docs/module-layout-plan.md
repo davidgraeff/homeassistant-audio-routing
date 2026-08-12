@@ -14,13 +14,14 @@ should graduate into [`decisions.md`](decisions.md).
 
 ## 0. Status (2026-08-12)
 
-**Landed:** `align/` — 7 files moved plus a new `mod.rs`, in `fc627e4`
-("align: move the alignment cluster into `align/`"). §3 rows 26 and 51–56.
+**Landed:**
 
-**Remaining:** 53 files still flat at the crate root, ~26.0k lines. `align/`
-holds the other ~19.8k across 8 files, so the crate is now **61 files /
-~45.8k lines** — the flat part is a minority of the code but a large majority of
-the files.
+- `align/` — 7 files plus a new `mod.rs`, in `fc627e4`. §3 rows 26, 51–56.
+- **wave 1** — `util/` + `audio/` + `pw/`, 11 files plus 3 new `mod.rs`.
+  §3 rows 3–13. Preceded by a standalone commit clearing the three pre-existing
+  `cargo fmt` findings, so the fmt baseline is now **zero** (§4 wave 0, §9).
+
+**Remaining:** 42 files still flat at the crate root. Waves 2–7 (§4).
 
 The align wave went first, out of order (§4 lists it as wave 5), and it was not a
 leaf when it did: **eight files outside `align/` reach into it** — `api.rs`,
@@ -204,7 +205,7 @@ by subject.
 
 ## 3. Full rename table
 
-60 files, of which 7 have landed. `★` marks the two moves that change meaning
+60 files, of which 18 have landed. `★` marks the two moves that change meaning
 rather than location; everything else is pure relocation. The `mod.rs` files each
 directory needs are new files, not rows here — `align/mod.rs` was written from
 scratch (§2, "Directory module style").
@@ -213,17 +214,17 @@ scratch (§2, "Directory module style").
 |---:|---|---|
 | 1 | `main.rs` | `main.rs` *(unchanged)* |
 | 2 | `discovery_supervisor.rs` | `supervisor.rs` |
-| 3 | `pw_thread.rs` | `pw/thread.rs` |
-| 4 | `sendspin_capture.rs` | `pw/capture.rs` ★ |
-| 5 | `player.rs` | `pw/player.rs` |
-| 6 | `profiler.rs` | `pw/profiler.rs` |
-| 7 | `metering.rs` | `pw/metering.rs` |
-| 8 | `resample.rs` | `audio/resample.rs` |
-| 9 | `wav.rs` | `audio/wav.rs` |
-| 10 | `decode.rs` | `audio/decode.rs` |
-| 11 | `locks.rs` | `util/locks.rs` |
-| 12 | `config.rs` | `util/node_names.rs` ★ |
-| 13 | `host_assessment.rs` | `util/host_assessment.rs` |
+| 3 ✔ | `pw_thread.rs` | `pw/thread.rs` |
+| 4 ✔ | `sendspin_capture.rs` | `pw/capture.rs` ★ |
+| 5 ✔ | `player.rs` | `pw/player.rs` |
+| 6 ✔ | `profiler.rs` | `pw/profiler.rs` |
+| 7 ✔ | `metering.rs` | `pw/metering.rs` |
+| 8 ✔ | `resample.rs` | `audio/resample.rs` |
+| 9 ✔ | `wav.rs` | `audio/wav.rs` |
+| 10 ✔ | `decode.rs` | `audio/decode.rs` |
+| 11 ✔ | `locks.rs` | `util/locks.rs` |
+| 12 ✔ | `config.rs` | `util/node_names.rs` ★ |
+| 13 ✔ | `host_assessment.rs` | `util/host_assessment.rs` |
 | 14 | `routing_store.rs` | `store/routing.rs` |
 | 15 | `outputs_store.rs` | `store/outputs.rs` |
 | 16 | `groups_store.rs` | `store/groups.rs` |

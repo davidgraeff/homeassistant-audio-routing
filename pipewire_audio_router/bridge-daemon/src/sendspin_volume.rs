@@ -117,7 +117,7 @@ pub struct SendspinControl {
     /// sync, without the UI having to poll. Injected once at startup from main.rs
     /// (the same broadcast every other change source nudges); `None` until then
     /// (e.g. in unit tests), where mutations simply don't notify.
-    change_notifier: Option<crate::pw_thread::ChangeNotifier>,
+    change_notifier: Option<crate::pw::thread::ChangeNotifier>,
     /// Desired per-device *static delay* (ms), keyed by virtual device node
     /// name; absent = no extra delay. Unlike volume this IS persisted (across
     /// restarts) by sync_settings.rs and seeded back in via [`Self::seed_delays`]
@@ -147,7 +147,7 @@ pub fn shared() -> SharedSendspinControl {
 impl SendspinControl {
     /// Wire up the change-notifier (main.rs, once at startup) so `desired`
     /// mutations push a fresh routing-matrix snapshot to watching UIs.
-    pub fn set_change_notifier(&mut self, changes: crate::pw_thread::ChangeNotifier) {
+    pub fn set_change_notifier(&mut self, changes: crate::pw::thread::ChangeNotifier) {
         self.change_notifier = Some(changes);
     }
 

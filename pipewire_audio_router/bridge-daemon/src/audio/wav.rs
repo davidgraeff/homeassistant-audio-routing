@@ -1,4 +1,4 @@
-//! Minimal in-memory WAV construction for announce audio: `decode.rs` hands
+//! Minimal in-memory WAV construction for announce audio: `audio/decode.rs` hands
 //! over PCM decoded from a URL-fetched clip (via symphonia), and `align/calibrate.rs`
 //! builds its click track directly. Neither needs a real encoder — both already
 //! have raw PCM samples in hand, just missing a header.

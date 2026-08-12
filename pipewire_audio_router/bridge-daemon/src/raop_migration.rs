@@ -23,9 +23,9 @@
 //!
 //! Idempotent + cheap, so it can be deleted once the deployment has booted once.
 
-use crate::config::{slugify, AP2_DEV_PREFIX};
 use crate::groups_store::GroupsStore;
 use crate::routing_store::RoutingStore;
+use crate::util::node_names::{slugify, AP2_DEV_PREFIX};
 use std::path::Path;
 
 /// The removed RAOP output node-name prefix (was `raop::RAOP_NODE_PREFIX`).

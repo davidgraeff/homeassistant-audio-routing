@@ -13,34 +13,26 @@ mod ap2_spike;
 mod ap2_volume;
 mod api;
 mod applemidi_sender;
+mod audio;
 mod bt_bridge_discovery;
-mod config;
-mod decode;
 mod discovery_supervisor;
 mod groups_store;
-mod host_assessment;
-mod locks;
-mod metering;
 mod now_playing;
 mod outputs_store;
 mod overlay_mixer;
 mod per_device_spike;
-mod player;
-mod profiler;
+mod pw;
 mod pw_sink;
 mod pw_sink_liveness;
 mod pw_sink_spike;
 mod pw_target_discovery;
 mod pw_target_liveness;
-mod pw_thread;
 mod pwsink_agent;
 mod pwsink_server;
 mod raop_migration;
-mod resample;
 mod routing;
 mod routing_store;
 mod rtp_source;
-mod sendspin_capture;
 mod sendspin_codec;
 mod sendspin_discovery;
 mod sendspin_liveness;
@@ -50,9 +42,9 @@ mod settings_store;
 mod sources_store;
 mod sync_group;
 mod sync_settings;
-mod wav;
+mod util;
 
-use crate::locks::LockRecover;
+use crate::util::locks::LockRecover;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -231,7 +223,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let airplay_clients_path = sources_path.with_file_name("airplay_clients.json");
     let airplay_clients = airplay_clients::AirplayClientStore::load(&airplay_clients_path)?;
     tracing::info!("{} remembered AirPlay client(s) in {}", airplay_clients.total_clients(), airplay_clients_path.display());
-    let meters = metering::MeterHub::new();
+    let meters = pw::metering::MeterHub::new();
     let sendspin_control = sendspin_volume::shared();
     let ap2_control = ap2_volume::shared();
     let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
@@ -253,7 +245,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // one-click adoption and a link to a bridge's diagnostics page.
     let bt_bridges: bt_bridge_discovery::SharedBtBridges = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
-    let (pw_state, changes, pw_cmd, xruns) = pw_thread::spawn()?;
+    let (pw_state, changes, pw_cmd, xruns) = pw::thread::spawn()?;
 
     // Per-source now-playing metadata (now_playing.rs). Purely in-memory: it
     // describes what is playing *right now*, so there is nothing worth persisting
@@ -581,8 +573,8 @@ async fn spawn_stored_sources(
     airplay: &api::SharedAirplay,
     airplay_clients: &airplay_clients::AirplayClientStore,
     now_playing: &now_playing::NowPlayingStore,
-    pw: &pw_thread::SharedState,
-    pw_cmd: pw_thread::PwCommandSender,
+    pw: &pw::thread::SharedState,
+    pw_cmd: pw::thread::PwCommandSender,
 ) {
     // Snapshot the source list and drop the (std) lock before awaiting anything.
     let entries = {

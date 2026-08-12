@@ -21,8 +21,8 @@
 //!   night's song forever (the ESP32 bridge blanked its text sensors on
 //!   disconnect for exactly this reason).
 
-use crate::locks::LockRecover;
-use crate::pw_thread::ChangeNotifier;
+use crate::pw::thread::ChangeNotifier;
+use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

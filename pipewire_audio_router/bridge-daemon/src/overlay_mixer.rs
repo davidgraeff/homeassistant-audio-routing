@@ -140,7 +140,7 @@ impl OverlayMixer {
     /// time to complete before the watchdog fires.
     pub fn start_with_grace(&self, output: &str, id: u64, pcm: Vec<u8>, duck: f32, grace: Duration) {
         let rate = self.output_rate.lock().unwrap().get(output).copied().unwrap_or(48_000);
-        let pcm = crate::resample::from_48k_stereo_to(&pcm, rate);
+        let pcm = crate::audio::resample::from_48k_stereo_to(&pcm, rate);
         self.slots.lock().unwrap().insert(
             output.to_string(),
             Overlay { id, pcm, cursor: 0, duck: duck.clamp(0.0, 1.0), grace, watch_cursor: 0, watch_since: Instant::now() },
@@ -414,7 +414,7 @@ fn mix_s16le(music: &[u8], overlay: &[u8], duck: f32) -> Vec<u8> {
 /// Generate a stereo S16LE test tone at the capture format (48 kHz), for the
 /// overlay spike: `seconds` of a `freq` Hz sine at `amplitude` (0.0–1.0).
 pub fn test_tone(seconds: f32, freq: f32, amplitude: f32) -> Vec<u8> {
-    let rate = crate::sendspin_capture::SAMPLE_RATE as f32;
+    let rate = crate::pw::capture::SAMPLE_RATE as f32;
     let frames = (rate * seconds.max(0.0)) as usize;
     let amp = amplitude.clamp(0.0, 1.0) * i16::MAX as f32;
     let mut v = Vec::with_capacity(frames * 4);

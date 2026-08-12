@@ -177,7 +177,7 @@ Mirrors the established discovery/output pattern.
 |---|---|---|
 | `pw_target_discovery.rs` (new) | Browse `_workstation._tcp`, populate `SharedPwTargets` (`pw-dev-<slug>`, `approved` flag), fire `changes` | `sendspin_discovery.rs` |
 | `discovery_supervisor.rs` | Register the browser on the shared LAN-restricted daemon in `start()` | existing browsers |
-| `config.rs` / `outputs_store.rs` | `PW_DEV_PREFIX`; persist approved targets + per-target `jb_msec`, dest IP/port | `RaopOutputConfig` |
+| `util/node_names.rs` / `outputs_store.rs` | `PW_DEV_PREFIX`; persist approved targets + per-target `jb_msec`, dest IP/port | `RaopOutputConfig` |
 | `rtp_sink.rs` (new) | Load `rtp-sink` (+ SAP announce) as a real node via `pw_thread` `Load`/`Unload`; build the per-device mix bus (loopback + null-sink) | old `raop.rs` module-load; anchor `CreateSinkNode` |
 | `sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
 | `pw_target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `sendspin_liveness.rs` |
