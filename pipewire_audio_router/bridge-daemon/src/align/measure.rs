@@ -103,6 +103,9 @@ use crate::align::estimator::{
 };
 use crate::align::levels::TARGET_PEAK_SNR_DB;
 use crate::align::mic::{MicStatus, MicWindow};
+// One push loop for all three alignment status sockets — see that module's docs for
+// why a fourth copy of it must not appear.
+use crate::align::status_ws::status_socket;
 use crate::align::transcript;
 use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
@@ -7554,7 +7557,7 @@ const EQUIV_CANNOT_TELL: [&str; 6] = [
 pub async fn equivalence_ws(ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|socket| {
         let m = equivalence();
-        status_socket(socket, m.subscribe(), || serde_json::to_string(&m.status()).ok())
+        status_socket(socket, m.subscribe(), || Box::pin(async { serde_json::to_string(&m.status()).ok() }))
     })
 }
 
@@ -7572,51 +7575,8 @@ pub async fn measure_ws(ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::r
         let m = shared();
         // Subscribed *before* the first status is read, so a change that lands between
         // the two is a redundant push rather than a missed one.
-        status_socket(socket, m.subscribe(), || serde_json::to_string(&m.status()).ok())
+        status_socket(socket, m.subscribe(), || Box::pin(async { serde_json::to_string(&m.status()).ok() }))
     })
-}
-
-/// The push loop both sockets use: one full status on connect, then one on every
-/// change. Shared because the difference between them is only which state is
-/// serialised, and a second copy of the closed-tab handling below is how one of them
-/// ends up leaking a subscription.
-async fn status_socket(
-    mut socket: axum::extract::ws::WebSocket,
-    mut changes: tokio::sync::watch::Receiver<u64>,
-    snapshot: impl Fn() -> Option<String>,
-) {
-    use axum::extract::ws::Message;
-
-    let mut push = true;
-    loop {
-        if push {
-            let Some(json) = snapshot() else {
-                return;
-            };
-            if socket.send(Message::Text(json.into())).await.is_err() {
-                return;
-            }
-        }
-        // Either the run state moved, or the client said something. Reading the
-        // socket matters even though this endpoint takes no commands: it is how a
-        // closed tab is noticed, and without it a dead socket would sit here holding
-        // a subscription until the next status change happened to fail to send.
-        tokio::select! {
-            changed = changes.changed() => {
-                if changed.is_err() {
-                    return; // the notifier is gone: the process is shutting down
-                }
-                push = true;
-            }
-            msg = socket.recv() => match msg {
-                // Text/binary is reserved for future control messages; ignoring it
-                // keeps an older daemon usable with a newer client. A client frame is
-                // not a state change, so it must not trigger a push of its own.
-                Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => push = false,
-                _ => return,
-            },
-        }
-    }
 }
 
 #[cfg(test)]

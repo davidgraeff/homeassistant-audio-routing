@@ -12,6 +12,49 @@ pub(crate) async fn align_status(State(state): State<AppState>) -> Json<crate::a
     Json(state.align.status().await)
 }
 
+/// `GET /api/align/ws` — the **session** state, pushed: one full `AlignState` on connect,
+/// then one on every change, and one on **teardown**.
+///
+/// The same shape and the same push loop as the run's socket
+/// (`align::status_ws::status_socket`), and worth having for a different reason. A
+/// measurement is pushed because it spends minutes inside gates where only the *message*
+/// moves; the session is pushed because the one state change a client cannot predict is
+/// the session **ending** — by the idle timeout, by a superseding `start`, or by a stop
+/// issued from another tab — and until it hears about that it is showing a wizard for a
+/// session that no longer exists while the speakers it named have already gone back to
+/// normal. `GET /api/align` stays, and the client falls back to it: a UI that shows
+/// nothing because this route 404'd would be worse than one that polls.
+///
+/// It takes no commands, and a frame sent on it is deliberately **not** activity — see
+/// `AlignManager::still_here` for why a held socket must never postpone the timeout.
+pub(crate) async fn align_ws(State(state): State<AppState>, ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let align = state.align.clone();
+        // Subscribed *before* the first status is read, so a change that lands between
+        // the two is a redundant push rather than a missed one.
+        let changes = align.subscribe();
+        crate::align::status_ws::status_socket(socket, changes, move || {
+            // A clone per frame rather than a borrow: `AlignManager` is a bundle of
+            // `Arc`s, and owning one is what lets the snapshot future be `'static`.
+            let align = align.clone();
+            Box::pin(async move { serde_json::to_string(&align.status().await).ok() })
+        })
+        .await;
+    })
+}
+
+/// `POST /api/align/still-here` — postpone the idle teardown, changing nothing else.
+///
+/// **Must be driven by a click, never by a timer.** The timeout exists so that a tab
+/// nobody is watching cannot leave a room muted, and renewing the session automatically
+/// would put that hazard straight back — invisibly. See `AlignManager::still_here`.
+pub(crate) async fn align_still_here(
+    State(state): State<AppState>,
+) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+    tracing::info!("USER ACTION: keep the alignment session open");
+    state.align.still_here().await.map(Json).map_err(|e| (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: e })))
+}
+
 /// The shared handles an alignment session needs to form and hold its temporary
 /// exclusive group (align/group.rs). Assembled here so `AlignManager` — which
 /// main.rs builds with three handles — needs no new constructor arguments.

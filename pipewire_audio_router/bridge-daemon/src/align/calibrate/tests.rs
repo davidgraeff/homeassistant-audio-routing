@@ -1112,6 +1112,294 @@ async fn every_teardown_path_restores_the_levels_it_changed() {
     //    release is `align_group`'s last resort, tested there.
 }
 
+// ---- The idle timeout, as something the user can see coming -------------------
+//
+// The hold is exclusive (plan §12.3), so when the idle timeout fires the speakers go
+// back to normal and any wizard on screen is describing a session that no longer
+// exists. A real multi-position run walked into exactly that, because reading a review
+// page is *quiet*. These tests pin the two halves of the fix: the remaining time is in
+// the status, and its disappearance is pushed.
+
+/// `closes_in_s` has to be a live reading of the idleness the watchdog decides on —
+/// shrinking while nothing happens and jumping back the moment something does.
+///
+/// Asserted through the public status rather than through `activity`, because the
+/// number a user counts down and the number the teardown is decided on being the same
+/// number is the actual claim (they are one function, `Session::idle`).
+#[tokio::test]
+async fn the_reported_remaining_time_shrinks_while_idle_and_jumps_back_on_activity() {
+    let (a, b) = ("sendspin-dev-cdowna", "sendspin-dev-cdownb");
+    let f = UnionFixture::new("closesin", &[(a, MemberKind::Sendspin), (b, MemberKind::Sendspin)]).await;
+
+    let fresh = f.mgr.status().await.closes_in_s.expect("a live session says when it would close");
+    assert!(fresh <= SESSION_TIMEOUT.as_secs(), "never more than the whole allowance, got {fresh}");
+    assert!(fresh + 5 >= SESSION_TIMEOUT.as_secs(), "a fresh session has nearly all of it, got {fresh}");
+
+    // Five minutes of a user reading a proposal: silent, so the clock runs down.
+    f.go_idle(Duration::from_secs(5 * 60)).await;
+    let idled = f.mgr.status().await.closes_in_s.unwrap();
+    assert!(idled < fresh, "idling has to shrink it: {idled} vs {fresh}");
+    assert!(idled.abs_diff(SESSION_TIMEOUT.as_secs() - 5 * 60) <= 5, "it counts the idleness, got {idled}");
+
+    // Soloing a speaker is the audibility change §1.2 relies on a walk making.
+    f.mgr.solo(b.to_string(), 30).await.expect("solo");
+    let refreshed = f.mgr.status().await.closes_in_s.unwrap();
+    assert!(refreshed > idled, "an audibility change must give the whole allowance back: {refreshed} vs {idled}");
+    assert!(refreshed + 5 >= SESSION_TIMEOUT.as_secs(), "…all of it, got {refreshed}");
+
+    // The two constants that let a client phrase it honestly: it may say "15 minutes
+    // without a change", and it must say "about", because the watchdog only looks every
+    // `TIMEOUT_POLL`.
+    let st = f.mgr.status().await;
+    assert_eq!(st.idle_timeout_s, SESSION_TIMEOUT.as_secs());
+    assert_eq!(st.timeout_slack_s, TIMEOUT_POLL.as_secs());
+    assert!(st.timeout_slack_s > 0, "a slack of zero would invite a UI to promise a precise second");
+
+    // Past the deadline it saturates at zero rather than wrapping — and zero means
+    // "awaiting teardown", not "gone": the session is still here, and still says so.
+    f.go_idle(SESSION_TIMEOUT * 2).await;
+    let st = f.mgr.status().await;
+    assert_eq!(st.closes_in_s, Some(0));
+    assert!(st.active, "the watchdog has not looked yet, so the session is still real");
+
+    // No session, nothing counting down — but the rules are still stated.
+    f.mgr.stop().await;
+    let st = f.mgr.status().await;
+    assert_eq!(st.closes_in_s, None, "an inactive state has no deadline to report");
+    assert_eq!(st.idle_timeout_s, SESSION_TIMEOUT.as_secs());
+    assert_eq!(AlignState::inactive().closes_in_s, None);
+}
+
+/// The by-ear path's two steps refresh the timer too.
+///
+/// `Session::activity`'s doc comment always claimed `select` and `set_level` did this
+/// and only `set_audible` ever called `note_activity` — so a by-ear session being
+/// compared pair by pair for a quarter of an hour was torn down as abandoned. The UI now
+/// *tells* the user that changing what they hear or its level refreshes the timer, which
+/// makes the discrepancy a promise rather than a doc bug.
+#[tokio::test]
+async fn the_by_ear_steps_refresh_the_idle_timeout_as_the_docs_always_claimed() {
+    let (a, b) = ("sendspin-dev-byeara", "sendspin-dev-byearb");
+    let f = UnionFixture::new("byearidle", &[(a, MemberKind::Sendspin), (b, MemberKind::Sendspin)]).await;
+
+    // Picking a reference/target pair.
+    f.go_idle(Duration::from_secs(10 * 60)).await;
+    f.mgr.select(a.to_string(), b.to_string()).await.expect("select");
+    assert!(f.idle().await.expect("session") < Duration::from_secs(60), "`select` refreshes the idle mark");
+
+    // Dragging the level.
+    f.go_idle(Duration::from_secs(10 * 60)).await;
+    f.mgr.set_level(42).await.expect("set_level");
+    assert!(f.idle().await.expect("session") < Duration::from_secs(60), "`set_level` refreshes the idle mark");
+
+    // The explicit "I am still here", which is the only remedy on a page that is
+    // otherwise silent by nature (a proposal being read).
+    f.go_idle(Duration::from_secs(14 * 60)).await;
+    let st = f.mgr.still_here().await.expect("a live session can be kept open");
+    assert!(st.closes_in_s.unwrap() + 5 >= SESSION_TIMEOUT.as_secs(), "one whole fresh allowance, got {:?}", st.closes_in_s);
+
+    // …and *parking the run* is not activity, on purpose: `silence()` is what a run does
+    // when it stops playing to let the user read, which is exactly the case the countdown
+    // exists for. If it refreshed the timer there would be nothing to warn about.
+    f.go_idle(Duration::from_secs(10 * 60)).await;
+    let before = f.mgr.status().await.closes_in_s.unwrap();
+    f.mgr.silence().await.expect("silence");
+    let after = f.mgr.status().await.closes_in_s.unwrap();
+    assert!(after <= before, "parking a run must keep the watchdog counting: {after} vs {before}");
+
+    f.mgr.stop().await;
+    assert!(f.mgr.still_here().await.is_err(), "there is nothing to keep open once it has stopped");
+}
+
+/// The push half: every exit path bumps the notifier, so a client hears about the
+/// teardown instead of noticing it at the next poll.
+///
+/// The notifier lives on the **manager** for exactly this reason — one owned by the
+/// session would be dropped by the event it exists to report.
+#[tokio::test]
+async fn the_notifier_fires_on_teardown_so_the_disappearance_is_pushed() {
+    let (a, b) = ("sendspin-dev-pusha", "sendspin-dev-pushb");
+    let f = UnionFixture::new("pushstop", &[(a, MemberKind::Sendspin), (b, MemberKind::Sendspin)]).await;
+    let mut rx = f.mgr.subscribe();
+    assert!(!rx.has_changed().unwrap(), "a fresh subscription is up to date, not pre-armed");
+
+    // An ordinary change first, so the test cannot pass by never distinguishing them.
+    f.mgr.solo(b.to_string(), 25).await.expect("solo");
+    assert!(rx.has_changed().unwrap(), "a change to a live session is pushed");
+    rx.borrow_and_update();
+
+    f.mgr.stop().await;
+    assert!(rx.has_changed().unwrap(), "the teardown is pushed");
+    rx.borrow_and_update();
+    assert!(!f.mgr.status().await.active, "…and what a subscriber then reads is the inactive state");
+
+    // The *other* teardown paths go through the same `teardown`, which is where the bump
+    // is: a superseding start that re-forms (and here fails at the adoption gate, leaving
+    // no session) has to reach a subscriber too.
+    let f = UnionFixture::new("pushreform", &[(a, MemberKind::Sendspin), (b, MemberKind::Sendspin)]).await;
+    let rx = f.mgr.subscribe();
+    let _ = f
+        .mgr
+        .start_outputs(&f.deps(), vec![a.into(), "sendspin-dev-elsewhere".into()], AlignMode::MultiPosition)
+        .await
+        .expect_err("the fixture adopts nothing, so the re-form is refused");
+    assert!(rx.has_changed().unwrap(), "a superseding start's teardown is pushed as well");
+    assert!(!f.mgr.status().await.active);
+}
+
+/// The watchdog end to end: an idle session is taken, torn down, and the teardown is
+/// pushed — the sequence a review page left open overnight actually produces.
+///
+/// Paused clock, so the 15 minutes cost nothing. This is also what pins the watchdog
+/// being a *loop*: it sleeps in `TIMEOUT_POLL` slices and only fires once idleness has
+/// really accumulated, so a session refreshed in between survives the same task.
+#[tokio::test(start_paused = true)]
+async fn an_idle_session_is_torn_down_by_its_watchdog_and_the_close_is_pushed() {
+    let (a, b) = ("sendspin-dev-wdoga", "sendspin-dev-wdogb");
+    let f = UnionFixture::new("watchdog", &[(a, MemberKind::Sendspin), (b, MemberKind::Sendspin)]).await;
+    let mut rx = f.mgr.subscribe();
+    let stop = f.mgr.session.lock().await.as_ref().expect("session").stop.clone();
+    f.mgr.arm_timeout(stop);
+
+    // One slice in, with the user still working: it must not fire.
+    f.mgr.solo(b.to_string(), 20).await.expect("solo");
+    rx.borrow_and_update();
+    tokio::time::sleep(TIMEOUT_POLL * 2).await;
+    assert!(f.mgr.status().await.active, "a session in use survives the watchdog's checks");
+
+    // Now stop touching it. Rather than sleeping fifteen paused minutes with the session
+    // lock changing hands, backdate the mark the watchdog reads — which is precisely what
+    // a quarter of an hour of reading does to it.
+    f.go_idle(SESSION_TIMEOUT).await;
+    tokio::time::timeout(SESSION_TIMEOUT, rx.changed()).await.expect("the teardown is pushed").expect("notifier alive");
+
+    let st = f.mgr.status().await;
+    assert!(!st.active, "the watchdog gave the speakers back");
+    assert_eq!(st.closes_in_s, None);
+    assert!(f.groups.lock().await.align_hold_outputs().is_empty(), "…and released the exclusive hold with them");
+}
+
+/// Plan §11's requirement for the session socket: **one full state on connect**, so a
+/// client needs no separate initial fetch.
+///
+/// Driven over a real socket (a hand-rolled handshake — no test-only WebSocket client
+/// dependency) because the claim is about the transport: `status_socket` sends before it
+/// waits, and a version that waited for the first *change* would look fine in every
+/// unit test and leave a wizard blank until the user touched something.
+#[tokio::test]
+async fn a_socket_opened_while_a_session_is_live_gets_the_current_state_at_once() {
+    let (a, b) = ("sendspin-dev-wsa", "sendspin-dev-wsb");
+    let f = UnionFixture::new("sessionws", &[(a, MemberKind::Sendspin), (b, MemberKind::Sendspin)]).await;
+    f.mgr.solo(b.to_string(), 31).await.expect("solo");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let mgr = f.mgr.clone();
+    // The same wiring `api::align::align_ws` does, minus `AppState`.
+    let app = axum::Router::new().route(
+        "/ws",
+        axum::routing::get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let mgr = mgr.clone();
+            async move {
+                ws.on_upgrade(move |socket| async move {
+                    let changes = mgr.subscribe();
+                    crate::align::status_ws::status_socket(socket, changes, move || {
+                        let mgr = mgr.clone();
+                        Box::pin(async move { serde_json::to_string(&mgr.status().await).ok() })
+                    })
+                    .await;
+                })
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let mut sock = ws_connect(addr).await;
+    // Not preceded by any request of ours: whatever arrives is unprompted. Read as a
+    // `Value` because `AlignState` is a serialise-only DTO — and because the assertions
+    // that matter are about the *wire* shape a client parses.
+    let first = ws_read_status(&mut sock).await;
+    assert_eq!(first["active"], serde_json::json!(true), "the socket describes the session that is already running");
+    assert_eq!(first["audible"], serde_json::json!([b]), "…including where the run currently is");
+    assert_eq!(first["volume"], serde_json::json!(31));
+    assert!(first["closes_in_s"].as_u64().is_some(), "and when it would close: {}", first["closes_in_s"]);
+    assert_eq!(first["timeout_slack_s"], serde_json::json!(TIMEOUT_POLL.as_secs()));
+    // Full state, not a delta: a client must not need a separate initial fetch.
+    for field in ["members", "outputs", "levels", "level_channels", "hold_id", "displaced"] {
+        assert!(!first[field].is_null(), "the connect frame is a whole status; '{field}' is missing");
+    }
+
+    // Then one frame per change, ending with the one that says it is over — which is the
+    // frame the whole socket exists for.
+    f.mgr.solo(a.to_string(), 44).await.expect("solo");
+    let next = ws_read_status(&mut sock).await;
+    assert_eq!(next["audible"], serde_json::json!([a]));
+
+    f.mgr.stop().await;
+    let closed = ws_read_status(&mut sock).await;
+    assert_eq!(closed["active"], serde_json::json!(false), "the teardown arrives as an event");
+    assert_eq!(closed["closes_in_s"], serde_json::Value::Null);
+
+    server.abort();
+}
+
+/// Open a WebSocket by hand and return the stream positioned at the first frame.
+///
+/// A literal RFC-6455 handshake instead of a client library: the daemon has no
+/// WebSocket-client dependency and one test is not a reason to grow the build. The key
+/// below is the RFC's own example value — the server only has to hash it.
+async fn ws_connect(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(
+        b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+          Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    )
+    .await
+    .expect("handshake request");
+    // Read exactly the response head, byte at a time, so nothing of the first frame is
+    // swallowed into a buffer this function then throws away.
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        sock.read_exact(&mut byte).await.expect("response head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(head.starts_with("HTTP/1.1 101"), "the upgrade was refused: {head}");
+    sock
+}
+
+/// One pushed status frame, parsed.
+async fn ws_read_status(sock: &mut tokio::net::TcpStream) -> serde_json::Value {
+    serde_json::from_str(&ws_read_text(sock).await).expect("a status frame is JSON")
+}
+
+/// Read one unmasked text frame (what a server sends) and return its payload.
+async fn ws_read_text(sock: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head).await.expect("frame header");
+    assert_eq!(head[0] & 0x0f, 0x1, "expected a text frame, got opcode {:#x}", head[0] & 0x0f);
+    assert_eq!(head[1] & 0x80, 0, "a server frame is never masked");
+    let len = match head[1] & 0x7f {
+        126 => {
+            let mut ext = [0u8; 2];
+            sock.read_exact(&mut ext).await.expect("16-bit length");
+            u16::from_be_bytes(ext) as usize
+        }
+        // A status frame is hundreds of bytes and never megabytes, so the 64-bit form
+        // cannot occur; failing loudly beats silently reading the wrong count.
+        127 => panic!("a status frame should never need a 64-bit length"),
+        short => short as usize,
+    };
+    let mut payload = vec![0u8; len];
+    sock.read_exact(&mut payload).await.expect("frame payload");
+    String::from_utf8(payload).expect("a status frame is UTF-8 JSON")
+}
+
 #[test]
 fn the_default_calibration_level_is_twenty() {
     // Plan §12.2: 50 was ~40 dB above the estimator's target in a real room.

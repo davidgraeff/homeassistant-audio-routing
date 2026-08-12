@@ -158,7 +158,18 @@ pub fn router(
         .route("/api/groups/announcement/{id}", put(update_announcement_group).delete(delete_announcement_group))
         .route("/api/align/groups", get(align_groups))
         .route("/api/align", get(align_status).delete(align_stop))
+        // Pushed **session** state: one full `AlignState` on connect, then one per
+        // change — and one on teardown, which is the frame no client could have
+        // predicted. The session's hold is exclusive and its safety timeout is an idle
+        // one, so an abandoned session hands the speakers back on its own; without this
+        // the wizard would keep describing a session that no longer exists. The polling
+        // `GET` above stays and the UI falls back to it.
+        .route("/api/align/ws", get(align_ws))
         .route("/api/align/start", post(align_start))
+        // "I am still here": the one way to postpone that idle teardown. A deliberate
+        // click, never a heartbeat — an open socket or a status poll counts for nothing,
+        // because a forgotten tab is exactly the hazard the timeout exists for.
+        .route("/api/align/still-here", post(align_still_here))
         .route("/api/align/select", post(align_select))
         // Plan §12.2's solo: "these members are audible" — one for level-setting and
         // for the sequential measurement, all of them for §7's all-play round.

@@ -125,6 +125,24 @@
 //!
 //! Adjusting a member's offset reuses the existing knobs (sendspin static
 //! delay), so this module only owns playback + muting, not the persisted offsets.
+//!
+//! ## The idle timeout is part of the API, not an implementation detail
+//!
+//! That safety timeout is an **idle** timeout ([`SESSION_TIMEOUT`], plan §1.2) and the
+//! hold it releases is **exclusive** (§12.3) — so when it fires, speakers that were held
+//! go back to normal and any wizard still on screen is describing a session that no
+//! longer exists. Two consequences shape the surface here:
+//!
+//! - the remaining time is **published** ([`AlignState::closes_in_s`], with
+//!   [`AlignState::timeout_slack_s`] as the honest bound on it), because a real
+//!   multi-position run ran out while its user was reading a review page — which is
+//!   *quiet*, and therefore refreshes nothing. Alongside it, [`AlignManager::still_here`]
+//!   is the one deliberate way to postpone it, and its docs explain why an open socket
+//!   deliberately is not;
+//! - the teardown is **pushed** ([`AlignManager::subscribe`], `GET /api/align/ws`).
+//!   Every exit path goes through [`AlignManager::teardown`], which bumps the notifier
+//!   after the restore, so "your session ended, and here is when" reaches the UI as an
+//!   event instead of being inferred from a poll that came back inactive.
 
 use crate::align::group::{AlignMode, ExclusiveHold, HoldDeps, Interference};
 use crate::outputs::ap2::volume::SharedAp2Control;
@@ -158,12 +176,23 @@ const CLICK_AMP: f64 = 0.5;
 pub const DEFAULT_ALIGN_LEVEL: u8 = 20;
 
 /// Safety net: never leave a group muted with a click looping if the UI
-/// vanishes. The session tears itself down after this if not stopped.
+/// vanishes. The session tears itself down after this much **idleness** if not stopped.
+///
+/// It is reported to clients as [`AlignState::closes_in_s`], because the hold is
+/// exclusive: when this fires, speakers that were held go back to normal and any wizard
+/// still on screen is describing a session that no longer exists. A real
+/// multi-position run walked into exactly that — reading a long review page is *quiet*,
+/// so it does not refresh the timer — and the fix is that the remaining time is on
+/// screen, with the thing that refreshes it named next to it.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// How often the safety watchdog re-checks idleness. Coarse on purpose: it decides
 /// nothing time-critical, and the cost of firing up to a minute late is a minute of a
 /// muted room that the user has already walked away from.
+///
+/// It is also the **accuracy bound** on [`AlignState::closes_in_s`] and is published as
+/// [`AlignState::timeout_slack_s`] for that reason: a client must say "about", because
+/// the close can be this much later than the number it was given.
 const TIMEOUT_POLL: Duration = Duration::from_secs(30);
 
 /// The **one** place the calibration level's scale meets AirPlay-2's: a calibration
@@ -525,6 +554,36 @@ pub struct AlignState {
     /// The routing intent the session is displacing while it holds these speakers —
     /// what the UI shows as "these will stop playing what they are playing now".
     pub displaced: Vec<crate::store::routing::RoutingLink>,
+    /// How much longer this session may sit **idle** before the daemon tears it down and
+    /// gives the speakers back — in whole seconds **relative to this frame**, `None`
+    /// when nothing is running.
+    ///
+    /// Relative, never an absolute instant: the browser's clock and the daemon's differ
+    /// by an unknown amount, and a client only needs to count down locally from what it
+    /// was told and re-sync on the next frame.
+    ///
+    /// **`Some(0)` does not mean the session is gone.** It means the idle deadline has
+    /// passed and the watchdog will take it at its next check, which is up to
+    /// [`Self::timeout_slack_s`] away — so a UI must not render the disappearance until
+    /// it is told about it (a frame with `active: false`).
+    ///
+    /// What refreshes it is *doing something to the run*, not looking at it: making
+    /// members audible or changing a level ([`AlignManager::set_audible`],
+    /// [`AlignManager::solo`], [`AlignManager::select`], [`AlignManager::set_level`]), a
+    /// re-scoping `start`, or the deliberate [`AlignManager::still_here`]. Reading a
+    /// proposal refreshes nothing, and neither does holding a socket open — see
+    /// `still_here`'s docs for why that asymmetry is the whole point.
+    pub closes_in_s: Option<u64>,
+    /// The whole idle allowance ([`SESSION_TIMEOUT`]) in seconds — what
+    /// [`Self::closes_in_s`] counts down from, so a client can phrase the rule ("15
+    /// minutes without a change") without hard-coding the daemon's number.
+    pub idle_timeout_s: u64,
+    /// How much later than [`Self::closes_in_s`] the close can actually happen
+    /// ([`TIMEOUT_POLL`]), because the watchdog is a poller.
+    ///
+    /// Published so a client is not left inventing a fudge factor: the honest rendering
+    /// of `closes_in_s` is "in about N", and this is the size of "about".
+    pub timeout_slack_s: u64,
 }
 
 impl AlignState {
@@ -548,6 +607,12 @@ impl AlignState {
             audible: Vec::new(),
             interference: Vec::new(),
             displaced: Vec::new(),
+            // No session, so nothing is counting down — but the two *rules* are still
+            // worth stating, so a client that has only ever seen the inactive frame can
+            // already say what the timeout is and how precise it is not.
+            closes_in_s: None,
+            idle_timeout_s: SESSION_TIMEOUT.as_secs(),
+            timeout_slack_s: TIMEOUT_POLL.as_secs(),
         }
     }
 }
@@ -714,6 +779,9 @@ impl Session {
             audible: self.audible.iter().cloned().collect(),
             interference: self.hold.interference(),
             displaced: self.hold.displaced().to_vec(),
+            closes_in_s: Some(self.closes_in().as_secs()),
+            idle_timeout_s: SESSION_TIMEOUT.as_secs(),
+            timeout_slack_s: TIMEOUT_POLL.as_secs(),
         }
     }
 
@@ -722,6 +790,22 @@ impl Session {
         // Poison-tolerant: this is a liveness hint, and a panic elsewhere must not
         // make the watchdog stop noticing that the user is still here.
         *self.activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+    }
+
+    /// How long this session has looked idle to the safety watchdog.
+    ///
+    /// One reader for both consumers — the watchdog's decision and
+    /// [`AlignState::closes_in_s`] — so the number the user is counting down and the
+    /// number the teardown is decided on cannot be two different opinions.
+    fn idle(&self) -> Duration {
+        self.activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).elapsed()
+    }
+
+    /// How much idle time is left before the watchdog would tear this session down.
+    /// Saturating: past the deadline it is zero, which is honest — the session is
+    /// *awaiting* its teardown, not already gone (see [`AlignState::closes_in_s`]).
+    fn closes_in(&self) -> Duration {
+        SESSION_TIMEOUT.saturating_sub(self.idle())
     }
 
     fn is_member(&self, node_name: &str) -> bool {
@@ -769,6 +853,17 @@ pub struct AlignManager {
     /// installed one ([`Self::set_out_of_band_mute`]). Set at most once, so reading it on
     /// every audibility change costs nothing and needs no lock.
     out_of_band: Arc<OnceLock<Arc<dyn OutOfBandMute>>>,
+    /// Bumped whenever [`Self::status`] would answer differently, so `GET /api/align/ws`
+    /// can push instead of the wizard polling — the same `watch` shape
+    /// `align::measure`'s run socket uses.
+    ///
+    /// It lives on the **manager**, not on the session, and that is the whole reason it
+    /// is worth having: the state change no client can predict is the session *ending*
+    /// — by the idle timeout, by a superseding `start`, or by an explicit stop — and a
+    /// notifier owned by the session would be dropped by exactly that event. Here
+    /// [`Self::teardown`] bumps it on every exit path, so a disappearance arrives as an
+    /// event rather than being noticed a few seconds later by a poll.
+    changes: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// Per member: should it be audible? The pure half of
@@ -992,7 +1087,26 @@ impl AlignManager {
             start_gen: Arc::new(AtomicU64::new(0)),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             out_of_band: Arc::new(OnceLock::new()),
+            changes: Arc::new(tokio::sync::watch::channel(0).0),
         }
+    }
+
+    /// A receiver that fires whenever [`Self::status`] would return something new —
+    /// including the teardown that makes it inactive. Read by `GET /api/align/ws`.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Tell every session-socket subscriber that [`Self::status`] would now answer
+    /// differently. Cheap and never fails: `watch` coalesces, and a bump with no
+    /// subscribers is a counter increment.
+    ///
+    /// Not called for everything that can move `AlignState`: `interference` is appended
+    /// by the announce arbiter and the duck holder through the *hold*, which has no way
+    /// back to here, so those entries still arrive on the next poll. That is why the
+    /// client keeps polling alongside the socket rather than treating it as complete.
+    fn bump(&self) {
+        self.changes.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Install the out-of-band silencer ([`OutOfBandMute`]) — once, at startup, by whoever
@@ -1212,8 +1326,9 @@ impl AlignManager {
             }
             *guard = Some(session);
         }
+        self.bump();
 
-        // Safety timeout: tear down if still the same session after the deadline.
+        // Safety timeout: tear down once the session has been *idle* this long.
         self.arm_timeout(stop);
         tracing::info!("alignment session started ({mode:?}) for {:?}: {}", state.outputs, state.hold_cost);
         if let Some(note) = &state.level_note {
@@ -1238,9 +1353,13 @@ impl AlignManager {
     /// - reference/target and audibility, defaulting to the selection's first two
     ///   members exactly as a fresh start does — per-position audibility proper is
     ///   [`Self::set_audible`]'s job, not `start`'s;
-    /// - the safety timeout, re-armed so a long walk is not cut off 15 minutes after
-    ///   the *first* position (the same `stop` handle, so the older watchdog still
-    ///   recognises the session and does nothing).
+    /// - the **idle mark** ([`Session::note_activity`]), so a long walk is not cut off 15
+    ///   minutes after the *first* position. Note what this is not: it does not arm a
+    ///   second watchdog. Plan §12.3.1 says the timeout is "re-armed" here, which was
+    ///   true of the one-shot deadline and became misleading when §1.2 turned it into an
+    ///   idle timeout — arming another watchdog on the same `stop` handle postpones
+    ///   nothing at all (both watchdogs read the same `activity`), it only leaks a task
+    ///   per position. Refreshing the mark is what actually buys the walk its time.
     ///
     /// The playback level is deliberately **not** reset to [`DEFAULT_ALIGN_LEVEL`]: by
     /// this point the user (or the level phase) has tuned it, and a start that is
@@ -1259,12 +1378,14 @@ impl AlignManager {
             session.audible = session.reference.iter().chain(session.target.iter()).cloned().collect();
             session.hold_reused = true;
             session.hold_cost = scope_cost_note(outputs.len(), session.members.len());
+            // A `start` is a person picking speakers, so it is activity by any reading —
+            // and this is the call a multi-position walk makes at every position.
+            session.note_activity();
             let volume = session.volume;
             session.record_levels(volume);
             (session.members.clone(), session.audible.clone(), volume, session.stop.clone(), session.state())
         };
         let state = self.apply_and_record(&members, &audible, volume, &stop, state).await;
-        self.arm_timeout(stop);
         tracing::info!(
             "alignment session re-scoped ({mode:?}) to {:?} inside the hold over {:?}: {}",
             state.sources,
@@ -1286,6 +1407,12 @@ impl AlignManager {
             session.audible = [reference.clone(), target.clone()].into_iter().collect();
             session.reference = Some(reference);
             session.target = Some(target);
+            // The by-ear path's own step. [`Session::activity`] always claimed `select`
+            // refreshed the idle mark and only `set_audible` ever did, so a by-ear
+            // session spent an hour being compared pair by pair could be torn down as
+            // abandoned. Both callers of `apply_and_record` that a *user* drives now
+            // agree with that doc comment.
+            session.note_activity();
             let volume = session.volume;
             session.record_levels(volume);
             (session.members.clone(), session.audible.clone(), volume, session.stop.clone(), session.state())
@@ -1362,10 +1489,48 @@ impl AlignManager {
             let mut guard = self.session.lock().await;
             let session = guard.as_mut().ok_or("no alignment session is running")?;
             session.volume = volume;
+            // Dragging the level slider is the user being present, and
+            // [`Session::activity`] said so before this call actually did it.
+            session.note_activity();
             session.record_levels(volume);
             (session.members.clone(), session.audible.clone(), session.stop.clone(), session.state())
         };
         Ok(self.apply_and_record(&members, &audible, volume, &stop, state).await)
+    }
+
+    /// "I am still here" — postpone the idle teardown without changing anything about the
+    /// run ([`AlignState::closes_in_s`]).
+    ///
+    /// It exists because the countdown would otherwise be a deadline with no remedy: the
+    /// step where a session runs out is the **review page**, and reading a proposal is
+    /// silent — no solo, no level, nothing the watchdog counts. Telling a user their room
+    /// is about to be handed back in two minutes and offering nothing to do about it is
+    /// worse than not telling them.
+    ///
+    /// Why this is safe when a **held socket** would not be. The timeout exists so that a
+    /// closed tab cannot leave a room muted, and a *forgotten* open tab is the same
+    /// hazard — an open `GET /api/align/ws` therefore counts for nothing, and neither
+    /// does a frame sent on it, or a status poll. What this endpoint requires is a person
+    /// pressing a button now, which is the one piece of evidence the watchdog is actually
+    /// looking for. The distinction is entirely in who initiates it, so:
+    ///
+    /// - a client must call this from a **click**, never from a timer. A UI that renewed
+    ///   the session automatically would reimplement the leak this whole mechanism
+    ///   exists to prevent, and it would do it invisibly;
+    /// - it grants one fresh [`SESSION_TIMEOUT`], not an exemption. There is deliberately
+    ///   no "keep open indefinitely": the failure this guards against is someone walking
+    ///   away, and a session that cannot expire has no defence against that at all.
+    pub async fn still_here(&self) -> Result<AlignState, String> {
+        let state = {
+            let guard = self.session.lock().await;
+            let session = guard.as_ref().ok_or("no alignment session is running")?;
+            session.note_activity();
+            session.state()
+        };
+        // Pushed, because the whole point is that the countdown on screen jumps back.
+        self.bump();
+        tracing::info!("alignment session kept open for another {}s at the user's request", SESSION_TIMEOUT.as_secs());
+        Ok(state)
     }
 
     /// Drain the exclusivity violations recorded against the running session (plan
@@ -1556,14 +1721,22 @@ impl AlignManager {
         applied: AlignState,
     ) -> AlignState {
         let channels = self.apply_audibility(members, audible, volume).await;
-        let mut guard = self.session.lock().await;
-        match guard.as_mut() {
-            Some(session) if Arc::ptr_eq(&session.stop, stop) => {
-                session.level_channels = channels;
-                session.state()
+        let state = {
+            let mut guard = self.session.lock().await;
+            match guard.as_mut() {
+                Some(session) if Arc::ptr_eq(&session.stop, stop) => {
+                    session.level_channels = channels;
+                    session.state()
+                }
+                _ => applied,
             }
-            _ => applied,
-        }
+        };
+        // Every user-driven change to a live session funnels through here (`select`,
+        // `set_audible`/`solo`, `set_level`, `silence`, `rescope`), so this is the one
+        // push that covers all of them — including the refreshed `closes_in_s`, which is
+        // what makes a countdown on a second screen jump back too.
+        self.bump();
+        state
     }
 
     /// Undo everything the session did, in the order that leaves the least room for
@@ -1682,46 +1855,62 @@ impl AlignManager {
         // and mutes are already back where the user left them. This is also what drops the
         // relay mutes.
         session.hold.release().await;
+        // The push that matters most, and the reason the notifier lives on the manager
+        // rather than on the session (see [`Self::changes`]): every exit path comes
+        // through here — the idle timeout, an explicit stop, a superseding start, a
+        // formation that lost its race — so a client learns that its session is gone as
+        // an event, not by noticing a poll a few seconds later. Bumped after the restore,
+        // so the frame that says `active: false` is only sent once it is true of the
+        // speakers as well as of the slot.
+        self.bump();
     }
 
-    /// Spawn a watchdog that tears the session down after `SESSION_TIMEOUT`,
-    /// but only if it's still the very session identified by `stop` (a newer
-    /// session has its own `stop`, so a restart doesn't get killed early).
+    /// Spawn the safety watchdog: tear the session down once it has been **idle** for
+    /// `SESSION_TIMEOUT`, and only while it is still the very session identified by
+    /// `stop` (a newer session has its own `stop`, so a restart is not killed early).
+    ///
+    /// Idle, not a deadline from `start`: it sleeps in `TIMEOUT_POLL` slices and re-reads
+    /// [`Session::idle`] each time. A one-shot `sleep(SESSION_TIMEOUT)` killed long
+    /// near-field walks mid-walk (plan §1.2), and the coarse slice is why
+    /// [`AlignState::closes_in_s`] has to be reported as approximate.
+    ///
+    /// **One watchdog per session**, and exactly one: a `start` that re-scopes an existing
+    /// hold refreshes the idle mark instead of arming another (see [`Self::rescope`]).
+    /// The decision and the take happen under a **single** lock acquisition, so a
+    /// [`Session::note_activity`] landing between "it looks idle" and "take it" cannot
+    /// lose to a verdict this task had already reached — the earlier two-step version
+    /// could tear down a session that had just been refreshed.
     fn arm_timeout(&self, stop: Arc<AtomicBool>) {
         let session = self.session.clone();
         let this = self.clone();
         tokio::spawn(async move {
-            // Idle timeout, not a deadline: sleep in slices and only tear down once the
-            // user has been *quiet* for `SESSION_TIMEOUT`. A one-shot
-            // `sleep(SESSION_TIMEOUT)` killed long near-field walks mid-walk (§1.2).
             loop {
                 tokio::time::sleep(TIMEOUT_POLL).await;
                 if stop.load(Ordering::Relaxed) {
                     return; // already stopped
                 }
-                let idle = {
-                    let guard = session.lock().await;
+                let taken = {
+                    let mut guard = session.lock().await;
                     match guard.as_ref() {
-                        // A different session now owns the slot; this watchdog is spent.
+                        // A different session now owns the slot, or none does: either way
+                        // this watchdog is spent and ours has been torn down already.
                         Some(s) if !Arc::ptr_eq(&s.stop, &stop) => return,
-                        Some(s) => s.activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).elapsed(),
                         None => return,
+                        Some(s) if s.idle() >= SESSION_TIMEOUT => guard.take(),
+                        // Still being used. Keep watching rather than returning: the
+                        // session has no other watchdog, so a task that gives up here
+                        // leaves the hazard this exists for.
+                        Some(_) => None,
                     }
                 };
-                if idle >= SESSION_TIMEOUT {
-                    break;
+                if let Some(s) = taken {
+                    tracing::info!(
+                        "alignment session was idle for {}s; restoring levels/mutes and releasing the exclusive hold",
+                        SESSION_TIMEOUT.as_secs()
+                    );
+                    this.teardown(s).await;
+                    return;
                 }
-            }
-            let taken = {
-                let mut guard = session.lock().await;
-                match guard.as_ref() {
-                    Some(s) if Arc::ptr_eq(&s.stop, &stop) => guard.take(),
-                    _ => None,
-                }
-            };
-            if let Some(s) = taken {
-                tracing::info!("alignment session timed out; restoring levels/mutes and releasing the exclusive hold");
-                this.teardown(s).await;
             }
         });
     }
