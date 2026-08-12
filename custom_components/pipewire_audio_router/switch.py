@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
+from homeassistant.const import STATE_OFF, EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -70,10 +70,15 @@ class PipewireRtpSourceSwitch(CoordinatorEntity[PipewireRouterCoordinator], Swit
 class PipewireVoiceDuckingSwitch(CoordinatorEntity[PipewireRouterCoordinator], SwitchEntity, RestoreEntity):
     """Duck the router's speakers in a room while a voice assistant there talks.
 
-    Off by default, deliberately: anyone still running the volume-ducking
-    blueprint would otherwise get both, ducking twice. Turning this on is the cue
-    to delete the blueprint. The state is ours to remember (the daemon knows
-    nothing about rooms or satellites), so it is restored here across restarts.
+    **On by default** (`DEFAULT_VOICE_DUCK_ENABLED`): it needs no configuration —
+    satellites, areas and outputs all come from registries HA already has — so a
+    default of off is a feature nobody finds. Only an explicit off is remembered:
+    the state is ours to keep, since the daemon knows nothing about rooms or
+    satellites.
+
+    Note this switch is an *enable flag*, not a duck: turning it on arms the
+    listener, and music only goes quiet once a satellite in a room with router
+    outputs actually starts a turn.
     """
 
     _attr_has_entity_name = True
@@ -88,9 +93,12 @@ class PipewireVoiceDuckingSwitch(CoordinatorEntity[PipewireRouterCoordinator], S
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_state()
-        if last is not None and last.state == "on":
-            self.coordinator.voice_duck.enabled = True
-            self.async_write_ha_state()
+        # Only a remembered *off* changes anything — the default is on, and a
+        # restored `unknown`/`unavailable` (the entity was down at shutdown) must
+        # not be read as a user's choice to disable it.
+        if last is not None and last.state == STATE_OFF:
+            self.coordinator.voice_duck.enabled = False
+        self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool:

@@ -47,6 +47,7 @@ from homeassistant.helpers.event import (
 from .api import PipewireRouterApiError
 from .const import (
     ASSIST_SATELLITE_DOMAIN,
+    DEFAULT_VOICE_DUCK_ENABLED,
     DEFAULT_VOICE_DUCK_LEVEL,
     DOMAIN,
     VOICE_DUCK_ACTIVE_STATES,
@@ -90,7 +91,7 @@ class VoiceDucker:
         # Settable from the entities in switch.py / number.py / select.py, which
         # also restore them across restarts (there's nothing daemon-side to
         # persist — the daemon has no concept of rooms or satellites).
-        self.enabled = False
+        self.enabled = DEFAULT_VOICE_DUCK_ENABLED
         self.level = DEFAULT_VOICE_DUCK_LEVEL
         self.scope = VOICE_DUCK_SCOPE_AREA
         # Satellite entity_id -> the daemon hold covering its room, while its turn

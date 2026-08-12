@@ -9,8 +9,9 @@ wired as they are in production; only the daemon's HTTP calls are mocked.
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, patch
 
+from homeassistant.core import State
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, mock_restore_cache
 
 from custom_components.pipewire_audio_router.api import (
     AppSettings,
@@ -138,9 +139,29 @@ async def test_ducks_only_the_outputs_in_the_satellites_area(hass):
         release.assert_awaited_once_with(77)
 
 
-async def test_disabled_by_default_ducks_nothing(hass):
-    """The switch is off until the user turns it on, so someone still running the
-    ducking blueprint doesn't get both."""
+async def test_enabled_by_default_ducks_with_no_setup_at_all(hass):
+    """Nothing to configure and nothing to switch on: a fresh install ducks on the
+    first voice turn. The feature has no settings of its own (satellites, areas and
+    outputs all come from registries HA already has), so shipping it off would ship
+    it undiscovered — there is no error and no log line to hint at it."""
+    entry = _make_entry(hass)
+    kitchen = ar.async_get(hass).async_get_or_create("Kitchen")
+    stack, duck, _renew, _release = _patch_daemon(_matrix("sendspin-dev-kitchen"))
+    with stack:
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        _place_output(hass, entry, "sendspin-dev-kitchen", kitchen.id)
+        satellite = _place_satellite(hass, kitchen.id)
+        assert hass.states.get("switch.voice_assistant_ducking").state == "on"
+
+        await _talk(hass, satellite, "listening")
+        duck.assert_awaited_once_with(["sendspin-dev-kitchen"], 0.25, VOICE_DUCK_TTL_SECONDS * 1000)
+
+
+async def test_a_remembered_off_survives_a_restart(hass):
+    """Someone who switched it off (still running the ducking blueprint, say) keeps
+    it off — the on-by-default only applies when there is nothing remembered."""
+    mock_restore_cache(hass, [State("switch.voice_assistant_ducking", "off")])
     entry = _make_entry(hass)
     kitchen = ar.async_get(hass).async_get_or_create("Kitchen")
     stack, duck, _renew, _release = _patch_daemon(_matrix("sendspin-dev-kitchen"))
@@ -153,6 +174,19 @@ async def test_disabled_by_default_ducks_nothing(hass):
 
         await _talk(hass, satellite, "listening")
         duck.assert_not_awaited()
+
+
+async def test_an_unavailable_restored_state_is_not_a_choice_to_disable(hass):
+    """The entity was down when HA shut down, so its restored state is
+    `unavailable` — not the user's decision. It comes back on."""
+    mock_restore_cache(hass, [State("switch.voice_assistant_ducking", "unavailable")])
+    entry = _make_entry(hass)
+    stack, _duck, _renew, _release = _patch_daemon(_matrix("sendspin-dev-kitchen"))
+    with stack:
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert hass.states.get("switch.voice_assistant_ducking").state == "on"
 
 
 async def test_responding_keeps_the_duck_and_idle_ends_it(hass):

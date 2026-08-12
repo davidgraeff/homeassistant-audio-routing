@@ -58,9 +58,20 @@ room** play quietly. No automation, no blueprint:
 
 | Entity | What it does |
 |---|---|
-| `switch.voice_assistant_ducking` | On/off. **Off by default** — if you still run a volume-ducking blueprint, turn that off first or you'll duck twice. |
-| `number.voice_assistant_duck_level` | How quiet, as a **gain**: `0.25` = quarter volume, `1` = no ducking. (Not a divisor.) |
-| `select.voice_assistant_duck_scope` | `area` (default) ducks only the satellite's own room, even mid-song inside a multi-room group. `music_group` widens it to the whole synchronized group — for open-plan rooms where the same track next door drowns the response. |
+| `switch.voice_assistant_ducking` | Whether the feature is armed — **on by default**. It is *not* a duck: switching it on ducks nothing by itself, it just means the next voice turn will. Switch it **off** if you still run a volume-ducking blueprint, or you'll duck twice; an explicit off is remembered across restarts. |
+| `number.voice_assistant_duck_level` | How quiet, as a **gain**: `0.25` = quarter volume, `1` = no ducking. (Not a divisor.) Takes effect on the next turn — an open one keeps its level rather than jumping mid-sentence. |
+| `select.voice_assistant_duck_scope` | *Only the room being talked to* (`area`, the default) ducks just the satellite's own room, even mid-song inside a multi-room group. *The whole music group of that room* (`music_group`) widens it to every member of that synchronized group — for open-plan rooms where the same track next door drowns the response. |
+
+**Nothing to set up:** the rooms, the satellites and the speakers all come from
+registries Home Assistant already has, which is why this ships switched on.
+
+To watch it work without saying anything, set a satellite's state by hand
+(*Developer Tools → States*, `assist_satellite.…` → `listening`, then `idle`) —
+that is the same trigger a real turn fires. The add-on's *Outputs* tab shows a
+`ducked NN%` badge on each held output while it lasts, and `GET /api/duck` lists
+the live holds. If a room never ducks, turn on debug logging for
+`custom_components.pipewire_audio_router.voice_duck`: it says whether the
+satellite had an area and whether any output was found in it.
 
 Every `assist_satellite` is covered automatically, including ones added later.
 The room comes from Home Assistant's areas: the satellite's area (its entity's

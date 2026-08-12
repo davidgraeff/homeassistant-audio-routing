@@ -22,7 +22,55 @@ makes definitively dead — see §7.
 
 ---
 
-## 0. Status: code complete, live validation outstanding
+## 0. Status: code complete; first live run 2026-08-12
+
+**Both halves work on the instance**, driven by
+[`tests/voice_duck_dev.sh`](../../../tests/voice_duck_dev.sh) rather than by
+talking: `POST /api/duck` for the daemon half, and a **faked
+`assist_satellite` state** for the HA half — writing the state fires the same
+`state_changed` the listener subscribes to, so the resolution → duck → renew →
+release path runs for real without a wake word or a pipeline. A faked turn ducked
+exactly the satellite's-area outputs at the configured gain and released on idle,
+in three of four rooms.
+
+Three things the first live run changed, all in §3.2/§3.3 territory rather than
+the mechanism:
+
+- **The switch was off, and "off by default" was wrong.** §3.3's rationale
+  (upgraders with the blueprint would duck twice) traded a loud, self-inflicted
+  problem for a silent one: the feature has no configuration to prompt anyone
+  into finding it, and disabled it emits no error and no log line. Now
+  **on by default** (`DEFAULT_VOICE_DUCK_ENABLED`), with only an explicit `off`
+  remembered — a restored `unavailable`/`unknown` is not read as a user's choice.
+- **It reads as a duck button, not an enable flag.** Nothing in the UI says that
+  switching it on ducks nothing by itself. Home Assistant has no per-entity
+  description field to fix that with (only `name`, `state` and
+  `state_attributes` are translatable — hassfest's schema at core
+  `4c41f56079f`), so the explanation went where HA *does* render prose: the
+  scope select's options are now labelled "Only the room being talked to" /
+  "The whole music group of that room" via `translations/en.json`, and the
+  integration README leads with "nothing to set up" plus how to test without
+  speaking. Note the integration previously shipped `strings.json` only, which HA
+  never loads for a custom component — hence the new `translations/` directory.
+- **One room never ducked**, and this was a real gap rather than a
+  configuration mistake: `media_player._find_ha_device` correlates a sendspin
+  output to its HA device by finding its mDNS hostname *inside* an ESPHome entity
+  id, and a speaker that advertises its MAC fragment twice
+  (`satellite1-c4150c-c4150c` for the node `satellite1_c4150c`) matches nothing —
+  no device, no area, no targets, visible only at debug level. There is now a
+  **trailing-MAC fallback** (`_find_ha_device_by_mac_suffix`): the device whose
+  `CONNECTION_NETWORK_MAC` ends in the hostname's six-hex tail. It refuses to
+  guess between two different MACs, ignores hostnames with no hex tail (a
+  hand-named `sendspin-dev-kitchen` must not be MAC-matched), and prefers the
+  entity-carrying registration when several registry devices share one MAC —
+  which the instance really has: two `Satellite1 c4150c` devices on one MAC, 31
+  entities and 2. HA's own connection index keeps only one of those, so this state
+  arrives from storage and `async_get_or_create` cannot reproduce it in a test.
+
+Still unrun: the audible cases (1–3, 6, 7 below), the reload-mid-turn lease case
+(4), and case 8's announcement/voice overlap on an agent-backed pw-sink host.
+
+## 0.1 Original status: code complete, live validation outstanding
 
 **VD1–VD5 and L1–L5 are all in.** They were built 2026-08-03/04 on
 `chore/drop-legacy-node-volume-api`, which then sat unmerged while the mainline
@@ -231,9 +279,11 @@ addressed by `node_name`.
 Three entities on the existing config entry — no options flow, and all three are
 automatable:
 
-- `switch.…_voice_ducking` — **off by default**, so upgrading users who still
+- `switch.…_voice_ducking` — ~~**off by default**, so upgrading users who still
   have the blueprint enabled don't get double ducking. Turning it on is the cue
-  to delete the blueprint.
+  to delete the blueprint.~~ **Superseded 2026-08-12 (§0): on by default.**
+  Double ducking is audible and self-inflicted; a feature shipped off with no
+  configuration to discover it through is silent.
 - `number.…_voice_duck_level` — the mixer gain (0.05–1.0, default from the
   daemon's `default_duck`). Note this is a *gain*, not the blueprint's divisor;
   the UI text must say so.

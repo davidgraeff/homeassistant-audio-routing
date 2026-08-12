@@ -39,6 +39,12 @@ class PipewireVoiceDuckScopeSelect(CoordinatorEntity[PipewireRouterCoordinator],
     _attr_entity_category = EntityCategory.CONFIG
     _attr_icon = "mdi:select-group"
     _attr_options = VOICE_DUCK_SCOPES
+    # The option *labels* come from `translations/en.json`
+    # (`entity.select.voice_duck_scope.state`), which is the one place Home
+    # Assistant will render an explanation of a setting rather than its raw value:
+    # the dropdown says what each scope does instead of "area" / "music_group".
+    # (`_attr_name` still wins for the name — see `switch.py`.)
+    _attr_translation_key = "voice_duck_scope"
 
     def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)

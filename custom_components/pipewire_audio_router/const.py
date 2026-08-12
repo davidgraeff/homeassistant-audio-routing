@@ -49,6 +49,14 @@ SERVICE_CLEANUP_ENTITIES = "cleanup_entities"
 # blueprint's divisor: 0.25 = quarter volume. Seeds the `number` entity.
 DEFAULT_VOICE_DUCK_LEVEL = 0.25
 
+# On by default: the feature needs no configuration at all (satellites and areas
+# come from HA's registries), so an installation that shipped it switched off is
+# one nobody discovers — there is no error, no log line, just music that never
+# ducks. Anyone still running the volume-ducking blueprint gets *both* until they
+# delete it, which is audible and self-inflicted rather than silent. An explicit
+# "off" is remembered across restarts (`switch.py`).
+DEFAULT_VOICE_DUCK_ENABLED = True
+
 # Lease we ask the daemon for, and how often we renew it while a turn is open.
 # The daemon un-ducks on its own one lease after we stop renewing, so a reload
 # or crash mid-turn can't leave music quiet; renewing at a third of the lease
