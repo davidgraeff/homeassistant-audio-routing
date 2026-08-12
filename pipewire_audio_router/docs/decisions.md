@@ -12,8 +12,13 @@ specific, documented reason.
 For decisions about the *other* components (the HA integration, the ESP32
 and Raspberry Pi Bluetooth bridges) and the project premise, see
 [`../../docs/decisions.md`](../../docs/decisions.md). For how the daemon is
-put together, see [architecture.md](architecture.md); for what's done vs.
-planned, [airplay2-roadmap.md](airplay2-roadmap.md).
+put together, see [architecture.md](architecture.md); for what each subsystem
+delivered and what is still open, the per-subsystem records
+([airplay2-roadmap.md](airplay2-roadmap.md),
+[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md),
+[receiver-agent-plan.md](receiver-agent-plan.md),
+[mic-alignment-plan.md](mic-alignment-plan.md),
+[sendspin-open-items.md](sendspin-open-items.md)).
 
 ---
 
@@ -32,7 +37,7 @@ Pioneer VSX-934; the user's verdict was "better than AirPlay 1."
   `sendspin-rs` / `shairplay-rust`. Keep only pairing/SETUP/RTP/streaming;
   the crate's own Rust-PTP code is **dead** (PTP is driven by libairptp).
 - **Hard-drop RAOP, no fallback** — all target receivers are AP2-capable.
-  **Done 2026-07-26** (plan: [ap2-track-p4-drop-raop-design.md](ap2-track-p4-drop-raop-design.md)):
+  **Done 2026-07-26** (plan: [ap2-track-p4-drop-raop-design.md](old/ap2-track-p4-drop-raop-design.md)):
   `raop.rs`/`store/outputs.rs`/the RAOP-only `discovery.rs` deleted, the
   `/api/outputs` CRUD + `raop_uses_anchor`/monitor-anchor logic removed,
   `pw_module.rs`/`volume.rs` kept (RTP source + source-ducking still use
@@ -106,7 +111,7 @@ threads, the unbounded capture→relay channel became bounded drop-on-full,
 and the AP2 producer moved off the tokio pool onto its own FIFO thread.
 The full RT ladder and the reasoning are in
 [architecture.md](architecture.md#7-real-time-thread-ladder); the original
-hazard analysis is [audio-jitter-analysis.md](audio-jitter-analysis.md).
+hazard analysis is [audio-jitter-analysis.md](old/audio-jitter-analysis.md).
 
 ## Anchor model: one steady driver per group, split only the sender
 
@@ -198,6 +203,143 @@ load ~20 → ~1.2. Diagnosis recipe in
 [live-instance-debugging.md](live-instance-debugging.md). (Note: HA Core is
 *also* `network_mode: host`, so any residual `172.30.32.1` mDNS after this
 is HA Core's zeroconf, not the add-on's.)
+
+## pw-sink transport: one AppleMIDI session per target, not `rtp-sink` + SAP
+
+The pw-sink backend exists because a remote PipeWire host can take our audio
+natively — no codec, no second Rust hot path. The obvious way to do that is
+`libpipewire-module-rtp-sink` per target plus one `rtp-sap` announcer, so the
+receiver auto-configures itself. Two spike findings killed it:
+**multicast SAP does not cross typical consumer LANs** (IGMP snooping drops
+the group, and PipeWire's rtp-sap receiver cannot cleanly take a unicast
+announcement — a connected socket), and **stock `module-rtp-session` refuses
+plain RTP** while being the only mDNS-discoverable stock receiver. So the
+sender is a **custom AppleMIDI/RTP sender** (`outputs/pwsink/applemidi.rs`,
+L16 `S16BE` 48 kHz stereo, 5 ms packets): the handshake is the price of
+admission to the one receiver a user does not have to hand-configure.
+
+Three consequences worth stating, because each replaced a designed mechanism:
+
+- **One session per target, not per group** — that is what makes per-device
+  announce/duck possible at all, since a shared session cannot duck one member.
+- **Ducking reuses `overlay_mixer::mix_into`**, exactly as AP2 does. The
+  designed alternative was a native in-graph mix bus per target (a
+  `module-loopback` carrying group music whose `channelVolumes` *is* the duck,
+  a `null-sink` summing it with the announce stream, then the RTP sink) —
+  defensible when the sender is a graph node, and pure overhead once the audio
+  passes through a per-device relay anyway.
+- **There is no RTCP** in PipeWire's RTP modules at all, so the planned
+  receiver-report liveness was impossible, not merely awkward. Presence comes
+  from advert withdrawal and session establishment
+  ([architecture.md §5.6](architecture.md#56-reachable-connected-playing--three-states-one-rule)).
+
+Evidence and the full as-built path:
+[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md).
+
+## A pw-sink target is an agent-managed host, and the agent dials out
+
+A pw-sink output **is** a paired `pwrouter-agent` (`Agents::connected_targets()`
+is the source of truth; the mDNS browse is a diagnostic). That was chosen over
+the two ways to control a remote host with no new software on it, both
+investigated on a live 1.6.8 host and both rejected:
+
+- **PipeWire has no network control protocol.**
+  `libpipewire-module-protocol-native` is Unix sockets only, so there is no
+  remote `pw-cli` and no remote `pipewire-rs` connection.
+- **Its PulseAudio-over-TCP server cannot be secured per client.** The pulse
+  cookie is not a preshared key here — `do_command_auth` checks only the blob's
+  *length* and never compares the bytes (verified: a random 256-byte cookie
+  behaves identically to the host's real one), so `auth-anonymous` is
+  near-meaningless. And access is per *listen address*, not per client: control
+  requires `client.access = "unrestricted"` on that address, which grants it to
+  everything that can reach the port, including microphone capture. An
+  SSH-forward variant was rejected for a human reason — the credential the user
+  installs still reads as *shell access to my desktop*.
+
+The helper is least privilege by construction (a fixed command enum, not a
+passthrough), **nothing listens on the receiver** (it dials out, so there is no
+port to find and no firewall rule), and it can do things no remote protocol
+could: load and own the receive-side module itself, ramp a duck locally with no
+network jitter, and exclude our own stream from that duck. `welcome` therefore
+carries *parameters* rather than a module-args string — passing args through
+would hand the far end arbitrary reconfiguration of the host's audio, which is
+exactly the property that disqualified the Pulse route.
+
+**The user-facing volume lever is the device's `SPA_PARAM_Route`, not the node's
+`Props`.** Writing `channelVolumes` on a node is right for our own virtual
+sinks and wrong for a real device sink: the write is visible in `pw-dump`,
+ignored by `wpctl`, leaves `softVolumes` at 1.0, and is reverted within seconds
+because WirePlumber mirrors the device route onto the node. Node `Props` keeps
+one job on that host — ducking *foreign* playback streams, where being
+invisible to the user's slider is the point. Full trust model, packaging and
+spike numbers: [receiver-agent-plan.md](receiver-agent-plan.md).
+
+## Aligning speakers: measure through the running codec, and write once
+
+Four decisions from building microphone-assisted alignment
+([mic-alignment-plan.md](mic-alignment-plan.md)) that outlive it, because each
+constrains anything else that wants to shift audio in time:
+
+- **A session must measure through whatever wire codec the group actually
+  runs.** The codec is part of the latency chain, not a neutral transport —
+  `codec_delay_us` and the send-ahead floor are both codec-dependent — so
+  calibrating under PCM and running under Opus would measure a lead that does
+  not exist and the offsets would not transfer. The codec's constant
+  contribution is something you *want* folded into the measured offset.
+- **The knobs do not share a sign.** AP2 render delay and pw-sink playout delay
+  are delays; sendspin's static delay is an **advance** — the firmware
+  subtracts it from the target instant, which is also why
+  `required_send_ahead_us` adds it to the group lead. So "pick the
+  latest-arriving member as the reference and delay everyone else" is *inverted*
+  for sendspin, and the correct model is a feasible-interval intersection per
+  member (with pw-sink's 15 ms playout floor as a real lower bound), choosing the
+  common target that keeps the largest knob smallest.
+- **Real writes are deferred; provisional delays live in the relay.** A delay
+  write costs a device reconnect (tens of seconds for sendspin), so a run applies
+  its offsets as a ring read at an offset inside each per-device relay — upstream
+  of the codec, needing no presentation timestamp, therefore transport-agnostic —
+  and writes the real knobs once at the end through the ordinary endpoints. The
+  residual risks are recorded rather than assumed away: the write-back rounds to
+  integer milliseconds, and a non-frame-multiple delay moves a transient inside
+  Opus's MDCT window in a way the device knob would not.
+- **"Can this output be silenced / levelled?" is a per-output capability, not a
+  property of its kind.** Two members of one kind differ (a pw-sink host whose
+  agent answers versus one whose agent just dropped), so it is resolved in one
+  place and re-resolved on every change, with a **relay zero-fill fallback** for
+  the mute — ordered so the relay silences first and releases only once an
+  out-of-band write lands. The level has *no* fallback, because a relay has no
+  gain, so "no level knob" must be reported rather than silently skipped.
+
+## Module layout: directories that state the layering
+
+The daemon's `src/` is a directory tree rather than a flat module list, and the
+tree is [architecture.md](architecture.md#11-where-the-code-lives)'s structure
+made visible on disk. Four rules make it hold its shape:
+
+- **`foo/mod.rs`, not `foo.rs` + `foo/`**, so a subsystem lives in exactly one
+  directory; children are `pub(crate) mod`, since nothing here is a library
+  surface.
+- **Every `mod.rs` carries a `//!` header** naming the boundary and each child's
+  role. That header is the payoff of the whole exercise — a flat list has nowhere
+  to put it, and a declaration list without one is a directory that explains
+  nothing.
+- **`store/` is defined by a constraint, not a subject**: a module belongs there
+  only if its sole dependency is `util/locks`. That is why the source store is
+  `sources/mod.rs` (it reconciles live receivers) and why `sync_settings.rs`
+  stays in `routing/` (it pushes settings into three senders on write).
+- **`api/` is a leaf.** `AppState` lives in `state.rs` and the output-listing
+  model in `outputs/listing.rs`, so handlers depend on subsystems and never the
+  reverse — enforceable by eye, and the precondition for a crate split if build
+  times ever justify one.
+
+The refactor that got there was a *move*, and two of its lessons generalise:
+dependency direction does not constrain the order of a rename (Rust tolerates
+module cycles inside a crate — what constrains it is call-site fan-in and
+concurrent edits), and the reviewable invariant is **"baseline unchanged", not
+"clean"** — state the test/clippy/fmt numbers in the commit message and prove
+them identical, since a wave that silences a pre-existing finding is as suspect
+as one that adds one. Details, including where tests live and the still-pending
+`align/measure.rs` decomposition: [module-layout-plan.md](module-layout-plan.md).
 
 ---
 
@@ -826,3 +968,34 @@ scheduling.
 A device that reports its own `min_buffer_ms` bypasses the floor in **both**
 directions: a firmware announcing 80 ms puts its group at 80 ms. That is the
 protocol's way to set this per device rather than guessing on the device's behalf.
+
+## RTP input: no IGMP watchdog, and `ignore_ssrc` stays true
+
+The daemon used to run a membership watchdog beside `module-rtp-source`
+(`rtp_membership.rs`) that held the host's multicast membership and reloaded the
+module if the group looked lost. It is **deleted**, for three independent
+reasons, each measured during the 2026-07-28 dropout investigation
+([rtp-input-dropouts-plan.md](rtp-input-dropouts-plan.md) §4):
+
+- **Its trigger could never fire.** It required `igmp_users < 2`; the value is
+  constantly 2, because the module and the keepalive are both joined.
+- **Its keepalive socket never drained** — `rx_queue` pinned at its 208 KB
+  ceiling, ~90 % of arriving packets dropped, continuously, for no benefit.
+- **Upstream does it properly.** libpipewire 1.6.2's `module-rtp-source`
+  re-joins the group itself (5 s check, 30 s deadline), with its own comment
+  naming the exact failure this watchdog targeted — so the module self-heals in
+  ~35 s with no module reload and no node churn.
+
+The trade accepted is that a module-side join loss now costs a ≤35 s outage
+instead of being *masked* — and the masking is what hid the problem. If a
+watchdog is ever wanted again, note that "silence while packets arrive" is **not
+a fault signal**: on the evidence of that investigation such a watchdog would
+have reloaded the module eight times in an hour, pointlessly, because the silence
+was genuine digital silence from the sender. Any such trigger needs a **payload**
+check, not just socket counters.
+
+Relatedly, **`ignore_ssrc = true` is the safe setting**, not the risky one — the
+module's code is `have_ssrc = !ignore_ssrc` guarding the only SSRC rejection path
+there is, so `true` means a sender restart with a fresh SSRC is accepted
+seamlessly. It is `DEFAULT_RTP_IGNORE_SSRC` in `sources/rtp.rs`, and the
+"cheap experiment" of setting it false would *add* a way to drop packets.

@@ -31,7 +31,7 @@
         <mxCell id="n1" value="AirPlay sender (phone / Mac / PipeWire host)&#10;RTP/RTSP over WiFi" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="380" y="90" width="400" height="44" as="geometry" />
         </mxCell>
-        <mxCell id="n2" value="shairplay: recv + decrypt + ALAC/AAC decode  [tokio]&#10;airplay_source.rs — advertises unencrypted ALAC (et=0, cn=1)&#10;off-rate senders get a one-off Rust resample here (44.1 kHz/stereo = passthrough)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+        <mxCell id="n2" value="shairplay: recv + decrypt + ALAC/AAC decode  [tokio]&#10;sources/airplay.rs — advertises unencrypted ALAC (et=0, cn=1)&#10;off-rate senders get a one-off Rust resample here (44.1 kHz/stereo = passthrough)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="380" y="152" width="400" height="62" as="geometry" />
         </mxCell>
         <mxCell id="n3" value="jitter buffer: lock-free SPSC ring  (rtrb, interleaved f32)&#10;prebuffer latency_msec (default 150 ms) · re-arm small guard on underrun · drop on overflow" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
@@ -41,14 +41,14 @@
         <mxCell id="n4" value="&quot;airplay-in&quot; producer node — RT_PROCESS callback  [graph data-loop · FIFO 83]&#10;drains the SPSC ring (owns the jitter-buffer state) → F32LE 44.1 kHz 2ch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="380" y="304" width="400" height="56" as="geometry" />
         </mxCell>
-        <mxCell id="n5" value="ANCHOR  support.null-audio-sink   (one per source-set = group clock)&#10;MIX inputs · resample 44.1→48 kHz · QUANT-1024 steady driver&#10;sync_group.rs links airplay-in INTO the anchor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+        <mxCell id="n5" value="ANCHOR  support.null-audio-sink   (one per source-set = group clock)&#10;MIX inputs · resample 44.1→48 kHz · QUANT-1024 steady driver&#10;routing/sync_group.rs links airplay-in INTO the anchor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="380" y="374" width="400" height="66" as="geometry" />
         </mxCell>
         <mxCell id="n6" value="anchor MONITOR ports  (48 kHz)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="380" y="452" width="400" height="34" as="geometry" />
         </mxCell>
 
-        <mxCell id="shared_note" value="Both branches capture from the SAME anchor monitor (one steady QUANT-1024 driver) — that shared origin keeps the Voice PE speaker and the AV receiver sample-coincident.&#10;Inter-device sync: Sendspin = SharedTimeline stamp + 250 ms lead;  AP2 = PTP wall clock + PT=87 anchors." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;fontSize=10;" vertex="1" parent="1">
+        <mxCell id="shared_note" value="Both branches capture from the SAME anchor monitor (one steady QUANT-1024 driver) — that shared origin keeps the Voice PE speaker and the AV receiver sample-coincident.&#10;Inter-device sync: Sendspin = SharedTimeline stamp + the send-ahead lead;  AP2 = PTP wall clock + PT=87 anchors." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;fontSize=10;" vertex="1" parent="1">
           <mxGeometry x="810" y="374" width="410" height="92" as="geometry" />
         </mxCell>
 
@@ -61,24 +61,24 @@
         </mxCell>
 
         <!-- ===================== SENDSPIN BRANCH (left) ===================== -->
-        <mxCell id="s_cap" value="sendspin-capture @ 48 kHz → S16LE 2ch&#10;[RT_PROCESS on data-loop FIFO 83 · mainloop FIFO 45]&#10;pooled buf over a BOUNDED channel (drop-on-full) · sendspin_capture.rs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+        <mxCell id="s_cap" value="sendspin-capture @ 48 kHz → S16LE 2ch&#10;[RT_PROCESS on data-loop FIFO 83 · mainloop FIFO 45]&#10;pooled buf over a BOUNDED channel (drop-on-full) · pw/capture.rs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="200" y="592" width="360" height="64" as="geometry" />
         </mxCell>
         <mxCell id="s_relay" value="sendspin-relay  [dedicated SCHED_FIFO 40]&#10;stamp(SharedTimeline) + overlay-mix / duck (OverlayMixer) + fan-out&#10;one PCM feed differentiated per device · reused mix_buf" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="200" y="668" width="360" height="70" as="geometry" />
         </mxCell>
-        <mxCell id="s_writers" value="per-device WebSocket writers  [tokio tasks]&#10;sendspin_server.rs (embedded native server)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+        <mxCell id="s_writers" value="per-device WebSocket writers  [tokio tasks]&#10;outputs/sendspin/server.rs (embedded native server)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="200" y="750" width="360" height="46" as="geometry" />
         </mxCell>
         <mxCell id="s_ws" value="WebSocket / TCP  →  WiFi" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="200" y="808" width="360" height="34" as="geometry" />
         </mxCell>
-        <mxCell id="s_rx" value="ESPHome / Voice PE receiver&#10;250 ms send-ahead lead = the ONLY jitter buffer end-to-end&#10;converts presentation-timestamp → local clock, plays then" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+        <mxCell id="s_rx" value="ESPHome / Voice PE receiver&#10;send-ahead lead = the ONLY jitter buffer end-to-end (what the members ask for; configured group lead defaults to 0)&#10;converts presentation-timestamp → local clock, plays then" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="200" y="856" width="360" height="72" as="geometry" />
         </mxCell>
 
         <!-- ===================== AP2 BRANCH (right) ===================== -->
-        <mxCell id="a_cap" value="ap2 capture @ group rate → S16LE 2ch  (sendspin_capture::spawn_with_rate)&#10;[RT_PROCESS on data-loop FIFO 83 · mainloop FIFO 45] · pooled buf, bounded ch&#10;48 kHz if all members accept it (no resample), else 44.1 kHz (PipeWire resamples in-graph)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+        <mxCell id="a_cap" value="ap2 capture @ group rate → S16LE 2ch  (pw::capture::spawn_with_rate)&#10;[RT_PROCESS on data-loop FIFO 83 · mainloop FIFO 45] · pooled buf, bounded ch&#10;48 kHz if all members accept it (no resample), else 44.1 kHz (PipeWire resamples in-graph)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="700" y="592" width="480" height="64" as="geometry" />
         </mxCell>
         <mxCell id="a_relay" value="ap2-relay  [dedicated SCHED_FIFO 40]&#10;per-device overlay-mix / duck (OverlayMixer) + fan to each receiver" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="1">
@@ -90,7 +90,7 @@
         <mxCell id="a_send" value="rt-sender  [SCHED_FIFO 50]&#10;RTP + PT=87 anchor packets · clock_nanosleep(TIMER_ABSTIME)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="700" y="796" width="480" height="52" as="geometry" />
         </mxCell>
-        <mxCell id="a_rx" value="AirPlay-2 receiver  (Yamaha WX-021 / Pioneer VSX-934)&#10;renders against the shared PTP clock&#10;render delay 200–2000 ms (default 1500)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+        <mxCell id="a_rx" value="AirPlay-2 receiver  (Yamaha WX-021 / Pioneer VSX-934)&#10;renders against the shared PTP clock&#10;render delay 0–2000 ms (default 0) · retuned live, no reconnect" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1;" vertex="1" parent="1">
           <mxGeometry x="700" y="860" width="480" height="64" as="geometry" />
         </mxCell>
 

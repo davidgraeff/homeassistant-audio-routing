@@ -10,7 +10,7 @@ All request/response bodies are JSON unless noted.
 
 ## Endpoint index
 
-The complete route table, as registered in `bridge-daemon/src/api.rs`. Sections below
+The complete route table, as registered in `bridge-daemon/src/api/mod.rs`. Sections below
 document the common paths in detail; the rest are listed here with their purpose and
 handler name, which is the authoritative place to check the exact body shape.
 
@@ -77,7 +77,7 @@ handler name, which is the authoritative place to check the exact body shape.
 
 > **Two-tier groups (`/api/groups/*`) and the alignment wizard (`/api/align/*`) are not
 > yet documented in detail here.** They are the newest subsystems; see
-> `bridge-daemon/src/api.rs` for their bodies and
+> `bridge-daemon/src/api/` (one module per resource) for their bodies and
 > [architecture.md](../pipewire_audio_router/docs/architecture.md) for the concepts.
 > The `/api/spike/*` routes are development harnesses, not a supported interface.
 
@@ -261,7 +261,7 @@ device actually negotiated.
 > announcement and named in `message`** (with all of them unavailable the call
 > is rejected), so a "playing" answer means audio is really going somewhere.
 > See
-> [architecture.md §5.4](../pipewire_audio_router/docs/architecture.md#54-announcing-to-an-output-with-nothing-routed-into-it).
+> [architecture.md §5.5](../pipewire_audio_router/docs/architecture.md#55-announcing-to-an-output-with-nothing-routed-into-it).
 
 ## Sources
 
@@ -421,7 +421,7 @@ and applied to the running receiver live, with no restart.
 
 What each source is currently playing — title, artist, album, position and cover art —
 from whichever producer can say. See
-[source-metadata-plan.md](source-metadata-plan.md) for the model and
+[source-metadata-plan.md](../pipewire_audio_router/docs/old/source-metadata-plan.md) for the model and
 `bridge-daemon/src/sources/now_playing.rs` for the implementation.
 
 **Keyed by source *node name*, not source id.** That is the key the routing matrix, the
@@ -656,7 +656,7 @@ pw-sink: the target discovering our advert and handshaking) and handed back afte
 lease. Targets that nothing can carry are **dropped and named in `message`** (with all of
 them unavailable the call is rejected), so a "playing" answer means audio is really going
 somewhere. See
-[architecture.md §5.4](../pipewire_audio_router/docs/architecture.md#54-announcing-to-an-output-with-nothing-routed-into-it).
+[architecture.md §5.5](../pipewire_audio_router/docs/architecture.md#55-announcing-to-an-output-with-nothing-routed-into-it).
 
 Every call logs one `USER ACTION: announce -> N target(s) [...]` line with the admission,
 any on-demand sessions being opened, and anything skipped and why — so an "it didn't
@@ -877,7 +877,7 @@ the matrix is a large payload a client re-reads in full (the web UI recomputes
 its graph layout, the HA integration re-renders every entity), while a track
 changes once a song, and an artwork revision has nothing to do with routing.
 Keeping the descriptive payload off it is the design
-(see [source-metadata-plan.md](source-metadata-plan.md) §3.2), so do not move
+(see [source-metadata-plan.md](../pipewire_audio_router/docs/old/source-metadata-plan.md) §3.2), so do not move
 it back onto a routing node.
 
 **A client must switch on `type` and ignore frames it does not know.** Frame

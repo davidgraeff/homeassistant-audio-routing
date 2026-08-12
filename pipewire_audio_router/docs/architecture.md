@@ -8,9 +8,14 @@ the system-wide, three-component picture (add-on + HA integration + BT
 bridge firmware) lives one level up in
 [`../../docs/system-architecture.md`](../../docs/system-architecture.md),
 and *why* each piece is built this way lives in
-[decisions.md](decisions.md). What is done vs. still planned is in
-[airplay2-roadmap.md](airplay2-roadmap.md); how to poke a running instance
-is in [live-instance-debugging.md](live-instance-debugging.md).
+[decisions.md](decisions.md). What each subsystem delivered and what is
+still open is in the per-subsystem records —
+[airplay2-roadmap.md](airplay2-roadmap.md),
+[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md),
+[receiver-agent-plan.md](receiver-agent-plan.md),
+[mic-alignment-plan.md](mic-alignment-plan.md),
+[sendspin-open-items.md](sendspin-open-items.md) — and how to poke a running
+instance is in [live-instance-debugging.md](live-instance-debugging.md).
 
 ---
 
@@ -20,8 +25,10 @@ The daemon is a single compiled binary. `run.sh` starts only
 infrastructure — a private D-Bus session bus, PipeWire, WirePlumber — and
 then the daemon; there are **no supervised subprocesses** (the AirPlay
 receiver, the Sendspin servers and the RTP source all run natively
-in-process, so `supervisor.rs` was removed — see
+in-process, so the *process* supervisor was deleted — see
 [decisions.md](decisions.md#source--sendspin-processes-are-daemon-supervised-not-spawned-by-runsh)).
+The `supervisor.rs` in the tree today is a different thing: it owns the one
+process-wide mDNS `ServiceDaemon` and registers every browser on it (§5.4).
 
 Threading model, top to bottom:
 
@@ -39,7 +46,37 @@ Threading model, top to bottom:
   the observed `tokio-rt-worker` count is higher than 2.
 - **SCHED_FIFO real-time threads.** Every stage that touches steady audio
   runs at a fixed real-time priority so that general-purpose tokio work,
-  mDNS, or host load can never preempt it. See §6.
+  mDNS, or host load can never preempt it. See §7.
+
+### 1.1 Where the code lives
+
+`bridge-daemon/src/` is 12 directories plus `main.rs` (boot + wiring),
+`state.rs` (`AppState` and the `Shared*` aliases) and `supervisor.rs`. The
+tree deliberately mirrors this document, so the sections below are also a
+map of the source:
+
+| directory | this document | contents |
+|---|---|---|
+| `pw/` | §2 | PipeWire plumbing with no product concepts: the graph thread and its command channel, node capture, clip playback, the Profiler FFI, peak taps |
+| `audio/` | §8 | resample / wav / decode helpers, zero crate deps |
+| `util/` | — | `LockRecover`, the node-name prefixes, the host RT-capability assessment |
+| `store/` | — | file-backed JSON with no live handles. Membership rule: a module belongs here only if its sole dependency is `util/locks` |
+| `sources/` | §3 | the source collection *and* its reconciler, plus the AirPlay receiver, its client registry, RTP, now-playing, BT-bridge discovery |
+| `outputs/` | §4, §5 | `sendspin/`, `ap2/`, `pwsink/`, the shared `overlay_mixer.rs` and the `listing.rs` model |
+| `routing/` | §4 | the matrix and its handlers, `sync_group.rs`, `sync_settings.rs` |
+| `announce/` | §5.5, §9 | announcement delivery and the pure scheduling decisions (`arbiter.rs`) |
+| `align/` | §11 | the manual and mic-assisted alignment cluster |
+| `api/` | §9 | the route table plus one module per resource. A **leaf**: nothing in the crate depends on it |
+| `spike/` | — | dev-only experiments behind `/api/spike/*` |
+
+Each `mod.rs` carries a `//!` header stating that directory's boundary and
+each child's role — the reason the tree exists at all. Two placements are
+deliberate and look wrong at first glance: `sources/mod.rs` *is* the source
+store (it reconciles live receivers, so it is not a pure `store/` module),
+and `align/relay_delay.rs` lives with alignment even though it is *called*
+from the three output relays. The refactor that produced this, and the
+lessons from doing it, are in
+[module-layout-plan.md](module-layout-plan.md).
 
 ## 2. The PipeWire graph
 
@@ -64,6 +101,17 @@ subprocess stderr. See
 |---|---|---|
 | **AirPlay receive** | `airplay-in` | Native, in-process RAOP receiver — vendored+patched pure-Rust `shairplay` crate (`sources/airplay.rs`). Decoded f32 PCM is pushed through a jitter buffer into a PipeWire producer node. |
 | **RTP** | `bt-bridge-rtp` (or similar) | PipeWire's `rtp-source` module, fed by the ESP32 / Pi Bluetooth bridge over RTP/UDP. Can bind a multicast group so several PipeWire hosts share one bridge stream. |
+
+Sources are a **keyed collection**, not one of each: `sources/mod.rs` holds a
+persisted list of sources of those two kinds (`sources.json`, presence in the
+list = enabled) and reconciles the live receivers when it changes, so the user
+can add and remove several of either type at runtime, each independently
+routable. Each AirPlay source carries its own registry of remembered senders,
+with bans and priorities (`sources/airplay_clients.rs`), and each source has a
+now-playing record fed by whichever producer can say (the receiver's DMAP
+callbacks locally, a Pi reporter over the API remotely). A legacy
+single-source file is migrated to this shape on load, and back-compat shims
+still present the old singular API to the rest of the crate.
 
 The AirPlay path is the interesting one for the AP2 flow below:
 
@@ -246,13 +294,54 @@ connect fail, and leaves the receiver's one AirPlay input busy for phones in
 between. `run.sh` (PID 1) waits up to ~8 s for the daemon before stopping
 PipeWire, so the bound fits inside the supervisor's ~10 s stop grace.
 
-**Alignment.** An AP2 group is alignable from its source card on the Sources page
-(`align/calibrate.rs`, `frontend/src/components/AlignPanel.svelte`):
-members are muted/soloed via `ap2_control` (device-authoritative mute) and
-each one's offset is tuned by ear with its **live render delay** — there is
-no node-volume path (AP2 outputs are virtual).
+**Alignment.** AP2 members are muted/soloed via `ap2_control`
+(device-authoritative mute) and each one's offset is tuned — by ear or by
+microphone measurement — with its **live render delay**; there is no
+node-volume path, since AP2 outputs are virtual. See §11.
 
-### 5.3 One mDNS browse per service type — a shared daemon can't be shared for browsing
+### 5.3 pw-sink (another PipeWire Linux host, via its agent)
+
+The cheap backend, because the receiver speaks our transport natively: no
+codec and no Rust hot path of its own. A **paired `pwrouter-agent`** running
+in a user's session on the remote host is what makes a target exist at all —
+`Agents::connected_targets()` is the source of truth, and the mDNS browse of
+`_pipewire-audio._udp` (`outputs/pwsink/discovery.rs`) survives as a
+*diagnostic only*. Outputs are `pwsink-dev-<host>_<user>`; the identity is
+machine + user, so two logged-in users on one host are two targets.
+
+- **`pwsink-relay`** [SCHED_FIFO 40]: one capture off the group anchor's
+  monitor (48 kHz/S16/stereo), fanned to one **`AppleMidiSender` per target**,
+  each fed a per-device-mixed copy via `OverlayMixer::mix_into` — so per-device
+  announce/duck works exactly as it does for AP2. A single shared session could
+  not duck one member alone.
+- **Transport**: AppleMIDI/RTP, L16 (`S16BE`) 48 kHz stereo in 5 ms packets,
+  each sender advertising its own session `pwrouter-<slug>`. The receiver is a
+  stock `libpipewire-module-rtp-session` that the *agent* loads into its own
+  `pw_context` and dials *us* — so nothing listens on the receiver, and module
+  lifetime is agent-process lifetime.
+- **Playout delay** is the receiver's jitter buffer (`pwsink_jitter`, default
+  100 ms, clamped 15–2000 ms in whole packet times), decided daemon-side and
+  pushed by re-sending `welcome`; the agent reloads its receiver on every one,
+  so retuning needs no new message type.
+- **Volume/mute/duck** are out-of-band, through the agent: it walks
+  `receive stream → link → target sink` and drives the **device's**
+  `SPA_PARAM_Route` (node `Props` is the wrong lever for a real device sink and
+  WirePlumber reverts it), reporting local changes back so HA follows the host
+  rather than overwriting it. Its duck attenuates the *foreign* streams on that
+  sink — the host's own music, which our mix cannot reach — and never our
+  `pwsink-in` stream.
+- **Two independent liveness questions**, §5.6: `target_liveness` watches the
+  remote host's advert (no active probe is possible — the receiver dials us), and
+  `sender_liveness` watches whether a session is actually established.
+
+Known limitation: stock `module-rtp-session` in discover mode attaches to
+*every* advertised session of the media type (the session name is never
+compared), so 2+ pw-sink targets on one LAN cross-connect. Details, and the
+`rtp.session` hook that would fix it agent-side, are in
+[pipewire-sink-roadmap.md](pipewire-sink-roadmap.md) §4 and
+[receiver-agent-plan.md](receiver-agent-plan.md) §7.1.
+
+### 5.4 One mDNS browse per service type — a shared daemon can't be shared for browsing
 
 The daemon runs **one** `mdns_sd::ServiceDaemon` for the whole process (that
 consolidation is what fixed the multicast CPU storm), and exactly **one browse per
@@ -299,7 +388,7 @@ to every session of the media type — including our own `pwrouter-*` output
 sessions, looping output audio back in as an input. See
 [decisions](../../docs/decisions.md#raspberry-pi-bluetooth--rtp-bridge).
 
-### 5.4 Announcing to an output with nothing routed into it
+### 5.5 Announcing to an output with nothing routed into it
 
 An announcement is only audible while **some per-device relay is consuming
 that output's overlay slot** — `mix_into` is what turns a clip into audio, and
@@ -350,7 +439,7 @@ differs per backend:
   Same caveat as routed pw-sink streaming: with 2+ pw-sink targets on one LAN,
   discover-mode receivers attach to *every* advertised session, so an
   announcement aimed at one can be heard by the others (the deferred
-  session-scoping decision, `docs/pipewire-sink-roadmap.md` §4/§10).
+  session-scoping decision, `docs/pipewire-sink-roadmap.md` §4).
 
 **"Live" means connected, not dialed.** For both dialed backends, group
 membership only says what the group *dialed*: `routing::sync_group::dialed_session_established`
@@ -359,7 +448,7 @@ and `PwSinkLiveness` `established` (a receiver completed the handshake), and
 `has_live_sender` builds on it. A routed endpoint that never came up is reported as
 such instead of counting as playable.
 
-### 5.5 Reachable, connected, playing — three states, one rule
+### 5.6 Reachable, connected, playing — three states, one rule
 
 Every surface that shows an output's state has to answer two questions, and
 conflating them is how the UI came to contradict itself (the routing graph animated
@@ -390,7 +479,7 @@ on-demand session connects) and `announce/mod.rs` completes it in the scheduler.
 Without that, a clip nothing consumes would hold the output occupied forever and
 every later announcement to it would queue behind a clip that can never finish.
 
-### 5.5 Voice ducking — the other producer of duck
+### 5.7 Voice ducking — the other producer of duck
 
 Announcement ducking is a *side effect* of an overlay being mixed. There is a
 second, independent producer: a **duck hold** (`outputs/overlay_mixer.rs`), an open-ended
@@ -638,3 +727,68 @@ flow in text.
 - **Everything on the steady path is SCHED_FIFO** — the ladder in §7. The
   only non-RT steady stages are the codec decode on ingest (tokio) and the
   per-device WebSocket writers (tokio, TCP-throttled).
+
+---
+
+## 11. Aligning outputs in time
+
+Sample-coincident delivery (§4) is not the same as coincident *sound*: each
+backend's receiver adds its own render path, and the room adds ~3 ms per metre.
+So each output has one "shift this speaker in time" knob
+([decisions.md](decisions.md#playout-delay-one-knob-per-backend-and-every-default-adds-nothing)),
+and `align/` is the machinery for choosing its value — by ear, or by measuring
+with the phone's microphone. The full design, its measured numbers and its known
+blind spots are in [mic-alignment-plan.md](mic-alignment-plan.md).
+
+**The session** (`align/calibrate.rs`) owns one alignment at a time. Starting it
+**holds a set of outputs**: they are given a source set nothing else has
+(`align-hold-source`), which derives a temporary group with its own anchor, and
+the two-tone click track (8 ms bursts at 3 kHz and 1.5 kHz, 2 s apart) is looped
+into that anchor. Forming the hold costs a reconnect wave, so a multi-position
+run holds the **union** of everything it will touch **once** and then scopes each
+step by *audibility*, which is live and free. Levels and mutes are snapshotted and
+restored, and an **idle** timeout tears the session down so a closed tab cannot
+leave the room muted with a click looping.
+
+**Audibility and level are per-output capabilities, not per-kind** — resolved in
+one place and re-resolved on every change, because a receiver agent can drop
+mid-run:
+
+| | sendspin | AP2 | pw-sink |
+|---|---|---|---|
+| silence | in-band mute | in-band mute | the agent's mute, else **relay zero-fill** (the universal fallback, `align/relay_delay.rs`) |
+| level | in-band volume | `ap2_volume`, snapshot/restore | the agent's master volume when it answers — and **no fallback**, since the relay has no gain |
+
+**The knobs do not all have the same sign.** AP2 render delay and pw-sink playout
+delay are delays; sendspin's static delay is an **advance** (the firmware
+subtracts it, and `required_send_ahead_us` adds it to the group lead for exactly
+that reason). So the solver intersects each member's feasible interval and picks
+the common target that keeps the largest knob smallest, rather than nominating a
+reference member.
+
+**Measurement never needs a synchronised clock.** Every member renders the same
+content from the same anchor, so differencing two members' arrival phases *within
+one continuous microphone capture* cancels the content's own timebase, leaving
+delay difference plus path difference. The mic arrives over a WebSocket
+(`align/mic.rs`), the DSP is a bandpass + envelope peak with parabolic
+interpolation (`align/estimator.rs`), and the run is orchestrated by
+`align/measure.rs`.
+
+**Writes are deferred.** A real delay write costs a device reconnect (tens of
+seconds for sendspin), so a multi-position run applies its delays
+**provisionally** in the per-device relays — a ring read at an offset, upstream of
+the codec, which needs no timestamp and therefore works for all three backends —
+and writes the real knobs **once** at the end, through the ordinary endpoints so
+the persistence and send-ahead high-water logic is not duplicated.
+
+**An alignment run must not be interfered with, and interference must be
+reported.** The hold takes an announce-arbiter **reservation**, so ordinary
+announcements queue rather than cutting in — but a barge-in announcement or a
+voice duck hold still **wins**, because nobody wants a fire alarm suppressed by a
+calibration. The holder is notified, so the affected member's measurement is
+discarded with a reason naming the cause instead of the gate blaming the user's
+hand for something a doorbell did.
+
+The wizard lives on the **Outputs** page, not on a source card: the user picks
+speakers and alignment forms the group around them, which is the inverse of how
+grouping normally works.

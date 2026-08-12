@@ -81,7 +81,7 @@ no incoming PCM to buffer.
 
 **Why a dedicated RTP port rather than mixing into `bt-bridge-rtp`:** each RTP source
 carries its own `rate`
-([`RtpSourceConfig`](../pipewire_audio_router/bridge-daemon/src/sources.rs)). YouTube
+([`RtpSourceConfig`](../pipewire_audio_router/bridge-daemon/src/sources/rtp.rs)). YouTube
 audio is natively **48 kHz** (Opus) and the router's graph runs at 48 kHz, so a dedicated
 source at 48000 avoids a resample on the sender *and* in the router, while Bluetooth keeps
 its 44100. It also makes the two independently routable, which is what you actually want.
