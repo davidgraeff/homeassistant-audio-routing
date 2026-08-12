@@ -12,7 +12,7 @@
 //! unloading modules into its own context (how RAOP outputs are added/removed
 //! live — `pw_control::module`, api/outputs.rs) and creating/destroying links
 //! natively via `Core::create_object`/`Registry::destroy_global` (api/nodes.rs,
-//! routing.rs). All mutations arrive over a `pipewire::channel` (`PwCommand`),
+//! routing/mod.rs). All mutations arrive over a `pipewire::channel` (`PwCommand`),
 //! which attaches to the loop as an IO source and is the thread-safe way to
 //! run code on this non-`Send` thread from the axum side; each command carries
 //! a `oneshot` reply so the caller learns the outcome.
@@ -139,7 +139,7 @@ impl RegistryState {
 pub type SharedState = Arc<Mutex<RegistryState>>;
 
 /// Fires (empty payload, just a ping) whenever the registry state changes —
-/// node/port/link added or removed. The routing UI's WebSocket (routing.rs)
+/// node/port/link added or removed. The routing UI's WebSocket (routing/mod.rs)
 /// subscribes to this to push live matrix updates instead of
 /// the client having to poll. `send` is synchronous and callable from any
 /// thread (including this module's own dedicated PipeWire OS thread, which

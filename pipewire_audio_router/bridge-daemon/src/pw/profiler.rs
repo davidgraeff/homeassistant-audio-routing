@@ -4,7 +4,7 @@
 //! global emits a `profile` POD once per driver cycle, carrying a driver block
 //! plus one follower block per node, each with a cumulative `xrun_count`. We
 //! bind that global and keep a `node_name -> xrun_count` snapshot the routing
-//! matrix reads (routing.rs), so the graph can badge a node that's dropping
+//! matrix reads (routing/mod.rs), so the graph can badge a node that's dropping
 //! frames — the "where is the stutter" signal.
 //!
 //! `pipewire-rs` 0.10 has no typed `Profiler` proxy and the `profile` event

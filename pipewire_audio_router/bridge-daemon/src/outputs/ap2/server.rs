@@ -383,7 +383,7 @@ pub fn start(
             // plain-music path (no allocation/work); when a device has an active
             // announcement it returns duck(music)+overlay in `mix_buf`. The overlay
             // PCM was resampled to this group's `rate` when the announcement started
-            // (announce.rs), so music and overlay are the same rate here — the mix is
+            // (announce/mod.rs), so music and overlay are the same rate here — the mix is
             // pure sample addition. `mix_buf` is reused across chunks AND devices.
             let mixer = crate::outputs::overlay_mixer::OverlayMixer::global();
             // Provisional per-device alignment delay (align/relay_delay.rs), applied AFTER the

@@ -32,7 +32,7 @@ pub fn build_wav(pcm: &[u8], sample_rate: u32, bits_per_sample: u16, channels: u
 /// Read a PCM WAV produced by [`build_wav`] (canonical 44-byte header, data
 /// chunk last): returns `(sample_rate, channels, pcm_bytes)`. Returns `None` if
 /// it isn't the expected layout. Used to turn a synthesized/decoded WAV back
-/// into raw PCM for resampling (announce.rs).
+/// into raw PCM for resampling (announce/mod.rs).
 pub fn read_pcm16(wav: &[u8]) -> Option<(u32, u16, &[u8])> {
     if wav.len() < 44 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" || &wav[12..16] != b"fmt " {
         return None;

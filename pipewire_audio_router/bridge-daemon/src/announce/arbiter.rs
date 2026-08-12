@@ -145,7 +145,7 @@ pub struct Effects {
     /// Announcements removed without playing/finishing (e.g. TTL), for logging.
     pub dropped: Vec<(AnnouncementId, DropReason)>,
     /// Reservations a barge-in just played over — the holder must be told (the
-    /// caller forwards these; see `announce.rs`).
+    /// caller forwards these; see `announce/mod.rs`).
     pub reservations_hit: Vec<ReservationHit>,
 }
 

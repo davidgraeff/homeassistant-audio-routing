@@ -360,7 +360,7 @@ impl OverlayMixer {
     /// Drop every overlay that has made no progress for longer than its grace and
     /// return them as `(output, id)` — the safety net for an output nothing is
     /// streaming (no per-device sender consuming it, or one that died mid-clip).
-    /// The caller (announce.rs) treats a reaped overlay like a finished one, so the
+    /// The caller (announce/mod.rs) treats a reaped overlay like a finished one, so the
     /// scheduler releases the output instead of holding it occupied forever.
     ///
     /// Called from the announce tick, so "no progress" is sampled at that cadence:

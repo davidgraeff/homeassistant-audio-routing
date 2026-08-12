@@ -501,7 +501,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         if let Ok(addr) = listener.local_addr() {
             outputs::pwsink::agent::advertise(addr.port());
         }
-        // Relay for announcement ducks on agent-backed hosts: announce.rs is
+        // Relay for announcement ducks on agent-backed hosts: announce/mod.rs is
         // synchronous, so it posts requests here instead of taking the async
         // registry lock (outputs/pwsink/agent.rs).
         outputs::pwsink::agent::spawn_duck_relay(agents_for_duck);

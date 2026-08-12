@@ -6,13 +6,13 @@ use super::*;
 // loaded/unloaded via the PipeWire thread (PwCommand::Load/Unload, keyed by the
 // entry's own node name) rather than through the process supervisor. Re-point it
 // live, no restart. Once loaded its node shows up in the routing matrix
-// automatically (routing.rs classifies it as a source).
+// automatically (routing/mod.rs classifies it as a source).
 
 // ---- Multi-source collection CRUD (Phase 3) ------------------------------
 //
 // The generalized, keyed replacement for the two singular `/api/source/*` routes
 // this daemon used to expose: a collection of AirPlay + RTP input sources, each with its own
-// stable id / node name (sources.rs). These handlers only mutate the
+// stable id / node name (sources/mod.rs). These handlers only mutate the
 // STORE — actually loading/unloading the PipeWire module (RTP) or starting/
 // stopping the embedded receiver (AirPlay) is done by the per-kind reconcilers
 // wired from main.rs (Phases 2 & 4). After each mutation we nudge the change

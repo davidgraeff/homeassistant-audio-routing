@@ -2,11 +2,11 @@
 //!
 //! There is no add-on `options.json` seeding — every source is created at
 //! runtime via the REST API and persisted in the daemon's own stores
-//! (sources.rs). These constants are the node-name prefixes those stores
+//! (sources/mod.rs). These constants are the node-name prefixes those stores
 //! and the API handlers share.
 
 /// Node-name prefix for sendspin output sink nodes (shared with
-/// sources.rs and the output classification in api/outputs.rs/routing.rs).
+/// sources/mod.rs and the output classification in api/outputs.rs/routing.rs).
 pub const SENDSPIN_NODE_PREFIX: &str = "sendspin-out-";
 
 /// Node-name prefix for a discovered sendspin *device* — a virtual routing

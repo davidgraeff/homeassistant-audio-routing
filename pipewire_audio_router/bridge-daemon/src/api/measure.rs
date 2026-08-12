@@ -477,7 +477,7 @@ pub(crate) async fn set_output_latency(
     state.ap2_control.lock().await.set_render_delay(&node_name, effective).await;
     // `latency_ms` is on the routing matrix, and the matrix is only pushed when
     // something says it changed — this used to reach the graph on the next 250 ms
-    // meter tick, which no longer carries it (routing.rs `Frame::Meters`).
+    // meter tick, which no longer carries it (routing/mod.rs `Frame::Meters`).
     let _ = state.changes.send(());
     let latency_label = match clamped {
         Some(ms) => format!("{ms} ms"),

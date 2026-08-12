@@ -12,7 +12,28 @@ should graduate into [`decisions.md`](decisions.md).
 
 ---
 
-## 0. Status (2026-08-12)
+## 0. Status — **complete** (2026-08-12)
+
+Every wave has landed. `bridge-daemon/src/` is now **12 directories and three root
+files** (`main.rs`, `state.rs`, `supervisor.rs`), 87 files in total:
+
+| directory | files | what |
+|---|---:|---|
+| `outputs/` | 25 | three backends + the shared overlay mixer and listing model |
+| `api/` | 16 | the route table and one module per resource |
+| `align/` | 8 | the mic-assisted and manual alignment cluster |
+| `store/` `sources/` `pw/` | 6 each | persistence, the input side, PipeWire plumbing |
+| `util/` `audio/` `spike/` | 4 each | helpers, format conversion, dev experiments |
+| `routing/` `announce/` | 3, 2 | the matrix and its groups; announcement delivery |
+
+Verified identically after every wave: `cargo test` **450 passed / 0 failed /
+3 ignored**, `cargo clippy --all-targets` at the same **6** unique pre-existing
+warning sites, `cargo fmt --check` **clean**, `cargo check --tests` clean with zero
+warnings. No behaviour was changed anywhere, and the only code that moved between
+modules is what §5 and §6 called for.
+
+The one thing left undone deliberately: §8's god-file splits, now designed in §10
+for the align cluster. `align/measure.rs` (7028 code lines) is the priority.
 
 **Landed:**
 
@@ -32,8 +53,17 @@ should graduate into [`decisions.md`](decisions.md).
   modules + the route table), and the cycle broken: the output-listing model moved
   to `outputs/listing.rs`, so `api/` is now a **leaf** (§5, §6).
 
-**Remaining:** wave 7's reference sweep (§7). The root holds `main.rs`,
-`state.rs`, `supervisor.rs` and 12 directories.
+- **wave 7** — the reference sweep (§7): every comment and doc reference now names
+  a path that exists, including the `mod.rs` cases (`announce.rs` ->
+  `announce/mod.rs`, `routing.rs` -> `routing/mod.rs`, `sources_store.rs` ->
+  `sources/mod.rs`) and the `api.rs` ones, which name the *owning* file rather than
+  the directory. Four references deliberately keep an old name because their whole
+  job is to explain a rename — `state.rs` on `api.rs`, `pw/mod.rs` on
+  `sendspin_capture.rs`, `util/mod.rs` on `config.rs`, `outputs/pwsink/mod.rs` on
+  the two liveness files. `docs/old/` is a historical archive and was left alone.
+
+  No transitional aliases were ever introduced (§4.1), so there was nothing to
+  remove: every wave rewrote its call sites in the same commit.
 
 The align wave went first, out of order (§4 lists it as wave 5), and it was not a
 leaf when it did: **eight files outside `align/` reach into it** — `api.rs`,

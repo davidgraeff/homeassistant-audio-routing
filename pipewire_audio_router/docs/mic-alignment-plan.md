@@ -646,7 +646,7 @@ which is nothing on a LAN. Handle a 44.1 kHz `AudioContext` (iOS) as well as
 48 kHz; carry the rate in a JSON hello frame.
 
 New endpoint `GET /api/align/mic/ws`, upgraded with `axum`'s ws feature —
-`routing::routing_ws` (`routing.rs:738`) and `outputs::pwsink::agent::agent_ws` are the
+`routing::routing_ws` (`routing/mod.rs:738`) and `outputs::pwsink::agent::agent_ws` are the
 in-repo precedents for the handler shape. One socket at a time; a second
 connection is rejected. Closing the socket does **not** tear down the session (the
 user may be switching modes), but the 15 min safety timeout still applies.
@@ -1343,7 +1343,7 @@ alone does **not** achieve that, and this was checked rather than assumed:
 
 - `announce_arbiter` derives occupancy purely from **in-flight announcements**
   (`occupancy()` over `self.active`), so an aligning output is invisible to it and
-  `begin()` takes the immediate-start path. `announce.rs` also *creates* a per-device
+  `begin()` takes the immediate-start path. `announce/mod.rs` also *creates* a per-device
   sender when none exists — including an on-demand AP2 session — so being unrouted
   protects nothing.
 - Even a reservation would not stop `barge_in`: the admission order is
@@ -1450,7 +1450,7 @@ and the final real write.
   names **once, when the hold forms** (`align_group::resolve_labels`: the rename store
   first, `routing::output_display_name` as the fallback — exactly what the Outputs page
   and the routing matrix do) and carrying them *with* the hold. The reporters
-  (`announce.rs`, `outputs/overlay_mixer.rs`) run where the outputs store is not reachable, so
+  (`announce/mod.rs`, `outputs/overlay_mixer.rs`) run where the outputs store is not reachable, so
   they could not have resolved a name themselves; `HoldRegistry` holds one
   `node_name → label` map and renders the sentence from it. `Interference` still carries
   the node name in `member` for matching, plus `member_label` so a consumer that writes
@@ -1562,7 +1562,7 @@ and the final real write.
     path was complete end to end; only the *read* path and the UI were missing, in four
     independent places that all encoded the same wrong assumption:
 
-    1. `routing.rs` populated `RoutingNode.volume`/`muted` for `sendspin-dev-*` and
+    1. `routing/mod.rs` populated `RoutingNode.volume`/`muted` for `sendspin-dev-*` and
        `ap2-dev-*` only, `None` for everything else — so the matrix never carried a
        pw-sink host's level even though `PUT /api/pwsink/volume` could set it. **Fixed**:
        both are now sourced from the agent's `HostState` under the same lock as

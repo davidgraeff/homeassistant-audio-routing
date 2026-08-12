@@ -506,7 +506,7 @@ desktop, a different feature; folding it into the agent is a separate decision.
 | **S2b** (spike) | `SPA_PARAM_Route` set on the Device (volume + mute), read-back observed by `wpctl` | `wpctl get-volume` reflects an agent-set value; local changes read back |
 | **P1** | agent (config, pairing, reconnect, restore rails); `outputs/pwsink/agent.rs`; master volume/mute through to the HA `media_player` | ✅ built; control plane verified live (§14.2). `pw-control` extraction deferred (§13) |
 | **P2** | receiver config owned by the agent; targets sourced from paired agents (§3); drop-in deleted; systemd unit | ✅ built; adoption gate verified live. "Targets sourced from paired agents" was only half done until 2026-08-05 — the *listing* was, the audio path and the matrix were not, so no pw-sink output could carry audio (§3). Serving the binary from the add-on frontend deferred (needs a cross-arch build stage) |
-| **P3** | per-stream duck of *foreign* streams with local ramp, wired to the announce path alongside `overlay_mixer` | ✅ built (`duck_output`/`unduck_output` from `announce.rs`); not yet heard on real audio |
+| **P3** | per-stream duck of *foreign* streams with local ramp, wired to the announce path alongside `overlay_mixer` | ✅ built (`duck_output`/`unduck_output` from `announce/mod.rs`); not yet heard on real audio |
 | **P4** | host-scoped extras: report sinks (target a *named* sink), report xruns into the profiler badges | deferred |
 
 Note P3's two ducks coexist: our own music in the stream is ducked by

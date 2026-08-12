@@ -267,7 +267,7 @@ device actually negotiated.
 
 Full CRUD over the router's inputs, persisted in a daemon-owned store
 (`/data/sources.json`) that starts empty on a fresh install (no `options.json`
-seeding) and is managed live here with no restart (`sources.rs`).
+seeding) and is managed live here with no restart (`sources/mod.rs`).
 
 > **These endpoints replaced the singular `/api/source/rtp` and
 > `/api/source/airplay`**, which no longer exist. The router now supports **several

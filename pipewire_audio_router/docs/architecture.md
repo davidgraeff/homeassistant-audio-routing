@@ -118,7 +118,7 @@ Sendspin overhaul and AP2 was aligned onto it.
 **Two-tier grouping:** an **MG** (Music Group) is the routable unit — a
 routing target is polymorphic (`output | MG | …`); an **AG**
 (Announcement Group) is additive, priority-preempting, with per-device
-duck/overlay (`announce/arbiter.rs` / `announce.rs`).
+duck/overlay (`announce/arbiter.rs` / `announce/mod.rs`).
 
 ### The `OutputBackend` seam (target end-state)
 
@@ -156,7 +156,7 @@ also finds the neighbours' HomePods and any laptop running
 real. The gate is applied in exactly three places, all of which read
 routing intent through the adopted set:
 
-- `routing.rs::build_matrix` — an unadopted device isn't in the matrix, so
+- `routing/mod.rs::build_matrix` — an unadopted device isn't in the matrix, so
   it can't be routed **and** the HA integration (which builds its
   `media_player` entities from that listing) never sees it;
 - `routing/sync_group.rs::reconcile` — intent whose output isn't adopted is
@@ -386,7 +386,7 @@ answers with what will actually carry each target (targets nothing can carry are
 dropped from the announcement and named in the response, so the UI toast is
 honest), and the mixer runs a **stall watchdog** — `reap_stalled` drops an
 overlay whose cursor hasn't moved for its grace (5 s normally, 40 s while an
-on-demand session connects) and `announce.rs` completes it in the scheduler.
+on-demand session connects) and `announce/mod.rs` completes it in the scheduler.
 Without that, a clip nothing consumes would hold the output occupied forever and
 every later announcement to it would queue behind a clip that can never finish.
 

@@ -702,7 +702,7 @@ fn welcome(node_name: &str, jitter_ms: u16) -> DaemonMsg {
 
 // ---- remote duck relay -----------------------------------------------------
 //
-// The announce coordinator (announce.rs) is synchronous and process-global, while
+// The announce coordinator (announce/mod.rs) is synchronous and process-global, while
 // sending to an agent needs the async registry lock. So announcements post duck
 // requests to this relay instead of blocking: a small task drains it and talks to
 // the agents.

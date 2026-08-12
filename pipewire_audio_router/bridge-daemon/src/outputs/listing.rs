@@ -549,7 +549,7 @@ pub(crate) fn output_label(state: &AppState, node_name: &str) -> String {
 /// Both listings from one pass: `(adopted, offered)`.
 ///
 /// Split out of the two handlers below so the routing WebSocket can push these
-/// listings when they change (routing.rs) instead of the UI polling for them. One
+/// listings when they change (routing/mod.rs) instead of the UI polling for them. One
 /// `collect_outputs` call serves both halves, which is what the handlers did
 /// individually anyway.
 pub(crate) async fn outputs_listings(state: &AppState) -> (Vec<OutputInfo>, Vec<OutputInfo>) {

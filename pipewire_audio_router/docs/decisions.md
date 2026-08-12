@@ -349,7 +349,7 @@ registry state, not by matching subprocess stderr for `"File exists"`.
 Combined with native volume (`Props`/`channelVolumes`) and native announce
 playback (`pw::stream`), the daemon now speaks one native PipeWire API
 with no `pw-link`/`pw-cat`/`wpctl`/`ffmpeg` subprocesses left. See
-`bridge-daemon/src/pw/thread.rs`, `routing.rs`, `volume.rs`, `pw/player.rs`.
+`bridge-daemon/src/pw/thread.rs`, `routing/mod.rs`, `volume.rs`, `pw/player.rs`.
 
 ## Source & sendspin processes are daemon-supervised, not spawned by `run.sh`
 

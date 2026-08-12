@@ -31,7 +31,7 @@ pub async fn decode_bytes_to_wav(bytes: &'static [u8], ext: &'static str) -> any
 
 /// Decode the file at `path` straight to overlay-ready PCM: 48 kHz, stereo,
 /// S16LE (the capture/overlay format). Used by the per-device announce path
-/// (announce.rs) which mixes the clip into one device's stream.
+/// (announce/mod.rs) which mixes the clip into one device's stream.
 pub async fn decode_file_to_pcm_48k_stereo(path: &Path) -> anyhow::Result<Vec<u8>> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {

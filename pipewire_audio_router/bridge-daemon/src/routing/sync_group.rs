@@ -417,7 +417,7 @@ fn supports_on_demand_announce(output: &str) -> bool {
 /// plain graph node has no session at all.
 ///
 /// Shared by [`GroupReconciler::has_live_sender`] (which adds the sendspin cases it
-/// alone can see) and the routing matrix (routing.rs `RoutingNode::streaming`), so
+/// alone can see) and the routing matrix (routing/mod.rs `RoutingNode::streaming`), so
 /// the graph, the Outputs page and the announce arbiter all judge delivery by the
 /// same rule.
 pub fn dialed_session_established(output: &str, ap2_connected: &HashSet<String>) -> Option<bool> {

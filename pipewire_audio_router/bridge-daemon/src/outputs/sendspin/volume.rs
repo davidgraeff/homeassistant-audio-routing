@@ -113,7 +113,7 @@ pub struct SendspinControl {
     /// unmuting restores the prior level (see [`mute_cmd`]).
     desired_muted: HashMap<String, bool>,
     /// Fired whenever `desired` changes so the routing-matrix WebSocket rebuilds
-    /// and pushes a fresh snapshot (routing.rs) — the device→UI half of volume
+    /// and pushes a fresh snapshot (routing/mod.rs) — the device→UI half of volume
     /// sync, without the UI having to poll. Injected once at startup from main.rs
     /// (the same broadcast every other change source nudges); `None` until then
     /// (e.g. in unit tests), where mutations simply don't notify.

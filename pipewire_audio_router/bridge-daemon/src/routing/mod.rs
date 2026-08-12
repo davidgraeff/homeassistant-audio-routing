@@ -442,7 +442,7 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         (c.volumes(), c.mutes())
     };
     // `connected()` comes from the same guard as the volumes: it's what makes an
-    // AP2 output's `streaming` verdict (routing.rs `RoutingNode::streaming`).
+    // AP2 output's `streaming` verdict (routing/mod.rs `RoutingNode::streaming`).
     let (ap2_volumes, ap2_mutes, ap2_connected) = {
         let c = state.ap2_control.lock().await;
         (c.volumes(), c.mutes(), c.connected())

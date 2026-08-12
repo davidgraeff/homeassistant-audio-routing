@@ -261,7 +261,7 @@ pub(crate) async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap
     }
 }
 
-/// Announcement-group announce (announce.rs): play a clip to a set of per-device
+/// Announcement-group announce (announce/mod.rs): play a clip to a set of per-device
 /// outputs with per-device duck+overlay and scheduler policy (queue/barge/TTL).
 ///
 /// Each target needs a per-device sender to *consume* its overlay, so the handler

@@ -4,13 +4,13 @@
 //! Raw PipeWire links are tied to ephemeral node ids and (even with
 //! `object.linger`) don't survive a container restart or a node reload — so a
 //! device that disappears and comes back loses its routing. This store records
-//! the *desired* routing by stable name instead; the reconciler (routing.rs)
+//! the *desired* routing by stable name instead; the reconciler (routing/mod.rs)
 //! applies it to the live graph whenever both endpoints are present, and
 //! reapplies automatically when an entity reappears. An intent link whose
 //! endpoint isn't currently in the graph is "offline" — retained here, shown
 //! grayed in the UI, and re-linked the moment the node returns.
 //!
-//! Mirrors the other `/data` stores (sources.rs): no `options.json`
+//! Mirrors the other `/data` stores (sources/mod.rs): no `options.json`
 //! seeding, starts empty, the file is authoritative and created on first
 //! mutation.
 

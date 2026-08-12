@@ -5,7 +5,7 @@ use super::*;
 // The AirPlay-receive source is an embedded, native RAOP receiver
 // (sources/airplay.rs) — not a subprocess and not a PipeWire module. Its
 // enabled/disabled state and knobs are persisted in the sources store
-// (sources.rs), which starts empty on a fresh install (no options.json
+// (sources/mod.rs), which starts empty on a fresh install (no options.json
 // seeding) and is then authoritative. Same "runtime, no restart" model as
 // /api/outputs, but backed by an in-process receiver rather than a module.
 

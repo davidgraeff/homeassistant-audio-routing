@@ -32,7 +32,7 @@ pub type SharedSources = Arc<Mutex<SourcesStore>>;
 pub type SharedAirplay = crate::sources::airplay::SharedAirplayMap;
 
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
-/// change-notification channel (routing.rs), and the command sender for runtime
+/// change-notification channel (routing/mod.rs), and the command sender for runtime
 /// module load/unload (pw/thread.rs). Existing handlers extract just the piece
 /// they need via `FromRef` — they don't need to know this type grew more fields.
 #[derive(Clone)]

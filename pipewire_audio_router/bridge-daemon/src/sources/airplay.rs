@@ -49,7 +49,7 @@ const CHANNELS: usize = 2;
 /// drift; without a cushion the producer ring underruns and you hear stutter.
 /// The producer prebuffers this much before draining and re-buffers on
 /// underrun. 150 ms rides out LAN jitter + drift while staying imperceptible
-/// for one-way audio. Stored per install (sources.rs) and settable via
+/// for one-way audio. Stored per install (sources/mod.rs) and settable via
 /// `/api/sources`, so a noisy install can trade latency for fewer
 /// dropouts.
 /// Node name of the old single AirPlay source. Production names sources
