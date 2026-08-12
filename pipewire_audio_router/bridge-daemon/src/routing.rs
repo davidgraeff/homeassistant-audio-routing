@@ -37,8 +37,9 @@
 
 use crate::api::AppState;
 use crate::pw::thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
-use crate::routing_store::{self, RoutingLink, SharedRouting};
 use crate::sendspin_discovery::SendspinDevice;
+use crate::store;
+use crate::store::routing::{RoutingLink, SharedRouting};
 use crate::util::locks::LockRecover;
 use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SENDSPIN_NODE_PREFIX};
 use axum::extract::ws::{Message, WebSocket};
@@ -53,7 +54,7 @@ use tokio::sync::oneshot;
 pub struct RoutingNode {
     /// Stable node name — the primary key everything routes on. Survives module
     /// reloads and device disappearance/reappearance; the HA integration and
-    /// the persisted routing intent (routing_store.rs) both key off it.
+    /// the persisted routing intent (store/routing.rs) both key off it.
     node_name: String,
     display_name: String,
     /// Whether the node is in the live graph right now. `false` = configured or
@@ -135,7 +136,7 @@ pub struct RoutingNode {
 pub struct RoutingMatrix {
     sources: Vec<RoutingNode>,
     outputs: Vec<RoutingNode>,
-    /// Desired routing = persisted intent (routing_store.rs), by stable name.
+    /// Desired routing = persisted intent (store/routing.rs), by stable name.
     /// The UI renders these as the linked cells (including links to a currently
     /// offline endpoint, shown grayed); reconcile() makes the live graph match
     /// for pairs whose endpoints are both present.
@@ -238,7 +239,7 @@ fn build_matrix(
     pwsink_hosts: &BTreeMap<String, String>,
     adopted: &std::collections::BTreeSet<String>,
     source_labels: &std::collections::HashMap<String, String>,
-    // User-chosen output names (outputs_store.rs), keyed by node name. Wins over
+    // User-chosen output names (store/outputs.rs), keyed by node name. Wins over
     // whatever discovery reported — it is the whole point of a rename.
     output_labels: &BTreeMap<String, String>,
     meters: &crate::pw::metering::MeterHub,
@@ -433,9 +434,9 @@ async fn build_snapshot(state: &AppState) -> RoutingMatrix {
         let c = state.ap2_control.lock().await;
         (c.volumes(), c.mutes(), c.connected())
     };
-    let intent = routing_store::snapshot(&state.routing);
-    let adopted = crate::outputs_store::adopted_snapshot(&state.outputs);
-    let output_labels = crate::outputs_store::names_snapshot(&state.outputs);
+    let intent = store::routing::snapshot(&state.routing);
+    let adopted = crate::store::outputs::adopted_snapshot(&state.outputs);
+    let output_labels = crate::store::outputs::names_snapshot(&state.outputs);
     let devices = state.sendspin_devices.lock_recover().clone();
     let ap2_devices = state.ap2_devices.lock_recover().clone();
     // One guard for the hosts *and* their reported levels, so the matrix cannot show a
@@ -612,7 +613,7 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
     let _ = reply_rx.await;
 }
 
-/// Reapply persisted routing intent (routing_store.rs) to the live graph: for
+/// Reapply persisted routing intent (store/routing.rs) to the live graph: for
 /// every stored `(source, output)` link whose *both* nodes are currently
 /// present, ensure the matched-channel PipeWire links exist. Idempotent —
 /// `CreateLinks` skips ports already linked — so this is safe to call on every
@@ -628,7 +629,7 @@ pub async fn ensure_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, sou
 /// kept (rather than deleted) so a future real-node output would still be
 /// direct-linked, and it stays a cheap no-op for the current output kinds.
 pub async fn reconcile(pw: &SharedState, pw_cmd: &PwCommandSender, routing: &SharedRouting) {
-    let intent = routing_store::snapshot(routing);
+    let intent = store::routing::snapshot(routing);
     for link in &intent {
         let ids = {
             let st = pw.lock_recover();
@@ -1218,7 +1219,7 @@ mod tests {
         matrix_of(adopted, intent, ap2_connected, &BTreeMap::new())
     }
 
-    /// As [`matrix_with`], with the user's renames (outputs_store.rs).
+    /// As [`matrix_with`], with the user's renames (store/outputs.rs).
     fn matrix_with_names(adopted: &[&str], intent: &[RoutingLink], names: &[(&str, &str)]) -> RoutingMatrix {
         let names: BTreeMap<String, String> = names.iter().map(|(n, l)| (n.to_string(), l.to_string())).collect();
         matrix_of(adopted, intent, &[], &names)

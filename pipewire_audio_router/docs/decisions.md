@@ -33,11 +33,11 @@ Pioneer VSX-934; the user's verdict was "better than AirPlay 1."
   the crate's own Rust-PTP code is **dead** (PTP is driven by libairptp).
 - **Hard-drop RAOP, no fallback** — all target receivers are AP2-capable.
   **Done 2026-07-26** (plan: [ap2-track-p4-drop-raop-design.md](ap2-track-p4-drop-raop-design.md)):
-  `raop.rs`/`outputs_store.rs`/the RAOP-only `discovery.rs` deleted, the
+  `raop.rs`/`store/outputs.rs`/the RAOP-only `discovery.rs` deleted, the
   `/api/outputs` CRUD + `raop_uses_anchor`/monitor-anchor logic removed,
   `pw_module.rs`/`volume.rs` kept (RTP source + source-ducking still use
   them). **Migration is by node-name rewrite, not store translation**
-  (`raop_migration.rs`, one-shot at startup, idempotent): a persisted
+  (`store/migration.rs`, one-shot at startup, idempotent): a persisted
   `raop-out-<slug>` link becomes `ap2-dev-<slug>` (same slug —
   `_raop._tcp` and `_airplay._tcp` advertise the same instance label), so
   routing/groups survive the switch; AP2 devices are re-discovered, not

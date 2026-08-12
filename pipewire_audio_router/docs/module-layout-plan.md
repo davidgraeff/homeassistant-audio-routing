@@ -20,8 +20,9 @@ should graduate into [`decisions.md`](decisions.md).
 - **wave 1** — `util/` + `audio/` + `pw/`, 11 files plus 3 new `mod.rs`.
   §3 rows 3–13. Preceded by a standalone commit clearing the three pre-existing
   `cargo fmt` findings, so the fmt baseline is now **zero** (§4 wave 0, §9).
+- **wave 2** — `store/`, 5 files plus a new `mod.rs`. §3 rows 14–18.
 
-**Remaining:** 42 files still flat at the crate root. Waves 2–7 (§4).
+**Remaining:** 37 files still flat at the crate root. Waves 3–7 (§4).
 
 The align wave went first, out of order (§4 lists it as wave 5), and it was not a
 leaf when it did: **eight files outside `align/` reach into it** — `api.rs`,
@@ -205,7 +206,7 @@ by subject.
 
 ## 3. Full rename table
 
-60 files, of which 18 have landed. `★` marks the two moves that change meaning
+60 files, of which 23 have landed. `★` marks the two moves that change meaning
 rather than location; everything else is pure relocation. The `mod.rs` files each
 directory needs are new files, not rows here — `align/mod.rs` was written from
 scratch (§2, "Directory module style").
@@ -225,11 +226,11 @@ scratch (§2, "Directory module style").
 | 11 ✔ | `locks.rs` | `util/locks.rs` |
 | 12 ✔ | `config.rs` | `util/node_names.rs` ★ |
 | 13 ✔ | `host_assessment.rs` | `util/host_assessment.rs` |
-| 14 | `routing_store.rs` | `store/routing.rs` |
-| 15 | `outputs_store.rs` | `store/outputs.rs` |
-| 16 | `groups_store.rs` | `store/groups.rs` |
-| 17 | `settings_store.rs` | `store/settings.rs` |
-| 18 | `raop_migration.rs` | `store/migration.rs` |
+| 14 ✔ | `routing_store.rs` | `store/routing.rs` |
+| 15 ✔ | `outputs_store.rs` | `store/outputs.rs` |
+| 16 ✔ | `groups_store.rs` | `store/groups.rs` |
+| 17 ✔ | `settings_store.rs` | `store/settings.rs` |
+| 18 ✔ | `raop_migration.rs` | `store/migration.rs` |
 | 19 | `sources_store.rs` | `sources/mod.rs` |
 | 20 | `airplay_source.rs` | `sources/airplay.rs` |
 | 21 | `airplay_clients.rs` | `sources/airplay_clients.rs` |

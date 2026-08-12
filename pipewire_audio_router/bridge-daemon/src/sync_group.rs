@@ -41,9 +41,10 @@ use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PR
 type PwsinkHosts = std::collections::BTreeMap<String, String>;
 use crate::pw::thread::{PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
-use crate::routing_store::{self, RoutingLink, SharedRouting};
 use crate::sendspin_discovery::{SendspinDevice, SharedSendspinDevices};
 use crate::sendspin_server::{self, SendspinServerHandle};
+use crate::store;
+use crate::store::routing::{RoutingLink, SharedRouting};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -340,10 +341,10 @@ pub struct AnnounceDeps<'a> {
     pub pw: &'a SharedState,
     pub pw_cmd: &'a PwCommandSender,
     pub routing: &'a SharedRouting,
-    /// Adoption verdicts (outputs_store.rs) — needed to read routing intent the
+    /// Adoption verdicts (store/outputs.rs) — needed to read routing intent the
     /// same way `reconcile` does, so a *discovered* device's leftover intent
     /// doesn't look like a group that owns its session.
-    pub outputs: &'a crate::outputs_store::SharedOutputs,
+    pub outputs: &'a crate::store::outputs::SharedOutputs,
     pub ap2_devices: &'a crate::ap2_discovery::SharedAp2Devices,
     pub ap2_ptp: &'a crate::ap2_ptp::SharedAp2Ptp,
     pub ap2_control: &'a crate::ap2_volume::SharedAp2Control,
@@ -630,8 +631,8 @@ impl GroupReconciler {
         // as `reconcile` does — an unadopted device's intent is dormant, so nothing
         // owns its session and the on-demand path is the only way to reach it (which
         // is precisely the "which speaker is this?" test-tone case).
-        let adopted = crate::outputs_store::adopted_snapshot(deps.outputs);
-        let intent: Vec<RoutingLink> = routing_store::snapshot(deps.routing).into_iter().filter(|l| adopted.contains(&l.output)).collect();
+        let adopted = crate::store::outputs::adopted_snapshot(deps.outputs);
+        let intent: Vec<RoutingLink> = store::routing::snapshot(deps.routing).into_iter().filter(|l| adopted.contains(&l.output)).collect();
         // Read through the alignment hold too: an output taken for a calibration IS
         // routed (into the temporary group), so opening a *second* on-demand session
         // to it would collide with the group's own sender — an AP2 receiver accepts
@@ -1103,7 +1104,7 @@ impl GroupReconciler {
         pw: &SharedState,
         pw_cmd: &PwCommandSender,
         routing: &SharedRouting,
-        adopted: &crate::outputs_store::SharedOutputs,
+        adopted: &crate::store::outputs::SharedOutputs,
         devices: &SharedSendspinDevices,
         control: &crate::sendspin_volume::SharedSendspinControl,
         send_ahead_us: i64,
@@ -1122,8 +1123,8 @@ impl GroupReconciler {
         // intent (rather than the device maps) keeps the *on-demand* announce
         // path — the test tone that tells you which speaker this is — working for
         // a merely discovered device.
-        let adopted_set = crate::outputs_store::adopted_snapshot(adopted);
-        let intent: Vec<RoutingLink> = routing_store::snapshot(routing).into_iter().filter(|l| adopted_set.contains(&l.output)).collect();
+        let adopted_set = crate::store::outputs::adopted_snapshot(adopted);
+        let intent: Vec<RoutingLink> = store::routing::snapshot(routing).into_iter().filter(|l| adopted_set.contains(&l.output)).collect();
         // An alignment session's temporary exclusive group (align/group.rs) is an
         // override on this intent, not an edit of the store — see `effective_intent`.
         let intent = self.effective_intent(intent);

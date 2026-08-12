@@ -23,8 +23,8 @@
 //!
 //! Idempotent + cheap, so it can be deleted once the deployment has booted once.
 
-use crate::groups_store::GroupsStore;
-use crate::routing_store::RoutingStore;
+use crate::store::groups::GroupsStore;
+use crate::store::routing::RoutingStore;
 use crate::util::node_names::{slugify, AP2_DEV_PREFIX};
 use std::path::Path;
 

@@ -151,7 +151,7 @@ anchor capture. With RAOP gone there are exactly two impls —
 Every output kind below is mDNS-discovered, which on a real home network
 also finds the neighbours' HomePods and any laptop running
 `module-rtp-session`. So discovery is an **offer**, not an enrolment:
-`outputs_store.rs` records one verdict per stable node name — *adopted*,
+`store/outputs.rs` records one verdict per stable node name — *adopted*,
 *discovered* (undecided) or *ignored* — and only an **adopted** output is
 real. The gate is applied in exactly three places, all of which read
 routing intent through the adopted set:

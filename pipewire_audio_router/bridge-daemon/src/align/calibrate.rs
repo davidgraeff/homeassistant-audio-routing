@@ -524,7 +524,7 @@ pub struct AlignState {
     pub interference: Vec<Interference>,
     /// The routing intent the session is displacing while it holds these speakers —
     /// what the UI shows as "these will stop playing what they are playing now".
-    pub displaced: Vec<crate::routing_store::RoutingLink>,
+    pub displaced: Vec<crate::store::routing::RoutingLink>,
 }
 
 impl AlignState {
@@ -2087,8 +2087,8 @@ mod tests {
         groups: SharedGroups,
         changes: crate::pw::thread::ChangeNotifier,
         _changes_rx: tokio::sync::broadcast::Receiver<()>,
-        routing: crate::routing_store::SharedRouting,
-        outputs: crate::outputs_store::SharedOutputs,
+        routing: crate::store::routing::SharedRouting,
+        outputs: crate::store::outputs::SharedOutputs,
         hold_id: u64,
         anchor: u32,
     }
@@ -2138,10 +2138,10 @@ mod tests {
             // so a re-form fails fast and visibly instead of waiting for an anchor.
             let dir = std::env::temp_dir();
             let outputs = Arc::new(std::sync::Mutex::new(
-                crate::outputs_store::OutputsStore::load(&dir.join(format!("calib-outputs-{tag}-{}.json", std::process::id()))).unwrap(),
+                crate::store::outputs::OutputsStore::load(&dir.join(format!("calib-outputs-{tag}-{}.json", std::process::id()))).unwrap(),
             ));
             let routing = Arc::new(std::sync::Mutex::new(
-                crate::routing_store::RoutingStore::load(&dir.join(format!("calib-routing-{tag}-{}.json", std::process::id()))).unwrap(),
+                crate::store::routing::RoutingStore::load(&dir.join(format!("calib-routing-{tag}-{}.json", std::process::id()))).unwrap(),
             ));
             Self { mgr, sendspin, ap2, groups, changes, _changes_rx, routing, outputs, hold_id, anchor }
         }

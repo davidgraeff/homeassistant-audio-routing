@@ -128,7 +128,7 @@
 use crate::align::calibrate::{AlignMember, MemberKind};
 use crate::announce_arbiter::ReservationId;
 use crate::pw::thread::ChangeNotifier;
-use crate::routing_store::{RoutingLink, SharedRouting};
+use crate::store::routing::{RoutingLink, SharedRouting};
 use crate::sync_group::SharedGroups;
 use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use serde::{Deserialize, Serialize};
@@ -273,8 +273,8 @@ pub type HoldLabels = BTreeMap<String, String>;
 ///
 /// The rename store is the source of truth, so an interference sentence says
 /// "Kitchen" exactly when the chip beside it does.
-pub fn resolve_labels(outputs: &crate::outputs_store::SharedOutputs, held: &BTreeSet<String>) -> HoldLabels {
-    let names = crate::outputs_store::names_snapshot(outputs);
+pub fn resolve_labels(outputs: &crate::store::outputs::SharedOutputs, held: &BTreeSet<String>) -> HoldLabels {
+    let names = crate::store::outputs::names_snapshot(outputs);
     held.iter().map(|n| (n.clone(), names.get(n).cloned().unwrap_or_else(|| crate::routing::output_display_name(n)))).collect()
 }
 
@@ -392,7 +392,7 @@ pub struct HoldDeps<'a> {
     pub routing: &'a SharedRouting,
     /// Adoption verdicts — a discovered-but-not-added output must not be dialed
     /// (see docs: the output adoption gate).
-    pub outputs: &'a crate::outputs_store::SharedOutputs,
+    pub outputs: &'a crate::store::outputs::SharedOutputs,
 }
 
 /// A formed, held, exclusive alignment group.
@@ -446,12 +446,12 @@ impl ExclusiveHold {
     /// [`plan_hold`] first and does not call this at all when the existing hold
     /// already covers the request.
     pub async fn form(deps: &HoldDeps<'_>, outputs: Vec<String>, mode: AlignMode) -> Result<Self, String> {
-        let adopted = crate::outputs_store::adopted_snapshot(deps.outputs);
+        let adopted = crate::store::outputs::adopted_snapshot(deps.outputs);
         let members = validate_selection(&outputs, &adopted)?;
         let held: BTreeSet<String> = members.iter().map(|m| m.node_name.clone()).collect();
         let labels = resolve_labels(deps.outputs, &held);
         let displaced: Vec<RoutingLink> =
-            crate::routing_store::snapshot(deps.routing).into_iter().filter(|l| held.contains(&l.output)).collect();
+            crate::store::routing::snapshot(deps.routing).into_iter().filter(|l| held.contains(&l.output)).collect();
         let mut hold = Self::acquire(deps.groups, deps.changes, members, labels, mode, displaced).await;
         match hold.await_anchor().await {
             Some(anchor) => {
@@ -929,9 +929,9 @@ mod tests {
     fn an_interference_sentence_carries_the_users_name_for_the_speaker() {
         let path = std::env::temp_dir().join(format!("align-group-labels-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let mut store = crate::outputs_store::OutputsStore::load(&path).unwrap();
+        let mut store = crate::store::outputs::OutputsStore::load(&path).unwrap();
         store.set_name("sendspin-dev-kitchen", Some("Küche")).unwrap();
-        let outputs: crate::outputs_store::SharedOutputs = std::sync::Arc::new(Mutex::new(store));
+        let outputs: crate::store::outputs::SharedOutputs = std::sync::Arc::new(Mutex::new(store));
 
         // The rename store is the source of truth; an output nobody renamed falls back
         // to the derived name, exactly as the Outputs page and the matrix resolve it.

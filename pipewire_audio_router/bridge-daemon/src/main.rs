@@ -16,9 +16,7 @@ mod applemidi_sender;
 mod audio;
 mod bt_bridge_discovery;
 mod discovery_supervisor;
-mod groups_store;
 mod now_playing;
-mod outputs_store;
 mod overlay_mixer;
 mod per_device_spike;
 mod pw;
@@ -29,17 +27,15 @@ mod pw_target_discovery;
 mod pw_target_liveness;
 mod pwsink_agent;
 mod pwsink_server;
-mod raop_migration;
 mod routing;
-mod routing_store;
 mod rtp_source;
 mod sendspin_codec;
 mod sendspin_discovery;
 mod sendspin_liveness;
 mod sendspin_server;
 mod sendspin_volume;
-mod settings_store;
 mod sources_store;
+mod store;
 mod sync_group;
 mod sync_settings;
 mod util;
@@ -142,7 +138,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // deployment has booted once. Stale per-output RAOP latency / settings keys
     // are dropped automatically by serde (the fields no longer exist).
     let groups_config_path = routing_path.with_file_name("groups.json");
-    raop_migration::migrate_raop_prefixes(routing_path, &groups_config_path);
+    crate::store::migration::migrate_raop_prefixes(routing_path, &groups_config_path);
 
     let sources = sources_store::SourcesStore::load(sources_path)?;
     {
@@ -156,20 +152,20 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // so there's no single process-wide flag here anymore.
     let sources = std::sync::Arc::new(std::sync::Mutex::new(sources));
 
-    let routing = routing_store::RoutingStore::load(routing_path)?;
+    let routing = crate::store::routing::RoutingStore::load(routing_path)?;
     tracing::info!("{} persisted routing link(s) in {}", routing.links().count(), routing_path.display());
-    let routing: routing_store::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
+    let routing: crate::store::routing::SharedRouting = std::sync::Arc::new(std::sync::Mutex::new(routing));
 
-    // Which discovered outputs the user has adopted (outputs_store.rs) — the
+    // Which discovered outputs the user has adopted (store/outputs.rs) — the
     // gate that keeps a freshly discovered device out of the routing matrix and
     // out of Home Assistant until it's added on the Outputs page. Beside the
     // other /data stores; empty on a fresh install *and* on upgrade, so an
     // existing deployment comes up with its routing intact but dormant until
     // each device is added once.
     let outputs_path = routing_path.with_file_name("outputs.json");
-    let outputs = outputs_store::OutputsStore::load(&outputs_path)?;
+    let outputs = crate::store::outputs::OutputsStore::load(&outputs_path)?;
     tracing::info!("{} adopted output(s) in {}", outputs.adopted().len(), outputs_path.display());
-    let outputs: outputs_store::SharedOutputs = std::sync::Arc::new(std::sync::Mutex::new(outputs));
+    let outputs: crate::store::outputs::SharedOutputs = std::sync::Arc::new(std::sync::Mutex::new(outputs));
 
     // Sync/latency tuning (group lead + per-device static delays), kept next to
     // routing.json in /data. Derived from the routing path so there's no extra
@@ -190,7 +186,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // persisted value is authoritative.
     let settings_path = routing_path.with_file_name("settings.json");
     let settings_fresh = !settings_path.exists();
-    let mut settings = settings_store::SettingsStore::load(&settings_path)?;
+    let mut settings = crate::store::settings::SettingsStore::load(&settings_path)?;
     if settings_fresh {
         settings.set_discovery_enabled(discovery_enabled_env())?;
     }
@@ -200,18 +196,18 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         if settings.discovery_enabled() { "on" } else { "off" },
         settings_path.display()
     );
-    let settings: settings_store::SharedSettings = std::sync::Arc::new(std::sync::Mutex::new(settings));
+    let settings: crate::store::settings::SharedSettings = std::sync::Arc::new(std::sync::Mutex::new(settings));
 
-    // Named music/announcement groups (groups_store.rs), beside the other /data
+    // Named music/announcement groups (store/groups.rs), beside the other /data
     // stores. The MG/AG data model behind the two-tier grouping design.
-    let groups_config = groups_store::GroupsStore::load(&groups_config_path)?;
+    let groups_config = crate::store::groups::GroupsStore::load(&groups_config_path)?;
     tracing::info!(
         "{} music group(s), {} announcement group(s) in {}",
         groups_config.music().len(),
         groups_config.announcement().len(),
         groups_config_path.display()
     );
-    let groups_config: groups_store::SharedGroupsStore = std::sync::Arc::new(std::sync::Mutex::new(groups_config));
+    let groups_config: crate::store::groups::SharedGroupsStore = std::sync::Arc::new(std::sync::Mutex::new(groups_config));
 
     // Running AirPlay receivers, keyed by source id (one per configured AirPlay
     // source), reconciled against the store below and via the API.

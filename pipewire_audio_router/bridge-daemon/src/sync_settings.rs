@@ -3,7 +3,7 @@
 //! possible, but keep everyone playing together".
 //!
 //! Two things live here, both keyed by stable name so they survive restarts,
-//! node reloads and device churn (same rationale as routing_store.rs):
+//! node reloads and device churn (same rationale as store/routing.rs):
 //!
 //! - **`group_lead_ms`** — the sendspin group's presentation lead
 //!   ([`sendspin::server::Group::with_send_ahead_us`]). It's how far ahead of

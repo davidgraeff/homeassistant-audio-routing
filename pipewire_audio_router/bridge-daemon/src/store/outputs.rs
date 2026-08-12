@@ -24,12 +24,12 @@
 //!   checkbox, so a network full of foreign devices stays out of the way.
 //!
 //! Keyed by the same stable `node_name` as the routing intent
-//! (routing_store.rs), so adoption survives a restart, a device dropping off
+//! (store/routing.rs), so adoption survives a restart, a device dropping off
 //! the network, and mDNS re-resolution. Adopting is *not* remembered per
 //! device-kind: the name prefix (`sendspin-dev-`, `ap2-dev-`, `pwsink-dev-`)
 //! already carries that.
 //!
-//! Mirrors the other `/data` stores (routing_store.rs, settings_store.rs): no
+//! Mirrors the other `/data` stores (store/routing.rs, store/settings.rs): no
 //! `options.json` seeding, every field `serde(default)` so an older/newer file
 //! still loads, and the file is authoritative once written (created on the
 //! first mutation). **No migration on upgrade** — an existing install comes up

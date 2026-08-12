@@ -4,7 +4,7 @@
 //! three knobs) and *exactly one* Bluetooth-bridge RTP source. It is now a
 //! **keyed collection** of sources of two kinds (AirPlay + RTP), so the user can
 //! add/remove more than one of either type at runtime, each independently
-//! routable. Mirrors outputs_store.rs: no `options.json` seeding — starts empty
+//! routable. Mirrors store/outputs.rs: no `options.json` seeding — starts empty
 //! on a fresh install, then the `/data` file is authoritative and everything is
 //! managed live via the API (api.rs).
 //!

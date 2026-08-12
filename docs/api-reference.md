@@ -102,7 +102,7 @@ filtering, no HA-specific concepts.
 > **RAOP outputs are gone.** Earlier versions of this API let you `POST`/`DELETE`
 > `libpipewire-module-raop-sink` outputs by hand. AirPlay output is now the native
 > **AirPlay 2** sender, and there are no create/delete endpoints left: outputs are
-> **auto-discovered over mDNS** and appear on their own. `raop_migration.rs` rewrites
+> **auto-discovered over mDNS** and appear on their own. `store/migration.rs` rewrites
 > any surviving `raop-out-*` names in the routing and groups stores on startup.
 
 Three output backends are discovered and reported here, all as virtual routing
@@ -116,7 +116,7 @@ outputs:
 
 Discovery only **offers** a device, though: mDNS on a home network also finds the
 neighbours' AirPlay speakers, so each discovered device carries a user verdict
-(`outputs_store.rs`, `/data/outputs.json`) in its `state` field —
+(`store/outputs.rs`, `/data/outputs.json`) in its `state` field —
 
 | `state` | Meaning |
 |---|---|

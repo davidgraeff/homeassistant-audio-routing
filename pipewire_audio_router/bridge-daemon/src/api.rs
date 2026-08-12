@@ -4,14 +4,14 @@
 use crate::airplay_clients::AirplayClientStore;
 use crate::ap2_discovery::SharedAp2Devices;
 use crate::ap2_ptp::SharedAp2Ptp;
-use crate::outputs_store::{OutputState, SharedOutputs};
 use crate::pw::thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
-use crate::routing_store::SharedRouting;
 use crate::rtp_source::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
 use crate::sendspin_discovery::SharedSendspinDevices;
-use crate::settings_store::SharedSettings;
 use crate::sources_store::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore};
+use crate::store::outputs::{OutputState, SharedOutputs};
+use crate::store::routing::SharedRouting;
+use crate::store::settings::SharedSettings;
 use crate::util::locks::LockRecover;
 use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX};
 use airplay_core::features::Features;
@@ -93,18 +93,18 @@ pub struct AppState {
     pub ap2_ptp: SharedAp2Ptp,
     pub sendspin_control: crate::sendspin_volume::SharedSendspinControl,
     pub ap2_control: crate::ap2_volume::SharedAp2Control,
-    /// Persistent routing intent (routing_store.rs): links by stable node
+    /// Persistent routing intent (store/routing.rs): links by stable node
     /// name, reconciled onto the live graph so routing survives node reloads
     /// and device disappearance/reappearance.
     pub routing: SharedRouting,
-    /// Which discovered outputs the user adopted (outputs_store.rs). Discovery
+    /// Which discovered outputs the user adopted (store/outputs.rs). Discovery
     /// only *offers* a device; until it's added here it stays out of the routing
     /// matrix, out of Home Assistant and out of the group reconciler.
     pub outputs: SharedOutputs,
     /// Persistent sync/latency tuning (sync_settings.rs): the group presentation
     /// lead + per-sendspin-device static delays.
     pub sync_settings: crate::sync_settings::SharedSyncSettings,
-    /// General app settings (settings_store.rs): announce default duck, mDNS
+    /// General app settings (store/settings.rs): announce default duck, mDNS
     /// discovery on/off.
     pub settings: SharedSettings,
     /// Runtime mDNS on/off, driven by the discovery flag above.
@@ -114,8 +114,8 @@ pub struct AppState {
     /// Live sync-group layout (sync_group.rs) — used to restart a group's
     /// sendspin stream when a static-delay change needs it to take effect.
     pub groups: crate::sync_group::SharedGroups,
-    /// Named music/announcement groups (groups_store.rs) — the MG/AG data model.
-    pub groups_config: crate::groups_store::SharedGroupsStore,
+    /// Named music/announcement groups (store/groups.rs) — the MG/AG data model.
+    pub groups_config: crate::store::groups::SharedGroupsStore,
     /// Add-on version string (main.rs `addon_version()`), for `/api/status`.
     pub version: String,
     /// Process start instant, for the `/api/status` uptime.
@@ -162,7 +162,7 @@ pub fn router(
     discovery: crate::discovery_supervisor::DiscoverySupervisor,
     align: crate::align::calibrate::AlignManager,
     groups: crate::sync_group::SharedGroups,
-    groups_config: crate::groups_store::SharedGroupsStore,
+    groups_config: crate::store::groups::SharedGroupsStore,
     version: String,
     started: std::time::Instant,
     static_dir: PathBuf,
@@ -537,7 +537,7 @@ pub(crate) struct OutputInfo {
     /// Always `false` now that every output is mDNS auto-discovered (kept for
     /// the API shape / a possible future manually-added output kind).
     configured: bool,
-    /// The user's verdict on this discovered device (outputs_store.rs):
+    /// The user's verdict on this discovered device (store/outputs.rs):
     /// `"adopted"` (a real output), `"discovered"` (found, awaiting a decision)
     /// or `"ignored"` (dismissed). Only `"adopted"` outputs are routable and
     /// exposed to Home Assistant.
@@ -841,7 +841,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
     // ≥2 present AP2 receivers share a source-set (a multi-room group that would
     // audibly drift without a shared clock). A lone AP2 output renders realtime
     // fine unlocked.
-    let ap2_intent = crate::routing_store::snapshot(&state.routing);
+    let ap2_intent = crate::store::routing::snapshot(&state.routing);
     let ap2_present_nodes: Vec<String> = ap2_devices.keys().cloned().collect();
     // Device-authoritative volume/mute snapshot (read from the receiver on connect,
     // or set by the user); volume is absent when unknown → reported as `None`.
@@ -1006,7 +1006,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
     // The user's own name for an output wins over whatever discovery reported —
     // applied once here rather than per kind above, since every kind derives its
     // name differently but overrides the same way.
-    let renamed = crate::outputs_store::names_snapshot(&state.outputs);
+    let renamed = crate::store::outputs::names_snapshot(&state.outputs);
     for o in &mut outputs {
         if let Some(name) = renamed.get(&o.node_name) {
             o.name = name.clone();
@@ -2151,7 +2151,7 @@ async fn set_sync_settings(State(state): State<AppState>, Json(req): Json<SetSyn
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
 
-/// General app settings (settings_store.rs) — the Settings page's General
+/// General app settings (store/settings.rs) — the Settings page's General
 /// section. Group lead lives on `/api/sync/settings` (it's sync-specific).
 #[derive(Serialize)]
 struct SettingsInfo {
@@ -2506,7 +2506,7 @@ struct AgAnnounceRequest {
     /// `announcement_group` is given (its targets are used).
     #[serde(default)]
     targets: Vec<String>,
-    /// Named announcement group (groups_store.rs) to resolve targets/priority/duck.
+    /// Named announcement group (store/groups.rs) to resolve targets/priority/duck.
     #[serde(default)]
     announcement_group: Option<String>,
     #[serde(default)]
@@ -2724,7 +2724,7 @@ struct DuckRequest {
     /// Output node names to duck. Optional if `announcement_group` is given.
     #[serde(default)]
     targets: Vec<String>,
-    /// Named announcement group (groups_store.rs) whose targets to duck — the
+    /// Named announcement group (store/groups.rs) whose targets to duck — the
     /// same addressing `/api/announce` accepts, so an AG can double as "these
     /// speakers" without repeating the list.
     #[serde(default)]
@@ -2872,7 +2872,7 @@ async fn duck_list() -> Json<Vec<DuckHoldView>> {
     )
 }
 
-// ---- Named groups (groups_store.rs) -------------------------------------
+// ---- Named groups (store/groups.rs) -------------------------------------
 
 #[derive(Deserialize)]
 struct CreateMusicGroupRequest {
@@ -2909,7 +2909,7 @@ struct UpdateAnnouncementGroupRequest {
     duck: Option<f32>,
 }
 
-async fn list_music_groups(State(state): State<AppState>) -> Json<Vec<crate::groups_store::MusicGroup>> {
+async fn list_music_groups(State(state): State<AppState>) -> Json<Vec<crate::store::groups::MusicGroup>> {
     Json(state.groups_config.lock_recover().music().to_vec())
 }
 
@@ -2966,7 +2966,7 @@ async fn route_music_group(
     if members.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: "music group has no members".into() }));
     }
-    let snapshot = crate::routing_store::snapshot(&state.routing);
+    let snapshot = crate::store::routing::snapshot(&state.routing);
     {
         let mut store = state.routing.lock_recover();
         for member in &members {
@@ -2998,7 +2998,7 @@ async fn unroute_music_group(State(state): State<AppState>, Path(id): Path<Strin
             None => return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("no music group '{id}'") })),
         }
     };
-    let snapshot = crate::routing_store::snapshot(&state.routing);
+    let snapshot = crate::store::routing::snapshot(&state.routing);
     {
         let mut store = state.routing.lock_recover();
         for l in snapshot.iter().filter(|l| members.contains(&l.output)) {
@@ -3009,7 +3009,7 @@ async fn unroute_music_group(State(state): State<AppState>, Path(id): Path<Strin
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("un-routed music group '{id}'") }))
 }
 
-async fn list_announcement_groups(State(state): State<AppState>) -> Json<Vec<crate::groups_store::AnnouncementGroup>> {
+async fn list_announcement_groups(State(state): State<AppState>) -> Json<Vec<crate::store::groups::AnnouncementGroup>> {
     Json(state.groups_config.lock_recover().announcement().to_vec())
 }
 
@@ -3288,7 +3288,7 @@ fn measure_deps(state: &AppState, mode: Mode, chained: bool, link_to: Vec<String
     // restores and the value the solve adds to.
     // Snapshotted before the sync-settings lock is taken: two locks in one expression
     // is how a lock-order inversion gets written.
-    let adopted = crate::outputs_store::adopted_snapshot(&state.outputs);
+    let adopted = crate::store::outputs::adopted_snapshot(&state.outputs);
     let (current_delays, send_ahead) = {
         let ss = state.sync_settings.lock_recover();
         let mut delays: HashMap<String, u16> = ss.sendspin_delays().into_iter().collect();
@@ -3626,7 +3626,7 @@ struct SetOutputNameRequest {
     name: Option<String>,
 }
 
-/// Rename an output (persisted in outputs_store.rs, keyed by node name).
+/// Rename an output (persisted in store/outputs.rs, keyed by node name).
 ///
 /// A device's own mDNS name is often useless in a house (`ap2-dev-living-2`, or
 /// four speakers all called "Yamaha"), so the name shown everywhere — Outputs,

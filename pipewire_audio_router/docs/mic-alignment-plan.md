@@ -405,7 +405,7 @@ Any per-speaker frequency labelling is new work (§6.2).
 
 `set_sendspin_delay_handler` (`api.rs:3117`) persists the delay, pushes it live,
 and then — unless `sendspin_delay_live` is on, which it is not by default
-(`settings_store.rs:52`) — calls `force_device_reconnect` for that one device,
+(`store/settings.rs:52`) — calls `force_device_reconnect` for that one device,
 because current ESPHome firmware reads the static delay only at stream start.
 Hardware-confirmed: a reconnecting sendspin device takes **tens of seconds** to
 render again regardless of how the previous session ended. AP2 render delay is the

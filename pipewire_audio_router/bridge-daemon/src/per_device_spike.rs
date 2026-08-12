@@ -21,10 +21,11 @@
 
 use crate::pw::thread::{ChangeNotifier, PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
-use crate::routing_store::{self, SharedRouting};
 use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::sendspin_server::{self, SendspinServerHandle};
 use crate::sendspin_volume::SharedSendspinControl;
+use crate::store;
+use crate::store::routing::SharedRouting;
 use crate::util::locks::LockRecover;
 use serde::Serialize;
 use std::sync::{Arc, OnceLock};
@@ -115,7 +116,7 @@ pub async fn start(
     // 1. Free the device from production routing so only our single-member server
     //    dials it. Remembered for restore on teardown.
     let freed_links: Vec<(String, String)> =
-        routing_store::snapshot(routing).into_iter().filter(|l| l.output == device_node_name).map(|l| (l.source, l.output)).collect();
+        store::routing::snapshot(routing).into_iter().filter(|l| l.output == device_node_name).map(|l| (l.source, l.output)).collect();
     if !freed_links.is_empty() {
         // Mutate the store in a *sync* helper so the (non-Send) std MutexGuard
         // never enters this async fn's state across the await below.
@@ -237,7 +238,7 @@ pub async fn start_multi(
 
     // Free all target devices from production routing (restored on teardown).
     let targets: std::collections::HashSet<&str> = device_node_names.iter().map(String::as_str).collect();
-    let freed_links: Vec<(String, String)> = routing_store::snapshot(routing)
+    let freed_links: Vec<(String, String)> = store::routing::snapshot(routing)
         .into_iter()
         .filter(|l| targets.contains(l.output.as_str()))
         .map(|l| (l.source, l.output))
