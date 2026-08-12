@@ -14,10 +14,17 @@ drops out every 5–10 min for up to 2 min).
 
 ## Environment / who's who (dev setup)
 
-- **HA host (daemon)** = `192.168.178.22` (`homeassistant.local`), add-on
-  container `addon_local_pipewire_audio_router`, daemon REST API on
-  `:8099`. SSH: `ssh root@homeassistant.local` (add-on container;
+- **HA host (daemon)** = `192.168.178.22` (`homeassistant.local`), daemon REST API
+  on `:8099`. SSH: `ssh root@homeassistant.local` (add-on container;
   `export XDG_RUNTIME_DIR=/run/user/0` for `pw-*` tools).
+- **The daemon's container name is `app_local_pipewire_audio_router`.** The
+  Supervisor used to name add-on containers `addon_*` and now uses `app_*`, so every
+  older recipe fails with a bare `No such container` — which reads like the add-on is
+  down rather than misnamed. Don't hardcode it; resolve it:
+  ```bash
+  ssh root@homeassistant.local 'docker ps --format "{{.Names}}" | grep pipewire'
+  # or, in a script:  C=$(docker ps --format '{{.Names}}' | grep pipewire_audio_router)
+  ```
 - **Receivers (AP2):** "Dusche" = Yamaha WX-021 `192.168.178.165`;
   "Pioneer" = VSX-934 `192.168.178.35`.
 - **AirPlay sender (input source)** = a Fedora box `192.168.178.21`.
@@ -93,6 +100,32 @@ a true lock-liveness signal.
 ssh root@homeassistant.local 'timeout 6 tcpdump -ni any "udp and (port 319 or port 320)"'
 ```
 
+### First: "needs several attempts" is usually **our** leaked session, not the receiver
+
+Before concluding anything about a receiver, separate the two failure modes — they look
+similar in the UI and have opposite causes. **Ask whether RTSP made progress.**
+
+| | wedged AirTunes (receiver's fault) | leaked session (ours) |
+|---|---|---|
+| log | fails at the *first* request, no `airplay_client` line in between | `Events port … connect timed out after 3s` → `RECORD timed out` |
+| `GET /info` from another host | **zero bytes**, no reply ever | answers in ~4 ms |
+| clears by | mains power cycle only | the next attempt, or on its own — "works after a few tries" |
+
+If `GET /info` answers, the receiver is healthy and the fault is on our side. **The
+mechanism, fixed 2026-08-12:** the vendored `Connection` has **no `Drop` impl**, `stop()`
+sends only FLUSH, and only `disconnect()` sends TEARDOWN — so a *failed* connect used to
+drop the value and tell the receiver nothing, leaving its single AirPlay session occupied
+(and detaching, not aborting, the `events_task`/`timing_task`/`ptp_master_sync_task` that
+`setup()` had already spawned). Retry N+1 then met a receiver still holding retry N's
+session: its event port stops accepting, RECORD times out, and that failure abandons
+another session — self-sustaining until the receiver's own session timeout expires. That
+is the "I always need to reconnect it a few times" symptom, and it was self-inflicted.
+`connect_one` now calls `abandon()` (bounded `disconnect()`) on every failure path.
+
+So a receiver needing several attempts is **not** evidence of a bad receiver. Confirmed on
+the Pioneer VSX-934 on 2026-08-12: it failed our connects repeatedly while answering
+`GET /info` in ~4 ms throughout, with the liveness probe never once demoting it.
+
 ### A receiver that accepts TCP but answers nothing ("wedged AirTunes")
 
 Symptom: one AP2 output never plays while others on the same source do. The log
@@ -155,7 +188,7 @@ mid-session: a Yamaha WX-021 streaming from this daemon answered six of them in
 ### Real-time thread inventory
 
 ```
-docker exec addon_local_pipewire_audio_router sh -c \
+docker exec app_local_pipewire_audio_router sh -c \
   'for t in $(ls /proc/$(pidof bridge-daemon)/task); do chrt -p $t; done'
 ```
 
@@ -164,6 +197,88 @@ Elevated threads should be: PipeWire `data-loop.N` (FIFO 83, ×6),
 mainloops (45), `ap2-relay`/`sendspin-relay` (40). (libairptp's worker may
 show a sibling thread's `comm` because its `thread_name_set` callback path
 can be null — identify it by the unique FIFO-55 priority, not the name.)
+
+### Thread ages, not just priorities — finding leaked senders
+
+`chrt` says what priority a thread runs at; it does not say whether the thread should
+still exist. For that, read each thread's `starttime` (field 22 of
+`/proc/<pid>/task/<tid>/stat`, in ticks since boot) and its CPU (fields 14+15), and take
+**two samples a few minutes apart**:
+
+```bash
+C=$(docker ps --format '{{.Names}}' | grep pipewire_audio_router)
+docker exec $C sh -c 'cat /proc/uptime; for t in /proc/$(pidof bridge-daemon)/task/*; do cat $t/stat; done'
+# per thread: age = uptime - starttime/100 ;  cpu = (utime+stime)/100
+# comm is between the first '(' and the LAST ')' — parsing on whitespace breaks
+# on thread names containing spaces, and on the parens themselves.
+```
+
+The signal is a **generation pattern**: several threads with the same `comm` and clearly
+different ages, where the count exceeds the number of things actually being served. On
+2026-08-12 a 40-minute-old daemon had three `ap2-producer` and five `rt-sender` threads
+against exactly **one** receiver streaming, spawned in three bursts that lined up with an
+alignment session, a failed Pioneer connect and a group restart. Two of the orphaned
+producers were still burning ~1.4 % CPU each with nothing to feed. Cross-check "how many
+should there be" on the wire rather than from the log:
+
+```bash
+# distinct UDP flows to a receiver — one audio flow per live session, plus 319/320 gPTP
+ssh root@homeassistant.local 'timeout 8 tcpdump -ni any -c 400 "udp and host <receiver-ip>" \
+  | grep -oE "192\.168\.178\.22\.[0-9]+ > <receiver-ip>\.[0-9]+" | sort | uniq -c | sort -rn'
+```
+
+Root cause and fix: `outputs/ap2/server.rs` reached teardown only after its connect loop
+had finished every member, so a group abandoned mid-connect never stopped the sender
+threads of the members already up. Teardown is now a function called on every exit path,
+a stop request is observed *between* members, and the post-connect volume read is bounded
+(`AP2_VOLUME_READ_TIMEOUT`).
+
+### The web UI is served but has no interactive parts
+
+Symptom: pages load, and the graph/outputs/settings widgets never populate. This is
+**not** the mDNS/CPU-starvation mode below — there the whole daemon is slow. Here most of
+the API is instant and a few endpoints hang forever, so bisect by endpoint before
+anything else:
+
+```bash
+for ep in /api/status /api/sources /api/settings /api/nodes /api/agents \
+          /api/sync/settings /api/groups/music /api/align \
+          /api/outputs /api/outputs/discovered /api/routing; do
+  printf '%-28s ' "$ep"
+  curl -s -o /dev/null -w 'http=%{http_code} t=%{time_total}s\n' --max-time 6 \
+    "http://192.168.178.22:8099$ep"
+done
+```
+
+A **split result is the diagnosis**: everything at 1–3 ms except a few at `http=000`
+after the timeout. Then map the hanging set onto the shared state it locks — the
+intersection names the wedged mutex. On 2026-08-12 exactly `/api/outputs`,
+`/api/outputs/discovered` and `/api/routing` hung, which is precisely the set that locks
+`state.ap2_control`; `/api/status` (PipeWire registry + `ap2_devices` + `sendspin_devices`
++ routing store) and `/api/agents` (the *other* async mutex) answered in 2 ms, which ruled
+every other candidate out without touching the code.
+
+Root cause: `Ap2Control`'s guard was held across `mpsc::Sender::send().await` on a
+depth-32 channel, so any group task that stopped draining it blocked every reader of that
+guard — including the reconciler, which is why AP2 also stopped retrying. The trigger was
+the unbounded `get_volume()` after `register()`: a wedged receiver left the device
+registered with nothing consuming its commands. Now every `Ap2Control` mutator is
+**synchronous** and uses `try_send` (`outputs/ap2/volume.rs`; the module header documents
+the rule and `a_task_that_stopped_draining_cannot_stall_a_writer` pins it).
+
+**Check the FD cascade too — it outlives the cause.** Each hung request leaks a socket
+and a blocked task, because the handler can't notice the client left:
+
+```bash
+docker exec $C sh -c 'PID=$(pidof bridge-daemon); ls /proc/$PID/fd | wc -l;
+  grep "Max open files" /proc/$PID/limits;
+  awk "NR>1{print \$4}" /proc/$PID/net/tcp | sort | uniq -c'   # 08 = CLOSE_WAIT
+```
+
+45 sockets sat in `CLOSE_WAIT` on `:8099` against a **1024** soft limit, climbing with
+every UI retry — so a wedged lock eventually becomes EMFILE and takes the audio sockets
+with it. A large `CLOSE_WAIT` count on 8099 is itself the fingerprint of a handler
+blocked on shared state.
 
 ### USER ACTION logging
 
@@ -176,8 +291,14 @@ distinguishes human actions from stack-driven churn.
 
 Symptom: sustained high CPU, stuttering audio, a device present-in-graph
 but silent, dead web UI. **Check host CPU first** — this has been host
-oversubscription (other add-ons) *and* the daemon's own mDNS daemons, not a
-daemon deadlock.
+oversubscription (other add-ons) *and* the daemon's own mDNS daemons.
+
+> Distinguish this from the deadlock above, because "dead web UI" is common to both and
+> they need opposite investigations. **Starvation:** the daemon is uniformly slow and CPU
+> is pegged (`docker stats`, per-thread CPU). **Deadlock:** CPU is unremarkable and the
+> API is *bimodal* — most endpoints in single-digit ms, a specific few hanging forever.
+> The endpoint sweep above costs seconds and tells you which one you have; run it before
+> reaching for `tcpdump`.
 
 ```
 # is the LAN flooding 5353? then which name is the culprit?
@@ -210,8 +331,8 @@ corrupt store file (e.g. `airplay_clients.json`):
 
 ```
 printf '{"clients":[]}' | ssh root@host 'docker run --rm -i --entrypoint sh \
-  --volumes-from addon_local_pipewire_audio_router \
-  "$(docker inspect addon_local_pipewire_audio_router --format {{.Config.Image}})" \
+  --volumes-from app_local_pipewire_audio_router \
+  "$(docker inspect app_local_pipewire_audio_router --format {{.Config.Image}})" \
   -c "cat > /data/<file>"'
 ```
 
@@ -237,8 +358,28 @@ printf '{"clients":[]}' | ssh root@host 'docker run --rm -i --entrypoint sh \
   a receiver whose AirTunes has stopped accepting (see the wedged-AirTunes section
   above), so `nc -z`, `ss`, and the old `ap2_liveness` probe all called a dead
   receiver healthy. Only a request/response round-trip is evidence.
+- **A repeated connect failure is not proof the receiver is wedged, and the inverse
+  mistake is easy to make.** On 2026-08-12 the `SETUP/RECORD timed out` pattern was read
+  as the wedged-AirTunes state and a mains power cycle was recommended — while the unit
+  was answering `GET /info` in ~4 ms and had never been demoted by the liveness probe. The
+  actual cause was our own un-torn-down session (see the table above). **Run the `GET
+  /info` one-liner before blaming a receiver**; it is two seconds of work and it
+  discriminates the two cases outright. Certified receivers do fail this way, but far less
+  often than we leak a session.
 - **A leaked `rt-sender` thread** persists to a receiver after a spike stop
   if teardown doesn't join the sender thread — shows as RTP still flowing
   (rms=0) with "no spike running." Confirm sender count with the chrt
   inventory above; two `Connection`s fighting one receiver is a candidate
-  for "flaky, needs many reconnects."
+  for "flaky, needs many reconnects." The same class bit again on 2026-08-12 via a
+  different route (teardown unreachable when a group was abandoned mid-connect) — see
+  *Thread ages* above, and prefer thread **age** over count when attributing it.
+- **A stuttering symptom does not mean the daemon is at fault, and its own
+  instrumentation will tell you.** On 2026-08-12 the sendspin relay logged a steady
+  46.9 blocks/s with `received == replied` on every device and no drops or underruns,
+  while the host ran frigate-beta at 113 % CPU on a 4-core Pi with 1.76 GB swapped —
+  i.e. the same host-starvation mode as 2026-07-26, plus leaked producers on top. Read
+  the relay's own line first (`sendspin relay '<group>' [codec]: N blocks in 10.0s`);
+  if it is steady and drop-free, the stutter is downstream or host-side, not in the
+  send path. Note also that a low `group_lead_*_ms` is **not** automatically the
+  culprit: an opus lead of ~40 ms is stutter-free on an unloaded box, so a small lead
+  only matters together with contention.

@@ -122,7 +122,7 @@ pub(crate) async fn set_ap2_volume(
     State(state): State<AppState>,
     Json(req): Json<SetAp2VolumeRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    let reached = state.ap2_control.lock().await.set_volume(&req.node_name, req.volume).await;
+    let reached = state.ap2_control.lock().await.set_volume(&req.node_name, req.volume);
     let pct = (req.volume.clamp(0.0, 1.0) * 100.0).round() as u8;
     let message = if reached {
         format!("set '{}' to {}%", req.node_name, pct)
@@ -142,7 +142,7 @@ pub(crate) async fn set_ap2_mute(
     State(state): State<AppState>,
     Json(req): Json<SetAp2MuteRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    let reached = state.ap2_control.lock().await.set_muted(&req.node_name, req.muted).await;
+    let reached = state.ap2_control.lock().await.set_muted(&req.node_name, req.muted);
     let verb = if req.muted { "muted" } else { "unmuted" };
     let message =
         if reached { format!("{verb} '{}'", req.node_name) } else { format!("saved {verb} for '{}' (not streaming)", req.node_name) };

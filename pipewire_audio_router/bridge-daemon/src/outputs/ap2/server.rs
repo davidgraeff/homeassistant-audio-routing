@@ -24,13 +24,9 @@ use airplay_core::features::Features;
 use airplay_core::stream::{PtpMode, StreamConfig, TimingProtocol};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::outputs::ap2::volume::{Ap2Command, SharedAp2Control};
+use crate::outputs::ap2::volume::{Ap2Command, SharedAp2Control, AP2_CMD_DEPTH};
 use crate::routing::sync_settings::SharedSyncSettings;
 use crate::util::locks::LockRecover;
-
-/// Depth of the per-group volume-command channel (outputs/ap2/volume.rs → this task).
-/// Volume/mute changes are rare and tiny; a small buffer is ample.
-const AP2_CMD_DEPTH: usize = 32;
 
 const AP2_PORT: u16 = 7000;
 
@@ -123,6 +119,13 @@ struct ConnectFail {
 /// past the container's stop-grace (which would SIGKILL us and lose the TEARDOWNs
 /// that *did* have somewhere to go).
 const AP2_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a freshly-connected receiver gets to answer the post-connect
+/// `GET_PARAMETER` volume read. Deliberately short: the answer is only a UI nicety
+/// (an unknown level is reported honestly), while the wait happens at the one point in
+/// the group task's life where the device is already registered for commands but its
+/// command channel is not yet being drained.
+const AP2_VOLUME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A running group's AP2 senders. Dropping it signals the task to stop + TEARDOWN
 /// every receiver session (mirrors `SendspinServerHandle`: drop = tear down), and
@@ -300,8 +303,14 @@ async fn try_connect_once(
     // is read as a 48 kHz rejection, while a transient RECORD timeout just retries.
     match tokio::time::timeout(AP2_SETUP_TIMEOUT, conn.setup()).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(ConnectFail { at_setup: true, msg: format!("SETUP/RECORD failed: {e}") }),
-        Err(_) => return Err(ConnectFail { at_setup: false, msg: "SETUP timed out".into() }),
+        Ok(Err(e)) => {
+            abandon(&mut conn, node_name).await;
+            return Err(ConnectFail { at_setup: true, msg: format!("SETUP/RECORD failed: {e}") });
+        }
+        Err(_) => {
+            abandon(&mut conn, node_name).await;
+            return Err(ConnectFail { at_setup: false, msg: "SETUP timed out".into() });
+        }
     }
     // Live PCM feed at the group's capture rate (PipeWire resampled the anchor to
     // `rate` in-graph). Register it BEFORE starting so the capture-forward loop fills
@@ -314,7 +323,10 @@ async fn try_connect_once(
     let start = tokio::time::timeout(AP2_SETUP_TIMEOUT, conn.start_streaming_live(decoder)).await;
     if !matches!(start, Ok(Ok(()))) {
         senders.lock().unwrap().retain(|(n, _)| n != node_name);
+        // `stop()` is a FLUSH — it stops the audio but leaves the RTSP session open, so
+        // the full release below is what lets the next attempt start clean.
         let _ = tokio::time::timeout(AP2_SETUP_TIMEOUT, conn.stop()).await;
+        abandon(&mut conn, node_name).await;
         return Err(match start {
             Ok(Err(e)) => ConnectFail { at_setup: true, msg: format!("start_streaming_live failed: {e}") },
             _ => ConnectFail { at_setup: false, msg: "start_streaming_live timed out".into() },
@@ -323,6 +335,91 @@ async fn try_connect_once(
     // Device→UI volume feedback (best-effort; reverse event channel).
     let volume_rx = conn.volume_events();
     Ok((conn, volume_rx))
+}
+
+/// Release a connection we are giving up on: TEARDOWN the receiver's session and abort
+/// the tasks `setup()` started, bounded so an unresponsive receiver can't stall the
+/// connect loop.
+///
+/// **Why a failed attempt must still clean up.** The vendored `Connection` has **no
+/// `Drop` impl**, and the two obvious calls are not interchangeable: `stop()` sends a
+/// FLUSH (audio stops, session stays), and only `disconnect()` sends TEARDOWN. Dropping
+/// the value therefore tells the receiver *nothing* and detaches — rather than aborts —
+/// the `events_task`, `timing_task`, `ptp_master_sync_task` and timing server that
+/// `setup()` spawned. All of those exist before the RECORD step, so they outlive exactly
+/// the failures we see most.
+///
+/// The receiver-side half of that is the interesting one, and this project already knew
+/// the mechanism from the other direction: [`Ap2ServerHandle::shutdown`] exists so a
+/// receiver "releases its single AirPlay session now instead of holding a stale one until
+/// it times out — which is what makes the next start's first connect fail". An abandoned
+/// *failed* attempt did precisely what that comment warns about, so retry N+1 met a
+/// receiver still holding the session from retry N: its event port doesn't accept and
+/// RECORD times out, which fails, which abandons another session. That is a
+/// self-sustaining loop that ends only when the receiver's own session timeout expires —
+/// and it is the most likely explanation for "this receiver always needs a few attempts
+/// before it works". Observed against the Pioneer VSX-934 on 2026-08-12 (`Events port …
+/// connect timed out after 3s` → `RECORD timed out`) on a unit that answered `GET /info`
+/// in ~4 ms throughout, i.e. a perfectly healthy receiver.
+async fn abandon(conn: &mut Connection, node_name: &str) {
+    if tokio::time::timeout(AP2_TEARDOWN_TIMEOUT, conn.disconnect()).await.is_err() {
+        tracing::warn!(
+            "AP2: '{node_name}' did not acknowledge TEARDOWN within {:?} after a failed connect; \
+             its session may stay busy until the receiver times it out",
+            AP2_TEARDOWN_TIMEOUT
+        );
+    }
+}
+
+/// Apply one control command to whichever of this group's connections it names.
+///
+/// Shared by the two places that drain the command channel — the connect loop and the
+/// steady-state loop — because the channel MUST be drained in both. A command for a
+/// member that isn't connected (yet, or at all) is silently ignored: `Ap2Control`
+/// keeps the desired state and `register` re-applies it on the next connect.
+async fn apply_command(conns: &mut [(String, Connection)], cmd: Ap2Command) {
+    match cmd {
+        Ap2Command::SetVolume { node_name, volume } => {
+            if let Some((_, conn)) = conns.iter_mut().find(|(n, _)| *n == node_name) {
+                if let Err(e) = conn.set_volume(volume).await {
+                    tracing::warn!("AP2: set_volume for '{node_name}' failed: {e}");
+                }
+            }
+        }
+        Ap2Command::SetRenderDelay { node_name, ms } => {
+            // Live anchor-offset change — no reconnect (that churn could leave the
+            // receiver silent). The streamer picks it up on the next packet.
+            if let Some((_, conn)) = conns.iter_mut().find(|(n, _)| *n == node_name) {
+                conn.set_render_delay_live(u32::from(ms)).await;
+                tracing::info!("AP2: '{node_name}' render delay set live to {ms}ms");
+            }
+        }
+    }
+}
+
+/// TEARDOWN every connection this group established, releasing each receiver's single
+/// AirPlay session and **joining the SCHED_FIFO sender + producer threads that
+/// `start_streaming_live` spawned** (`Connection::stop`).
+///
+/// Factored out because it has to run on *every* exit from the group task, not just the
+/// steady-state one. It previously ran only after the connect loop had finished every
+/// member, so a task abandoned mid-connect — the handle dropped while an unresponsive
+/// receiver burned its timeouts — left the already-connected members' threads running
+/// for the life of the process. That is the AP2 thread leak: on 2026-08-12 a daemon 40
+/// minutes old had three `ap2-producer` threads and five `rt-sender` threads for one
+/// receiver actually streaming, two of the producers still burning ~1.4 % CPU each with
+/// nothing to feed.
+async fn teardown(conns: Vec<(String, Connection)>, fwd_tasks: Vec<tokio::task::JoinHandle<()>>, control: &SharedAp2Control) {
+    for t in fwd_tasks {
+        t.abort();
+    }
+    for (name, mut c) in conns {
+        control.lock().await.unregister(&name);
+        crate::outputs::overlay_mixer::OverlayMixer::global().clear_output_rate(&name);
+        let _ = c.stop().await;
+        let _ = c.disconnect().await; // also aborts the event-channel reader
+    }
+    tracing::info!("AP2 group: senders stopped");
 }
 
 /// Best-effort real-time scheduling for the capture→feed relay thread. Mirrors
@@ -432,9 +529,42 @@ pub fn start(
         // Set when a 48 kHz SETUP was rejected: cache the receiver as 44.1k-only and
         // nudge the reconciler so the group restarts at 44.1 kHz (auto-negotiation).
         let mut downgraded = false;
+        // Set once the handle asks us to stop. Checked between members so a group
+        // abandoned mid-connect stops connecting the *rest* of them and goes straight to
+        // teardown — which is what stops the sender threads of the members already up.
+        let mut shutting_down = false;
         for (name, ip, delay) in &members {
+            if shutting_down {
+                tracing::info!("AP2 group: shutting down; skipping the remaining member(s) from '{name}'");
+                break;
+            }
             let render_delay_ms = u32::from(delay.unwrap_or(AP2_RENDER_DELAY_MS as u16));
-            match connect_one(name, *ip, clock_id, render_delay_ms, rate, &senders).await {
+            // Connect this member while STILL SERVICING the command channel. Not
+            // draining `cmd_rx` for the length of a connect is what let the channel fill
+            // up: a caller then blocked on a full channel while holding the `Ap2Control`
+            // guard, which deadlocked `/api/outputs`, `/api/routing` and the reconciler
+            // (outputs/ap2/volume.rs `try_queue` documents the incident). `try_queue`
+            // alone makes that lossy rather than fatal; draining here is what keeps the
+            // queue from filling in the first place, since a connect against an
+            // unresponsive receiver is precisely the long window.
+            //
+            // A stop request is *recorded*, not acted on, until this connect returns:
+            // cancelling `connect_one` at its `start_streaming_live` await could orphan
+            // the SCHED_FIFO threads it had just spawned — the leak this is meant to
+            // prevent. Letting the in-flight member finish is bounded by
+            // AP2_CONNECT_TIMEOUT/AP2_SETUP_TIMEOUT and leaves a connection we can tear
+            // down properly.
+            let connect = connect_one(name, *ip, clock_id, render_delay_ms, rate, &senders);
+            tokio::pin!(connect);
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut connect => break result,
+                    // Guarded so the oneshot is never polled after it completes.
+                    _ = &mut shutdown_rx, if !shutting_down => shutting_down = true,
+                    Some(cmd) = cmd_rx.recv() => apply_command(&mut conns, cmd).await,
+                }
+            };
+            match outcome {
                 Ok((mut c, mut volume_rx)) => {
                     tracing::info!("AP2: streaming to '{}' ({}) @ {}Hz render_delay={}ms", name, ip, rate, render_delay_ms);
                     // It works — drop any stale "why isn't this playing" note the UI
@@ -445,12 +575,21 @@ pub fn start(
                     crate::outputs::overlay_mixer::OverlayMixer::global().set_output_rate(name, rate);
                     // Register the command channel (does NOT push a volume unless the
                     // user set one — the device's own volume is authoritative).
-                    control_task.lock().await.register(name.clone(), cmd_tx.clone()).await;
+                    control_task.lock().await.register(name.clone(), cmd_tx.clone());
                     // READ the receiver's current volume so the UI reflects the real
                     // level (what the user set on the device) rather than a made-up
                     // one. If the receiver doesn't answer GET_PARAMETER, leave it
                     // unknown (the UI shows no/zero level — honest).
-                    match c.get_volume().await {
+                    //
+                    // **Bounded**, because this sits between `register` (the device is
+                    // now in `Ap2Control::senders`) and the loop that drains its command
+                    // channel. An unbounded wait here is the worst possible place for
+                    // one: the device looks live to every writer while nothing consumes
+                    // what they write. A wedged receiver — TCP established, RTSP silent —
+                    // parked this indefinitely and took the daemon's whole UI down with
+                    // it (see docs/live-instance-debugging.md). A receiver that cannot
+                    // answer a volume read in this long simply has an unknown level.
+                    match tokio::time::timeout(AP2_VOLUME_READ_TIMEOUT, c.get_volume()).await.unwrap_or(None) {
                         Some(v) => {
                             tracing::info!("AP2: '{name}' reported volume {:.0}%", v * 100.0);
                             control_task.lock().await.note_reported_volume(name, v);
@@ -502,43 +641,21 @@ pub fn start(
             tracing::warn!("AP2 group: no receivers connected");
         }
 
-        // Run until the handle is dropped (shutdown), applying volume commands
-        // meanwhile. Then TEARDOWN each receiver session. The relay thread is
-        // stopped separately by the handle dropping `_capture` (closes the capture
-        // channel → relay's blocking_recv returns None).
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                Some(cmd) = cmd_rx.recv() => match cmd {
-                    Ap2Command::SetVolume { node_name, volume } => {
-                        if let Some((_, conn)) = conns.iter_mut().find(|(n, _)| *n == node_name) {
-                            if let Err(e) = conn.set_volume(volume).await {
-                                tracing::warn!("AP2: set_volume for '{node_name}' failed: {e}");
-                            }
-                        }
-                    }
-                    Ap2Command::SetRenderDelay { node_name, ms } => {
-                        // Live anchor-offset change — no reconnect (that churn could
-                        // leave the receiver silent). The streamer picks it up on the
-                        // next packet.
-                        if let Some((_, conn)) = conns.iter_mut().find(|(n, _)| *n == node_name) {
-                            conn.set_render_delay_live(u32::from(ms)).await;
-                            tracing::info!("AP2: '{node_name}' render delay set live to {ms}ms");
-                        }
-                    }
-                },
+        // Run until the handle is dropped (shutdown), applying control commands
+        // meanwhile. Skipped entirely if the stop already arrived during the connect
+        // loop — `shutdown_rx` has completed by then and must not be polled again.
+        // Either way we fall through to teardown, which is the only path that stops the
+        // sender threads. The relay thread is stopped separately by the handle dropping
+        // `_capture` (closes the capture channel → relay's blocking_recv returns None).
+        if !shutting_down {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    Some(cmd) = cmd_rx.recv() => apply_command(&mut conns, cmd).await,
+                }
             }
         }
-        for t in fwd_tasks {
-            t.abort();
-        }
-        for (name, mut c) in conns {
-            control_task.lock().await.unregister(&name);
-            crate::outputs::overlay_mixer::OverlayMixer::global().clear_output_rate(&name);
-            let _ = c.stop().await;
-            let _ = c.disconnect().await; // also aborts the event-channel reader
-        }
-        tracing::info!("AP2 group: senders stopped");
+        teardown(conns, fwd_tasks, &control_task).await;
     });
 
     Ok(Ap2ServerHandle { shutdown: Some(shutdown_tx), task: Some(task), capture: Some(capture), _relay: relay })

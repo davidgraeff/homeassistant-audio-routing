@@ -195,6 +195,7 @@ impl HttpdCallbacks for RaopShared {
             remote_addr: remote_str,
             cancel_rx: Some(cancel_rx),
             connected_at: std::time::Instant::now(),
+            request_log: std::collections::HashMap::new(),
             #[cfg(feature = "ap2")]
             cipher: None,
             #[cfg(feature = "ap2")]
@@ -212,6 +213,10 @@ struct RaopConnectionHandler {
     /// Connection-start instant, used to log per-request elapsed time for
     /// connect-latency diagnostics (AP2 PTP-sync wait vs AP1 fast path).
     connected_at: std::time::Instant,
+    /// Info-log throttle for the request timeline, keyed by method: when that method
+    /// was last logged at info, and how many of it have been suppressed since.
+    /// See [`RaopConnectionHandler::log_request_now`].
+    request_log: std::collections::HashMap<String, (std::time::Instant, u64)>,
     #[cfg(feature = "ap2")]
     cipher: Option<crate::crypto::chacha_transport::EncryptedChannel>,
     #[cfg(feature = "ap2")]
@@ -225,6 +230,49 @@ impl Drop for RaopConnectionHandler {
         self.conn.shared.release_session(&self.remote_addr);
         self.conn.shared.deregister_connection(&self.remote_addr);
         self.conn.shared.handler.on_client_disconnected(&self.remote_addr);
+    }
+}
+
+/// Shortest gap between two info-level lines for the *same* RTSP method on one
+/// connection. Long enough to collapse a storm, short enough that a normal handshake
+/// (whose methods differ) is unaffected.
+const REQUEST_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl RaopConnectionHandler {
+    /// Whether this request should be logged at info, and how many of the same method
+    /// were suppressed since the last one that was. `None` = log it at debug instead.
+    ///
+    /// The request timeline is per-method rather than per-request because its purpose is
+    /// the *connect sequence* (`OPTIONS`, `ANNOUNCE`, `SETUP`, `RECORD` — each distinct,
+    /// each logged the moment it first appears, which is the diagnostic value). What it
+    /// was never meant to carry is a sender repeating one method: `SET_PARAMETER` is
+    /// volume, metadata and progress on the same verb, and a sender that ramps volume
+    /// emits it in bursts. One such burst put 259 info lines in a single second on
+    /// 2026-08-12 — pure noise that also costs CPU and log I/O on a Pi at the exact
+    /// moment audio is most sensitive to both.
+    ///
+    /// Throttling by method keeps one line per second per verb and says how many it
+    /// swallowed, so a storm is still *visible* — as a count — without drowning the
+    /// timeline it would otherwise hide.
+    fn log_request_now(&mut self, method: &str) -> Option<u64> {
+        let now = std::time::Instant::now();
+        match self.request_log.get_mut(method) {
+            // First time this connection has seen the method: always interesting.
+            None => {
+                self.request_log.insert(method.to_string(), (now, 0));
+                Some(0)
+            }
+            Some((last, suppressed)) => {
+                if now.duration_since(*last) >= REQUEST_LOG_INTERVAL {
+                    let swallowed = std::mem::take(suppressed);
+                    *last = now;
+                    Some(swallowed)
+                } else {
+                    *suppressed += 1;
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -243,7 +291,11 @@ impl ConnectionHandler for RaopConnectionHandler {
         if url == "/feedback" {
             tracing::debug!(elapsed_ms, method, url, "RTSP request");
         } else {
-            tracing::info!(elapsed_ms, method, url, "RTSP request");
+            match self.log_request_now(method) {
+                Some(0) => tracing::info!(elapsed_ms, method, url, "RTSP request"),
+                Some(suppressed) => tracing::info!(elapsed_ms, method, url, suppressed, "RTSP request (repeated)"),
+                None => tracing::debug!(elapsed_ms, method, url, "RTSP request (throttled)"),
+            }
         }
         let resp = rtsp::dispatch(&mut self.conn, request);
 
