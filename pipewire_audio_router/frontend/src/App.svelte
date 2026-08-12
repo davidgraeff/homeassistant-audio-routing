@@ -56,7 +56,7 @@
     <!-- The one cross-page navigation in the app, and it is one-way: Outputs offers to
          align, and this owns the tab, so the page that starts an alignment does not have to
          know it is a tab at all. -->
-    <OutputsTab onAlign={() => (tab = 'alignment')} />
+    <OutputsTab />
   {:else if tab === 'alignment'}
     <!-- Closing the wizard (offered only when nothing is held and no run is in progress)
          goes back to the speakers it is about. -->

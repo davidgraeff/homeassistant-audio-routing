@@ -8,20 +8,10 @@
   import GroupTitle from '../groups/GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
   import ReceiverAgentDocs from './ReceiverAgentDocs.svelte';
-  import { align } from '../../lib/align.svelte';
-  import AlignHoldTimer from '../align/AlignHoldTimer.svelte';
   import DelaySlider from '../ui/DelaySlider.svelte';
   import VolumeControl from '../ui/VolumeControl.svelte';
-  import { measure } from '../../lib/measure.svelte';
 
-  interface Props {
-    /** Go to the Alignment page. The only cross-page link in the app, and it goes one way:
-     *  this page offers to align a set of speakers, App.svelte owns which page is showing.
-     *  A callback rather than a shared "current tab" store — one owner of that state is
-     *  what keeps the tab strip and the pages from disagreeing. */
-    onAlign: () => void;
-  }
-  let { onAlign }: Props = $props();
+  // No props: this page owns its own listings, and alignment lives on its own page.
 
   // Two listings, because discovery only *offers* a device: `outputs` is what
   // the user has added (routable, exposed to Home Assistant, tunable) and
@@ -671,45 +661,6 @@
   //     run that wrote it and is exactly what someone wants when they decide they preferred
   //     the old timing.
   //
-  // The wizard is deliberately *not* also rendered here. One alignment session exists
-  // process-wide, and two places rendering the wizard are two places that can each believe
-  // they own the session that is running. The Sources page references alignment not at all.
-
-  // A measured run stays *revertable* after the run is over (plan §9.4), and the undo has
-  // to be reachable from where someone notices the timing. One status read on mount rather
-  // than `measure.attach()`: attaching would open the push socket and poll for as long as
-  // this page is open, on a page most visits never align from.
-  //
-  // The session is watched for a related reason, and it answers a question this page could
-  // not otherwise answer at all: **are speakers held right now?** An alignment hold is
-  // exclusive, and it outlives a visit to the Alignment page — so without this the user
-  // would be looking at speakers that are silent for a reason nothing on the page mentions.
-  //
-  // `watchSession()` rather than the old one-shot `refreshStatus()`, and it is *cheaper*
-  // than the poll loop that phrase used to warn about: it pushes over
-  // `GET /api/align/ws` and polls only while the socket is not delivering. The one-shot
-  // read was wrong in both directions on the notice below — it could not show a hold that
-  // started after this page was opened, and worse, it went on claiming one after the
-  // daemon's idle timeout had already given the speakers back. That claim is now dropped
-  // the moment the session ends, which is the whole reason the socket exists.
-  onMount(() => void measure.refreshOnce());
-  $effect(() => align.watchSession());
-  const revertScope = $derived(measure.canRevert ? measure.revertScope : []);
-  /** Speakers held by an alignment session right now, as this page last saw it. */
-  const heldFor = $derived(align.sessionActive ? (align.session?.outputs ?? []) : []);
-
-  /** Friendly name for a node name, the same resolution the routing graph uses (the
-   *  rename store first). Needed for the two alignment notices below, which name speakers
-   *  this page may not be listing — a held or reverted speaker can be offline. */
-  function alignLabel(nodeName: string): string {
-    const matrix = [...$routing.matrix.outputs, ...$routing.matrix.sources];
-    return (
-      matrix.find((n) => n.node_name === nodeName)?.display_name ??
-      outputs.find((o) => o.node_name === nodeName)?.name ??
-      nodeName
-    );
-  }
-
   // Label for a codec option, with the bandwidth trade-off spelled out — that's the
   // whole reason to pick one.
   function codecLabel(codec: string): string {
@@ -847,78 +798,6 @@
     does nothing until you <strong>add</strong> it.
   </p>
 </div>
-
-<!-- Speaker alignment, as much of it as belongs on this page: the way in, and the state.
-     Its own card between the page's explanation and the output list, because it is about
-     the *set* rather than about any one output. Kept out of the loading branch so a run in
-     progress, or an outstanding revert, is still reachable while the listings refresh. -->
-{#if outputs.length >= 2 || revertScope.length || heldFor.length}
-  <div class="card align-card">
-    <div class="info-head">
-      <h2>Timing between speakers</h2>
-      <div class="info-actions">
-        <button
-          class="ghost"
-          type="button"
-          title="Pick the speakers, then measure them with a phone — or tune them by ear if the microphone cannot be used"
-          onclick={onAlign}
-        >
-          Align speakers
-        </button>
-      </div>
-    </div>
-    <p class="card-sub" style="margin-bottom:0">
-      Speakers playing one stream should land together, but each adds its own delay on the way to the cone.
-      <strong>Align speakers</strong> opens its own page: it checks the microphone, asks what should end up aligned, and
-      takes the speakers you pick over for the run — whatever they are playing stops and comes back afterwards. Nothing
-      is written to a speaker until you approve it.
-    </p>
-
-    {#if heldFor.length}
-      <!-- An alignment is holding speakers right now, and this page is where that is
-           noticed: the hold is *exclusive*, so the alternative is a user staring at
-           speakers that are silent for a reason nothing mentions. It stays here rather than
-           only on the Alignment page precisely because this is the page they were looking
-           at when they wondered. -->
-      <div class="held">
-        <span>
-          An alignment is holding {heldFor.map(alignLabel).join(', ')} right now, so nothing else plays on
-          {heldFor.length === 1 ? 'it' : 'them'} until it stops.
-        </span>
-        <button class="ghost" onclick={onAlign}>Show it</button>
-        <!-- …and when it stops by itself. Here, not only in the wizard, because this is the
-             page someone is looking at when they wonder why a room is quiet — and the
-             answer "for another twelve minutes, unless someone is using it" is most of what
-             they wanted to know. -->
-        <AlignHoldTimer compact />
-      </div>
-    {:else if align.ended}
-      <!-- The hold this page was reporting has just been released. Said once rather than
-           having the notice simply vanish, which would leave the earlier line looking like
-           it had been imagined. -->
-      <div class="held">
-        <span>{align.ended.why}</span>
-        <button class="ghost" onclick={() => align.clearEnded()}>Got it</button>
-      </div>
-    {/if}
-
-    <!-- Plan §9.4: the write is destructive to a previously-tuned setup, and the daemon
-         keeps it revertable after the run is over and the wizard left — which is
-         exactly when someone decides they preferred it before. -->
-    {#if revertScope.length}
-      <div class="revert">
-        <span>A measurement wrote timing settings to {revertScope.map(alignLabel).join(', ')}.</span>
-        <button class="ghost" disabled={measure.busy} onclick={() => void measure.revert()}>
-          Revert to the settings from before
-        </button>
-        <span class="hint">
-          Every one of them goes back to what it had before that run, and each speaker whose setting changes reconnects —
-          so expect another quiet gap.
-        </span>
-      </div>
-    {/if}
-  </div>
-{/if}
 
 {#if loading}
   <div class="card"><p class="empty" style="padding:0">Loading…</p></div>
@@ -1201,7 +1080,6 @@
   <ReceiverAgentDocs onClose={() => (agentDocsOpen = false)} />
 {/if}
 
-<!-- The alignment explainer went with the wizard, to the page it describes. -->
 
 
 <style>
@@ -1227,45 +1105,9 @@
   /* The alignment card — the way in and the two notices. The wizard is a page of its own
      now, so this only has to hold the header, the sentence, the live-hold line and the
      revert offer. */
-  .align-card .revert {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 10px;
-    padding: 8px 10px;
-    border-radius: 6px;
-    border: 1px solid color-mix(in srgb, var(--warning-color, #ffa600) 55%, transparent);
-    background: color-mix(in srgb, var(--warning-color, #ffa600) 10%, transparent);
-    font-size: 0.82rem;
-  }
-  .align-card .revert button {
-    padding: 4px 10px;
-    font-size: 0.8rem;
-  }
-  .align-card .revert .hint {
-    font-size: 0.78rem;
-    color: var(--secondary-text-color);
-  }
   /* A live hold, seen from the page that lists the speakers. Primary-coloured rather than
      amber: nothing is wrong, something is *running* — and it is the colour the wizard uses,
      so "Show it" leads somewhere that looks related. */
-  .align-card .held {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 10px;
-    padding: 8px 10px;
-    border-radius: 6px;
-    border: 1px solid color-mix(in srgb, var(--primary-color) 45%, transparent);
-    background: color-mix(in srgb, var(--primary-color) 8%, transparent);
-    font-size: 0.82rem;
-  }
-  .align-card .held button {
-    padding: 4px 10px;
-    font-size: 0.8rem;
-  }
 
   /* ---- Section headings between the two listings ------------------------- */
   .section-head {
