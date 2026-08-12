@@ -19,11 +19,12 @@
 //! productionization after S1). It is deliberately the smallest thing that plays
 //! audio to a real device through a per-device node.
 
+use crate::outputs::sendspin;
+use crate::outputs::sendspin::discovery::SharedSendspinDevices;
+use crate::outputs::sendspin::server::SendspinServerHandle;
+use crate::outputs::sendspin::volume::SharedSendspinControl;
 use crate::pw::thread::{ChangeNotifier, PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
-use crate::sendspin_discovery::SharedSendspinDevices;
-use crate::sendspin_server::{self, SendspinServerHandle};
-use crate::sendspin_volume::SharedSendspinControl;
 use crate::store;
 use crate::store::routing::SharedRouting;
 use crate::util::locks::LockRecover;
@@ -149,7 +150,7 @@ pub async fn start(
     //    this device.
     let filter = std::collections::HashSet::from([fullname.clone()]);
     let display = format!("per-device spike: {}", routing::output_display_name(device_node_name));
-    let server = match sendspin_server::start_server_per_device(
+    let server = match sendspin::server::start_server_per_device(
         &sink_node_name,
         &display,
         SPIKE_PORT,
@@ -158,7 +159,7 @@ pub async fn start(
         send_ahead_us,
         control.clone(),
         devices.clone(),
-        sendspin_server::StreamPolicy::Always,
+        sendspin::server::StreamPolicy::Always,
         "pcm", // spike: fixed, uncompressed — not the user's per-output choice
     )
     .await
@@ -198,7 +199,7 @@ pub async fn start(
 
 /// Multi-device variant (spike S1): ONE anchor sink + ONE capture + ONE
 /// [`sendspin::server::SharedTimeline`] driving one single-member sender per
-/// device (via [`sendspin_server::start_server_per_device`]). Proves per-device
+/// device (via [`sendspin::server::start_server_per_device`]). Proves per-device
 /// senders on a shared timeline stay coincident, and avoids the per-device
 /// null-sink dropout by feeding from one steady anchor monitor. Frees all target
 /// devices from routing first (restored on teardown).
@@ -268,7 +269,7 @@ pub async fn start_multi(
     };
 
     let display = format!("per-device sync spike: {} devices", device_node_names.len());
-    let server = match sendspin_server::start_server_per_device(
+    let server = match sendspin::server::start_server_per_device(
         &sink_node_name,
         &display,
         MULTI_PORT,
@@ -277,7 +278,7 @@ pub async fn start_multi(
         send_ahead_us,
         control.clone(),
         devices.clone(),
-        sendspin_server::StreamPolicy::Always,
+        sendspin::server::StreamPolicy::Always,
         "pcm", // spike: fixed, uncompressed — not the user's per-output choice
     )
     .await
@@ -368,7 +369,7 @@ fn restore_links(routing: &SharedRouting, changes: &ChangeNotifier, freed: &[(St
 /// registry — the same source the group reconciler uses (see sendspin_server: the
 /// servers no longer browse for themselves).
 fn spike_members(
-    devices: &crate::sendspin_discovery::SharedSendspinDevices,
+    devices: &crate::outputs::sendspin::discovery::SharedSendspinDevices,
     fullnames: &std::collections::HashSet<String>,
 ) -> Vec<(String, String)> {
     use crate::util::locks::LockRecover;

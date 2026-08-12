@@ -1,6 +1,6 @@
 //! Per-device AirPlay-2 sender for a sync group — the audio path.
 //!
-//! Mirrors `sendspin_server::start_server_per_device`, but the transport is the
+//! Mirrors `outputs::sendspin::server::start_server_per_device`, but the transport is the
 //! vendored AirPlay-2 sender (`airplay_client::Connection`) instead of sendspin.
 //! For each receiver in a group it opens an independent RTSP session (transient
 //! pairing, PIN 3939) + RECORD + realtime-ALAC RTP stream, then fans the group's
@@ -385,7 +385,7 @@ pub fn start(
             // PCM was resampled to this group's `rate` when the announcement started
             // (announce.rs), so music and overlay are the same rate here — the mix is
             // pure sample addition. `mix_buf` is reused across chunks AND devices.
-            let mixer = crate::overlay_mixer::OverlayMixer::global();
+            let mixer = crate::outputs::overlay_mixer::OverlayMixer::global();
             // Provisional per-device alignment delay (align/relay_delay.rs), applied AFTER the
             // overlay so it shifts everything this receiver renders — as the AP2 render-
             // delay knob it stands in for does. It emits exactly what it is fed, one
@@ -442,7 +442,7 @@ pub fn start(
                     crate::ap2_health::Ap2Health::global().clear(name);
                     // Publish this output's capture rate so announcement overlays are
                     // rate-matched to it (overlay_mixer resamples the 48 kHz clip).
-                    crate::overlay_mixer::OverlayMixer::global().set_output_rate(name, rate);
+                    crate::outputs::overlay_mixer::OverlayMixer::global().set_output_rate(name, rate);
                     // Register the command channel (does NOT push a volume unless the
                     // user set one — the device's own volume is authoritative).
                     control_task.lock().await.register(name.clone(), cmd_tx.clone()).await;
@@ -533,7 +533,7 @@ pub fn start(
         }
         for (name, mut c) in conns {
             control_task.lock().await.unregister(&name);
-            crate::overlay_mixer::OverlayMixer::global().clear_output_rate(&name);
+            crate::outputs::overlay_mixer::OverlayMixer::global().clear_output_rate(&name);
             let _ = c.stop().await;
             let _ = c.disconnect().await; // also aborts the event-channel reader
         }

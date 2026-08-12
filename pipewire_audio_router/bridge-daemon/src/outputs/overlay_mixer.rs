@@ -3,7 +3,7 @@
 // ABOUTME: duck(music)+overlay; its groupmates keep plain music — the per-speaker
 // ABOUTME: announcement/duck capability (AG delivery for sendspin).
 //
-// The per-device capture loop (`sendspin_server::start_server_per_device`) drives
+// The per-device capture loop (`outputs::sendspin::server::start_server_per_device`) drives
 // every device's single-member `Group` from one PCM source. For a device with an
 // active overlay it calls [`OverlayMixer::mix`] to get a per-device frame
 // (ducked music + the next slice of the announcement clip) instead of the plain

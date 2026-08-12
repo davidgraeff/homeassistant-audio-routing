@@ -21,7 +21,7 @@
 // docs/receiver-agent-plan.md §11 P3).
 
 use crate::announce_arbiter::{Action, Admission, AnnounceScheduler, AnnouncementId, Effects, OnBusy, Request};
-use crate::overlay_mixer::OverlayMixer;
+use crate::outputs::overlay_mixer::OverlayMixer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -37,7 +37,7 @@ struct Clip {
     duck: f32,
     /// Stall grace handed to the mixer on every (re)start of this clip — longer
     /// when a target's transport is being opened on demand (see
-    /// `overlay_mixer::OVERLAY_ONDEMAND_GRACE`). Kept on the clip so a queued or
+    /// `outputs::overlay_mixer::OVERLAY_ONDEMAND_GRACE`). Kept on the clip so a queued or
     /// barge-preempted announcement gets the same grace when it finally starts.
     grace: Duration,
 }
@@ -125,7 +125,7 @@ impl AnnounceCoordinator {
     /// the scheduler's admission (`Playing` / `Queued{pos}` / `Rejected`).
     ///
     /// `grace` is how long the clip may sit unconsumed on an output before the
-    /// stall watchdog releases it — pass `overlay_mixer::OVERLAY_ONDEMAND_GRACE`
+    /// stall watchdog releases it — pass `outputs::overlay_mixer::OVERLAY_ONDEMAND_GRACE`
     /// when a target's sender is still being connected (an unrouted AP2 receiver).
     #[allow(clippy::too_many_arguments)]
     pub fn announce(

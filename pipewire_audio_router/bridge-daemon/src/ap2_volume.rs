@@ -1,6 +1,6 @@
 //! Per-device volume/mute control for AirPlay-2 senders.
 //!
-//! Like sendspin devices (sendspin_volume.rs), AP2 receivers are *virtual*
+//! Like sendspin devices (outputs/sendspin/volume.rs), AP2 receivers are *virtual*
 //! outputs (`ap2-dev-<slug>`) with no PipeWire node volume — volume is carried
 //! in-band, here as an RTSP `SET_PARAMETER` the sender sends to the receiver
 //! (`airplay_client::Connection::set_volume`, 0.0–1.0 → dB). Two differences

@@ -1,6 +1,6 @@
 // ABOUTME: Minimal linear resampler + channel normalizer to the capture format
 // ABOUTME: (48 kHz, stereo, S16LE) so an announce clip can be mixed sample-for-
-// ABOUTME: sample into the per-device overlay (overlay_mixer.rs).
+// ABOUTME: sample into the per-device overlay (outputs/overlay_mixer.rs).
 //
 // Linear interpolation is low-fidelity but entirely adequate for short speech/
 // chime announcements, and it adds no dependency. If higher quality is ever

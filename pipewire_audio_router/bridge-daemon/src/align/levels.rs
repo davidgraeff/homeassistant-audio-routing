@@ -138,7 +138,7 @@ pub const START_LEVEL: u8 = 30;
 /// it is not a usable operating point — "cannot be turned down further" is the
 /// honest verdict instead.
 pub const MIN_LEVEL: u8 = 5;
-/// Highest level the knobs accept (`sendspin_volume::set_volume` clamps to 100).
+/// Highest level the knobs accept (`outputs::sendspin::volume::set_volume` clamps to 100).
 pub const MAX_LEVEL: u8 = 100;
 
 /// Target for the ingest's aggregate peak (`align_mic::MicStatus::peak`, 0.0–1.0)
@@ -215,7 +215,7 @@ pub const USABLE_BAND_HZ: (f64, f64) = (800.0, 6000.0);
 /// in *amplitude*, i.e. `gain_db = 20·log10(level/100)`.
 ///
 /// It is a guess in both transports, for different reasons: the sendspin device
-/// applies the 0–100 value in its own firmware (`sendspin_volume::volume_cmd`
+/// applies the 0–100 value in its own firmware (`outputs::sendspin::volume::volume_cmd`
 /// just ships the number), and AP2 maps 0.0–1.0 to dB inside the vendored sender
 /// (`ap2_volume`, `airplay_client::Connection::set_volume`) with a curve we do not
 /// control. Either could be linear-amplitude, cubic, or dB-linear.

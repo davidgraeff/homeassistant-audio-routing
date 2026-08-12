@@ -128,7 +128,7 @@
 
 use crate::align::group::{AlignMode, ExclusiveHold, HoldDeps, Interference};
 use crate::ap2_volume::SharedAp2Control;
-use crate::sendspin_volume::SharedSendspinControl;
+use crate::outputs::sendspin::volume::SharedSendspinControl;
 use crate::sync_group::SharedGroups;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1991,7 +1991,7 @@ mod tests {
     /// the calibration level, teardown puts the user's level back.
     #[tokio::test]
     async fn teardown_puts_the_users_levels_back() {
-        let sendspin = crate::sendspin_volume::shared();
+        let sendspin = crate::outputs::sendspin::volume::shared();
         let ap2 = crate::ap2_volume::shared();
         let groups: crate::sync_group::SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
         let mgr = AlignManager::new(sendspin.clone(), ap2, groups);
@@ -2097,7 +2097,7 @@ mod tests {
         async fn new(tag: &str, held: &[(&str, MemberKind)]) -> Self {
             let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
             let (changes, _changes_rx) = tokio::sync::broadcast::channel(8);
-            let (sendspin, ap2) = (crate::sendspin_volume::shared(), crate::ap2_volume::shared());
+            let (sendspin, ap2) = (crate::outputs::sendspin::volume::shared(), crate::ap2_volume::shared());
             let mgr = AlignManager::new(sendspin.clone(), ap2.clone(), groups.clone());
             let members: Vec<AlignMember> = held.iter().map(|(n, k)| member(n, *k)).collect();
             let hold = crate::align::group::ExclusiveHold::for_test(
@@ -2536,7 +2536,7 @@ mod tests {
             member(host_node, MemberKind::PwSink),
             member(orphan, MemberKind::PwSink),
         ];
-        let sendspin = crate::sendspin_volume::shared();
+        let sendspin = crate::outputs::sendspin::volume::shared();
         let ap2 = crate::ap2_volume::shared();
         let new_mgr = || {
             let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
@@ -2597,7 +2597,7 @@ mod tests {
         let (spin, node) = ("sendspin-dev-refuse", "pwsink-dev-refuse");
         let m = vec![member(spin, MemberKind::Sendspin), member(node, MemberKind::PwSink)];
         let groups: SharedGroups = Arc::new(tokio::sync::Mutex::new(crate::sync_group::GroupReconciler::new()));
-        let mgr = AlignManager::new(crate::sendspin_volume::shared(), crate::ap2_volume::shared(), groups);
+        let mgr = AlignManager::new(crate::outputs::sendspin::volume::shared(), crate::ap2_volume::shared(), groups);
         mgr.set_out_of_band_mute(FakeHost::refusing(&[(node, false)], &[node]));
         mgr.apply_audibility(&m, &audible(&[spin]), 20).await;
         assert!(relay.is_muted(node), "an agent that went away must not leave the member audible");

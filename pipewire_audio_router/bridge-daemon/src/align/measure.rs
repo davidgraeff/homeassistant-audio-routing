@@ -1413,7 +1413,7 @@ pub struct MeasureDeps {
 /// Inputs for the plan §9.2 send-ahead warning.
 ///
 /// A sendspin group's send-ahead is a high-water mark over its members'
-/// `min_buffer_ms + static_delay_ms` (`sendspin_server::required_send_ahead_us`).
+/// `min_buffer_ms + static_delay_ms` (`outputs::sendspin::server::required_send_ahead_us`).
 /// Raising it reconfigures the *group's* stream — every speaker in the room goes
 /// quiet for tens of seconds — where a smaller change reconnects only the one
 /// device. So the solve warns before crossing that line.
@@ -5693,7 +5693,7 @@ pub fn signal_check_window(w: &MicWindow, pattern_ms: f64) -> SignalCheck {
 ///
 /// **20 ms, and what set it.** In order of how binding each consideration is:
 ///
-/// * **Exactly one wire-codec frame** (`sendspin_codec::OPUS_FRAME_FRAMES` = 960 frames
+/// * **Exactly one wire-codec frame** (`outputs::sendspin::codec::OPUS_FRAME_FRAMES` = 960 frames
 ///   = 20 ms at 48 kHz), and this is the *deciding* one. §1.1.2 item 2: a relay-side
 ///   delay that is not a whole codec frame moves a transient to a different position
 ///   inside the MDCT window, so the measured *peak* can move by a fraction of a frame
@@ -5715,7 +5715,7 @@ pub const EQUIV_STEP_MS: u16 = 20;
 // The property the docs above claim, asserted rather than trusted: if the wire codec's
 // frame size ever changes, §1.1.2 item 2's confound is silently back in the numbers.
 const _: () = assert!(
-    EQUIV_STEP_MS as usize * (crate::pw::capture::SAMPLE_RATE as usize / 1000) == crate::sendspin_codec::OPUS_FRAME_FRAMES,
+    EQUIV_STEP_MS as usize * (crate::pw::capture::SAMPLE_RATE as usize / 1000) == crate::outputs::sendspin::codec::OPUS_FRAME_FRAMES,
     "the equivalence step must be exactly one Opus frame, or a relay-side delay moves the codec's window phase and the device's does not"
 );
 
@@ -10003,7 +10003,7 @@ mod tests {
     #[test]
     fn the_step_is_exactly_one_wire_codec_frame() {
         assert_eq!(EQUIV_STEP_MS, 20);
-        assert_eq!(usize::from(EQUIV_STEP_MS) * 48, crate::sendspin_codec::OPUS_FRAME_FRAMES);
+        assert_eq!(usize::from(EQUIV_STEP_MS) * 48, crate::outputs::sendspin::codec::OPUS_FRAME_FRAMES);
         // And it dwarfs the estimator by the margins §5.4.1 measured.
         assert!(f64::from(EQUIV_STEP_MS) > 100.0 * 0.14, "100× the worst accepted delta error");
         assert!(f64::from(EQUIV_STEP_MS) > 10.0 * REPEATABILITY_TOL_MS);

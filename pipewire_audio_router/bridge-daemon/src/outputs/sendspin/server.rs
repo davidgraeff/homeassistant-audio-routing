@@ -172,7 +172,7 @@ pub struct SendspinServerHandle {
     client_to_node: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Discovery registry, to map an mDNS fullname back to a device node name in
     /// [`Self::stop_device`].
-    devices: crate::sendspin_discovery::SharedSendspinDevices,
+    devices: crate::outputs::sendspin::discovery::SharedSendspinDevices,
     /// `Option` so a deliberate shutdown can `take()` each task, abort it and
     /// **await** it — that await is what guarantees the listener's socket is
     /// closed (and its port free) before the caller binds a new server on it.
@@ -347,7 +347,7 @@ fn reported_timing(message: &Message) -> Option<(Option<u32>, Option<u32>)> {
 
 /// Apply a device-reported player state to the shared control (device→UI sync).
 async fn apply_reported_state(
-    control: &crate::sendspin_volume::SharedSendspinControl,
+    control: &crate::outputs::sendspin::volume::SharedSendspinControl,
     node_name: &str,
     volume: Option<u8>,
     muted: Option<bool>,
@@ -456,7 +456,7 @@ fn record_timing_request(
     min_buffer_ms: Option<u32>,
     required_lead_ms: Option<u32>,
     send_ahead_us: i64,
-    devices: &crate::sendspin_discovery::SharedSendspinDevices,
+    devices: &crate::outputs::sendspin::discovery::SharedSendspinDevices,
 ) -> bool {
     let mut changed = false;
     match devices.lock_recover().get_mut(node_name) {
@@ -510,7 +510,7 @@ pub fn required_send_ahead_us(
     // A device that reports nothing still needs enough lead to decode a compressed
     // stream, so the codec's own floor applies to it — see `min_send_ahead_us`.
     // `opus_floor_ms` is the user's setting for that headroom (sync_settings.rs).
-    let codec_floor = crate::sendspin_codec::min_send_ahead_us(codec, opus_floor_ms);
+    let codec_floor = crate::outputs::sendspin::codec::min_send_ahead_us(codec, opus_floor_ms);
     members
         .into_iter()
         .map(|(min_buffer_ms, static_delay_ms)| match min_buffer_ms {
@@ -527,12 +527,12 @@ pub fn required_send_ahead_us(
 /// Prefers the exact discovery-registry entry (so it matches whatever
 /// display-name rule discovery used); falls back to deriving from the mDNS
 /// instance label when the device isn't in the registry yet.
-fn resolve_node_name(devices: &crate::sendspin_discovery::SharedSendspinDevices, fullname: &str) -> String {
+fn resolve_node_name(devices: &crate::outputs::sendspin::discovery::SharedSendspinDevices, fullname: &str) -> String {
     if let Some(node_name) = devices.lock_recover().iter().find(|(_, d)| d.fullname == fullname).map(|(node_name, _)| node_name.clone()) {
         return node_name;
     }
     let label = fullname.split("._sendspin._tcp").next().unwrap_or(fullname);
-    crate::sendspin_discovery::device_node_name(label)
+    crate::outputs::sendspin::discovery::device_node_name(label)
 }
 
 /// Advertise a sendspin server on the process-wide shared, LAN-restricted mDNS
@@ -571,8 +571,8 @@ pub async fn start_server_per_device(
     // second browse steals it.
     members: Vec<(String, String)>,
     send_ahead_us: i64,
-    control: crate::sendspin_volume::SharedSendspinControl,
-    devices: crate::sendspin_discovery::SharedSendspinDevices,
+    control: crate::outputs::sendspin::volume::SharedSendspinControl,
+    devices: crate::outputs::sendspin::discovery::SharedSendspinDevices,
     policy: StreamPolicy,
     codec: &str,
 ) -> anyhow::Result<SendspinServerHandle> {
@@ -619,7 +619,7 @@ pub async fn start_server_per_device(
         sample_rate: crate::pw::capture::SAMPLE_RATE,
         channels: crate::pw::capture::CHANNELS as u8,
         bit_depth: 16,
-        codec_header: crate::sendspin_codec::codec_header_base64(codec),
+        codec_header: crate::outputs::sendspin::codec::codec_header_base64(codec),
     });
 
     // One single-member Group per device, all sharing `timeline`. Keyed by the
@@ -770,7 +770,7 @@ pub async fn start_server_per_device(
             .name("sendspin-relay".into())
             .spawn(move || {
                 set_relay_realtime_priority();
-                let mixer = crate::overlay_mixer::OverlayMixer::global();
+                let mixer = crate::outputs::overlay_mixer::OverlayMixer::global();
                 // Provisional per-device alignment delay (align/relay_delay.rs). Costs one
                 // relaxed atomic load per device per block while no alignment run is
                 // active, which is always unless one is in progress.
@@ -785,18 +785,18 @@ pub async fn start_server_per_device(
                 // Same deal for the delay line's output; a separate buffer because it
                 // reads from `mix_buf` (delay AFTER overlay — see relay_delay's docs).
                 let mut delay_buf: Vec<u8> = Vec::new();
-                // Wire codec (sendspin_codec.rs). PCM is a passthrough; a compressed
+                // Wire codec (outputs/sendspin/codec.rs). PCM is a passthrough; a compressed
                 // codec needs fixed-size blocks, so captured quanta are re-cut here —
                 // once for the whole group, since one stream carries one format, which
                 // is what keeps the members sample-coincident.
-                let block_frames = crate::sendspin_codec::Encoder::block_frames(&relay_codec);
-                let mut blocker = crate::sendspin_codec::Reblocker::new(block_frames);
+                let block_frames = crate::outputs::sendspin::codec::Encoder::block_frames(&relay_codec);
+                let mut blocker = crate::outputs::sendspin::codec::Reblocker::new(block_frames);
                 // A predictive codec's decoded output lags its input (Opus lookahead),
                 // and sendspin has no pre-skip field to declare that — so shift our
                 // timestamps back by it, or every chunk is heard that much after the
                 // instant it asked for. Zero for PCM/FLAC. Queried once here, not per
                 // block: it's a property of the codec + format, not of a device.
-                let codec_delay_us = crate::sendspin_codec::codec_delay_us(&relay_codec);
+                let codec_delay_us = crate::outputs::sendspin::codec::codec_delay_us(&relay_codec);
                 if codec_delay_us != 0 {
                     tracing::info!("sendspin relay: compensating {relay_codec} encoder delay of {codec_delay_us} µs");
                 }
@@ -804,7 +804,7 @@ pub async fn start_server_per_device(
                 // announced to gets different audio from its groupmates, so a shared
                 // encoder would put a discontinuity in everyone's stream. Created
                 // lazily (a new member is a new stream) and pruned with membership.
-                let mut encoders: HashMap<String, crate::sendspin_codec::Encoder> = HashMap::new();
+                let mut encoders: HashMap<String, crate::outputs::sendspin::codec::Encoder> = HashMap::new();
                 // Rate-limited stats for the compressed path, so a "codec X stutters"
                 // report is answerable from the log instead of a deploy cycle: does the
                 // timeline stay continuous and ahead of now, and how big are the
@@ -842,7 +842,8 @@ pub async fn start_server_per_device(
                                 _ => mixed,
                             };
                             let encoder = encoders.entry(client_id.clone()).or_insert_with(|| {
-                                crate::sendspin_codec::Encoder::new(&relay_codec).unwrap_or(crate::sendspin_codec::Encoder::Pcm)
+                                crate::outputs::sendspin::codec::Encoder::new(&relay_codec)
+                                    .unwrap_or(crate::outputs::sendspin::codec::Encoder::Pcm)
                             });
                             // A failed encode drops just this chunk for this device —
                             // same as a full backlog — rather than sending garbage.
@@ -917,7 +918,7 @@ fn report_format_support(
     node_name: &str,
     hello: &ClientHello,
     codec: &str,
-    devices: &crate::sendspin_discovery::SharedSendspinDevices,
+    devices: &crate::outputs::sendspin::discovery::SharedSendspinDevices,
 ) -> bool {
     let wire = wire_format_for(codec);
     let Some(support) = &hello.player_v1_support else {
@@ -986,7 +987,7 @@ fn wire_format_for(codec: &str) -> AudioFormatSpec {
     }
 }
 
-/// Codecs this daemon can **encode** right now, best-first — see sendspin_codec.rs
+/// Codecs this daemon can **encode** right now, best-first — see outputs/sendspin/codec.rs
 /// (Opus via vendored libopus, FLAC via pure-Rust flacenc, PCM passthrough). The spec
 /// requires a server to support all three, and this is what the UI's codec picker
 /// greys out against.
@@ -1082,7 +1083,7 @@ fn spawn_membership_task(
         let mut ticker = tokio::time::interval(ARM_POLL_INTERVAL);
         loop {
             ticker.tick().await;
-            let mixer = crate::overlay_mixer::OverlayMixer::global();
+            let mixer = crate::outputs::overlay_mixer::OverlayMixer::global();
             let in_flight = crate::announce::AnnounceCoordinator::global().outputs_in_flight();
             let wanted = |node: &str| match policy {
                 StreamPolicy::Always => true,
@@ -1159,12 +1160,12 @@ fn spawn_accept_loop_per_device(
     // Group membership (and therefore `stream/start`) is decided by the membership
     // task, not here — an accepted connection is only parked.
     _timeline: Arc<SharedTimeline>,
-    control: crate::sendspin_volume::SharedSendspinControl,
+    control: crate::outputs::sendspin::volume::SharedSendspinControl,
     _policy: StreamPolicy,
     pending_members: SharedPending,
     ready_members: SharedReady,
     codec_accept: String,
-    devices_accept: crate::sendspin_discovery::SharedSendspinDevices,
+    devices_accept: crate::outputs::sendspin::discovery::SharedSendspinDevices,
     send_ahead_us: i64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1172,7 +1173,7 @@ fn spawn_accept_loop_per_device(
             match listener.accept().await {
                 Ok((conn, _addr)) => {
                     let client_id = conn.client_id().to_string();
-                    let node_name = crate::sendspin_discovery::device_node_name(&conn.hello().name);
+                    let node_name = crate::outputs::sendspin::discovery::device_node_name(&conn.hello().name);
                     let sender = conn.sender();
                     if report_format_support(&node_name, conn.hello(), &codec_accept, &devices_accept) {
                         control.lock().await.notify_reconcile();
@@ -1219,11 +1220,11 @@ async fn drain_messages_per_device(
     node_name: String,
     groups: Arc<Mutex<HashMap<String, Group<SharesTimeline>>>>,
     client_to_node: Arc<Mutex<HashMap<String, String>>>,
-    control: crate::sendspin_volume::SharedSendspinControl,
+    control: crate::outputs::sendspin::volume::SharedSendspinControl,
     pending_members: SharedPending,
     ready_members: SharedReady,
     send_ahead_us: i64,
-    devices_drain: crate::sendspin_discovery::SharedSendspinDevices,
+    devices_drain: crate::outputs::sendspin::discovery::SharedSendspinDevices,
 ) {
     while let Some(message) = conn.recv_message().await {
         // Device→UI volume/mute sync (same as the dial-out path): reflect a
@@ -1258,7 +1259,7 @@ mod tests {
 
     #[test]
     fn auto_prefers_opus_when_the_device_decodes_it() {
-        // All three are encodable now (sendspin_codec.rs), as the spec requires.
+        // All three are encodable now (outputs/sendspin/codec.rs), as the spec requires.
         assert!(can_encode("opus") && can_encode("flac") && can_encode("pcm"));
         let full = codecs(&["pcm", "flac", "opus"]);
         assert_eq!(resolve_codec(SendspinCodec::Auto, std::iter::once(&full)), "opus");
@@ -1320,11 +1321,11 @@ mod tests {
         }
     }
 
-    fn registry(node_name: &str, display_name: &str) -> crate::sendspin_discovery::SharedSendspinDevices {
+    fn registry(node_name: &str, display_name: &str) -> crate::outputs::sendspin::discovery::SharedSendspinDevices {
         let mut map = std::collections::BTreeMap::new();
         map.insert(
             node_name.to_string(),
-            crate::sendspin_discovery::SendspinDevice {
+            crate::outputs::sendspin::discovery::SendspinDevice {
                 fullname: format!("{display_name}._sendspin._tcp.local."),
                 display_name: display_name.to_string(),
                 addr: None,
@@ -1359,7 +1360,7 @@ mod tests {
     }
 
     /// The shipped Opus floor, so these cases read as "with the default headroom".
-    const DEFAULT_OPUS_FLOOR: u32 = crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS;
+    const DEFAULT_OPUS_FLOOR: u32 = crate::outputs::sendspin::codec::DEFAULT_OPUS_FLOOR_MS;
 
     #[test]
     fn send_ahead_is_raised_to_the_largest_member_requirement() {

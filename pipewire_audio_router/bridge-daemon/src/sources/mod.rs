@@ -43,7 +43,7 @@
 //! using the two legacy ids, so nothing else has to change yet.
 //!
 //! (Sendspin is not configured here: devices are auto-discovered
-//! (sendspin_discovery.rs) and grouped from the routing intent
+//! (outputs/sendspin/discovery.rs) and grouped from the routing intent
 //! (sync_group.rs), so there's nothing per-output to persist.)
 
 pub(crate) mod airplay;

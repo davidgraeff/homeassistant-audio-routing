@@ -172,18 +172,18 @@ be sent a test tone, because that's how the user works out which speaker
 
 ### 5.1 Sendspin (ESPHome speakers, e.g. HA Voice PE)
 
-Devices are **auto-discovered** over mDNS (`sendspin_discovery.rs`) and
+Devices are **auto-discovered** over mDNS (`outputs/sendspin/discovery.rs`) and
 surfaced as virtual routing outputs `sendspin-dev-<slug>`. Devices routed
 from the same source-set are formed into one synchronized group. Per
 group:
 
 - **`sendspin-relay`** [SCHED_FIFO 40]: consumes the capture channel,
-  `timeline.stamp()` + **overlay-mix / duck** (`overlay_mixer.rs`) +
+  `timeline.stamp()` + **overlay-mix / duck** (`outputs/overlay_mixer.rs`) +
   fan-out. One PCM feed is differentiated per device *inside the Rust
   process*. Uses a reused `mix_buf` (no per-chunk `Vec`).
 - **Per-device WebSocket writers** [tokio tasks] push
   `stream_start`/audio to each device over the Sendspin WebSocket via an
-  embedded native server (`sendspin_server.rs`, vendored+patched
+  embedded native server (`outputs/sendspin/server.rs`, vendored+patched
   `sendspin` crate).
 - **ESPHome / Voice PE receiver**: the **send-ahead lead** is the *only*
   jitter buffer end-to-end — it converts the presentation timestamp to its
@@ -195,8 +195,8 @@ group:
   [decisions.md](decisions.md#playout-delay-one-knob-per-backend-and-every-default-adds-nothing).
 
 Per-device **volume** is sent in-band over the protocol
-(`sendspin_volume.rs`); **liveness** is connection-driven (mDNS is
-discovery-only, `sendspin_liveness.rs`). See
+(`outputs/sendspin/volume.rs`); **liveness** is connection-driven (mDNS is
+discovery-only, `outputs/sendspin/liveness.rs`). See
 [decisions.md](decisions.md#sendspin-auto-discovery-grouping-per-device-volume-and-connection-driven-liveness).
 
 ### 5.2 AirPlay-2 (AV receivers, e.g. Yamaha WX-021, Pioneer VSX-934)
@@ -393,7 +393,7 @@ every later announcement to it would queue behind a clip that can never finish.
 ### 5.5 Voice ducking — the other producer of duck
 
 Announcement ducking is a *side effect* of an overlay being mixed. There is a
-second, independent producer: a **duck hold** (`overlay_mixer.rs`), an open-ended
+second, independent producer: a **duck hold** (`outputs/overlay_mixer.rs`), an open-ended
 lease that attenuates one output's music with no clip at all. It exists for a
 voice assistant that speaks through its **own** speaker (an HA Voice PE): the
 router has nothing to play, only music to get out of the way.
@@ -488,7 +488,7 @@ and PipeWire does the SRC in-graph on its RT thread.
   audio duration stays at or above its `min_buffer_ms`", with a group using "the
   maximum per-player send-ahead across grouped players". So a group's send-ahead is
   `max(configured group lead, max over members of (min_buffer_ms + that member's
-  static delay))` (`sendspin_server::required_send_ahead_us`), and it is part of the
+  static delay))` (`outputs::sendspin::server::required_send_ahead_us`), and it is part of the
   server's **restart identity** — the timeline fixes its send-ahead at construction.
   `required_lead_time_ms` is deliberately not folded in: the spec says to extend
   toward it only for buffered sources, and this is a live stream. A player may raise
@@ -497,7 +497,7 @@ and PipeWire does the SRC in-graph on its RT thread.
   exposes `group_lead_floor_ms` / `group_lead_effective_ms` plus which device set it,
   so a value typed below the floor is shown as having no effect rather than silently
   ignored.
-- **Sendspin wire codec is negotiated per group** (`sendspin_codec.rs`): PCM,
+- **Sendspin wire codec is negotiated per group** (`outputs/sendspin/codec.rs`): PCM,
   **Opus** (vendored libopus via `opusic-sys`) or **FLAC** (pure-Rust `flacenc`) —
   the spec requires a server to support all three. The rate/depth stay at the
   capture format, so only the *framing* changes: encoding runs inline on the

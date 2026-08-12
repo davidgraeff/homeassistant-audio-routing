@@ -3,7 +3,7 @@
 //! AirPlay-2 speakers (Yamaha MusicCast, Pioneer/Onkyo, Denon/HEOS, HomePod, …)
 //! advertise `_airplay._tcp.local.`. This module browses that service type and
 //! maintains a shared registry of live receivers, mirroring
-//! `sendspin_discovery.rs`: a discovered receiver becomes a *virtual* routing
+//! `outputs/sendspin/discovery.rs`: a discovered receiver becomes a *virtual* routing
 //! output (`ap2-dev-<slug>`, no PipeWire node of its own). The audio path — one
 //! anchor + a per-device AP2 RTP sender per co-routed receiver — is built later
 //! by the grouping reconciler (Phase 3); here we only populate the registry and
@@ -72,7 +72,7 @@ fn display_name_from_service(info: &ResolvedService) -> String {
 /// `devices` in sync, registering each resolved receiver as a PTP peer of the
 /// host-global grandmaster. The browser runs until `daemon` is shut down (which
 /// disconnects the receiver and ends the loop). Mirrors
-/// `sendspin_discovery::spawn`.
+/// `outputs::sendspin::discovery::spawn`.
 pub fn spawn(daemon: &ServiceDaemon, devices: SharedAp2Devices, changes: ChangeNotifier, ptp: SharedAp2Ptp) -> anyhow::Result<()> {
     let receiver = daemon.browse(AIRPLAY_SERVICE_TYPE)?;
     std::thread::Builder::new().name("ap2-discovery".into()).spawn(move || {

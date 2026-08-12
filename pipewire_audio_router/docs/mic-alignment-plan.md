@@ -174,7 +174,7 @@ daemon**, and writes the real knobs **once** after the last step.
 
 The mechanism is a **per-device delay line**, not per-device tone synthesis. Every
 per-device relay already calls `mix_into(node_name, block, &mut buf)`
-(`sendspin_server.rs:824`, `ap2_server.rs:408`, `pwsink_server.rs:220`); a per-device
+(`outputs/sendspin/server.rs:824`, `ap2_server.rs:408`, `pwsink_server.rs:220`); a per-device
 ring buffer read at an offset of *d* samples emits older content against the unchanged
 timestamp schedule, so the device renders it later — exactly a delay.
 
@@ -252,7 +252,7 @@ Four ways relay-side and device-side delay still differ:
    not a property of the delay line; the line is a true delay, and the knob it stands in
    for may be an advance.
 2. **Codec frame phase — inherent, not calibratable.** The line sits *upstream* of
-   `sendspin_codec::Reblocker`, so a delay that is not a whole multiple of the codec frame
+   `outputs::sendspin::codec::Reblocker`, so a delay that is not a whole multiple of the codec frame
    (20 ms for Opus) moves a transient to a different position inside the MDCT window,
    whereas the device knob shifts rendering with the content-to-frame phase untouched.
    The decoded audio is still delayed by exactly *d*, but Opus's smearing is
@@ -382,7 +382,7 @@ Two practical costs this section originally glossed over:
   and loops the WAV into the group's **sync anchor** via
   `pw::player::play_loop_to_target(anchor, …)` (`pw/player.rs:79`).
 - `apply_audibility()` (`align/calibrate.rs:319`) solos the reference + target and mutes
-  everyone else — sendspin via the protocol mute (`sendspin_volume.rs:293`, a live
+  everyone else — sendspin via the protocol mute (`outputs/sendspin/volume.rs:293`, a live
   transient push, no reconnect), AP2 via `ap2_volume::set_muted`.
 - `arm_timeout()` tears the session down after 15 min so a closed tab cannot leave
   the room muted with a click looping.
@@ -425,7 +425,7 @@ than a preference:
 
 **The codec is part of the latency chain, not a neutral transport.** Both
 `codec_delay_us` and the send-ahead floor are codec-dependent
-(`sendspin_codec.rs:337` derives Opus's floor from `opus_floor_ms`). Calibrating
+(`outputs/sendspin/codec.rs:337` derives Opus's floor from `opus_floor_ms`). Calibrating
 under PCM and then running under Opus would measure a lead that does not exist in
 normal operation, so the offsets would not transfer — the substitution would quietly
 invalidate its own results. The codec's constant contribution to delay is something
@@ -485,7 +485,7 @@ Three independent readings, all pointing the same way:
   **output-latency compensation**, not a delay.
 - Our own daemon agrees: `required_send_ahead_us` adds each member's `static_delay_ms`
   to the group lead *"because the device plays that much earlier"*
-  (`sendspin_server.rs:520`).
+  (`outputs/sendspin/server.rs:520`).
 
 If that is how the ESPHome firmware behaves, then for sendspin you can only ever
 **advance** a speaker (0–5000 ms), never delay it, so:
@@ -917,8 +917,8 @@ Why filtering rather than synthesis: a filter needs **no timing information at
 all**. It does not need to know the content position, a frame index, or a
 presentation timestamp — which is precisely what the AP2 and pw-sink relays cannot
 provide (§6.3). The injection point already exists in all three:
-`overlay_mixer::mix_into(node_name, …)` is called per device in
-`sendspin_server.rs:824`, `ap2_server.rs:408` and `pwsink_server.rs:220`. A
+`outputs::overlay_mixer::mix_into(node_name, …)` is called per device in
+`outputs/sendspin/server.rs:824`, `ap2_server.rs:408` and `pwsink_server.rs:220`. A
 sibling `cal_gate(node_name, block, &mut buf)` slots in beside it.
 
 Design notes:
@@ -961,7 +961,7 @@ The tempting alternative is to synthesise each device's tone as a pure function 
 a shared timeline position — sample-aligned by construction, no filter cost, best
 possible SNR. It works, but **only inside the sendspin per-device relay**, which
 has exactly what is needed: `let ts = timeline.stamp(len)` is computed once per
-block and fanned identically to every member (`sendspin_server.rs:818`), so
+block and fanned identically to every member (`outputs/sendspin/server.rs:818`), so
 `tone(ts, device_i)` is coincident across sendspin members by construction.
 
 The other two transports have no such anchor:
@@ -1384,7 +1384,7 @@ write path, reintroduced in the formation path.
 1. **Hold the union once; scope each step by audibility.** ← chosen. Select every speaker the run
    will touch up front (usually "all of them", or "this floor"), form **one** hold, and
    let each position choose which held members are *audible*. Mutes are live and free
-   (`sendspin_volume::set_mute`), so the whole multi-position run costs **one** form and
+   (`outputs::sendspin::volume::set_mute`), so the whole multi-position run costs **one** form and
    **one** release. This needs no new mechanism — the set-based audibility
    (`set_audible` / `solo`) already built is exactly it. The only UX consequence is that
    the up-front selection is the run's full scope rather than the first position's, which
@@ -1450,7 +1450,7 @@ and the final real write.
   names **once, when the hold forms** (`align_group::resolve_labels`: the rename store
   first, `routing::output_display_name` as the fallback — exactly what the Outputs page
   and the routing matrix do) and carrying them *with* the hold. The reporters
-  (`announce.rs`, `overlay_mixer.rs`) run where the outputs store is not reachable, so
+  (`announce.rs`, `outputs/overlay_mixer.rs`) run where the outputs store is not reachable, so
   they could not have resolved a name themselves; `HoldRegistry` holds one
   `node_name → label` map and renders the sentence from it. `Interference` still carries
   the node name in `member` for matching, plus `member_label` so a consumer that writes

@@ -175,12 +175,12 @@ Mirrors the established discovery/output pattern.
 
 | File | Change | Mirrors |
 |---|---|---|
-| `pw_target_discovery.rs` (new) | Browse `_workstation._tcp`, populate `SharedPwTargets` (`pw-dev-<slug>`, `approved` flag), fire `changes` | `sendspin_discovery.rs` |
+| `pw_target_discovery.rs` (new) | Browse `_workstation._tcp`, populate `SharedPwTargets` (`pw-dev-<slug>`, `approved` flag), fire `changes` | `outputs/sendspin/discovery.rs` |
 | `discovery_supervisor.rs` | Register the browser on the shared LAN-restricted daemon in `start()` | existing browsers |
 | `util/node_names.rs` / `store/outputs.rs` | `PW_DEV_PREFIX`; persist approved targets + per-target `jb_msec`, dest IP/port | `RaopOutputConfig` |
 | `rtp_sink.rs` (new) | Load `rtp-sink` (+ SAP announce) as a real node via `pw_thread` `Load`/`Unload`; build the per-device mix bus (loopback + null-sink) | old `raop.rs` module-load; anchor `CreateSinkNode` |
 | `sync_group.rs` | Re-introduce **one follower-sink branch**: ensure per-target nodes + monitor links on route; tear down on unroute; wire announce-stream links into `pw-mix-<X>` for AG targets | deleted RAOP monitor-link step (§4) |
-| `pw_target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `sendspin_liveness.rs` |
+| `pw_target_liveness.rs` (new) | host-reachability liveness → output health (RTCP ruled out, §4) | `outputs/sendspin/liveness.rs` |
 | `api.rs` | Candidate list + `approve` endpoint + per-target JB setter + help URL; expose `pw-dev-*` as routable output & `media_player` | §9 outputs derivation |
 | `frontend/` (Svelte) | Discovery listing: approve + help button; per-target JB slider | existing admin console |
 
@@ -272,7 +272,7 @@ RTP. Liveness = `AppleMidiSender::status().established`, polled into
   signal — so targets are directly routable, exactly like sendspin/AP2 devices.
   (§4/§8's approval + config-persistence steps are intentionally dropped.)
 - **Per-target sessions (not per-group).** One `AppleMidiSender` per target, each
-  fed a per-device-**mixed** copy of the capture via `overlay_mixer::mix_into`, so
+  fed a per-device-**mixed** copy of the capture via `outputs::overlay_mixer::mix_into`, so
   per-device announce/duck (the must-have, §3/P2) works for free — the same shape
   AP2's relay uses. A single shared session couldn't duck one member alone.
 - **Announce/duck reuses `overlay_mixer`** — no separate mix-bus topology needed

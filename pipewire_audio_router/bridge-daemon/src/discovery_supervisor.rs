@@ -2,7 +2,7 @@
 //! targets + Bluetooth→RTP bridges).
 //!
 //! A **single** shared `ServiceDaemon` lives here behind a shared mutex and both
-//! browsers (sendspin_discovery.rs + ap2_discovery.rs) run their `browse()` on
+//! browsers (outputs/sendspin/discovery.rs + ap2_discovery.rs) run their `browse()` on
 //! it — one `mDNS_daemon` OS thread for the whole daemon instead of one per
 //! service type. `start()` builds the daemon (restricted to the LAN interface —
 //! see `lan_restricted_daemon`) and spawns the two worker threads; `stop()`
@@ -17,8 +17,9 @@
 
 use crate::ap2_discovery::{self, SharedAp2Devices};
 use crate::ap2_ptp::SharedAp2Ptp;
+use crate::outputs::sendspin;
+use crate::outputs::sendspin::discovery::SharedSendspinDevices;
 use crate::pw::thread::ChangeNotifier;
-use crate::sendspin_discovery::{self, SharedSendspinDevices};
 use crate::util::locks::LockRecover;
 use mdns_sd::{IfKind, ServiceDaemon};
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
@@ -157,7 +158,7 @@ impl DiscoverySupervisor {
         // If any browser fails to spawn, shut the daemon down so we don't leak
         // its OS thread (the run loop only exits on an explicit shutdown).
         let spawned = (|| -> anyhow::Result<()> {
-            sendspin_discovery::spawn(&daemon, inner.devices.clone(), inner.changes.clone())?;
+            sendspin::discovery::spawn(&daemon, inner.devices.clone(), inner.changes.clone())?;
             ap2_discovery::spawn(&daemon, inner.ap2_devices.clone(), inner.changes.clone(), inner.ap2_ptp.clone())?;
             crate::pw_target_discovery::spawn(&daemon, inner.pw_targets.clone(), inner.changes.clone())?;
             crate::sources::bt_bridge::spawn(&daemon, inner.bt_bridges.clone(), inner.changes.clone())?;

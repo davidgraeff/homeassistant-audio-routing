@@ -15,7 +15,7 @@
 //! - **`sendspin_delays`** — a per-device *static* delay in ms
 //!   (`PlayerCommandType::SetStaticDelay`), for trimming an individual speaker
 //!   that's consistently early/late relative to the rest of its group. Applied
-//!   in-band by the sendspin server on (re)connect (sendspin_volume.rs).
+//!   in-band by the sendspin server on (re)connect (outputs/sendspin/volume.rs).
 //! - **`ap2_latency`** — the AirPlay-2 per-output render delay in ms (the PT=87
 //!   anchor shift; ap2_server.rs), keyed by AP2 node name. It's retuned LIVE on
 //!   the running stream (ap2_control → SetRenderDelay), and used as the initial
@@ -54,16 +54,16 @@ fn default_group_lead_ms() -> u32 {
 
 /// The Opus send-ahead floor, in ms: the decode+network headroom every Opus stream
 /// gets whether or not a device asked for it
-/// ([`crate::sendspin_codec::min_send_ahead_us`], default
-/// [`crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS`]).
+/// ([`crate::outputs::sendspin::codec::min_send_ahead_us`], default
+/// [`crate::outputs::sendspin::codec::DEFAULT_OPUS_FLOOR_MS`]).
 ///
 /// Configurable because the network half of that budget belongs to the site: it is the
 /// one term of a sendspin group's latency that is neither the user's choice nor a
 /// device's request. Clamped at the bottom to the codec's block size
-/// ([`crate::sendspin_codec::opus_floor_lower_bound_ms`]) — nothing can be sent before
+/// ([`crate::outputs::sendspin::codec::opus_floor_lower_bound_ms`]) — nothing can be sent before
 /// a whole block exists.
 pub fn default_opus_floor_ms() -> u32 {
-    crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS
+    crate::outputs::sendspin::codec::DEFAULT_OPUS_FLOOR_MS
 }
 
 /// The pw-sink playout delay used when an output has no stored override: the
@@ -152,7 +152,7 @@ impl Default for Ap2RateMode {
 /// Sendspin negotiates: a device advertises the `{codec, rate, depth, channels}`
 /// combinations it decodes, and one stream serves a whole group — so the *effective*
 /// codec is this choice narrowed by what the daemon can encode and what every member
-/// of the group supports (`sendspin_server::resolve_codec`). An unusable choice falls
+/// of the group supports (`outputs::sendspin::server::resolve_codec`). An unusable choice falls
 /// back to PCM rather than sending a stream nothing can decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -264,7 +264,7 @@ impl SyncSettings {
     /// Set the Opus floor, clamped to the codec's block size at the bottom (below
     /// which it cannot mean anything) and to the group-lead ceiling at the top.
     pub fn set_opus_floor_ms(&mut self, ms: u32) -> anyhow::Result<()> {
-        let lower = crate::sendspin_codec::opus_floor_lower_bound_ms("opus");
+        let lower = crate::outputs::sendspin::codec::opus_floor_lower_bound_ms("opus");
         self.config.opus_floor_ms = ms.clamp(lower, 5000);
         self.persist()
     }

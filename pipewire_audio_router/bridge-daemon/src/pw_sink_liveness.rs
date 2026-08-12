@@ -10,11 +10,11 @@
 //! publishes it here, keyed by output node name; the API (`/api/outputs`) reads
 //! it so the UI can show a target as present-but-not-yet-connected vs streaming.
 //!
-//! Mirrors overlay_mixer.rs's global-singleton shape (a `OnceLock` behind a
+//! Mirrors outputs/overlay_mixer.rs's global-singleton shape (a `OnceLock` behind a
 //! mutex): cheap, lock-guarded, no per-call allocation.
 //!
 //! A status *change* also nudges the routing-matrix WebSocket (via the notifier
-//! main.rs installs, like sendspin_volume.rs's): the matrix reports this as each
+//! main.rs installs, like outputs/sendspin/volume.rs's): the matrix reports this as each
 //! output's `streaming`, and the graph decides from it whether a wire is really
 //! carrying audio — so a handshake completing has to push a frame, not wait for
 //! some unrelated registry event.

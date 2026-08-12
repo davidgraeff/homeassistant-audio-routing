@@ -544,7 +544,7 @@ derisked by actually building and testing it, not by re-estimating it.
 
 `sendspin-adapter.py` (a Python subprocess per output, wrapping
 `aiosendspin[server]`) is replaced by an embedded native server
-(`sendspin_server.rs`), pinning the fork by commit hash (`sendspin = { git =
+(`outputs/sendspin/server.rs`), pinning the fork by commit hash (`sendspin = { git =
 "...", rev = "..." }` — unreviewed/unmerged, so pinned to an exact commit,
 not a branch). This also picks up the two shellouts the Python adapter still
 had: sink-node creation now goes through `pw/thread.rs`'s
@@ -620,7 +620,7 @@ default 150 ms) rides out clock drift between the receiver and the graph.
 ## Sendspin: auto-discovery, grouping, per-device volume, and connection-driven liveness
 
 Sendspin outputs were manually created one-per-output. They're now
-**auto-discovered** over mDNS (`sendspin_discovery.rs`) and surfaced as
+**auto-discovered** over mDNS (`outputs/sendspin/discovery.rs`) and surfaced as
 virtual routing outputs (`sendspin-dev-<slug>`), mirroring how RAOP devices
 appear. Devices a user routes from the **same set of sources** are formed into
 one **synchronized group** automatically (`sendspin_group.rs`): a single sink
@@ -628,7 +628,7 @@ one **synchronized group** automatically (`sendspin_group.rs`): a single sink
 speakers in sync" needs no manual group setup and is visible as a group badge
 in the UI.
 
-**Per-device volume** (`sendspin_volume.rs`): these virtual outputs have no
+**Per-device volume** (`outputs/sendspin/volume.rs`): these virtual outputs have no
 PipeWire node volume, so volume is sent in-band over the protocol
 (`ServerSender::send_player_command`). Mapping a connection to a device needed
 a patch to the (also vendored, `bridge-daemon/vendor/sendspin/`) `sendspin`
@@ -641,7 +641,7 @@ connection to the right discovered device.
 TTL-expiry flap (WiFi power-save on the speaker), not a real departure; acting
 on it tore down live groups (and raced the group's server-port rebind). Now a
 device is *present* if it has a **live server connection** or an active **TCP
-probe** succeeds; mDNS only ever *adds* (`sendspin_liveness.rs`). A device is
+probe** succeeds; mDNS only ever *adds* (`outputs/sendspin/liveness.rs`). A device is
 demoted to offline (grayed) only after sustained failure, and removed only
 after a long grace — so a flap no longer disturbs a playing group. RAOP
 discovery gets the same treatment: after a grace-debounce on mDNS removal it

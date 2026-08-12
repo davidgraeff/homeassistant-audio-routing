@@ -69,7 +69,7 @@ pub enum PwCommand {
     DestroyLinks { link_ids: Vec<u32>, reply: oneshot::Sender<Result<String, String>> },
     /// Create a `support.null-audio-sink` adapter node named `node_name` —
     /// the native equivalent of `pw-cli create-node adapter "{ ... }"`
-    /// (sendspin_server.rs's capture target; replaces adapter.py's one-time
+    /// (outputs/sendspin/server.rs's capture target; replaces adapter.py's one-time
     /// `pw-cli` shellout). Fire-and-forget like `Load`: the new node shows up
     /// through the `global` listener same as any other, so the caller
     /// resolves `node_name` to a node id from the shared registry snapshot
@@ -411,7 +411,7 @@ fn destroy_links(registry: &pw::registry::RegistryRc, link_ids: &[u32]) -> Resul
 /// Creates a `support.null-audio-sink` adapter node — the native equivalent
 /// of `pw-cli create-node adapter "{ factory.name=support.null-audio-sink
 /// node.name=<name> media.class=Audio/Sink object.linger=true
-/// audio.position=[FL,FR] }"` (sendspin_server.rs's capture target). Runs on
+/// audio.position=[FL,FR] }"` (outputs/sendspin/server.rs's capture target). Runs on
 /// the PipeWire thread. Like `create_links`, the proxy is dropped
 /// immediately — the new node shows up through the `global` listener same as
 /// anything else, and destruction always goes through `destroy_global` by

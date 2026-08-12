@@ -12,7 +12,7 @@ pub const SENDSPIN_NODE_PREFIX: &str = "sendspin-out-";
 /// Node-name prefix for a discovered sendspin *device* — a virtual routing
 /// output (no PipeWire node of its own; audio reaches it via whatever group
 /// sink it's dialed into). This is what appears as a matrix column and on the
-/// Outputs tab. See sendspin_discovery.rs.
+/// Outputs tab. See outputs/sendspin/discovery.rs.
 pub const SENDSPIN_DEV_PREFIX: &str = "sendspin-dev-";
 
 /// Node-name prefix for a discovered AirPlay-2 *receiver* — a virtual routing

@@ -3,9 +3,9 @@
 
 use crate::ap2_discovery::SharedAp2Devices;
 use crate::ap2_ptp::SharedAp2Ptp;
+use crate::outputs::sendspin::discovery::SharedSendspinDevices;
 use crate::pw::thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, SharedState};
 use crate::routing;
-use crate::sendspin_discovery::SharedSendspinDevices;
 use crate::sources::airplay_clients::AirplayClientStore;
 use crate::sources::rtp::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
 use crate::sources::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SourcesStore};
@@ -70,7 +70,7 @@ pub struct AppState {
     /// (`PwCommand::SetProfiling(true)`), the last disarms it — same "pay only
     /// while watched" gating as the peak meters.
     pub profiler_watchers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Live mDNS-discovered sendspin devices (sendspin_discovery.rs), surfaced
+    /// Live mDNS-discovered sendspin devices (outputs/sendspin/discovery.rs), surfaced
     /// as virtual routing outputs.
     pub sendspin_devices: SharedSendspinDevices,
     /// Live mDNS-discovered AirPlay-2 receivers (ap2_discovery.rs), surfaced as
@@ -91,7 +91,7 @@ pub struct AppState {
     /// reused by the AP2 tone spike (ap2_spike.rs) so it shares 319/320 rather
     /// than double-binding.
     pub ap2_ptp: SharedAp2Ptp,
-    pub sendspin_control: crate::sendspin_volume::SharedSendspinControl,
+    pub sendspin_control: crate::outputs::sendspin::volume::SharedSendspinControl,
     pub ap2_control: crate::ap2_volume::SharedAp2Control,
     /// Persistent routing intent (store/routing.rs): links by stable node
     /// name, reconciled onto the live graph so routing survives node reloads
@@ -155,7 +155,7 @@ pub fn router(
     ap2_ptp: SharedAp2Ptp,
     routing: SharedRouting,
     outputs: SharedOutputs,
-    sendspin_control: crate::sendspin_volume::SharedSendspinControl,
+    sendspin_control: crate::outputs::sendspin::volume::SharedSendspinControl,
     ap2_control: crate::ap2_volume::SharedAp2Control,
     sync_settings: crate::sync_settings::SharedSyncSettings,
     settings: SharedSettings,
@@ -704,11 +704,11 @@ fn sendspin_codec_info(
     settings: &crate::sync_settings::SyncSettings,
 ) -> (&'static str, &'static str, Vec<CodecOption>) {
     let mode = settings.sendspin_codec(node_name);
-    let active = crate::sendspin_server::resolve_codec(mode, std::iter::once(&device_codecs.to_vec()));
+    let active = crate::outputs::sendspin::server::resolve_codec(mode, std::iter::once(&device_codecs.to_vec()));
     let mut options = vec![CodecOption { codec: "auto", available: true, reason: None }];
-    for codec in crate::sendspin_server::OFFERED_CODECS {
-        let encodable = crate::sendspin_server::can_encode(codec);
-        let supported = crate::sendspin_server::device_supports(device_codecs, codec);
+    for codec in crate::outputs::sendspin::server::OFFERED_CODECS {
+        let encodable = crate::outputs::sendspin::server::can_encode(codec);
+        let supported = crate::outputs::sendspin::server::device_supports(device_codecs, codec);
         let reason = match (encodable, supported) {
             (true, true) => None,
             (false, _) => Some(format!("the add-on can't encode {codec} yet")),
@@ -778,7 +778,7 @@ async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         let send_ahead_ms = {
             let ss = state.sync_settings.lock_recover();
             let static_delay = ss.sendspin_delays().get(&node_name).copied().unwrap_or(0);
-            let us = crate::sendspin_server::required_send_ahead_us(
+            let us = crate::outputs::sendspin::server::required_send_ahead_us(
                 ss.group_lead_us(),
                 codec_active,
                 ss.opus_floor_ms(),
@@ -1807,7 +1807,7 @@ async fn delete_source(State(state): State<AppState>, Path(id): Path<String>) ->
 // Sendspin devices are virtual outputs fed by a shared group sink, so there's
 // no PipeWire node volume to drive. Volume is carried in-band over the sendspin
 // protocol to the specific device; see
-// sendspin_volume.rs. `GET` returns the desired volume per device node name
+// outputs/sendspin/volume.rs. `GET` returns the desired volume per device node name
 // (sparse — absent means the default); `PUT` sets one device.
 
 #[derive(Deserialize)]
@@ -1827,7 +1827,7 @@ async fn set_sendspin_volume(
     Json(req): Json<SetSendspinVolumeRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
     // Two statements: the control guard must drop before the send is awaited
-    // (see sendspin_volume::PendingCommands).
+    // (see outputs::sendspin::volume::PendingCommands).
     let pending = state.sendspin_control.lock().await.set_volume(&req.node_name, req.volume);
     let reached = pending.apply().await;
     let message = if reached {
@@ -2022,7 +2022,7 @@ struct SyncSettingsInfo {
     /// Decode+network headroom imposed on an **Opus** stream, in ms — the one term of
     /// a group's lead that is neither the user's choice nor a device's request, and the
     /// reason an Opus group cannot go below it however low the group lead is set.
-    /// Tunable because the shipped 250 ms is a guess (sendspin_codec.rs).
+    /// Tunable because the shipped 250 ms is a guess (outputs/sendspin/codec.rs).
     opus_floor_ms: u32,
     /// The lowest value `opus_floor_ms` accepts: the Opus block size, since nothing can
     /// be sent before a whole block exists. Sent so the UI can bound its own input
@@ -2065,10 +2065,10 @@ fn lead_floor(state: &AppState) -> (u32, Vec<LeadFloorSource>) {
         .filter(|(_, d)| d.present)
         .map(|(node_name, d)| {
             let static_delay_ms = delays.get(node_name).copied().unwrap_or(0);
-            let codec = crate::sendspin_server::resolve_codec(ss.sendspin_codec(node_name), std::iter::once(&d.supported_codecs));
+            let codec = crate::outputs::sendspin::server::resolve_codec(ss.sendspin_codec(node_name), std::iter::once(&d.supported_codecs));
             // Same rule the audio path uses: what the device asked for, else our floor
             // for its codec — and the device's static delay on top either way.
-            let codec_minimum_ms = (crate::sendspin_codec::min_send_ahead_us(codec, opus_floor_ms) / 1000) as u32;
+            let codec_minimum_ms = (crate::outputs::sendspin::codec::min_send_ahead_us(codec, opus_floor_ms) / 1000) as u32;
             let (base_ms, reason) = match d.min_buffer_ms {
                 Some(m) => (m, "reported"),
                 None => (codec_minimum_ms, "codec-minimum"),
@@ -2112,7 +2112,7 @@ async fn get_sync_settings(State(state): State<AppState>) -> Json<SyncSettingsIn
         group_lead_effective_ms: configured.max(floor),
         group_lead_floor_sources: sources,
         opus_floor_ms,
-        opus_floor_min_ms: crate::sendspin_codec::opus_floor_lower_bound_ms("opus"),
+        opus_floor_min_ms: crate::outputs::sendspin::codec::opus_floor_lower_bound_ms("opus"),
     })
 }
 
@@ -2441,7 +2441,7 @@ async fn spike_multi_device_start(
     }
 }
 
-/// Overlay spike (overlay_mixer.rs): inject a test-tone announcement overlay on
+/// Overlay spike (outputs/overlay_mixer.rs): inject a test-tone announcement overlay on
 /// one output. Audible on any sendspin device with a running per-device sender —
 /// i.e. any discovered device (grouped, or via its always-on idle sender).
 #[derive(Deserialize)]
@@ -2462,9 +2462,9 @@ async fn spike_overlay_start(Json(req): Json<OverlayStartRequest>) -> (StatusCod
     let seconds = req.seconds.unwrap_or(6.0);
     let freq = req.freq.unwrap_or(660.0);
     let duck = req.duck.unwrap_or(0.25);
-    let pcm = crate::overlay_mixer::test_tone(seconds, freq, 0.3);
+    let pcm = crate::outputs::overlay_mixer::test_tone(seconds, freq, 0.3);
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::overlay_mixer::OverlayMixer::global().start(&req.device, id, pcm, duck);
+    crate::outputs::overlay_mixer::OverlayMixer::global().start(&req.device, id, pcm, duck);
     (
         StatusCode::OK,
         Json(OutputOpResponse {
@@ -2480,7 +2480,7 @@ async fn spike_overlay_start(Json(req): Json<OverlayStartRequest>) -> (StatusCod
 async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<OutputOpResponse>) {
     match q.get("device") {
         Some(device) => {
-            let stopped = crate::overlay_mixer::OverlayMixer::global().stop(device).is_some();
+            let stopped = crate::outputs::overlay_mixer::OverlayMixer::global().stop(device).is_some();
             (
                 StatusCode::OK,
                 Json(OutputOpResponse {
@@ -2650,9 +2650,9 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     // A clip may sit unconsumed while an on-demand session pairs up; give the
     // mixer's stall watchdog a matching grace so it isn't reaped mid-connect.
     let grace = if transports.iter().any(|(_, s)| s.is_on_demand()) {
-        crate::overlay_mixer::OVERLAY_ONDEMAND_GRACE
+        crate::outputs::overlay_mixer::OVERLAY_ONDEMAND_GRACE
     } else {
-        crate::overlay_mixer::OVERLAY_STALL_GRACE
+        crate::outputs::overlay_mixer::OVERLAY_STALL_GRACE
     };
     let targets: Vec<String> =
         transports.into_iter().filter(|(_, s)| !matches!(s, AnnounceTransport::Unavailable(_))).map(|(t, _)| t).collect();
@@ -2705,7 +2705,7 @@ async fn ag_announce(State(state): State<AppState>, Json(req): Json<AgAnnounceRe
     (StatusCode::OK, Json(AgAnnounceResponse { ok, admission: label.to_string(), position, reason, message }))
 }
 
-// ---- Duck holds (overlay_mixer.rs) --------------------------------------
+// ---- Duck holds (outputs/overlay_mixer.rs) --------------------------------------
 //
 // A duck hold attenuates an output's music with **no clip of its own** — what
 // voice ducking needs, since a voice assistant speaking through its own speaker
@@ -2757,7 +2757,7 @@ struct DuckHoldView {
 }
 
 fn duck_ttl(ttl_ms: Option<u64>) -> std::time::Duration {
-    ttl_ms.map_or(crate::overlay_mixer::DUCK_HOLD_TTL, std::time::Duration::from_millis)
+    ttl_ms.map_or(crate::outputs::overlay_mixer::DUCK_HOLD_TTL, std::time::Duration::from_millis)
 }
 
 /// Start a duck hold on a set of outputs. Idempotent in the only sense that
@@ -2783,7 +2783,7 @@ async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>)
     }
     let level = req.level.unwrap_or_else(|| state.settings.lock_recover().default_duck()).clamp(0.0, 1.0);
     let ttl = duck_ttl(req.ttl_ms);
-    let id = crate::overlay_mixer::OverlayMixer::global().start_duck(&targets, level, ttl);
+    let id = crate::outputs::overlay_mixer::OverlayMixer::global().start_duck(&targets, level, ttl);
     // An agent-backed pw-sink host also ducks the audio it plays *itself* — the
     // overlay mix can't reach that. No-op for every other kind.
     for target in &targets {
@@ -2815,7 +2815,7 @@ async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>)
 /// caller starts a fresh hold instead of believing it is still ducking.
 async fn duck_renew(Path(hold_id): Path<u64>, Json(req): Json<DuckRequest>) -> (StatusCode, Json<DuckResponse>) {
     let ttl = duck_ttl(req.ttl_ms);
-    if crate::overlay_mixer::OverlayMixer::global().renew_duck(hold_id, ttl) {
+    if crate::outputs::overlay_mixer::OverlayMixer::global().renew_duck(hold_id, ttl) {
         (
             StatusCode::OK,
             Json(DuckResponse {
@@ -2842,7 +2842,7 @@ async fn duck_renew(Path(hold_id): Path<u64>, Json(req): Json<DuckRequest>) -> (
 
 /// Release a hold now (the normal end of a voice turn).
 async fn duck_release(Path(hold_id): Path<u64>) -> (StatusCode, Json<DuckResponse>) {
-    let affected = crate::overlay_mixer::OverlayMixer::global().release_duck(hold_id);
+    let affected = crate::outputs::overlay_mixer::OverlayMixer::global().release_duck(hold_id);
     let existed = !affected.is_empty();
     for output in &affected {
         crate::announce::sync_agent_duck(output);
@@ -2864,7 +2864,7 @@ async fn duck_release(Path(hold_id): Path<u64>) -> (StatusCode, Json<DuckRespons
 /// Live holds — for the UI and for answering "why is this output quiet?".
 async fn duck_list() -> Json<Vec<DuckHoldView>> {
     Json(
-        crate::overlay_mixer::OverlayMixer::global()
+        crate::outputs::overlay_mixer::OverlayMixer::global()
             .duck_holds()
             .into_iter()
             .map(|(output, hold_id, level)| DuckHoldView { output, hold_id, level })

@@ -45,7 +45,7 @@ symphonia = { version = "0.6", features = ["all"] }
 # in the add-on container as on a dev box (needs multicast reachability, i.e.
 # host networking in the container).
 mdns-sd = "0.20"
-# SCHED_FIFO for the sendspin capture→wire relay thread (sendspin_server.rs), so
+# SCHED_FIFO for the sendspin capture→wire relay thread (outputs/sendspin/server.rs), so
 # it can't be starved by general-purpose async work — the primary sendspin
 # stutter cause (RC1, docs/audio-jitter-analysis.md). Already in the build tree
 # via the vendored crates.

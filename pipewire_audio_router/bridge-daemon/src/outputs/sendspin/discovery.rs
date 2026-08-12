@@ -34,7 +34,7 @@ pub struct SendspinDevice {
     pub fullname: String,
     pub display_name: String,
     /// Resolved server address, used by the liveness probe when the device has
-    /// no live connection (sendspin_liveness.rs). `None` until mDNS resolves an
+    /// no live connection (outputs/sendspin/liveness.rs). `None` until mDNS resolves an
     /// IPv4 address.
     pub addr: Option<std::net::SocketAddr>,
     /// Liveness. mDNS only ever sets this `true` (on resolve) and never removes
@@ -193,7 +193,7 @@ pub fn spawn(daemon: &ServiceDaemon, devices: SharedSendspinDevices, changes: Ch
                     // Deliberately ignored: an mDNS "removed" is a TTL-expiry
                     // flap (WiFi power-save, a missed re-announce), not proof
                     // the device left — acting on it tore down live groups.
-                    // Liveness (sendspin_liveness.rs: connection state + an
+                    // Liveness (outputs/sendspin/liveness.rs: connection state + an
                     // active TCP probe) owns real offline/removal.
                     tracing::debug!("mDNS removed {fullname} (ignored; liveness decides offline)");
                 }

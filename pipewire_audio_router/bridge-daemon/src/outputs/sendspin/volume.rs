@@ -10,7 +10,7 @@
 //! This registry is keyed by each device's virtual **node name**
 //! (`sendspin-dev-<slug>`), the same identity the routing matrix and the API
 //! use. The connection's own `client_id` is an opaque MAC on ESPHome devices
-//! and does NOT match the advertised name, so the caller (sendspin_server.rs)
+//! and does NOT match the advertised name, so the caller (outputs/sendspin/server.rs)
 //! resolves the node name from the dialed mDNS fullname before registering —
 //! see `ClientEvent::Connected.fullname` (our sendspin-rs patch). Desired
 //! volumes persist across (re)connects and are re-applied on register.
@@ -166,7 +166,7 @@ impl SendspinControl {
     }
 
     /// Record a **device-reported** current volume (from an inbound `client/state`
-    /// player update — see sendspin_server.rs) as the new desired level, WITHOUT
+    /// player update — see outputs/sendspin/server.rs) as the new desired level, WITHOUT
     /// echoing a `Volume` command back to the device. Echoing would fight a user
     /// turning the physical knob, and re-applying our own just-sent value on the
     /// device's confirming state emit would loop. This is the device→UI half of
@@ -321,7 +321,7 @@ impl SendspinControl {
     }
 
     /// Whether a device currently has a live server connection — the
-    /// connection-driven liveness signal (sendspin_liveness.rs). A connected
+    /// connection-driven liveness signal (outputs/sendspin/liveness.rs). A connected
     /// device is unambiguously present without needing an active probe.
     pub fn is_connected(&self, node_name: &str) -> bool {
         self.senders.contains_key(node_name)

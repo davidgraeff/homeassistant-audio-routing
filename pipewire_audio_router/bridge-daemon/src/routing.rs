@@ -36,8 +36,8 @@
 //! being hardcoded per source/output type.
 
 use crate::api::AppState;
+use crate::outputs::sendspin::discovery::SendspinDevice;
 use crate::pw::thread::{LinkSpec, PortInfo, PwCommand, PwCommandSender, RegistryState, SharedState};
-use crate::sendspin_discovery::SendspinDevice;
 use crate::store;
 use crate::store::routing::{RoutingLink, SharedRouting};
 use crate::util::locks::LockRecover;
@@ -93,7 +93,7 @@ pub struct RoutingNode {
     peak: f32,
     /// Current volume (0.0–1.0) for outputs whose volume the daemon tracks
     /// out-of-band. Presently sendspin devices only — their in-band volume
-    /// (sendspin_volume.rs) is pushed here so the UI slider syncs live over this
+    /// (outputs/sendspin/volume.rs) is pushed here so the UI slider syncs live over this
     /// WebSocket (including a physical volume change the device reports). `None`
     /// for sources/offline entries.
     #[serde(skip_serializing_if = "Option::is_none")]

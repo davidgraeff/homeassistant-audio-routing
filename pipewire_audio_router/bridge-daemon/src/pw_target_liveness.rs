@@ -6,7 +6,7 @@
 //! `present: true` for the daemon's lifetime — the routing graph then showed a
 //! powered-off host as an online speaker and animated its wire.
 //!
-//! **Why no active probe** (unlike sendspin_liveness.rs / ap2_liveness.rs): a
+//! **Why no active probe** (unlike outputs/sendspin/liveness.rs / ap2_liveness.rs): a
 //! pw-sink target exposes nothing of ours to connect to. The audio path is
 //! *receiver*-initiated — the remote `module-rtp-session` dials the session we
 //! advertise — so there is no port on the target to TCP-probe, and probing the host

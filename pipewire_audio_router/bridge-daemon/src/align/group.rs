@@ -195,7 +195,7 @@ pub enum InterferenceCause {
     BargeIn { announcement: u64 },
     /// A voice-duck hold attenuated the member's music. A second, independent
     /// interferer: it has no clip of its own, so nothing in the announce path sees
-    /// it — `overlay_mixer::start_duck` reports it directly.
+    /// it — `outputs::overlay_mixer::start_duck` reports it directly.
     DuckHold { hold: u64 },
 }
 
@@ -1040,7 +1040,7 @@ mod tests {
 
         // 4. A voice-duck hold is the second interferer, and it is reported too — the
         //    one nothing in the announce path can see.
-        crate::overlay_mixer::OverlayMixer::global().start_duck(std::slice::from_ref(&b), 0.2, Duration::from_secs(1));
+        crate::outputs::overlay_mixer::OverlayMixer::global().start_duck(std::slice::from_ref(&b), 0.2, Duration::from_secs(1));
         let reports = hold.take_interference();
         assert_eq!(reports.len(), 2, "{reports:?}");
         let duck = reports.iter().find(|r| matches!(r.cause, InterferenceCause::DuckHold { .. })).expect("duck reported");

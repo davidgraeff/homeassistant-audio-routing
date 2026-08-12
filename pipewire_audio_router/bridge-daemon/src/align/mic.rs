@@ -331,7 +331,7 @@ fn i16_to_f32(v: i16) -> f32 {
 /// The mic ingest: the socket owner and the window provider.
 ///
 /// A process-global singleton reached with [`shared`], in the shape
-/// `overlay_mixer.rs` / `pw_sink_liveness.rs` already use — it is a single
+/// `outputs/overlay_mixer.rs` / `pw_sink_liveness.rs` already use — it is a single
 /// hardware-ish resource with one socket, so there is nothing per-request to
 /// thread through `AppState`, and W3 can reach it without a new plumbing layer.
 pub struct MicIngest {

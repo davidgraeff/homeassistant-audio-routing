@@ -35,10 +35,10 @@
 //! Beside the existing per-device announcement overlay, and **after** it:
 //!
 //! ```text
-//! capture ─▶ overlay_mixer::mix_into(node, …) ─▶ relay_delay::delay_into(node, …) ─▶ encoder/sender
+//! capture ─▶ outputs::overlay_mixer::mix_into(node, …) ─▶ relay_delay::delay_into(node, …) ─▶ encoder/sender
 //! ```
 //!
-//! (`sendspin_server.rs`, `ap2_server.rs`, `pwsink_server.rs`; for sendspin this sits
+//! (`outputs/sendspin/server.rs`, `ap2_server.rs`, `pwsink_server.rs`; for sendspin this sits
 //! *before* the per-member encoder, because the ring stores PCM.)
 //!
 //! The order is forced by what this module is standing in for. The real knob it
@@ -231,7 +231,7 @@
 //!
 //! * **A relay-side delay moves content relative to the codec's frame grid; a
 //!   device-side delay does not.** The sendspin relay re-cuts the stream into fixed
-//!   960-frame Opus blocks (`sendspin_codec::Reblocker`) and this line sits upstream of
+//!   960-frame Opus blocks (`outputs::sendspin::codec::Reblocker`) and this line sits upstream of
 //!   that, so a delay that is not a multiple of 20 ms changes *where inside an MDCT
 //!   window* a measurement transient falls. The decoded signal is still delayed by
 //!   exactly *d*, but Opus's transient smearing is window-position dependent, so the
@@ -253,7 +253,7 @@
 //! what it is fed. None of them can observe that the content is older. The one
 //! asymmetry, and it belongs to the *device* side, is that a real sendspin
 //! `static_delay_ms` is folded into the group's required lead
-//! (`sendspin_server::required_send_ahead_us`) and so can force a group-wide restart
+//! (`outputs::sendspin::server::required_send_ahead_us`) and so can force a group-wide restart
 //! when it crosses the high-water mark (plan §9.2) — the provisional delay never does,
 //! which is a reason the final write can behave differently from the walk that preceded
 //! it, and a reason to check the mark *before* writing.
@@ -868,7 +868,7 @@ impl RelayDelay {
     ///
     /// Returns `true` when `out` holds the audio to send, `false` when this output has
     /// neither effect (or the block could not be delayed safely) and the caller should
-    /// keep using `src` — the same contract as `overlay_mixer::mix_into`, so the two
+    /// keep using `src` — the same contract as `outputs::overlay_mixer::mix_into`, so the two
     /// compose by chaining. Call it **after** `mix_into` (see the module docs for why).
     ///
     /// The name predates the mute; the contract did not change, which is why the three
@@ -1082,7 +1082,7 @@ mod tests {
         // Mirrors the call sites: mix_into first, then delay_into on its result — so the
         // delay applies to duck(music)+overlay, exactly as a device-side knob would.
         let output = "relay-delay-compose-test";
-        let mixer = crate::overlay_mixer::OverlayMixer::global();
+        let mixer = crate::outputs::overlay_mixer::OverlayMixer::global();
         const BLOCK: usize = 480;
         const D: usize = 700;
         let rd = RelayDelay::new();
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn a_mute_composes_with_an_overlay_and_a_delay_at_the_same_time() {
         let output = "relay-delay-mute-compose-test";
-        let mixer = crate::overlay_mixer::OverlayMixer::global();
+        let mixer = crate::outputs::overlay_mixer::OverlayMixer::global();
         const BLOCK: usize = 480;
         const D: usize = 700;
         let rd = RelayDelay::new();

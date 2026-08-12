@@ -220,7 +220,7 @@ was the only option.
 > A disconnected device reports `ok: false` with a reason rather than pretending: there is
 > nothing to clear, and its next stream starts fresh anyway. Unlike volume/mute/delay a
 > clear stores no desired state, which is pinned by
-> `sendspin_volume::tests::clearing_a_disconnected_device_is_reported_not_stored`.
+> `outputs::sendspin::volume::tests::clearing_a_disconnected_device_is_reported_not_stored`.
 >
 > This is the first thing to try next time item 4 recurs — and it leaves the evidence
 > intact, which an add-on restart did not.

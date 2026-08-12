@@ -1,6 +1,6 @@
 //! Connection-driven presence + active-probe fallback for sendspin devices.
 //!
-//! mDNS (sendspin_discovery.rs) only ever *adds* devices; this task owns the
+//! mDNS (outputs/sendspin/discovery.rs) only ever *adds* devices; this task owns the
 //! online/offline flag and eventual removal, so a flapping mDNS record (TTL
 //! expiry on a WiFi-power-saving speaker) never tears down a live group.
 //!
@@ -11,9 +11,9 @@
 //! that stays offline past a grace window is removed from the registry — so a
 //! genuinely-gone device still disappears, just not on a transient blip.
 
+use crate::outputs::sendspin::discovery::SharedSendspinDevices;
+use crate::outputs::sendspin::volume::SharedSendspinControl;
 use crate::pw::thread::ChangeNotifier;
-use crate::sendspin_discovery::SharedSendspinDevices;
-use crate::sendspin_volume::SharedSendspinControl;
 use crate::util::locks::LockRecover;
 use std::collections::HashMap;
 use std::net::SocketAddr;

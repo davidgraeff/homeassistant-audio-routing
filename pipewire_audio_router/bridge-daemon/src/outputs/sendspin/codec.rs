@@ -11,7 +11,7 @@
 // ## Where this runs, and what that forbids
 //
 // Encoding happens **on the `sendspin-relay` SCHED_FIFO thread**, inline in the
-// capture→wire fan-out (sendspin_server.rs). That's the cheapest place — the PCM is
+// capture→wire fan-out (outputs/sendspin/server.rs). That's the cheapest place — the PCM is
 // already there, no extra hop or thread — but it means the steady path must not
 // allocate, block, or take an unbounded amount of time. So every buffer here is
 // allocated once and reused:
@@ -32,7 +32,7 @@
 // before. Devices in a group normally receive byte-identical PCM, but a device
 // being announced to gets `duck(music)+overlay` instead — so its audio *diverges*,
 // and sharing one encoder across the group would put a discontinuity in everyone's
-// stream at overlay start/end. Hence one encoder per member (sendspin_server.rs
+// stream at overlay start/end. Hence one encoder per member (outputs/sendspin/server.rs
 // keys them by `client_id`), created lazily and dropped with the membership.
 //
 // ## Blocking

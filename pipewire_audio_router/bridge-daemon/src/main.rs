@@ -13,7 +13,7 @@ mod api;
 mod applemidi_sender;
 mod audio;
 mod discovery_supervisor;
-mod overlay_mixer;
+mod outputs;
 mod per_device_spike;
 mod pw;
 mod pw_sink;
@@ -24,11 +24,6 @@ mod pw_target_liveness;
 mod pwsink_agent;
 mod pwsink_server;
 mod routing;
-mod sendspin_codec;
-mod sendspin_discovery;
-mod sendspin_liveness;
-mod sendspin_server;
-mod sendspin_volume;
 mod sources;
 mod store;
 mod sync_group;
@@ -215,9 +210,9 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     let airplay_clients = crate::sources::airplay_clients::AirplayClientStore::load(&airplay_clients_path)?;
     tracing::info!("{} remembered AirPlay client(s) in {}", airplay_clients.total_clients(), airplay_clients_path.display());
     let meters = pw::metering::MeterHub::new();
-    let sendspin_control = sendspin_volume::shared();
+    let sendspin_control = outputs::sendspin::volume::shared();
     let ap2_control = ap2_volume::shared();
-    let sendspin_devices: sendspin_discovery::SharedSendspinDevices =
+    let sendspin_devices: outputs::sendspin::discovery::SharedSendspinDevices =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     // Discovered AirPlay-2 receivers (ap2_discovery.rs) + the host-global PTP
     // grandmaster (ap2_ptp.rs) they register with. The RAOP-output replacement.
@@ -304,7 +299,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Own sendspin device online/offline (and eventual removal) from the
         // live connection state + an active TCP probe — mDNS only ever adds.
         // Without this, an mDNS TTL flap would tear down live groups.
-        sendspin_liveness::spawn(sendspin_devices.clone(), sendspin_control.clone(), changes.clone());
+        outputs::sendspin::liveness::spawn(sendspin_devices.clone(), sendspin_control.clone(), changes.clone());
         // Same contract for AP2 receivers: mDNS (ap2_discovery) only adds; this
         // task TCP-probes each and demotes/removes a powered-off receiver so its
         // sender is torn down (and its PTP peer released).
@@ -314,7 +309,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // as proof of life. Without this a target seen once stayed "online" forever.
         pw_target_liveness::spawn(pw_targets.clone(), changes.clone());
 
-        // Let device-reported sendspin volume changes (sendspin_server.rs) nudge
+        // Let device-reported sendspin volume changes (outputs/sendspin/server.rs) nudge
         // the routing-matrix WebSocket, so the UI slider syncs live to a physical
         // volume change without polling. AP2 volume/mute is UI-driven (no receiver
         // feedback yet) but uses the same notifier so a set pushes immediately.
@@ -326,7 +321,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         pw_sink_liveness::PwSinkLiveness::global().set_change_notifier(changes.clone());
 
         // Seed persisted per-device static delays so they re-apply when each
-        // device (re)connects, exactly like stored volumes (sendspin_volume.rs).
+        // device (re)connects, exactly like stored volumes (outputs/sendspin/volume.rs).
         {
             let delays = sync_settings.lock_recover().sendspin_delays();
             if !delays.is_empty() {

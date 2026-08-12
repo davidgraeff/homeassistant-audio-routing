@@ -12,7 +12,7 @@
 //!
 //! ## One session per target (per-device announce/duck)
 //! Each target gets its **own** `AppleMidiSender`, fed a **per-device-mixed**
-//! copy of the capture: the relay applies `overlay_mixer::mix_into(node_name,…)`
+//! copy of the capture: the relay applies `outputs::overlay_mixer::mix_into(node_name,…)`
 //! before handing the PCM to that target's sender, so an announcement can duck
 //! one target's music independently — the must-have per-device overlay, obtained
 //! exactly as the AP2 relay does. (A single shared session couldn't duck one
@@ -92,7 +92,7 @@ impl Drop for PwSinkServerHandle {
         self._status_task.abort();
         for (name, _sender) in &self.senders {
             PwSinkLiveness::global().remove(name);
-            crate::overlay_mixer::OverlayMixer::global().clear_output_rate(name);
+            crate::outputs::overlay_mixer::OverlayMixer::global().clear_output_rate(name);
         }
         // `senders` then drop (field order): each Arc<AppleMidiSender>'s strong
         // count hits zero → the sender's Drop tears down its session + advert.
@@ -174,9 +174,9 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
         match AppleMidiSender::start(config, pcm_rx_sender) {
             Ok(sender) => {
                 // Overlay clips are 48 kHz stereo → matches this capture's rate,
-                // but publish it anyway so overlay_mixer::start rate-matches
+                // but publish it anyway so outputs::overlay_mixer::start rate-matches
                 // correctly (and clears cleanly on teardown).
-                crate::overlay_mixer::OverlayMixer::global().set_output_rate(&m.node_name, format.rate);
+                crate::outputs::overlay_mixer::OverlayMixer::global().set_output_rate(&m.node_name, format.rate);
                 tracing::info!(
                     "pw-sink: advertising session '{}' on control port {} for target '{}'",
                     session_name_for(&m.node_name),
@@ -204,7 +204,7 @@ pub fn start(members: Vec<PwSinkMember>, sink_node_id: u32) -> anyhow::Result<Pw
         .name("pwsink-relay".into())
         .spawn(move || {
             set_relay_realtime_priority();
-            let mixer = crate::overlay_mixer::OverlayMixer::global();
+            let mixer = crate::outputs::overlay_mixer::OverlayMixer::global();
             // Provisional per-device alignment delay (align/relay_delay.rs), applied AFTER the
             // overlay so it shifts everything this target renders — as the playout-delay
             // knob it stands in for does. One block out per block in, so the sender's

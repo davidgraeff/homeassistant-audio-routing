@@ -110,7 +110,7 @@ outputs:
 
 | `kind` | What it is | Discovery |
 |---|---|---|
-| `sendspin` | ESPHome sendspin speakers (e.g. HA Voice PE) | mDNS (`sendspin_discovery.rs`) |
+| `sendspin` | ESPHome sendspin speakers (e.g. HA Voice PE) | mDNS (`outputs/sendspin/discovery.rs`) |
 | `airplay2` | native AirPlay-2 receivers | mDNS (`ap2_discovery.rs`) |
 | `pwsink` | remote PipeWire hosts | a `pwrouter-agent` on that host dials in (`pwsink_agent.rs`) — not a browse |
 
@@ -510,12 +510,12 @@ up before its source was added here.
 ## Sendspin devices
 
 Sendspin speakers (ESPHome, e.g. HA Voice PE) are **auto-discovered** over
-mDNS (`sendspin_discovery.rs`) — there is no per-output config to create.
+mDNS (`outputs/sendspin/discovery.rs`) — there is no per-output config to create.
 Each discovered device shows up as a virtual routing output
 (`sendspin-dev-<slug>`); devices routed from the same source set are formed
 into one synchronized group automatically (`sendspin_group.rs`). Online/offline
 is decided by the live connection plus a TCP liveness probe, not raw mDNS
-(`sendspin_liveness.rs`). The only per-device control is volume, carried
+(`outputs/sendspin/liveness.rs`). The only per-device control is volume, carried
 in-band over the protocol (there is no PipeWire node volume for these virtual
 outputs).
 
@@ -668,7 +668,7 @@ A **duck hold** attenuates an output's music with **no clip of its own** — an
 open-ended lease rather than an announcement. It exists for voice assistants that
 speak through their *own* speaker (an HA Voice PE): the router has nothing to
 play, only music to get out of the way. Ducking happens as a gain in the
-per-device mix (`overlay_mixer.rs`), so a device's own volume never moves, there
+per-device mix (`outputs/overlay_mixer.rs`), so a device's own volume never moves, there
 is nothing to restore, and one member of a synchronized group can duck while its
 groupmates keep playing.
 

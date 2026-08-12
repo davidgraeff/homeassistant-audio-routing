@@ -31,7 +31,7 @@
 //! it), creates new anchors, and restarts a group's sendspin server / AP2 senders
 //! when their dialed set (or the AP2 wire rate) changes.
 
-use crate::overlay_mixer::OverlayMixer;
+use crate::outputs::overlay_mixer::OverlayMixer;
 use crate::util::locks::LockRecover;
 use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PREFIX, SYNC_GRP_PREFIX};
 /// Connected receiver hosts, `node_name → label`, as
@@ -39,10 +39,11 @@ use crate::util::node_names::{AP2_DEV_PREFIX, PWSINK_DEV_PREFIX, SENDSPIN_DEV_PR
 /// because an agent is on the socket (plan §3) — mDNS is not consulted, and cannot
 /// be: its node names lack the `_<user>` half that routing intent carries.
 type PwsinkHosts = std::collections::BTreeMap<String, String>;
+use crate::outputs::sendspin;
+use crate::outputs::sendspin::discovery::{SendspinDevice, SharedSendspinDevices};
+use crate::outputs::sendspin::server::SendspinServerHandle;
 use crate::pw::thread::{PwCommand, PwCommandSender, SharedState};
 use crate::routing::{self, node_id_for};
-use crate::sendspin_discovery::{SendspinDevice, SharedSendspinDevices};
-use crate::sendspin_server::{self, SendspinServerHandle};
 use crate::store;
 use crate::store::routing::{RoutingLink, SharedRouting};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -207,7 +208,7 @@ struct RunningGroup {
 /// announcement. Superseded by the device's group sender the moment it's routed
 /// into a group.
 ///
-/// It runs under [`sendspin_server::StreamPolicy::WhenAnnounced`]: the connection
+/// It runs under [`sendspin::server::StreamPolicy::WhenAnnounced`]: the connection
 /// stays up (dialed as `Discovery`, so it doesn't claim the device against another
 /// server) but carries **no audio** until an announcement is headed for the device.
 /// It used to `stream/start` on connect and push silence forever — see that enum
@@ -1106,7 +1107,7 @@ impl GroupReconciler {
         routing: &SharedRouting,
         adopted: &crate::store::outputs::SharedOutputs,
         devices: &SharedSendspinDevices,
-        control: &crate::sendspin_volume::SharedSendspinControl,
+        control: &crate::outputs::sendspin::volume::SharedSendspinControl,
         send_ahead_us: i64,
         ap2_devices: &crate::ap2_discovery::SharedAp2Devices,
         ap2_ptp: &crate::ap2_ptp::SharedAp2Ptp,
@@ -1167,13 +1168,13 @@ impl GroupReconciler {
                             crate::sync_settings::SendspinCodec::Auto => 3,
                         })
                         .unwrap_or_default();
-                    d.sendspin_codec = sendspin_server::resolve_codec(mode, member_codecs.iter());
+                    d.sendspin_codec = sendspin::server::resolve_codec(mode, member_codecs.iter());
                     // Send-ahead floor, resolved AFTER the codec because a compressed
                     // stream needs more decode headroom than PCM: whichever is larger of
                     // what each member reported and its codec's own minimum, plus that
                     // member's static delay.
                     let delays = ss.sendspin_delays();
-                    d.sendspin_send_ahead_us = sendspin_server::required_send_ahead_us(
+                    d.sendspin_send_ahead_us = sendspin::server::required_send_ahead_us(
                         send_ahead_us,
                         d.sendspin_codec,
                         ss.opus_floor_ms(),
@@ -1405,7 +1406,7 @@ impl GroupReconciler {
                 }
             }
             if restart {
-                match sendspin_server::start_server_per_device(
+                match sendspin::server::start_server_per_device(
                     &anchor_name,
                     &group_display(d),
                     port,
@@ -1414,7 +1415,7 @@ impl GroupReconciler {
                     d.sendspin_send_ahead_us,
                     control.clone(),
                     devices.clone(),
-                    sendspin_server::StreamPolicy::Always,
+                    sendspin::server::StreamPolicy::Always,
                     d.sendspin_codec,
                 )
                 .await
@@ -1675,8 +1676,8 @@ impl GroupReconciler {
             let (idle_codec, idle_lead_us) = {
                 let ss = sync_settings.lock_recover();
                 let caps = devices_map.get(dev).map(|d| d.supported_codecs.clone()).unwrap_or_default();
-                let codec = sendspin_server::resolve_codec(ss.sendspin_codec(dev), std::iter::once(&caps));
-                let lead = sendspin_server::required_send_ahead_us(
+                let codec = sendspin::server::resolve_codec(ss.sendspin_codec(dev), std::iter::once(&caps));
+                let lead = sendspin::server::required_send_ahead_us(
                     send_ahead_us,
                     codec,
                     ss.opus_floor_ms(),
@@ -1715,7 +1716,7 @@ impl GroupReconciler {
                 continue;
             };
             let members = vec![(fullname, idle_url)];
-            match sendspin_server::start_server_per_device(
+            match sendspin::server::start_server_per_device(
                 &sink_node_name,
                 &format!("idle: {}", routing::output_display_name(dev)),
                 port,
@@ -1726,7 +1727,7 @@ impl GroupReconciler {
                 devices.clone(),
                 // Idle: stay connected (warm + controllable) but stream nothing
                 // until an announcement is actually headed for this device.
-                sendspin_server::StreamPolicy::WhenAnnounced,
+                sendspin::server::StreamPolicy::WhenAnnounced,
                 idle_codec,
             )
             .await
@@ -2022,12 +2023,12 @@ mod tests {
     /// 300 ms buffer requirement and sets the group's floor, `kitchen` only 100 ms.
     /// Both members' static delays are inputs, because the spec makes a player's
     /// send-ahead `min_buffer_ms + static_delay_ms` and a group's the maximum of those
-    /// (see `sendspin_server::required_send_ahead_us`).
+    /// (see `sendspin::server::required_send_ahead_us`).
     fn group_lead_us(kitchen_delay_ms: u16, bath_delay_ms: u16) -> i64 {
-        sendspin_server::required_send_ahead_us(
+        sendspin::server::required_send_ahead_us(
             100_000, // the user's configured group lead
             "opus",
-            crate::sendspin_codec::DEFAULT_OPUS_FLOOR_MS,
+            crate::outputs::sendspin::codec::DEFAULT_OPUS_FLOOR_MS,
             // Both report, so the Opus floor above is bypassed either way.
             [(Some(100), kitchen_delay_ms), (Some(300), bath_delay_ms)],
         )
