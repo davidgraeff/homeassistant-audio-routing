@@ -5,7 +5,7 @@
 //! members it names audible** and the rest muted. Which members are audible is what
 //! the two consumers differ on: the by-ear path makes two audible (a fixed
 //! **reference** and the **target** being tuned) and the user drags the target's
-//! delay until they coincide; the microphone path (align/measure.rs) solos **one**
+//! delay until they coincide; the microphone path (align/measure/mod.rs) solos **one**
 //! at a time so a per-member SNR can be attributed at all (plan §12.2, §7.1).
 //!
 //! ## The group is formed by the session, not found by it

@@ -16,7 +16,7 @@
 //!
 //! ## How it is driven
 //!
-//! The orchestrator (`align/measure.rs`, W3) owns the audio, the volume knobs and
+//! The orchestrator (`align/measure/mod.rs`, W3) owns the audio, the volume knobs and
 //! the API; this module owns only the arithmetic:
 //!
 //! ```ignore

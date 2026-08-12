@@ -181,7 +181,7 @@ pub fn router(
         .route("/api/align/mic", get(crate::align::mic::mic_status))
         // Whether the level is good enough to measure — the meter cannot say.
         .route("/api/align/mic/signal", get(mic_signal))
-        // Measurement orchestration (align/measure.rs, plan §11). `apply` is a
+        // Measurement orchestration (align/measure/mod.rs, plan §11). `apply` is a
         // separate, explicit step: the user sees the proposed deltas and the
         // confidence before a single delay is written.
         .route("/api/align/measure", get(measure_status).delete(measure_abandon))

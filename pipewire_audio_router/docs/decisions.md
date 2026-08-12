@@ -339,7 +339,7 @@ concurrent edits), and the reviewable invariant is **"baseline unchanged", not
 "clean"** — state the test/clippy/fmt numbers in the commit message and prove
 them identical, since a wave that silences a pre-existing finding is as suspect
 as one that adds one. Details, including where tests live and the still-pending
-`align/measure.rs` decomposition: [module-layout-plan.md](module-layout-plan.md).
+`align/measure/mod.rs` decomposition: [module-layout-plan.md](module-layout-plan.md).
 
 ---
 

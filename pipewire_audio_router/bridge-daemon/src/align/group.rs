@@ -99,7 +99,7 @@
 //! dials anyway — so a superset re-forms and says so, rather than acquiring a second
 //! formation mechanism with its own restore obligations.
 //!
-//! ## Intended call sequence (the seam `align/measure.rs` is wired to)
+//! ## Intended call sequence (the seam `align/measure/mod.rs` is wired to)
 //!
 //! 1. `calibrate::AlignManager::start_outputs(&HoldDeps, outputs, mode)` —
 //!    validates the selection ([`validate_selection`]), forms and holds the group

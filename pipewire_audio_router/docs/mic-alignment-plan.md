@@ -323,6 +323,27 @@ that:
   **idle** timeout: each arrival re-solos its speaker, so a walk refreshes it without
   the measurement code knowing the watchdog exists. A genuinely abandoned session
   still tears down.
+- **An idle timeout that nobody can see is a trap, because the hold is exclusive**
+  (§12.3): when it fires, held speakers go back to normal and an open wizard is
+  describing a session that no longer exists. It bit a real multi-position run, and in
+  the least obvious place — the **review page**, where the user is reading a proposal,
+  which is exactly the activity the watchdog cannot see. Three corrections followed:
+  - `AlignState` carries **`closes_in_s`** (relative whole seconds as of the frame, not an
+    absolute instant: the two clocks differ and the client ticks locally), plus
+    `idle_timeout_s` and `timeout_slack_s`. The last of those is the honest bound — the
+    watchdog is a poller, so a UI must say "about" and never count anyone down to a second
+    it does not have;
+  - the UI must name **what refreshes it**, because a countdown with no remedy is worse
+    than none, and `POST /api/align/still-here` is that remedy. It is safe *because* it is
+    a click: an open socket, a frame on it and a status poll all deliberately count for
+    nothing, since a forgotten open tab is the same hazard as a closed one;
+  - **two things this section got wrong about its own mechanism.** `Session::activity`'s
+    doc claimed `select` and `set_level` refreshed the idle mark and only `set_audible`
+    ever did, so a by-ear session tuned pair by pair for a quarter of an hour was torn
+    down as abandoned; and §12.3.1's "re-arms the safety timeout" was left over from the
+    one-shot version — arming a second watchdog on the same session postpones nothing
+    (both read the same `activity`) and only leaks a task per position. A `start` now
+    refreshes the mark and arms nothing.
 - **A mid-walk mic reconnect costs the *user* a re-walk**, not the daemon a loop.
   Budget it as a user-visible failure and allow more restarts than the internal path
   does, because each one is expensive to the person, not the process.
@@ -880,7 +901,7 @@ this is a per-speaker gain solve, not a global volume.
 
 The solver lives in `align/levels.rs` and is complete, including the two-sided solve
 and the crosstalk verdict. **Its automated ramp is not yet driven** —
-`align/measure.rs`'s `learn_levels` still reports `learned: false` — so in practice
+`align/measure/mod.rs`'s `learn_levels` still reports `learned: false` — so in practice
 levels are set per speaker in the wizard (§12.2) rather than solved for.
 
 Level knob availability differs by member kind:
@@ -1154,7 +1175,17 @@ failure is still retryable.
 
 The session endpoints it builds on: `POST /api/align/start` (hold these outputs for
 the whole run, §12.3.1), `/api/align/select`, `/api/align/audible`,
-`/api/align/volume`, `GET|DELETE /api/align`, `GET /api/align/groups`.
+`/api/align/volume`, `GET|DELETE /api/align`, `GET /api/align/groups` — plus two the
+idle timeout made necessary (§1.2):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/align/ws` | pushed **session** state: one full `AlignState` on connect, one per change, **one on teardown**. The frame that matters is the last one — a session can end with nothing on screen having asked it to |
+| `POST` | `/api/align/still-here` | postpone the idle teardown by one whole allowance, changing nothing else. **A click, never a heartbeat**: a held socket, a frame on it and a status poll all count for nothing, on purpose |
+
+Both sockets share one push loop (`align/status_ws.rs`), because a second copy of its
+closed-tab handling is how one of them ends up leaking a `watch` subscription — and the
+session socket is the one where that would matter for an hour.
 
 `measure/start`'s `link_to` is **refused** while W8b is unbuilt, so a client cannot
 believe in cross-session coherence that does not exist. Chaining exists *within* a
@@ -1189,6 +1220,28 @@ effective mode must be **derived**, not written back into state, or selecting it
 the microphone control and stops the capture the user just proved works; and "is this a
 measured run" must derive from the mode being **shown**, not from the picker, or a measured
 proposal ends up under a by-ear heading.
+
+**The session's remaining time is on screen, and its ending resets the wizard.** Both
+follow from the hold being exclusive and the timeout being an *idle* one (§1.2), and both
+are needed in **two** places — the wizard, and the Outputs page's "an alignment is holding
+these speakers" notice, because that is what someone looking at their speakers sees. The
+UI's obligations, each of which was got wrong first:
+
+- **say "about"** (`holdCloseLabel`), never a ticking `mm:ss`: the daemon's watchdog only
+  looks every `timeout_slack_s`, and a precise readout would be a lie with a decimal point
+  as well as an invitation to sit and watch it. It turns amber only in the last two minutes;
+- **say what refreshes it** and offer the remedy in the same line ("Keep it open"). Naming
+  it accurately matters: what counts is touching the run, not looking at it;
+- **treat 0 as "the watchdog has not looked yet"**, not as "gone". The end is rendered when
+  a frame says `active: false`, which arrives on `/api/align/ws`;
+- **reset properly when it does end.** The soloed speaker and the level verdicts go (they
+  described *that* hold), the selection and the per-speaker levels stay (they are the
+  user's choices, and keeping them makes "start again" one click), the wizard steps back
+  off a body page it can no longer show — and it **says why**, distinguishing the timeout
+  from someone else's stop. A panel that silently empties leaves the user wondering what
+  they broke. The **review page is the exception**: a measured proposal is still readable
+  and still revertable (§9.4), and discarding it because the session expired would throw
+  away an apartment's worth of walking.
 
 The history, since it explains the shape: the panel used to live on
 source cards because a group *is* its source set, and the session resolved the group
@@ -1304,8 +1357,12 @@ How it works (`align/group.rs`, `align/calibrate.rs`, `api/align.rs`):
   which touches nothing that could reconnect a speaker — not the reconciler's
   override, not the reservation, not the anchor, not the click loop, not the
   level/mute snapshot. It updates the echoed selection, the mode, reference/target/
-  audibility, and re-arms the safety timeout (so a long walk is not cut off), and
-  deliberately does **not** reset the playback level.
+  audibility, and **refreshes the idle mark** so a long walk is not cut off, and
+  deliberately does **not** reset the playback level. ("Re-arms the safety timeout",
+  which this said until §1.2 turned the deadline into an idle timeout, was wrong in a way
+  that read as harmless: arming a second watchdog over the same session postpones nothing
+  — every watchdog reads the same `activity` — it only leaks a task per position, and the
+  walk got its extra time from the arrivals rather than from the re-arm.)
 - A **superset** re-forms, on purpose. The reconciler would cope with growing the
   hold in place (the align group's key is the constant `align-hold-source`, so adding
   a member dials only that member) — but the session's snapshot/restore set, member
@@ -1508,7 +1565,7 @@ Open questions:
 
 The microphone ingest and its worklet client (`align/mic.rs`, `MicCapture.svelte`);
 the estimator and its measured accuracy (`align/estimator.rs`, §5.4.1); the run
-state machine, the loop-phase gate and every §11 endpoint (`align/measure.rs`);
+state machine, the loop-phase gate and every §11 endpoint (`align/measure/mod.rs`);
 the two-sided level solver and crosstalk verdict (`align/levels.rs`); solve / write
 / settle / verify, with the merged-peak check **dropped by decision** (§10.3); the
 temporary exclusive group as a routing-intent override (`align/group.rs`) and the

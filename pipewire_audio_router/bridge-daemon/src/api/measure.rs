@@ -1,6 +1,6 @@
 use super::*;
 
-// ---- Microphone-assisted alignment (align/measure.rs, plan §11) ----------
+// ---- Microphone-assisted alignment (align/measure/mod.rs, plan §11) ----------
 //
 // The measurement rides *beside* the by-ear session rather than replacing it: it
 // needs that session running (the click track has to be playing on every member
@@ -424,7 +424,7 @@ pub(crate) async fn measure_split_calibrate(
     tracing::info!("USER ACTION: calibrate '{}''s band split at close range", req.node_name);
     let deps = measure_deps(&state, Mode::NearField, false, Vec::new());
     let cal = crate::align::measure::shared().calibrate_split(deps, req.node_name, req.level).await.map_err(refused)?;
-    // Persisted here rather than in `align/measure.rs` for the same reason the delay
+    // Persisted here rather than in `align/measure/mod.rs` for the same reason the delay
     // writes are (plan §9.3): the store belongs to the API layer, and the measurement
     // module never sees `AppState`.
     let stored = crate::routing::sync_settings::BandSplit {

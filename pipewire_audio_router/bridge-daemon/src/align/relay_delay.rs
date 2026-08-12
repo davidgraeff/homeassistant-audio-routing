@@ -166,7 +166,7 @@
 //! produce the same audible shift", to be retired by measuring once. This module
 //! provides the relay arm — [`RelayDelay::set_delay_us`] plus [`RelayDelay::status`] for
 //! the exact applied sample count — and deliberately does not orchestrate it. The
-//! orchestration is W21, in `align/measure.rs` (`plan_equivalence`, `EquivalenceReport`);
+//! orchestration is W21, in `align/measure/mod.rs` (`plan_equivalence`, `EquivalenceReport`);
 //! read its section header for what the experiment turned out to measure, which is not
 //! what §1.1.1 expected:
 //!

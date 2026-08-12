@@ -255,7 +255,7 @@ had grown past that:
 
 | file | before | after | tests |
 |---|---:|---:|---|
-| `align/measure.rs` | 10092 | 7032 | `measure/tests/` — 9 files by subject |
+| `align/measure/mod.rs` | 10092 | 7032 | `measure/tests/` — 9 files by subject |
 | `align/calibrate.rs` | 2841 | 1704 | `calibrate/tests.rs` |
 | `routing/sync_group.rs` | 2216 | 1851 | `sync_group/tests.rs` |
 | `align/levels.rs` | 2153 | 1579 | `levels/tests.rs` |
@@ -310,9 +310,9 @@ the suite; it silently stops running those tests, and the only signal is the tot
 
 ---
 
-## 6. Still outstanding: decomposing `align/measure.rs`
+## 6. Still outstanding: decomposing `align/measure/mod.rs`
 
-`align/measure.rs` is the one file where size is still a real problem: **7032
+`align/measure/mod.rs` is the one file where size is still a real problem: **7032
 lines**, the largest in the crate by a factor of nearly four, and it grew ~3.9k
 lines *during* this refactor (multi-position chaining plus the relay-vs-device
 equivalence experiment). The rest of the cluster is defensible at its size:

@@ -772,7 +772,7 @@ one continuous microphone capture* cancels the content's own timebase, leaving
 delay difference plus path difference. The mic arrives over a WebSocket
 (`align/mic.rs`), the DSP is a bandpass + envelope peak with parabolic
 interpolation (`align/estimator.rs`), and the run is orchestrated by
-`align/measure.rs`.
+`align/measure/mod.rs`.
 
 **Writes are deferred.** A real delay write costs a device reconnect (tens of
 seconds for sendspin), so a multi-position run applies its delays
