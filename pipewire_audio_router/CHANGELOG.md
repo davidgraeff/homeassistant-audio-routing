@@ -97,7 +97,8 @@ runtime through the web UI, and outputs can be grouped.
 _2026-07-13_
 
 Initial release — a PipeWire-based whole-home audio router as a Home Assistant
-add-on, replacing Music Assistant's Python audio engine.
+add-on, with the audio path on PipeWire's realtime graph rather than a Python
+engine.
 
 - Headless PipeWire graph in the add-on container, with graph control from a
   Rust bridge daemon.

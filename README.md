@@ -48,22 +48,24 @@ in the kitchen and the living room" is two taps and stays in sync.
 answers *where* it goes, and when it has to be exact.
 
 MA is a library and a player: NAS files, playlists, web radio, provider
-accounts, queues, artwork. Its grouping works within one protocol, and it has
-no notion of routing a chosen input to a chosen set of outputs — a player
-doesn't need one. This project is the layer underneath: transports (AirPlay 2,
+accounts, queues, artwork. *Synchronised* grouping there is per-ecosystem — its
+own docs say a cross-provider Universal Group plays the same audio but not in
+sync, because there are no shared timestamps across ecosystems — and it has no
+notion of routing a chosen input to a chosen set of outputs, which a player
+does not need. This project is the layer underneath: transports (AirPlay 2,
 ESPHome speakers, PC agents) on one clock, groups that span protocols, a matrix
 from any input to any set of outputs, and ducking as an operation on the audio
 graph rather than on a queue.
 
 So they compose. Point MA at this add-on's AirPlay input and it becomes one
-more AirPlay player in MA's list: MA keeps the library, the queue and the
-metadata, and the audio it sends is routed, grouped and ducked here like
-anything else that streams in.
+more AirPlay player in MA's list: MA keeps the library and the queue, and the
+audio it sends is routed, grouped and ducked here like anything else that
+streams in.
 
 | | Music Assistant | this project |
 |---|---|---|
 | Knows about | libraries, playlists, web radio, providers, queues, artwork | PipeWire nodes, AirPlay/RTP/sendspin transports, clocks |
-| Groups | within one protocol | across protocols |
+| Multiroom | in sync within one ecosystem; across ecosystems, unsynced | in sync across protocols |
 | Routing | a queue to its player | any input to any set of outputs, live |
 | Latency | not a design driver | the design driver |
 
@@ -108,6 +110,8 @@ original-ESP32 board (not S2/S3/C3/C6 — that README explains why), or use
 for higher-quality codecs.
 
 ### 4. YouTube Music's Cast button — optional
+
+![Puts the house in the Cast menu of the YouTube Music app](docs/images/ytmusic_share.jpg)
 
 Puts the house in the Cast menu of the YouTube Music app. It is a second add-on
 in the same repository, so it is already in your store from step 1 — install it,
