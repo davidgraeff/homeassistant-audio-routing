@@ -17,7 +17,7 @@ rather than in place of one — see
 
 ## Routing is one card
 
-![The audio routing dashboard card: inputs on the left, zones on the right, live routes drawn as wires between them](docs/images/audio_routing_card.png)
+![The audio routing dashboard card: inputs on the left, zones on the right, live routes drawn as wires between them](docs/images/audio_routing_card.webp)
 
 Tap an input, then where it should play. Tap a wire to remove a route. Speakers
 fed by the same inputs are synchronised into one group for you, so "play this
@@ -41,6 +41,42 @@ in the kitchen and the living room" is two taps and stays in sync.
   *offered*, including the neighbours' AirPlay speakers; nothing is routable,
   gets an entity, or is ever sent audio until you add it — each with a
   test-tone button so you can tell which speaker is which.
+
+## A look around
+
+The add-on's own web UI, in Home Assistant's sidebar — and the device it adds to
+Home Assistant itself. Click any shot for full size.
+
+<table>
+  <tr valign="top">
+    <td width="33%" align="center">
+      <a href="docs/images/screen_sources.webp"><img src="docs/images/screen_sources.webp" width="270" alt="Sources tab: three input sources with present/offline badges, and buttons to add an AirPlay or RTP receiver"></a>
+      <br><sub><b>Sources</b> — every input you can route: AirPlay endpoints phones and PCs cast into, RTP from a Bluetooth bridge or a PipeWire machine. Add as many as you like.</sub>
+    </td>
+    <td width="33%" align="center">
+      <a href="docs/images/screen_outputs.webp"><img src="docs/images/screen_outputs.webp" width="270" alt="Outputs tab: seven adopted outputs with protocol and online badges and per-device volume sliders"></a>
+      <br><sub><b>Outputs</b> — what you added, with its protocol, whether it is online, its PTP lock, and its own volume. Discovered devices are only <i>offered</i> until you add them.</sub>
+    </td>
+    <td width="33%" align="center">
+      <a href="docs/images/screen_alignment.webp"><img src="docs/images/screen_alignment.webp" width="270" alt="Alignment tab: a five-step wizard, currently on the microphone check"></a>
+      <br><sub><b>Alignment</b> — speakers on one stream should land together, but each adds its own delay. The wizard lines them up, measured with your phone's microphone or by ear.</sub>
+    </td>
+  </tr>
+  <tr valign="top">
+    <td width="33%" align="center">
+      <a href="docs/images/screen_announcements.webp"><img src="docs/images/screen_announcements.webp" width="270" alt="Announcements tab: two announcement groups with settings, test and delete buttons"></a>
+      <br><sub><b>Announcements</b> — a reusable set of speakers a clip is played to. <b>Duck</b> is how far the music drops, <b>Priority</b> who wins when two clips collide.</sub>
+    </td>
+    <td width="33%" align="center">
+      <a href="docs/images/screen_music_groups.webp"><img src="docs/images/screen_music_groups.webp" width="270" alt="Music groups tab: two groups built from speaker chips, each with a source picker"></a>
+      <br><sub><b>Music groups</b> — speakers that play the same audio in sync, one Home Assistant <code>media_player</code> each. <b>Source</b> picks what the whole group plays.</sub>
+    </td>
+    <td width="33%" align="center">
+      <a href="docs/images/screen_ha_device.webp"><img src="docs/images/screen_ha_device.webp" width="270" alt="Home Assistant device page for the add-on, showing service information, configuration entities and recent activity"></a>
+      <br><sub><b>In Home Assistant</b> — the add-on's own device: voice-assistant ducking, the Bluetooth-bridge source, and which build is running on what hardware.</sub>
+    </td>
+  </tr>
+</table>
 
 ## Works with Music Assistant
 
@@ -98,8 +134,6 @@ for higher-quality codecs.
 
 ### 4. YouTube Music's Cast button — optional
 
-![Puts the house in the Cast menu of the YouTube Music app](docs/images/ytmusic_share.jpg)
-
 Puts the house in the Cast menu of the YouTube Music app. It is a second add-on
 in the same repository, so it is already in your store from step 1 — install it,
 start it, open its panel, and it walks you through the two things it needs: one
@@ -112,6 +146,10 @@ on `yt-dlp` keeping pace with YouTube, so treat it as the least stable thing
 here. Details in [`ytmusic_receiver/`](ytmusic_receiver/README.md), reasoning and
 every measured gotcha in
 [docs/ytmusic-receiver.md](docs/ytmusic-receiver.md).
+
+<a href="docs/images/ytmusic_share.jpg"><img src="docs/images/ytmusic_share.jpg" width="200" alt="The YouTube Music app's cast sheet on a phone, offering 'Musik (Home Assistant)' as a target"></a>
+
+<sub>What it buys you: the house in the app's own Cast menu.</sub>
 
 ## Status
 
