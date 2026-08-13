@@ -201,6 +201,20 @@ systemctl --user start pwrouter-agent</code
       none.
     </p>
 
+    <h3>When that machine sleeps</h3>
+    <p class="card-sub">
+      The helper hears the suspend coming (from <code>logind</code>) and tells this add-on <em>before</em>
+      the machine freezes, so its card says <strong>asleep</strong> — or <strong>shut down</strong> — rather
+      than offline. Its routing, level and group membership are kept, its audio session is closed cleanly,
+      and Home Assistant marks it unavailable instead of offering a slider for a sleeping computer.
+    </p>
+    <p class="card-sub hint">
+      Without that warning nobody would know for minutes: a suspended machine never closes its connection,
+      so it keeps looking connected while being sent audio nobody can hear. Waking it reconnects within a
+      second or so. A machine that just falls off the network still reads offline — only its own word
+      earns the gentler wording.
+    </p>
+
     <p class="card-sub hint">
       If the machine cannot find the add-on — a routed VLAN, or mDNS blocked — point it straight at the
       add-on's host and port instead: <code>pwrouter-agent run --daemon &lt;host&gt;:8099</code>.

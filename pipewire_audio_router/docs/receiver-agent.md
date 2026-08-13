@@ -616,6 +616,58 @@ are now fixed and both were proven live in both directions; the `publish` path a
 the state it sends, and warns when the control plane is too slow to drain it, so a
 recurrence says so in the journal instead of looking like a UI bug.
 
+### 9.5 Suspend: the host says goodbye, and **asleep** is a state
+
+A suspending machine says nothing. The kernel freezes it mid-connection, so its socket is
+never closed and the daemon goes on believing the host is connected and streaming for as
+long as TCP keeps retransmitting — **minutes**, during which the Outputs page shows a
+healthy output, its group keeps a session advertised and fans audio into it, the §7.4
+rebuild watchdog keeps asking a socket nobody reads, and Home Assistant offers a volume
+slider for a machine that is asleep. Coming back was no better: the agent noticed only
+via its own 30 s keepalive deadline, so a resumed host spent half a minute looking alive
+and being silent.
+
+`org.freedesktop.login1` has exactly the right signals, on the **system** bus:
+`PrepareForSleep(true)` before suspend/hibernate and `(false)` after resume,
+`PrepareForShutdown(true)` before poweroff/reboot. `sleep.rs` subscribes to both and
+relays them to the client loop.
+
+**The inhibitor is what makes the signal useful.** logind only waits for *delay*
+inhibitors that already exist when it begins the sequence, so taking one in response to
+the signal is too late by construction. The agent therefore holds one continuously and
+**drops it as its answer** — releasing the fd is how you say "done, go ahead". A new one
+is taken after resume. `delay`, never `block`: this helper has no business preventing a
+suspend, only finishing a sentence before one. The budget is `InhibitDelayMaxUSec`,
+5 s by default (verified on a live host, where a normal user is allowed to take one), and
+what it is spent on is one WebSocket frame, a module unload and a socket close.
+
+The agent's half, in order, all inside that window:
+
+1. send `AgentMsg::Suspending { shutdown }` and **flush** it — a frame left in a socket
+   buffer is a frame that never arrives, because the next thing this machine does is stop
+   executing;
+2. `UnloadReceiver` — the module's nodes would otherwise come back from suspend attached
+   to a session that no longer exists;
+3. close the WebSocket, so the daemon does not have to wait for TCP to tell it what we
+   just said in words;
+4. then wait for `Resumed` rather than for a backoff. `Instant` does not advance across a
+   suspend on Linux, so a timer set before the freeze would fire late anyway — and a host
+   asleep for eight hours has no business dialling a daemon it cannot reach. On resume it
+   reconnects at once, and the fresh `welcome` reloads the receiver, which was already the
+   documented remedy for a resumed session (§13.4 — now handled rather than deferred).
+
+**The daemon keeps it as its own state**, not as a disconnect: `Agents::asleep`, cleared
+by the next `hello` (which is what "it's back" looks like). The host leaves
+`connected_targets()` immediately, so the reconciler tears its session down cleanly, the
+rebuild watchdog stops asking, and HA goes unavailable honestly. `SleepState` reaches the
+Outputs listing as `pwsink_asleep`, where the badge says **asleep** or **shut down**
+instead of "offline".
+
+Which is the whole point of a separate state: *offline* invites someone to go and check
+a cable, *asleep* means it comes back when the mouse is wiggled. Only the host's own word
+earns the softer sentence — a host that simply vanishes still reads offline, and there is
+a test for exactly that.
+
 ## 10. Packaging
 
 - **One binary per arch — x86_64 *and* aarch64**, both built regardless of the
@@ -706,7 +758,8 @@ talking.
 | `pwrouter-agent/src/receiver.rs` | the `rtp-session` args replacing the drop-in (§7), with tests |
 | `pwrouter-agent/src/pw_thread.rs` | the service path: graph tracking, master lever, duck ramps, `resync_pin` |
 | `pwrouter-agent/src/volume.rs` | the diagnostic path (`spike-*`): snapshot, stream→sink walk, lever |
-| `pwrouter-agent/src/desktop.rs` | tray icon + pairing notification (§8.1); status rows are display-only, the controls are volume/mute (§8.2), Play to and Autostart |
+| `pwrouter-agent/src/desktop.rs` | tray icon + pairing notification (§8.1); status rows are display-only, the controls are volume/mute (§8.2), Play to, Autostart and Quit |
+| `pwrouter-agent/src/sleep.rs` | logind's `PrepareForSleep`/`PrepareForShutdown` and the delay inhibitor that buys time to answer them (§9.5) |
 | `pwrouter-agent/src/autostart.rs` | the embedded systemd unit and the enable/disable pair behind both the tray switch and the CLI (§10) |
 | `pw-control/` (own workspace root) | shared with the daemon: volume/route pods, the cubic scale, and the `pw_context_load_module` FFI neither `pipewire-rs` wraps nor either side should duplicate |
 | `bridge-daemon/src/outputs/pwsink/agent.rs` | daemon side: WS endpoint, token store, per-host command channel, keepalive |
@@ -727,10 +780,12 @@ talking.
    one host pair as two independent targets. A system-wide agent is not built.
 3. **The BT-bridge RTP source is not the agent's business** — that drop-in was a
    test fixture. The agent owns only the pw-sink receive side.
-4. **Sleep/resume** — to be determined empirically during normal use; no
-   self-inflicted suspend cycles. The agent already reloads the receiver module on
-   every reconnect, which is the expected remedy if a resumed session comes back
-   mute.
+4. **Sleep/resume — answered, not deferred any more (§9.5).** It was parked as "see
+   what happens in normal use", on the assumption that the reconnect's module reload
+   would cover it. It does cover the *audio*; what it could not cover is the minutes
+   in which a suspended host still reads as connected and streaming, because nothing
+   tells the daemon. logind does tell the agent, so now the agent tells the daemon,
+   and **asleep** is a state of its own rather than a slow-motion offline.
 
 Still deferred: the send-twin cleanup / self-created link (§7.2), which includes
 "which sink" control; and §11's P4 host-scoped extras.

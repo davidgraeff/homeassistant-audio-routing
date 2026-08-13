@@ -205,6 +205,12 @@ pub(crate) struct OutputInfo {
     /// pw-sink only: whether foreign streams on that host are currently ducked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pwsink_ducked: Option<bool>,
+    /// pw-sink only: the host is away *and said why* — `asleep` (suspended) or
+    /// `shut_down` (§9.5). `None` for a connected host, and for one that simply
+    /// vanished: this is the difference between "wiggle the mouse" and "check the
+    /// cable", so it is only ever set on the word of the host itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pwsink_asleep: Option<crate::outputs::pwsink::agent::SleepState>,
     /// Why this output currently can't play — a human-readable sentence, or `None`
     /// when nothing is known to be wrong. AirPlay-2 only so far
     /// ([`crate::outputs::ap2::health`], written by the liveness probe and by a
@@ -355,6 +361,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             pwsink_muted: None,
             pwsink_sink_name: None,
             pwsink_ducked: None,
+            pwsink_asleep: None,
             // No health source for sendspin yet (its own liveness task would be the
             // place); reported honestly as "nothing known" rather than "fine".
             last_error: None,
@@ -464,6 +471,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             pwsink_muted: None,
             pwsink_sink_name: None,
             pwsink_ducked: None,
+            pwsink_asleep: None,
             last_error: crate::outputs::ap2::health::Ap2Health::global().get(&node_name),
             node_name,
         });
@@ -539,6 +547,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             pwsink_muted: host_state.as_ref().and_then(|s| s.muted),
             pwsink_sink_name: host_state.as_ref().and_then(|s| s.sink_name.clone()),
             pwsink_ducked: host_state.as_ref().map(|s| s.ducked),
+            pwsink_asleep: agent_rows.iter().find(|row| row.node_name == node_name).and_then(|row| row.asleep),
             last_error: None,
             node_name,
         });

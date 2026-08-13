@@ -59,6 +59,28 @@ pub enum AgentMsg {
     ForeignSession {
         session: String,
     },
+    /// **This host is about to suspend (or shut down)** — logind's
+    /// `PrepareForSleep`/`PrepareForShutdown`, relayed while a delay inhibitor holds
+    /// the machine for the moment it takes to say so (§9.5).
+    ///
+    /// Sent because the alternative is silence: a suspending host stops answering
+    /// without closing its socket, so the daemon goes on believing it is connected
+    /// and streaming for as long as TCP keeps retransmitting — minutes of an output
+    /// that reads healthy, is fed audio nobody hears, and answers no command. One
+    /// frame ahead of the freeze turns that into a state the add-on can show and act
+    /// on.
+    ///
+    /// `shutdown` separates "it will be back when someone wiggles the mouse" from
+    /// "it will be back when someone turns it on" — the same handling either way, but
+    /// not the same sentence for a person looking at the Outputs page.
+    ///
+    /// There is no matching "resumed": coming back *is* a new connection, and
+    /// `Hello` already says so. An older daemon that does not know this message logs
+    /// it and falls back to noticing the closed socket, which is what it did before.
+    Suspending {
+        #[serde(default)]
+        shutdown: bool,
+    },
     Pong,
 }
 
@@ -185,6 +207,20 @@ mod tests {
         // half-interpreted by an older agent.
         let err = serde_json::from_str::<DaemonMsg>(r#"{"type":"run_shell","cmd":"rm -rf /"}"#);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn suspending_says_which_kind_of_going_away_it_is() {
+        for shutdown in [false, true] {
+            let msg = AgentMsg::Suspending { shutdown };
+            let json = serde_json::to_string(&msg).unwrap();
+            assert!(json.contains("\"type\":\"suspending\""));
+            assert_eq!(serde_json::from_str::<AgentMsg>(&json).unwrap(), msg);
+        }
+        // A daemon reading it from an agent that omits the flag treats it as a suspend,
+        // which is the commoner case and the safer sentence to show.
+        let bare = serde_json::from_str::<AgentMsg>(r#"{"type":"suspending"}"#).unwrap();
+        assert_eq!(bare, AgentMsg::Suspending { shutdown: false });
     }
 
     #[test]

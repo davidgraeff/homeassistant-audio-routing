@@ -25,6 +25,7 @@ use crate::config::{self, Config};
 use crate::desktop::{Desktop, Request};
 use crate::proto::{AgentMsg, DaemonMsg, HostState, PROTOCOL_VERSION};
 use crate::pw_thread::{ramp_schedule, Cmd, Event, Handle, MasterState};
+use crate::sleep::SleepEvent;
 use anyhow::{anyhow, Context as _};
 use futures_util::{SinkExt as _, StreamExt as _};
 use pipewire as pw;
@@ -135,6 +136,7 @@ fn host_state(master: &MasterState) -> HostState {
 pub async fn run(
     handle: Handle,
     mut events: tokio::sync::mpsc::Receiver<Event>,
+    mut sleep: tokio::sync::mpsc::Receiver<SleepEvent>,
     override_addr: Option<String>,
 ) -> anyhow::Result<()> {
     let mut config = config::load()?;
@@ -192,12 +194,26 @@ pub async fn run(
             &mut events,
             &desktop,
             &mut requests,
+            &mut sleep,
             &mut connected,
         )
         .await
         {
             Ok(Outcome::Reconnect) => {
                 backoff = BACKOFF_START;
+            }
+            // The host is going away and has already said so. Reconnecting on a timer
+            // now would be shouting at a machine about to freeze — and the timer is
+            // `Instant`-based, which on Linux does not advance across a suspend, so it
+            // would fire late anyway. `Resumed` is the wake-up that matters.
+            Ok(Outcome::Suspended) => {
+                backoff = BACKOFF_START;
+                if wait_for_resume(&mut sleep, &mut requests, &mut config, &handle, &desktop).await
+                    == Next::Quit
+                {
+                    return Ok(());
+                }
+                continue;
             }
             Ok(Outcome::Paired) => {
                 tracing::info!("pairing approved; reconnecting with the token");
@@ -268,15 +284,78 @@ pub async fn run(
                     // Quitting has to work here too — a host that cannot reach the add-on
                     // is exactly when someone reaches for the tray.
                     Some(request) => match apply_request(request, &mut config, &handle, &desktop).await {
-                        std::ops::ControlFlow::Continue(()) => {}
-                        std::ops::ControlFlow::Break(()) => return Ok(()),
+                        Next::Continue => {}
+                        Next::Reconnect => break,
+                        Next::Quit => return Ok(()),
                     },
                     // The tray is gone (it never existed, or its task ended); just wait.
+                    None => { tokio::time::sleep_until(until).await; break }
+                },
+                // A resume while waiting: reconnect *now* rather than serving out a
+                // backoff measured before the machine went to sleep.
+                event = sleep.recv() => match event {
+                    Some(SleepEvent::Resumed) => break,
+                    // Suspending with no session to announce it on: nothing to send, and
+                    // this host is about to stop executing anyway.
+                    Some(SleepEvent::Suspending { .. }) => {}
                     None => { tokio::time::sleep_until(until).await; break }
                 },
             }
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+/// What a local event — a tray click, a logind signal — asks the loop to do next.
+///
+/// Three outcomes rather than a bool because the two loops that handle these events
+/// (inside a session, and while waiting to reconnect) both need all three, and a
+/// a two-valued `ControlFlow` could only say two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Handled; carry on as before.
+    Continue,
+    /// End this session (or stop waiting) and connect again now.
+    Reconnect,
+    /// Stop the agent — `run` returns and `main` restores the host (§8.1's Quit).
+    Quit,
+}
+
+/// Holds here until the machine comes back, serving the tray meanwhile.
+///
+/// Deliberately *not* a timer: `Instant` does not advance across a suspend on Linux, so
+/// a backoff started before the freeze would be served out only after resume anyway, and
+/// a host asleep for eight hours would spend those hours dialling a daemon it cannot
+/// reach. logind's `PrepareForSleep(false)` is the only honest wake-up signal, and the
+/// channel closing (no logind at all) falls back to the ordinary backoff.
+async fn wait_for_resume(
+    sleep: &mut tokio::sync::mpsc::Receiver<SleepEvent>,
+    requests: &mut tokio::sync::mpsc::Receiver<Request>,
+    config: &mut Config,
+    handle: &Handle,
+    desktop: &Desktop,
+) -> Next {
+    loop {
+        tokio::select! {
+            event = sleep.recv() => match event {
+                Some(SleepEvent::Resumed) => {
+                    tracing::info!("resumed; reconnecting to the add-on");
+                    return Next::Reconnect;
+                }
+                // A second suspend without a resume in between: the first one was
+                // aborted, or logind repeated itself. Either way there is nothing new
+                // to announce — the session is already closed.
+                Some(SleepEvent::Suspending { .. }) => {}
+                None => return Next::Reconnect,
+            },
+            request = requests.recv() => match request {
+                Some(request) => match apply_request(request, config, handle, desktop).await {
+                    Next::Continue => {}
+                    other => return other,
+                },
+                None => std::future::pending::<()>().await,
+            },
+        }
     }
 }
 
@@ -300,7 +379,7 @@ async fn apply_request(
     config: &mut Config,
     handle: &Handle,
     desktop: &Desktop,
-) -> std::ops::ControlFlow<()> {
+) -> Next {
     match request {
         Request::Quit => {
             // The service instance must not merely exit: its unit is `Restart=always`,
@@ -314,7 +393,7 @@ async fn apply_request(
                             "quit from the tray: asked systemd to stop {}",
                             autostart::UNIT_NAME
                         );
-                        return std::ops::ControlFlow::Continue(());
+                        return Next::Continue;
                     }
                     // Falling through to a plain exit is better than ignoring the click:
                     // a respawn is at least visible, whereas nothing happening is not.
@@ -324,7 +403,7 @@ async fn apply_request(
                 }
             }
             tracing::info!("quit from the tray; restoring host state");
-            return std::ops::ControlFlow::Break(());
+            return Next::Quit;
         }
         Request::SetVolume(volume) => {
             tracing::debug!("volume set to {:.0}% on this machine", volume * 100.0);
@@ -339,7 +418,7 @@ async fn apply_request(
         }
         Request::SetTarget(target) => {
             if config.target_sink == target {
-                return std::ops::ControlFlow::Continue(());
+                return Next::Continue;
             }
             config.target_sink = target.clone();
             if let Err(e) = config::save(config) {
@@ -353,7 +432,7 @@ async fn apply_request(
             desktop.set_target(target).await;
         }
     }
-    std::ops::ControlFlow::Continue(())
+    Next::Continue
 }
 
 enum Outcome {
@@ -365,6 +444,9 @@ enum Outcome {
     Denied(String),
     /// The tray asked the agent to stop. The one outcome that ends `run`.
     Quit,
+    /// This host is suspending or shutting down; the daemon has been told and the
+    /// socket is closed. Wait for the resume rather than for a timer (§9.5).
+    Suspended,
 }
 
 /// Six uppercase hex characters, the shape the daemon validates. Read straight
@@ -397,6 +479,7 @@ async fn session(
     events: &mut tokio::sync::mpsc::Receiver<Event>,
     desktop: &Desktop,
     requests: &mut tokio::sync::mpsc::Receiver<Request>,
+    sleep: &mut tokio::sync::mpsc::Receiver<SleepEvent>,
     connected: &mut bool,
 ) -> anyhow::Result<Outcome> {
     let url = format!("ws://{addr}/api/agent/ws");
@@ -482,12 +565,46 @@ async fn session(
             request = requests.recv() => {
                 match request {
                     Some(request) => match apply_request(request, config, handle, desktop).await {
-                        std::ops::ControlFlow::Continue(()) => {}
-                        std::ops::ControlFlow::Break(()) => return Ok(Outcome::Quit),
+                        Next::Continue => {}
+                        Next::Reconnect => return Ok(Outcome::Reconnect),
+                        Next::Quit => return Ok(Outcome::Quit),
                     },
                     // Tray gone: stop selecting on a closed channel, which would
                     // otherwise return immediately forever and spin this loop.
                     None => std::future::pending::<()>().await,
+                }
+            }
+
+            // This host is about to suspend or power off. Everything here happens while
+            // logind's delay inhibitor is still held (sleep.rs), so it is the last thing
+            // the machine does before freezing — and it has to be quick and ordered:
+            // tell the daemon, then let go of the receiver, then close the socket.
+            event = sleep.recv() => {
+                match event {
+                    Some(SleepEvent::Suspending { shutdown }) => {
+                        let msg = AgentMsg::Suspending { shutdown };
+                        // Best-effort, and *flushed*: a queued frame in a socket buffer
+                        // is a frame that never arrives, since the next thing this
+                        // machine does is stop running.
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            let _ = ws.send(Message::Text(text.into())).await;
+                            let _ = ws.flush().await;
+                        }
+                        // Release the receiver: its module's nodes would come back from
+                        // suspend attached to a session that no longer exists, and the
+                        // daemon has just been told to stop feeding this host anyway.
+                        handle.send(Cmd::UnloadReceiver);
+                        // A clean close, so the daemon does not have to wait for TCP to
+                        // tell it what we just said in words.
+                        let _ = ws.close(None).await;
+                        return Ok(Outcome::Suspended);
+                    }
+                    // A resume *inside* a live session means the suspend never happened
+                    // (aborted), or we slept through it without noticing. Reconnecting is
+                    // the cheap way to be sure: the hello brings a fresh `welcome`, which
+                    // reloads the receiver — the documented resume remedy (§13.4).
+                    Some(SleepEvent::Resumed) => return Ok(Outcome::Reconnect),
+                    None => {}
                 }
             }
         }

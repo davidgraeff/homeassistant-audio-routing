@@ -23,6 +23,7 @@ mod desktop;
 mod proto;
 mod pw_thread;
 mod receiver;
+mod sleep;
 mod volume;
 
 use anyhow::{bail, Context as _};
@@ -148,8 +149,15 @@ fn run(daemon: Option<String>) -> anyhow::Result<()> {
     runtime.block_on(async move {
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        // logind's suspend/shutdown signal, so the add-on hears about it from us rather
+        // than from a socket that stops answering (§9.5). Optional: a host without a
+        // system bus or without logind simply never sends an event.
+        let (sleep_tx, sleep_rx) = tokio::sync::mpsc::channel(sleep::EVENT_DEPTH);
+        if sleep::spawn(sleep_tx).await {
+            tracing::info!("watching logind: the add-on will be told before this machine suspends");
+        }
         tokio::select! {
-            result = client::run(handle, event_rx, daemon) => result,
+            result = client::run(handle, event_rx, sleep_rx, daemon) => result,
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("interrupted; restoring host state");
                 Ok(())

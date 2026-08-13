@@ -28,6 +28,25 @@ export function kindLabel(o: OutputInfo): string {
 // Only an *added* pw-sink target has a session to wait for; a merely discovered
 // one has none by definition, so it just reads online.
 export function statusBadge(o: OutputInfo): { cls: string; text: string; title: string } {
+  // A host that *said* it was going away gets the accurate sentence rather than
+  // "offline": it is coming back, and nothing about it needs looking at. Checked before
+  // `present`, since from the network's point of view a sleeping machine is simply gone.
+  if (o.pwsink_asleep === 'asleep') {
+    return {
+      cls: 'badge off',
+      text: 'asleep',
+      title:
+        'That machine suspended and told us so before it went. Its routing, volume and group membership are kept, and it comes back on its own when the machine wakes.',
+    };
+  }
+  if (o.pwsink_asleep === 'shut_down') {
+    return {
+      cls: 'badge off',
+      text: 'shut down',
+      title:
+        'That machine powered off (or rebooted) and told us so before it went. Everything about it is kept and reapplied when it starts up again.',
+    };
+  }
   if (!o.present) return { cls: 'badge off', text: 'offline', title: 'Not on the network right now. Its routing is kept and reapplied when it returns.' };
   if (o.kind === 'pwsink' && o.state === 'adopted' && o.pwsink_streaming !== true) {
     return {

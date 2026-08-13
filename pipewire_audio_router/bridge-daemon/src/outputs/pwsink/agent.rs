@@ -90,6 +90,13 @@ pub enum AgentMsg {
     ForeignSession {
         session: String,
     },
+    /// This host is about to suspend or power off (§9.5). Mirrors the agent's
+    /// `proto.rs`; `shutdown` separates "back when someone wiggles the mouse" from
+    /// "back when someone turns it on".
+    Suspending {
+        #[serde(default)]
+        shutdown: bool,
+    },
     Pong,
 }
 
@@ -106,6 +113,17 @@ pub enum DaemonMsg {
     Duck { depth: f32, ramp_ms: u64 },
     Unduck { ramp_ms: u64 },
     Ping,
+}
+
+/// Why a paired host is away, when it told us (§9.5). Serialised into the outputs
+/// listing so the Outputs page can say which of the two it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepState {
+    /// Suspended or hibernating: back when someone wiggles the mouse.
+    Asleep,
+    /// Powered off or rebooting: back when someone turns it on.
+    ShutDown,
 }
 
 /// What a host reports about itself. `volume` is cubic 0.0-1.0 — the same scale
@@ -282,7 +300,28 @@ pub struct Agents {
     pending: Vec<Pending>,
     /// Keyed by node name — the routing-matrix identity.
     live: HashMap<String, Live>,
+    /// Hosts that *said* they were going away, keyed by node name (§9.5).
+    ///
+    /// A state of its own, because "asleep" and "offline" are different situations and
+    /// only one of them is worth doing anything about: a suspended desktop comes back
+    /// when someone wiggles the mouse, while an output that dropped off the network
+    /// might need looking at. Without this the two are indistinguishable — a suspending
+    /// host never closes its socket, so the daemon used to keep it *connected* for as
+    /// long as TCP kept retransmitting.
+    ///
+    /// Cleared by the next `hello` from that host, which is what "it's back" looks like.
+    asleep: HashMap<String, Asleep>,
     changes: ChangeNotifier,
+}
+
+/// Why a host is not here, and since when.
+#[derive(Debug, Clone, Copy)]
+struct Asleep {
+    /// True for poweroff/reboot, false for suspend/hibernate.
+    shutdown: bool,
+    /// For the log line when it comes back; not published, since the Outputs page has
+    /// no other timestamps and "asleep" is the useful part.
+    since: std::time::Instant,
 }
 
 pub type SharedAgents = Arc<Mutex<Agents>>;
@@ -333,6 +372,8 @@ pub struct AgentInfo {
     pub state: Option<HostState>,
     /// The connected agent's build (`None` when it is not connected).
     pub version: Option<String>,
+    /// Set when this host is away *and told us why* (§9.5).
+    pub asleep: Option<SleepState>,
 }
 
 /// One host for the Outputs listing: paired or merely asking to be. A pending host
@@ -354,7 +395,7 @@ impl Agents {
         if !paired.is_empty() {
             tracing::info!("loaded {} paired agent(s) from {}", paired.len(), path.display());
         }
-        Self { path, paired, pending: Vec::new(), live: HashMap::new(), changes }
+        Self { path, paired, pending: Vec::new(), live: HashMap::new(), asleep: HashMap::new(), changes }
     }
 
     pub fn shared(path: PathBuf, changes: ChangeNotifier) -> SharedAgents {
@@ -430,6 +471,15 @@ impl Agents {
                     stored.label = label.clone();
                 }
                 save_store(&self.path, &self.paired);
+            }
+            // Back from wherever it was: a hello *is* the resume, so the sleep state
+            // clears here rather than on a timer.
+            if let Some(was) = self.asleep.remove(&agent.node_name) {
+                tracing::info!(
+                    "'{label}' is back after {:?} ({})",
+                    was.since.elapsed(),
+                    if was.shutdown { "was shut down" } else { "was asleep" }
+                );
             }
             self.live.insert(
                 agent.node_name.clone(),
@@ -534,6 +584,34 @@ impl Agents {
         tracing::info!("unpaired '{}' ({})", agent.label, agent.node_name);
         let _ = self.changes.send(());
         Ok(())
+    }
+
+    /// This host announced that it is suspending or powering off (§9.5).
+    ///
+    /// Treated as a disconnect *plus* a reason: the live entry goes now rather than when
+    /// TCP eventually notices, so `connected_targets` stops naming it, the reconciler
+    /// tears its session down cleanly, the rebuild watchdog stops asking, and Home
+    /// Assistant stops offering a slider for a machine that is asleep. The difference
+    /// from a plain drop is only what the UI gets to say — but that is the difference
+    /// between "wiggle the mouse" and "check the cable".
+    pub fn suspending(&mut self, node_name: &str, shutdown: bool) {
+        let label = self.live.get(node_name).map(|l| l.label.clone()).unwrap_or_else(|| node_name.to_string());
+        tracing::info!("'{label}' is {}", if shutdown { "shutting down" } else { "suspending" });
+        self.asleep.insert(node_name.to_string(), Asleep { shutdown, since: std::time::Instant::now() });
+        self.live.remove(node_name);
+        // Always notified, never delegated to `disconnected`: the *state* changed even
+        // when the socket had already gone, and this is the frame that takes the host out
+        // of the routing matrix and puts "asleep" on its card.
+        let _ = self.changes.send(());
+    }
+
+    /// Is this host away because it said so, and was that a shutdown? `None` when it is
+    /// simply not connected (or is connected right now).
+    pub fn sleep_state(&self, node_name: &str) -> Option<SleepState> {
+        if self.live.contains_key(node_name) {
+            return None;
+        }
+        self.asleep.get(node_name).map(|a| if a.shutdown { SleepState::ShutDown } else { SleepState::Asleep })
     }
 
     /// Drops a live connection (socket closed).
@@ -685,6 +763,7 @@ impl Agents {
                 code: None,
                 state: self.state(&a.node_name),
                 version: self.live.get(&a.node_name).map(|l| l.version.clone()),
+                asleep: self.sleep_state(&a.node_name),
             })
             .collect();
         rows.extend(self.pending.iter().map(|p| AgentInfo {
@@ -697,6 +776,7 @@ impl Agents {
             state: None,
             // A pending host has not been welcomed yet; its build is reported once it is.
             version: None,
+            asleep: None,
         }));
         rows
     }
@@ -885,6 +965,11 @@ async fn handle_socket(socket: WebSocket, state: crate::state::AppState) {
                     Message::Text(text) => match serde_json::from_str::<AgentMsg>(&text) {
                         Ok(AgentMsg::State(host_state)) => {
                             state.agents.lock().await.update_state(&node_name, host_state);
+                        }
+                        Ok(AgentMsg::Suspending { shutdown }) => {
+                            // Recorded before the socket closes, which is the point: the
+                            // agent sends this while logind still holds the machine.
+                            state.agents.lock().await.suspending(&node_name, shutdown);
                         }
                         Ok(AgentMsg::ForeignSession { session }) => {
                             tracing::warn!(
@@ -1200,6 +1285,62 @@ mod tests {
         assert!(!agents.set_volume(&paired.node_name, 0.5));
         assert!(!agents.set_mute(&paired.node_name, true));
         assert!(!agents.duck(&paired.node_name, 0.2, 200));
+    }
+
+    #[test]
+    fn a_host_that_says_it_is_suspending_becomes_asleep_and_stops_being_a_target() {
+        let mut agents = registry();
+        agents.hello(claim("m1", "dave", None), channel());
+        let paired = agents.approve("m1:dave").unwrap();
+        let (tx, _rx) = mpsc::channel(AGENT_MSG_DEPTH);
+        agents.hello(claim("m1", "dave", Some(&paired.token)), tx);
+        assert!(agents.connected_targets().contains_key(&paired.node_name));
+        assert_eq!(agents.sleep_state(&paired.node_name), None, "a connected host is not asleep");
+
+        // Nothing reaches the UI without a change notification, and this one has to fire
+        // even though the caller may already have lost the socket — it is what takes the
+        // host out of the matrix and puts "asleep" on its card.
+        let mut changes = agents.changes.subscribe();
+        agents.suspending(&paired.node_name, false);
+        assert!(changes.try_recv().is_ok(), "the sleep state has to push a frame");
+        // The whole point: the session goes *now*, not when TCP notices.
+        assert!(!agents.connected_targets().contains_key(&paired.node_name));
+        assert!(!agents.is_connected(&paired.node_name));
+        assert_eq!(agents.sleep_state(&paired.node_name), Some(SleepState::Asleep));
+
+        // …and coming back is a hello, which is what clears it.
+        let (tx, _rx) = mpsc::channel(AGENT_MSG_DEPTH);
+        agents.hello(claim("m1", "dave", Some(&paired.token)), tx);
+        assert_eq!(agents.sleep_state(&paired.node_name), None);
+        assert!(agents.connected_targets().contains_key(&paired.node_name));
+    }
+
+    #[test]
+    fn a_plain_disconnect_is_not_asleep() {
+        // The distinction the UI depends on: only a host that *told* us gets the softer
+        // sentence. One that fell off the network reads as offline, as before.
+        let mut agents = registry();
+        agents.hello(claim("m1", "dave", None), channel());
+        let paired = agents.approve("m1:dave").unwrap();
+        let (tx, _rx) = mpsc::channel(AGENT_MSG_DEPTH);
+        agents.hello(claim("m1", "dave", Some(&paired.token)), tx);
+        agents.disconnected(&paired.node_name);
+        assert_eq!(agents.sleep_state(&paired.node_name), None);
+    }
+
+    #[test]
+    fn a_shutdown_is_reported_apart_from_a_suspend() {
+        let mut agents = registry();
+        agents.hello(claim("m1", "dave", None), channel());
+        let paired = agents.approve("m1:dave").unwrap();
+        let (tx, _rx) = mpsc::channel(AGENT_MSG_DEPTH);
+        agents.hello(claim("m1", "dave", Some(&paired.token)), tx);
+        agents.suspending(&paired.node_name, true);
+        assert_eq!(agents.sleep_state(&paired.node_name), Some(SleepState::ShutDown));
+        // And it reaches the diagnostics row the Outputs page is built from.
+        let row = agents.snapshot().into_iter().find(|r| r.node_name == paired.node_name).unwrap();
+        assert_eq!(row.asleep, Some(SleepState::ShutDown));
+        assert!(!row.connected);
     }
 
     #[test]

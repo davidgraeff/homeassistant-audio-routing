@@ -251,6 +251,11 @@ export interface OutputInfo {
   /** pw-sink only: whether the agent is currently ducking the host's *other*
    * applications for an announcement. */
   pwsink_ducked?: boolean;
+  /** pw-sink only: the host is away and *told us why* — it suspended (`asleep`) or
+   * powered off (`shut_down`). Absent for a connected host and for one that simply
+   * vanished: only the host's own word gets the softer reading, because "wiggle the
+   * mouse" and "check the cable" are different advice. */
+  pwsink_asleep?: 'asleep' | 'shut_down';
   /** Why this output can't play right now, as a sentence to show the user; absent
    * when nothing is known to be wrong. AirPlay 2 only so far (set by the daemon's
    * liveness probe or a failed connect). Before this existed, a receiver that
