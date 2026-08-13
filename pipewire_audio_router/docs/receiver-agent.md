@@ -641,14 +641,40 @@ recurrence says so in the journal instead of looking like a UI bug.
   and installed by `pwrouter-agent autostart enable` (or the tray switch) — which is
   what removed a `curl` of a raw.githubusercontent URL from the install
   instructions: two steps, one of them a download from a *third party*, for a file
-  the binary already contains. `ExecStart` is rewritten to the installing binary's
-  own path (`%h/…` when it is under the user's home), so the unit can never start a
-  different copy than the one that wrote it, and enabling deliberately does **not**
-  start: the installer is usually the running agent, and a second one in the same
-  session would fight it over the volume. That the agent writes its own unit is also
-  the one thing `ProtectHome=read-only` had to be relaxed for
+  the binary already contains. Enabling deliberately does **not** start: the installer
+  is usually the running agent, and a second one in the same session would fight it
+  over the volume. That the agent writes its own unit is also the one thing
+  `ProtectHome=read-only` had to be relaxed for
   (`ReadWritePaths=-%h/.config/systemd/user`, `-` because the directory need not
   exist).
+- **`enable` installs the binary to `~/.local/bin/pwrouter-agent`** and points
+  `ExecStart` there — the path the shipped unit and the in-app instructions already
+  name. It used to rewrite `ExecStart` to wherever the *installing* binary sat, on the
+  reasoning that the unit should never start a different copy than the one that wrote
+  it. That is right exactly once: a real host had
+  `ExecStart=%h/Downloads/pwrouter-agent-x86_64`, its owner had replaced the binary in
+  `~/.local/bin` several times, and systemd kept starting the download from days
+  earlier. One canonical location makes updating "copy over that file and
+  `systemctl --user restart`", with nothing to rewrite and nothing to go stale. The
+  copy is a temp-file-plus-rename (a rename replaces the directory entry, so it works
+  even when the destination is the running agent, where writing in place gives
+  `ETXTBSY`) and best-effort: a read-only home still gets a working unit pointed at
+  the current binary, plus a note saying updating it means running `enable` again.
+  A side effect worth knowing: the process is now called `pwrouter-agent`, so
+  `pgrep`/`pkill` find it — `pkill -x pwrouter-agent` silently matched nothing while
+  the binary was named `pwrouter-agent-x86_64`, because a process name is truncated to
+  15 characters.
+- **Every build says which build it is.** `0.1.0` cannot tell two binaries apart, and
+  this one gets copied around by hand — so `build.rs` bakes an identity in:
+  `PWROUTER_BUILD` when set (the `Dockerfile`'s agent stage passes `ADDON_VERSION`, so
+  a downloaded binary names the add-on build it came from), else
+  `git describe --always --dirty` plus a UTC minute for builds from a checkout. It is
+  reported by `pwrouter-agent version` (with the binary's own path, since "which of
+  the three copies is running" is the actual question), in the startup log line, in the
+  tray's status rows, and as `agent_version` in `hello` — which the daemon logs and
+  `/api/agents` reports, so the add-on can answer it for a host you are not sitting at.
+  `autostart` with no argument prints the unit's `ExecStart` *read from the file* next
+  to the running binary's build, which is what makes a stale unit obvious.
 
 ## 11. What shipped, in what order
 
@@ -769,7 +795,9 @@ A daemon built from this tree plus the real agent, both on the author's desktop:
   themselves are proven: the whole layout was read back over `com.canonical.dbusmenu`
   on a live KDE session, and **Quit** was exercised by calling that interface's `Event`
   method — the agent logged the request, unloaded its receiver (4 `pwsink-in` nodes → 0)
-  and exited. The *service* branch of Quit (systemd `StopUnit`) is not yet proven live;
-  it needs an installed unit running a build that has the row.
+  and exited. Its **service branch is proven too** (2026-08-13): with the agent running
+  as the unit from `~/.local/bin`, the same click stopped the unit — `SIGTERM`, "restoring
+  host state", `inactive`, and no `Restart=always` respawn, because a stop job is not a
+  failure.
 - **An audible duck of foreign streams** (P3), and **sleep/resume** (§13.4) — both
   need normal day-to-day use rather than a test rig.

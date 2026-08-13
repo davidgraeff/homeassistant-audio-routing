@@ -364,6 +364,7 @@ fn a_connected_receiver_host_joins_the_group_of_whatever_feeds_it() {
     let mut agents = Agents::new(path.clone(), tokio::sync::broadcast::channel(1).0);
     let claim = || HelloClaim {
         protocol: PROTOCOL_VERSION,
+        agent_version: "0.1.0 (test)",
         machine_id: "m1",
         hostname: "david-local",
         user: "david",

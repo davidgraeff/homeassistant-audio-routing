@@ -204,8 +204,16 @@ WORKDIR /agent
 # churn. pw-control comes first because it changes less often than the agent.
 COPY pw-control/Cargo.toml /pw-control/
 COPY pw-control/src/ /pw-control/src/
-COPY pwrouter-agent/Cargo.toml pwrouter-agent/Cargo.lock pwrouter-agent/pwrouter-agent.service ./
+COPY pwrouter-agent/Cargo.toml pwrouter-agent/Cargo.lock pwrouter-agent/pwrouter-agent.service pwrouter-agent/build.rs ./
 COPY pwrouter-agent/src/ ./src/
+# The add-on's version, compiled *into* the agent binaries as their build id (build.rs
+# reads PWROUTER_BUILD). Unlike the daemon — which reads ADDON_VERSION from its
+# container env at runtime — the agent runs on someone else's machine, so the only way
+# it can answer "which build am I?" is to carry the answer. That is what makes a
+# downloaded binary comparable with the add-on that served it. Declared here so the
+# existing `--build-arg ADDON_VERSION=…` (scripts/deploy-dev.sh, CI) reaches this stage
+# too, and placed after the COPYs so a version bump does not invalidate them.
+ARG ADDON_VERSION=dev
 # One loop per arch: build, strip, then assert the binary really does floor at
 # GLIBC_2.34 — shipping one that needs more would silently break the minimum
 # distro versions the in-app help text promises. The objdump must be the matching
@@ -228,6 +236,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
       env "CARGO_TARGET_${up_triple}_LINKER=${gnu}-gcc" \
           "PKG_CONFIG_PATH=/usr/lib/${gnu}/pkgconfig" \
           "BINDGEN_EXTRA_CLANG_ARGS=--target=${gnu} --sysroot=/ -I/usr/include/${gnu}" \
+          "PWROUTER_BUILD=${ADDON_VERSION}" \
           cargo build --release --target "$triple"; \
       cp "target/${triple}/release/pwrouter-agent" "/agent-out/${out}"; \
       "${gnu}-strip" "/agent-out/${out}"; \

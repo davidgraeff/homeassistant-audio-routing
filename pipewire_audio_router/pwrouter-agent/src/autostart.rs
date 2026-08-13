@@ -72,27 +72,86 @@ pub fn unit_path() -> anyhow::Result<PathBuf> {
         .join(UNIT_NAME))
 }
 
-/// The unit text as it should land on disk: the shipped template with `ExecStart`
-/// pointed at the running binary.
-pub fn unit_text() -> String {
-    match std::env::current_exe() {
-        Ok(exe) => render_unit(
-            UNIT_TEMPLATE,
-            &exe,
-            std::env::var_os("HOME").map(PathBuf::from),
-        ),
-        Err(e) => {
-            // Keep the template's `%h/.local/bin` default: it is the path the
-            // install instructions use, so it is the best guess available.
-            tracing::warn!(
-                "cannot determine this binary's path ({e}); leaving ExecStart as shipped"
-            );
-            UNIT_TEMPLATE.to_string()
-        }
-    }
+/// Where the agent lives once it is installed: `~/.local/bin/pwrouter-agent`, the path
+/// the shipped unit and the in-app instructions both name.
+///
+/// A *stable* path is the point. `ExecStart` used to be rewritten to wherever the
+/// binary that ran `autostart enable` happened to sit — usually `~/Downloads/
+/// pwrouter-agent-x86_64` — which is right exactly once: replace that binary with a
+/// newer download and the unit still starts whatever is left at the old path, or
+/// nothing at all. With one canonical location, updating is a copy over this file and
+/// `systemctl --user restart`, and nothing has to be rewritten.
+pub fn install_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("no HOME to install into"))?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("bin")
+        .join("pwrouter-agent"))
 }
 
-/// Split out from [`unit_text`] to be testable without touching the process's own
+/// What [`enable`] did, so the CLI can print it and the tray can say so.
+#[derive(Debug, Clone)]
+pub struct Installed {
+    /// The unit file that was written.
+    pub unit: PathBuf,
+    /// What its `ExecStart` points at.
+    pub exec: PathBuf,
+    /// Whether this binary was copied to [`install_path`] as part of enabling.
+    pub copied: bool,
+    /// Why `exec` is *not* the canonical path, when it isn't — a read-only home, a
+    /// sandboxed agent. Worth showing: it is the difference between "updating means
+    /// copying one file" and "updating means running enable again".
+    pub note: Option<String>,
+}
+
+/// Copies this binary to [`install_path`] unless it is already running from there.
+///
+/// Temp file plus rename, like the unit and the config: a rename replaces the
+/// *directory entry*, so it works even when the destination is the currently running
+/// agent (writing to it in place would fail with `ETXTBSY`) and never leaves a half-
+/// copied executable behind.
+fn install_self() -> anyhow::Result<(PathBuf, bool)> {
+    let target = install_path()?;
+    let exe = std::env::current_exe().context("locating this binary")?;
+    // `canonicalize` so a symlink or a `./pwrouter-agent` invocation is compared by
+    // what it actually is; a failure here just means "not the same file".
+    let same = match (exe.canonicalize(), target.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => exe == target,
+    };
+    if same {
+        return Ok((target, false));
+    }
+    let dir = target
+        .parent()
+        .ok_or_else(|| anyhow!("install path has no parent"))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(".pwrouter-agent.new");
+    std::fs::copy(&exe, &tmp)
+        .with_context(|| format!("copying {} to {}", exe.display(), tmp.display()))?;
+    // 0755 explicitly: `copy` carries the source's mode, and a binary fetched by a
+    // browser can arrive without the execute bit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("making {} executable", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &target).with_context(|| format!("installing {}", target.display()))?;
+    Ok((target, true))
+}
+
+/// The unit text as it should land on disk: the shipped template with `ExecStart`
+/// pointed at `exec`.
+pub fn unit_text_for(exec: &Path) -> String {
+    render_unit(
+        UNIT_TEMPLATE,
+        exec,
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Split out from [`unit_text_for`] to be testable without touching the process's own
 /// environment.
 fn render_unit(template: &str, exe: &Path, home: Option<PathBuf>) -> String {
     // `%h/…` for a binary under the user's home: the unit then keeps working if the
@@ -151,11 +210,36 @@ pub async fn state() -> State {
     }
 }
 
-/// Writes the unit and enables it. Returns where it landed.
+/// Installs this binary to [`install_path`], writes the unit pointed at it, and enables
+/// it. Returns what it did ([`Installed`]).
 ///
 /// Idempotent: re-running it also *refreshes* an older unit file, which is how a
-/// host picks up hardening changes after an upgrade.
-pub async fn enable() -> anyhow::Result<PathBuf> {
+/// host picks up hardening changes after an upgrade — and re-installs the binary, which
+/// is how "I downloaded a newer one and ran enable" does the obvious thing.
+///
+/// The install is best-effort: a read-only home (a sandboxed agent whose unit predates
+/// the `ReadWritePaths` relaxation) still gets a working unit, pointed at wherever this
+/// binary already is, plus a note saying so. A unit that starts *something* beats
+/// refusing to enable.
+pub async fn enable() -> anyhow::Result<Installed> {
+    let (exec, copied, note) = match install_self() {
+        Ok((path, copied)) => (path, copied, None),
+        Err(e) => {
+            let exe = std::env::current_exe().context("locating this binary")?;
+            tracing::warn!(
+                "could not install into ~/.local/bin ({e:#}); pointing the unit at {}",
+                exe.display()
+            );
+            let note = format!(
+                "could not copy this binary to {} ({e:#}), so the unit starts it where it is — \
+                 replacing it later means running `autostart enable` again",
+                install_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "~/.local/bin/pwrouter-agent".into())
+            );
+            (exe, false, Some(note))
+        }
+    };
     let path = unit_path()?;
     let dir = path
         .parent()
@@ -165,7 +249,7 @@ pub async fn enable() -> anyhow::Result<PathBuf> {
     // Temp file plus rename, so a half-written unit is never something systemd can
     // load. Same reason as the config file, different directory.
     let tmp = path.with_extension("service.tmp");
-    std::fs::write(&tmp, unit_text()).with_context(|| {
+    std::fs::write(&tmp, unit_text_for(&exec)).with_context(|| {
         format!(
             "writing {} (a sandboxed agent needs the unit's \
              ReadWritePaths=-%h/.config/systemd/user; from a terminal it always works)",
@@ -182,7 +266,12 @@ pub async fn enable() -> anyhow::Result<PathBuf> {
     manager_call("EnableUnitFiles", &(vec![UNIT_NAME], false, true))
         .await
         .with_context(|| format!("enabling {UNIT_NAME}"))?;
-    Ok(path)
+    Ok(Installed {
+        unit: path,
+        exec,
+        copied,
+        note,
+    })
 }
 
 /// Is *this* process the unit systemd is running — the same PID it calls the
@@ -327,6 +416,36 @@ mod tests {
         for keep in ["ProtectSystem=strict", "KillSignal=SIGTERM"] {
             assert!(unit.contains(keep), "lost {keep}");
         }
+    }
+
+    #[test]
+    fn the_install_path_is_the_one_the_shipped_unit_names() {
+        // The invariant that keeps `enable` honest: it copies the binary to
+        // `install_path()` and points the unit there, so the rendered `ExecStart` has to
+        // be the line the template already carries — otherwise "replace the file at that
+        // path and restart" would be advice about the wrong path.
+        std::env::set_var("HOME", "/home/someone");
+        let installed = install_path().unwrap();
+        assert_eq!(
+            installed,
+            PathBuf::from("/home/someone/.local/bin/pwrouter-agent")
+        );
+        let unit = render_unit(
+            UNIT_TEMPLATE,
+            &installed,
+            Some(PathBuf::from("/home/someone")),
+        );
+        assert_eq!(unit.trim_end(), UNIT_TEMPLATE.trim_end());
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn the_build_id_is_always_baked_in() {
+        // build.rs guarantees it, and every surface (log line, `version`, the tray, the
+        // `agent_version` in `hello`) reads the same string — an empty one would make
+        // "which build is this?" unanswerable everywhere at once.
+        assert!(!env!("PWROUTER_BUILD").is_empty());
+        assert!(crate::version().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

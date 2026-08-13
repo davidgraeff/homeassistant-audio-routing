@@ -14,13 +14,15 @@
 //!   before: the log line. Nothing here can fail the agent, and nothing here is
 //!   the *only* way to reach any information — the journal keeps printing
 //!   everything, and the add-on UI shows the same code on the host's card.
-//! * **The menu shows state; it decides only what belongs to this machine.** A tray
-//!   that could unpair or quit would be a second, divergent way to manage a systemd
-//!   unit that `Restart=always` would undo anyway, so the status rows stay disabled.
-//!   What *is* local to this machine is which of its own outputs the audio should come
-//!   out of, and whether the session starts the agent by itself; those two are
-//!   settings, and they live here rather than in the add-on because the person at this
-//!   keyboard is the one who knows which speakers they mean.
+//! * **The menu shows state; it decides only what belongs to this machine.** The status
+//!   rows are all disabled. What *is* local to this machine is which of its own outputs
+//!   the audio should come out of, and whether the session starts the agent by itself;
+//!   those two are settings, and they live here rather than in the add-on because the
+//!   person at this keyboard is the one who knows which speakers they mean. **Unpairing**
+//!   stays the add-on's decision — a second place to make it could only disagree with the
+//!   first — but **Quit** is here (§8.1): a hand-started agent, or one whose unit was
+//!   stopped, has no other interface at all, and for the service instance quitting means
+//!   asking systemd to stop the unit rather than exiting into a `Restart=always` respawn.
 //! * **Volume and mute are the exception, and belong here too.** They are this
 //!   machine's own master out (§6) — the same lever `pavucontrol` and the volume keys
 //!   drive, which the agent controls but never owns (§9.4) — so a tray sitting next to
@@ -330,6 +332,11 @@ impl AgentTray {
             Some(addr) => format!("Add-on: {addr}"),
             None => "Add-on: looking for it on the network".to_string(),
         });
+        // Which build this is. On a machine where the binary has been replaced a few
+        // times — downloaded again, rebuilt from a checkout — "which one is actually
+        // running" is otherwise only answerable from a terminal, and the tray is the
+        // surface that is already open. Same string the add-on is told in `hello`.
+        lines.push(format!("Build: {}", crate::version()));
         if self.pairing == Pairing::Paired {
             // What is actually happening, which is not always what was chosen — and
             // when the two differ, why. A pin whose device is unplugged is silent on
@@ -583,9 +590,21 @@ impl ksni::Tray for AgentTray {
                             let (slot, notifier) = (slot.clone(), notifier.clone());
                             tokio::spawn(async move {
                                 let outcome = if want {
-                                    autostart::enable()
-                                        .await
-                                        .map(|path| tracing::info!("installed {}", path.display()))
+                                    autostart::enable().await.map(|installed| {
+                                        tracing::info!(
+                                            "wrote {}, starting {}{}",
+                                            installed.unit.display(),
+                                            installed.exec.display(),
+                                            if installed.copied {
+                                                " (installed from this binary)"
+                                            } else {
+                                                ""
+                                            }
+                                        );
+                                        if let Some(note) = installed.note {
+                                            tracing::warn!("{note}");
+                                        }
+                                    })
                                 } else {
                                     autostart::disable().await.inspect(|()| {
                                         tracing::info!("removed the systemd user unit")

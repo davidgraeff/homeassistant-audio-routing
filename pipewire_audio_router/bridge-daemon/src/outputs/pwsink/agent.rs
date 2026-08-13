@@ -267,6 +267,11 @@ struct Pending {
 /// A live, approved connection.
 struct Live {
     label: String,
+    /// The build the connected agent reported in its `hello` (§10): the answer to
+    /// "which binary is actually running over there", which is otherwise only in that
+    /// host's own journal — and the thing to check first when a host behaves like an
+    /// older version, because the binary gets copied around by hand.
+    version: String,
     state: HostState,
     tx: mpsc::Sender<DaemonMsg>,
 }
@@ -289,6 +294,10 @@ pub type SharedAgents = Arc<Mutex<Agents>>;
 /// exactly why they are passed raw instead of pre-combined by the caller.
 pub struct HelloClaim<'a> {
     pub protocol: u32,
+    /// What the agent says it is: crate version plus the build id compiled into it
+    /// (the add-on version for a downloaded binary, else `git describe` + a stamp).
+    /// Reported, never acted on — a host is identified by its pairing, not its build.
+    pub agent_version: &'a str,
     pub machine_id: &'a str,
     pub hostname: &'a str,
     pub user: &'a str,
@@ -322,6 +331,8 @@ pub struct AgentInfo {
     /// Pairing code, only for pending requests.
     pub code: Option<String>,
     pub state: Option<HostState>,
+    /// The connected agent's build (`None` when it is not connected).
+    pub version: Option<String>,
 }
 
 /// One host for the Outputs listing: paired or merely asking to be. A pending host
@@ -399,7 +410,7 @@ impl Agents {
 
     /// Handles a `Hello`. `tx` is this connection's outgoing queue.
     pub fn hello(&mut self, claim: HelloClaim<'_>, tx: mpsc::Sender<DaemonMsg>) -> HelloOutcome {
-        let HelloClaim { protocol, machine_id, hostname, user, token, pair_code: offered_code } = claim;
+        let HelloClaim { protocol, agent_version, machine_id, hostname, user, token, pair_code: offered_code } = claim;
         if protocol != PROTOCOL_VERSION {
             return HelloOutcome::Denied(format!("protocol {protocol} is not {PROTOCOL_VERSION}; update the agent or the add-on"));
         }
@@ -420,7 +431,10 @@ impl Agents {
                 }
                 save_store(&self.path, &self.paired);
             }
-            self.live.insert(agent.node_name.clone(), Live { label: label.clone(), state: HostState::default(), tx });
+            self.live.insert(
+                agent.node_name.clone(),
+                Live { label: label.clone(), version: agent_version.to_string(), state: HostState::default(), tx },
+            );
             let _ = self.changes.send(());
             return HelloOutcome::Welcome { node_name: agent.node_name, label };
         }
@@ -670,6 +684,7 @@ impl Agents {
                 connected: self.live.contains_key(&a.node_name),
                 code: None,
                 state: self.state(&a.node_name),
+                version: self.live.get(&a.node_name).map(|l| l.version.clone()),
             })
             .collect();
         rows.extend(self.pending.iter().map(|p| AgentInfo {
@@ -680,6 +695,8 @@ impl Agents {
             connected: true,
             code: Some(p.code.clone()),
             state: None,
+            // A pending host has not been welcomed yet; its build is reported once it is.
+            version: None,
         }));
         rows
     }
@@ -817,6 +834,7 @@ async fn handle_socket(socket: WebSocket, state: crate::state::AppState) {
 
     let claim = HelloClaim {
         protocol,
+        agent_version: &agent_version,
         machine_id: &machine_id,
         hostname: &hostname,
         user: &user,
@@ -992,7 +1010,15 @@ mod tests {
     /// A well-formed hello from `machine`/`user`, tokenless unless given one. Tests
     /// that care about a field override it: `HelloClaim { pair_code: .., ..claim(..) }`.
     fn claim<'a>(machine: &'a str, user: &'a str, token: Option<&'a str>) -> HelloClaim<'a> {
-        HelloClaim { protocol: PROTOCOL_VERSION, machine_id: machine, hostname: "host", user, token, pair_code: None }
+        HelloClaim {
+            protocol: PROTOCOL_VERSION,
+            agent_version: "0.1.0 (test)",
+            machine_id: machine,
+            hostname: "host",
+            user,
+            token,
+            pair_code: None,
+        }
     }
 
     #[test]

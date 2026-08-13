@@ -34,6 +34,7 @@ pwrouter-agent — receiver-side helper for the PipeWire audio router add-on
 
 USAGE:
   pwrouter-agent run             [--daemon <host:port>]
+  pwrouter-agent version
   pwrouter-agent autostart       [enable | disable]
   pwrouter-agent spike-receiver  [--ifname <iface>] [--node-name <name>] [--target <sink>]
   pwrouter-agent spike-volume    [--node-name <name>] [--session <rtp.session>] [--set <0.0-1.0>]
@@ -64,6 +65,7 @@ fn main() -> anyhow::Result<()> {
     match cmd {
         "run" => run(opt("--daemon")),
         "autostart" => autostart_cmd(args.get(1).map(String::as_str)),
+        "version" | "--version" | "-V" => version_cmd(),
         "spike-receiver" => spike_receiver(
             opt("--ifname"),
             opt("--node-name").unwrap_or_else(|| receiver::RECEIVE_NODE_NAME.into()),
@@ -88,6 +90,35 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// What this build *is*: the crate version plus the build identity `build.rs` baked in
+/// (the add-on version for a downloaded binary, else `git describe` + a UTC minute).
+///
+/// One string, used everywhere the question is asked — the startup log, `version`, the
+/// tray, and the `agent_version` in `hello` — so the answer cannot differ by surface.
+pub fn version() -> String {
+    format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("PWROUTER_BUILD"))
+}
+
+/// `version` — which build is this, and where is it?
+///
+/// The path matters as much as the number: this binary gets copied to
+/// `~/.local/bin`, downloaded again into `~/Downloads`, and built from a checkout, and
+/// "which of those is running" is the question that actually gets asked. `autostart`
+/// prints what the *unit* starts, which is the other half.
+fn version_cmd() -> anyhow::Result<()> {
+    // Written rather than `println!`ed, and errors dropped: `pwrouter-agent version |
+    // head -1` closes the pipe, and the default `println!` answers that with a panic
+    // message — a silly thing to show someone who just asked which build this is.
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "pwrouter-agent {}", version());
+    let _ = match std::env::current_exe() {
+        Ok(exe) => writeln!(out, "binary: {}", exe.display()),
+        Err(e) => writeln!(out, "binary: unknown ({e})"),
+    };
+    Ok(())
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -102,7 +133,7 @@ fn run(daemon: Option<String>) -> anyhow::Result<()> {
     init_tracing();
     tracing::info!(
         "pwrouter-agent {} starting as {} ({})",
-        env!("CARGO_PKG_VERSION"),
+        version(),
         config::label(),
         config::identity()
     );
@@ -147,15 +178,37 @@ fn autostart_cmd(action: Option<&str>) -> anyhow::Result<()> {
             None | Some("status") => {
                 println!("autostart: {}", autostart::state().await.label());
                 println!("unit:      {}", path.display());
+                // What the unit actually starts, read from the file rather than guessed:
+                // that line is the one that goes stale when a binary is replaced, and
+                // the whole reason `enable` now installs to a fixed path.
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        for line in text.lines() {
+                            if let Some(exec) = line.strip_prefix("ExecStart=") {
+                                println!("it starts: {exec}");
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => println!("it starts: unknown ({e})"),
+                }
+                println!("this binary: {}", version());
                 println!("\nchange it with: pwrouter-agent autostart enable|disable");
             }
             Some("enable") => {
-                let path = autostart::enable().await?;
-                println!("wrote {}", path.display());
-                for line in autostart::unit_text().lines() {
-                    if let Some(exec) = line.strip_prefix("ExecStart=") {
-                        println!("it starts: {exec}");
-                    }
+                let installed = autostart::enable().await?;
+                if installed.copied {
+                    println!("installed {} ({})", installed.exec.display(), version());
+                }
+                println!("wrote {}", installed.unit.display());
+                println!("it starts: {} run", installed.exec.display());
+                if let Some(note) = &installed.note {
+                    println!("note: {note}");
+                } else {
+                    println!(
+                        "to update later: copy a new binary over {} and restart the service",
+                        installed.exec.display()
+                    );
                 }
                 println!(
                     "enabled; it will start at your next login.\n\

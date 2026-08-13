@@ -114,14 +114,22 @@
 
     <h3>2. Install</h3>
     <pre><code
-        >chmod +x pwrouter-agent-* &amp;&amp; install -Dm755 pwrouter-agent-* ~/.local/bin/pwrouter-agent
-~/.local/bin/pwrouter-agent autostart enable
+        >chmod +x pwrouter-agent-* &amp;&amp; ./pwrouter-agent-* autostart enable
 systemctl --user start pwrouter-agent</code
       ></pre>
     <p class="card-sub hint">
-      Two commands, no download of a service file: the systemd unit is built into the binary.
+      <code>autostart enable</code> copies the binary to <code>~/.local/bin/pwrouter-agent</code> and
+      points the service at that fixed path, so <strong>updating later is one copy</strong>: put a newer
+      download over that file and <code>systemctl --user restart pwrouter-agent</code>. Nothing has to be
+      re-enabled, and the service can never end up starting an older copy you left in
+      <code>~/Downloads</code>. <code>pwrouter-agent version</code> says which build a binary is (and
+      <code>autostart</code> with no argument says which one the service starts) — worth checking when a
+      machine behaves like an older version.
+    </p>
+    <p class="card-sub hint">
+      No download of a service file either: the systemd unit is built into the binary.
       <code>autostart enable</code> writes it to
-      <code>~/.config/systemd/user/pwrouter-agent.service</code>, pointed at the binary you ran it from,
+      <code>~/.config/systemd/user/pwrouter-agent.service</code>
       and turns it on for your next login; <code>autostart disable</code> removes it again, and
       <code>autostart</code> alone reports which it is. The tray menu has the same switch under
       <strong>Autostart</strong>. Starting and stopping stay separate commands on purpose — an agent
