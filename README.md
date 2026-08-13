@@ -13,7 +13,7 @@ a realtime-scheduling problem: on a Raspberry Pi 4 a Python engine doing that
 job stuttered audibly and took seconds to start a stream, while PipeWire's
 graph is a C daemon built for precisely it. This sits *under* a music library
 rather than in place of one — see
-[How this fits with Music Assistant](#how-this-fits-with-music-assistant).
+[Works with Music Assistant](#works-with-music-assistant).
 
 ## Routing is one card
 
@@ -42,25 +42,13 @@ in the kitchen and the living room" is two taps and stays in sync.
   gets an entity, or is ever sent audio until you add it — each with a
   test-tone button so you can tell which speaker is which.
 
-## How this fits with Music Assistant
+## Works with Music Assistant
 
-[Music Assistant](https://music-assistant.io/) answers *what* to play. This
-answers *where* it goes, and when it has to be exact.
-
-MA is a library and a player: NAS files, playlists, web radio, provider
-accounts, queues, artwork. *Synchronised* grouping there is per-ecosystem — its
-own docs say a cross-provider Universal Group plays the same audio but not in
-sync, because there are no shared timestamps across ecosystems — and it has no
-notion of routing a chosen input to a chosen set of outputs, which a player
-does not need. This project is the layer underneath: transports (AirPlay 2,
-ESPHome speakers, PC agents) on one clock, groups that span protocols, a matrix
-from any input to any set of outputs, and ducking as an operation on the audio
-graph rather than on a queue.
-
-So they compose. Point MA at this add-on's AirPlay input and it becomes one
-more AirPlay player in MA's list: MA keeps the library and the queue, and the
-audio it sends is routed, grouped and ducked here like anything else that
-streams in.
+[Music Assistant](https://music-assistant.io/) answers *what* to play; this
+answers *where* it goes and when it has to be exact. Point MA at this add-on's
+AirPlay input and it becomes one more AirPlay player in its list: MA keeps the
+library and the queue, and the audio it sends is routed, grouped and ducked here
+like anything else that streams in.
 
 | | Music Assistant | this project |
 |---|---|---|
@@ -69,9 +57,8 @@ streams in.
 | Routing | a queue to its player | any input to any set of outputs, live |
 | Latency | not a design driver | the design driver |
 
-Deliberately **not** built here: playlists, queues, gapless, library browsing.
-That is what MA is for, and two half-players would serve nobody. Setup and
-anything that needs troubleshooting:
+Playlists, queues, gapless and library browsing are deliberately not built here
+— that is MA's job. Setup and troubleshooting:
 [docs/music_assistant_compatibility.md](docs/music_assistant_compatibility.md).
 
 ## Quick install

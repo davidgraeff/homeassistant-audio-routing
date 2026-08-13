@@ -2,7 +2,7 @@
 
 [Music Assistant](https://music-assistant.io/) and this project do different
 jobs — MA knows *what* to play, this knows *where* it goes and when it has to be
-exact (the division of labour is in the [root README](../README.md#how-this-fits-with-music-assistant)).
+exact (the division of labour is in the [root README](../README.md#works-with-music-assistant)).
 This page is the practical half: how to connect them, and what to do when it
 does not work.
 
