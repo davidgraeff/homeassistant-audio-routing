@@ -59,6 +59,7 @@ async def _setup(hass, stack, rtp=RTP_DISABLED):
     from custom_components.pipewire_audio_router.api import AppSettings
 
     stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=DAEMON_STATUS)))
+    stack.enter_context(patch(f"{API}.async_get_agents", new=AsyncMock(return_value=[])))
     stack.enter_context(
         patch(
             f"{API}.async_get_settings",

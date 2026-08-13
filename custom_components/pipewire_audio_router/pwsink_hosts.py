@@ -21,13 +21,15 @@ explicitly. Notes on why this holds up:
   identity — "a host that paired before keeps its stored name, or its routing and
   HA entity ids would break on a re-pairing" (`outputs/pwsink/agent.rs`) — so a
   renamed host or a re-pairing keeps this device, and with it the room.
-* **A device with no entities is fine.** `device_registry.async_cleanup` reaps
-  only devices that have neither entities nor a live config entry, and this one
-  belongs to ours. The room therefore survives restarts even with the daemon's
-  per-output `media_player` toggle switched off — which is the case that matters,
-  since that toggle being off is why ducking needs a device at all.
-* When per-output entities *are* exposed, the host's `media_player` attaches here
-  (via `find_output_ha_device`), so it reads as that machine rather than a slug.
+* **The room survives a registry cleanup.** `device_registry.async_cleanup` reaps
+  devices that have neither entities nor a live config entry, and this one belongs
+  to ours — so the assignment holds with the daemon's per-output `media_player`
+  toggle switched off, which is the case that matters, since that toggle being off
+  is why ducking needs a device at all.
+* It is also where the host's own facts go: the agent's build as the device
+  version, and its current PipeWire sink as a diagnostic sensor (`sensor.py`).
+  When per-output entities *are* exposed, the host's `media_player` attaches here
+  too (via `find_output_ha_device`), so it reads as that machine rather than a slug.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from typing import TYPE_CHECKING
 
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.typing import UNDEFINED
 
 from .const import DOMAIN
 
@@ -100,12 +103,19 @@ def async_reconcile_pwsink_host_devices(
 
     dev_reg = dr.async_get(hass)
     for node_name, label in wanted.items():
+        agent = coordinator.agents.get(node_name)
+        version = agent.version if agent is not None else None
         dev_reg.async_get_or_create(
             config_entry_id=entry.entry_id,
             identifiers={pwsink_host_identifier(node_name)},
             name=label,
             manufacturer=DEVICE_MANUFACTURER,
             model=DEVICE_MODEL,
+            # The agent's build. The daemon only learns it from a live connection, so
+            # a disconnected host reports none — pass `UNDEFINED` rather than `None`
+            # there, which keeps the last version instead of blanking the field every
+            # time the machine sleeps.
+            sw_version=version if version is not None else UNDEFINED,
         )
 
     if not coordinator.routing.outputs:

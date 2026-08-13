@@ -15,6 +15,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.pipewire_audio_router.api import (
     AppSettings,
     DaemonStatus,
+    PwsinkAgent,
     RoutingMatrix,
     RoutingNode,
     RtpSourceState,
@@ -48,7 +49,7 @@ def _matrix(*outputs):
     )
 
 
-def _patch_daemon(routing, *, expose_outputs=False):
+def _patch_daemon(routing, *, expose_outputs=False, agents=None):
     """Offline setup. `expose_outputs` defaults to *off* here — the case that
     matters, since a host device is what makes ducking work without per-output
     entities."""
@@ -61,6 +62,7 @@ def _patch_daemon(routing, *, expose_outputs=False):
     stack.enter_context(patch(f"{API}.async_get_music_groups", new=AsyncMock(return_value=[])))
     stack.enter_context(patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=[])))
     stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=DAEMON_STATUS)))
+    stack.enter_context(patch(f"{API}.async_get_agents", new=AsyncMock(return_value=agents or [])))
     stack.enter_context(
         patch(
             f"{API}.async_get_settings",
@@ -133,10 +135,11 @@ async def test_without_a_room_the_host_is_simply_not_ducked(hass):
     duck.assert_not_awaited()
 
 
-async def test_the_host_device_survives_with_no_entities(hass):
-    """It carries no entities when per-output players are off, and
-    `device_registry.async_cleanup` reaps exactly that shape of device — unless it
-    belongs to a live config entry, which is why the room assignment is safe."""
+async def test_the_host_device_survives_a_registry_cleanup(hass):
+    """`device_registry.async_cleanup` reaps devices with neither entities nor a
+    live config entry. This one belongs to ours, so the room assignment is safe even
+    in the shape that would otherwise qualify — per-output players off, leaving only
+    the diagnostic sink sensor."""
     entry = _make_entry(hass)
     stack, _duck = _patch_daemon(_matrix((HOST, HOST_LABEL)))
     with stack:
@@ -145,12 +148,104 @@ async def test_the_host_device_survives_with_no_entities(hass):
 
         device = _host_device(hass)
         ent_reg = er.async_get(hass)
-        assert not er.async_entries_for_device(ent_reg, device.id, include_disabled_entities=True)
+        assert {e.entity_id for e in er.async_entries_for_device(ent_reg, device.id)} == {
+            "sensor.david_local_david_output_device"
+        }
 
         dr.async_cleanup(hass, dr.async_get(hass), ent_reg)
         await hass.async_block_till_done()
 
     assert _host_device(hass) is not None
+
+
+async def test_the_device_shows_the_agents_build(hass):
+    """The version the host reports over its connection, as the device's firmware
+    line — the answer to "is that machine running the agent I just built"."""
+    entry = _make_entry(hass)
+    agents = [PwsinkAgent(node_name=HOST, label=HOST_LABEL, paired=True, connected=True, version="0.2.1")]
+    stack, _duck = _patch_daemon(_matrix((HOST, HOST_LABEL)), agents=agents)
+    with stack:
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert _host_device(hass).sw_version == "0.2.1"
+
+
+async def test_a_sleeping_host_keeps_its_last_known_build(hass):
+    """The daemon only learns the version from a live connection, so a disconnected
+    host reports none. Blanking the field every time the machine sleeps would make
+    the device page flicker between "0.2.1" and nothing."""
+    entry = _make_entry(hass)
+    agents = [PwsinkAgent(node_name=HOST, label=HOST_LABEL, paired=True, connected=True, version="0.2.1")]
+    stack, _duck = _patch_daemon(_matrix((HOST, HOST_LABEL)), agents=agents)
+    with stack:
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        offline = [PwsinkAgent(node_name=HOST, label=HOST_LABEL, paired=True, connected=False, version=None)]
+        stack.enter_context(patch(f"{API}.async_get_agents", new=AsyncMock(return_value=offline)))
+        await hass.data[DOMAIN][entry.entry_id].async_refresh()
+        await hass.async_block_till_done()
+
+    assert _host_device(hass).sw_version == "0.2.1"
+
+
+async def test_the_sink_sensor_reports_where_the_agent_plays(hass):
+    """"Routed there but I can't hear it" is usually answered by which sink on that
+    machine the agent chose, and only the agent can say."""
+    entry = _make_entry(hass)
+    agents = [
+        PwsinkAgent(
+            node_name=HOST,
+            label=HOST_LABEL,
+            paired=True,
+            connected=True,
+            version="0.2.1",
+            sink_name="alsa_output.pci-0000_0a_00.4.analog-stereo",
+        )
+    ]
+    stack, _duck = _patch_daemon(_matrix((HOST, HOST_LABEL)), agents=agents)
+    with stack:
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    sink = hass.states.get("sensor.david_local_david_output_device")
+    assert sink is not None
+    assert sink.state == "alsa_output.pci-0000_0a_00.4.analog-stereo"
+    assert sink.attributes["friendly_name"] == f"{HOST_LABEL} Output device"
+
+
+async def test_the_sink_sensor_is_unavailable_with_no_agent_connected(hass):
+    """A sink name from a machine that may have rebooted since is a guess, so it
+    goes unavailable rather than showing a stale device."""
+    entry = _make_entry(hass)
+    agents = [
+        PwsinkAgent(node_name=HOST, label=HOST_LABEL, paired=True, connected=False, sink_name="alsa_output.old")
+    ]
+    stack, _duck = _patch_daemon(_matrix((HOST, HOST_LABEL)), agents=agents)
+    with stack:
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.david_local_david_output_device").state == "unavailable"
+
+
+async def test_the_sink_sensor_goes_when_the_host_does(hass):
+    """It is tied to the output, so removing the host takes the sensor with it
+    rather than leaving an unavailable entity behind."""
+    entry = _make_entry(hass)
+    agents = [PwsinkAgent(node_name=HOST, label=HOST_LABEL, paired=True, connected=True, sink_name="alsa_output.x")]
+    stack, _duck = _patch_daemon(_matrix((HOST, HOST_LABEL)), agents=agents)
+    with stack:
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert hass.states.get("sensor.david_local_david_output_device") is not None
+
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        coordinator._apply_routing(_matrix("sendspin-dev-kitchen"))
+        await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.david_local_david_output_device") is None
 
 
 async def test_an_exposed_output_entity_joins_its_host_device(hass):

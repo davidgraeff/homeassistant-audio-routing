@@ -198,6 +198,25 @@ class AppSettings:
 
 
 @dataclass
+class PwsinkAgent:
+    """One receiver agent from `GET /api/agents` — the `pwrouter-agent` process on a
+    remote PipeWire host, which is what a `pwsink-dev-*` output actually is.
+
+    Only the parts the integration shows: the build it is running (`version`, `None`
+    while the host is not connected — the daemon only learns it from a live Hello)
+    and the sink it plays to on that machine (`sink_name`, e.g.
+    `alsa_output.pci-0000_0a_00.4.analog-stereo`). Volume and mute come through
+    `/api/outputs` with the rest of the per-output state, not from here."""
+
+    node_name: str
+    label: str
+    paired: bool
+    connected: bool
+    version: str | None = None
+    sink_name: str | None = None
+
+
+@dataclass
 class DaemonStatus:
     """Subset of the daemon's `/api/status` used to describe the service device:
     which build is running, and what it is running on."""
@@ -606,6 +625,32 @@ class PipewireRouterApiClient:
             host_model=host.get("cpu_model"),
             host_arch=host.get("arch"),
         )
+
+    async def async_get_agents(self) -> list[PwsinkAgent]:
+        """Receiver agents (`GET /api/agents`) — the hosts behind `pwsink-dev-*`
+        outputs. Pending (unpaired) hosts are included by the daemon; the caller
+        decides what to do with them."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/agents") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        agents = []
+        for item in data:
+            state = item.get("state") or {}
+            agents.append(
+                PwsinkAgent(
+                    node_name=item["node_name"],
+                    label=item.get("label") or item["node_name"],
+                    paired=bool(item.get("paired", False)),
+                    connected=bool(item.get("connected", False)),
+                    # Absent on a daemon older than the agent build-identity change.
+                    version=item.get("version"),
+                    sink_name=state.get("sink_name"),
+                )
+            )
+        return agents
 
     async def async_route_music_group(self, group_id: str, source: str) -> None:
         """Route a source to a whole music group (`POST /api/groups/music/{id}/route`)."""

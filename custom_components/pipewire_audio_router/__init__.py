@@ -30,6 +30,7 @@ from .api import (
     OutputMeta,
     PipewireRouterApiClient,
     PipewireRouterApiError,
+    PwsinkAgent,
     RoutingMatrix,
     RtpSourceState,
 )
@@ -49,7 +50,7 @@ from .service_device import async_register_service_device
 from .voice_duck import VoiceDucker
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS = [Platform.MEDIA_PLAYER, Platform.NUMBER, Platform.SELECT, Platform.SWITCH]
+PLATFORMS = [Platform.MEDIA_PLAYER, Platform.NUMBER, Platform.SELECT, Platform.SENSOR, Platform.SWITCH]
 
 _EMPTY_ROUTING = RoutingMatrix(sources=[], outputs=[], links=[])
 
@@ -119,6 +120,10 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
         # older daemon without `/api/status` leaves this `None`). Only the service
         # device reads it, to show a version and to notice an add-on update.
         self.status: DaemonStatus | None = None
+        # Receiver agents by output node name, refreshed each poll: the build each
+        # pw-sink host runs (shown as its device's version) and the sink it plays to
+        # (a diagnostic sensor). Empty for a daemon without `/api/agents`.
+        self.agents: dict[str, PwsinkAgent] = {}
         # Voice-assistant ducking (voice_duck.py). Set in `async_setup_entry`
         # right after the coordinator exists, because the ducker reads the polled
         # routing/groups/outputs state this object holds. Its enabled/level/scope
@@ -156,6 +161,12 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
             self.outputs_meta = {o.node_name: o for o in await self.client.async_get_outputs()}
         except PipewireRouterApiError as err:
             _LOGGER.debug("outputs listing unavailable: %s", err)
+        # Receiver agents, likewise secondary: without them a pw-sink host device
+        # simply shows no version and its sink sensor goes unknown.
+        try:
+            self.agents = {a.node_name: a for a in await self.client.async_get_agents()}
+        except PipewireRouterApiError as err:
+            _LOGGER.debug("agent listing unavailable: %s", err)
         # Groups + the per-output toggle drive entity creation; secondary, and an
         # older daemon without these endpoints simply yields no groups.
         try:

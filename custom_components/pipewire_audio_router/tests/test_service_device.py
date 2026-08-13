@@ -50,6 +50,7 @@ def _patch_daemon(routing=EMPTY_ROUTING, *, status=DAEMON_STATUS, music_groups=N
         patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=announcement_groups or []))
     )
     stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=status)))
+    stack.enter_context(patch(f"{API}.async_get_agents", new=AsyncMock(return_value=[])))
     stack.enter_context(
         patch(
             f"{API}.async_get_settings",

@@ -42,9 +42,12 @@ A second kind of device appears for every adopted **pw-sink host** — a PC runn
 `pwrouter-agent` — named the way that machine reports itself, *"david-local
 (david)"*. Unlike a speaker, a PC has nothing in Home Assistant to inherit a room
 from, so this is the thing you **assign a room to**; voice ducking then covers it
-like any other output. It carries no entities of its own unless per-output players
-are exposed, which is fine: the room assignment lives on the device and survives
-restarts.
+like any other output. The device also shows the host's own facts: the **agent
+build** it is running as the device version (kept from the last connection while the
+machine sleeps), and a diagnostic sensor *"Output device"* naming the PipeWire sink
+the agent is playing into (`alsa_output.pci-…analog-stereo`) — the usual answer to
+"it's routed there but I can't hear it". That sensor is unavailable while no agent
+is connected, rather than showing a sink the machine may have rebooted out of.
 
 The `media_player`s deliberately stay off the settings device, because a device
 prefixes its entities' displayed names and that is wrong for a speaker:
