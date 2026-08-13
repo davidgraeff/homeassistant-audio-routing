@@ -15,13 +15,28 @@ graph is a C daemon built for precisely it. This sits *under* a music library
 rather than in place of one — see
 [Works with Music Assistant](#works-with-music-assistant).
 
-## Routing is one card
 
-![The audio routing dashboard card: inputs on the left, zones on the right, live routes drawn as wires between them](docs/images/audio_routing_card.webp)
-
+<table>
+  <tr valign="top">
+    <td width="50%" align="left">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/audio-flow-dark.svg">
+        <img src="docs/diagrams/audio-flow.svg" width="660" alt="Audio comes in from a phone, a Bluetooth bridge and a PC, is mixed by PipeWire's realtime graph, and plays in two grouped rooms while a Home Assistant announcement ducks the music">
+      </picture>
+      <br><sub><b>Audio flows left to right</b>: The music dips when Home Assistant speaks, then comes
+back.</sub>
+    </td>
+    <td width="50%" align="left">
+      <a href="docs/images/audio_routing_card.webp"><img src="docs/images/audio_routing_card.webp" width="270" alt="The audio routing dashboard card: inputs on the left, zones on the right, live routes drawn as wires between them"></a>
+      <br><sub><b>The audio routing dashboard card</b> inputs on the left, zones on the right, live routes drawn as wires between them.</sub>
+      <br><sub>
 Tap an input, then where it should play. Tap a wire to remove a route. Speakers
 fed by the same inputs are synchronised into one group for you, so "play this
 in the kitchen and the living room" is two taps and stays in sync.
+</sub>
+    </td>
+  </tr>
+</table>
 
 ## What you get
 

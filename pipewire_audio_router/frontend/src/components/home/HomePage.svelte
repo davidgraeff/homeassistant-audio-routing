@@ -17,6 +17,12 @@
   // The diagram deliberately reuses the routing graph's own idiom for "audio is flowing"
   // (travelling dashes along a wire, `FlowGraph`'s `.wire.active`), so the animation here
   // teaches the thing the user will see on the Music groups page for real.
+  //
+  // The same drawing also exists as standalone files for the README —
+  // docs/diagrams/audio-flow.svg and audio-flow-dark.svg. Change one, change the other. They
+  // are deliberately copies rather than one shared asset: GitHub renders an <img>, which has
+  // no Home Assistant theme variables to read (hence a hardcoded palette, one file per
+  // scheme) and no interactivity (hence no hover highlight and no live counts there).
 
   /** The three steps, in `PAGES` order — the same slice the tab bar's chevron flow takes,
    *  for the same reason: one list decides what "the setup path" is. */

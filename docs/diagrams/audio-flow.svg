@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 258" width="660" height="258"
+     role="img" aria-labelledby="flow-title flow-desc">
+  <title id="flow-title">What this add-on does</title>
+  <desc id="flow-desc">Audio comes in from a phone, a Bluetooth bridge and a PC, is mixed by
+    PipeWire's realtime graph, and plays in two grouped rooms while a Home Assistant
+    announcement ducks the music.</desc>
+
+  <!-- The README's copy of the front page's diagram — see, and keep in step with,
+       pipewire_audio_router/frontend/src/components/home/HomePage.svelte.
+       Same geometry and the same 9s bar; two things differ, both because this file is
+       rendered by GitHub inside an <img> rather than by the app:
+         · the palette is hardcoded (the app's is Home Assistant's theme variables), so the
+           dark counterpart is a second file, audio-flow-dark.svg, chosen by the README's
+           <picture> element;
+         · there is no hover-to-highlight and no live device counts — an <img> is not
+           interactive and has no API to ask.
+       Everything else is a copy on purpose: this drawing has to survive without the app's
+       theme, and the app's has to stay interactive. -->
+
+  <style>
+    svg {
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      /* Light palette. The dark file differs from this file in this block and nothing else. */
+      --accent: #03a9f4;
+      --accent-45: rgb(3 169 244 / 0.45);
+      --accent-55: rgb(3 169 244 / 0.55);
+      --box-fill: #e1f5fe;
+      --chip-fill: #f2f2f2;
+      --chip-stroke: rgb(114 114 114 / 0.35);
+      --text: #24292f;
+      --text-dim: #57606a;
+      --warn: #e09112;
+      --warn-stroke: rgb(224 145 18 / 0.5);
+      --talk-fill: #fdf2df;
+    }
+
+    .chip rect { fill: var(--chip-fill); stroke: var(--chip-stroke); }
+    .chip text { font-size: 14px; fill: var(--text); }
+    .box rect { fill: var(--box-fill); stroke: var(--accent-55); }
+    .box text { text-anchor: middle; }
+    .box-t { font-size: 15px; font-weight: 600; fill: var(--text); }
+    .box-s { font-size: 11px; fill: var(--text-dim); }
+    .bracket { fill: none; stroke: var(--accent-45); stroke-width: 1.5; stroke-dasharray: 5 5; }
+    .bracket-t { font-size: 11px; text-anchor: middle; letter-spacing: 0.03em; fill: var(--text-dim); }
+    .wire { fill: none; stroke: var(--accent); stroke-width: 2.5; stroke-linecap: round; }
+    .wire.talk { stroke: var(--warn); stroke-width: 2; }
+    .talk-chip rect { fill: var(--talk-fill); stroke: var(--warn-stroke); }
+    .talk-chip text { font-size: 12px; fill: var(--text); }
+    .beat { fill: none; stroke: var(--accent); opacity: 0; }
+
+    /* One 9s bar, and everything is a phase of it: dashes travel the wires the whole time,
+       the box pulses once a second, and from 5s to 7s Home Assistant talks — the
+       announcement wire and its bubble come up while the music wires drop to a duck. */
+    .wire.music {
+      stroke-dasharray: 6 8;
+      animation: flow 0.8s linear infinite, duck 9s ease-in-out infinite;
+    }
+    @keyframes flow { to { stroke-dashoffset: -14; } }
+    @keyframes duck {
+      0%, 52% { opacity: 1; stroke-width: 2.5; }
+      58%, 74% { opacity: 0.4; stroke-width: 1.8; }
+      82%, 100% { opacity: 1; stroke-width: 2.5; }
+    }
+    .beat { animation: beat 1s ease-out infinite; }
+    @keyframes beat {
+      0% { opacity: 0.5; r: 6; }
+      100% { opacity: 0; r: 34; }
+    }
+    .voice { opacity: 0; animation: talk 9s ease-in-out infinite; }
+    .voice .wire { stroke-dasharray: 5 6; animation: flow-up 0.6s linear infinite; }
+    @keyframes flow-up { to { stroke-dashoffset: 11; } }
+    @keyframes talk {
+      0%, 50% { opacity: 0; }
+      58%, 74% { opacity: 1; }
+      84%, 100% { opacity: 0; }
+    }
+
+    /* All of the above is decoration on a drawing that is already legible standing still:
+       with motion off the wires are solid, the announcement bubble simply stays visible,
+       and nothing pulses. */
+    @media (prefers-reduced-motion: reduce) {
+      .wire.music, .voice .wire, .beat, .voice { animation: none; }
+      .wire.music, .voice .wire { stroke-dasharray: none; }
+      .voice { opacity: 1; }
+      .beat { opacity: 0; }
+    }
+  </style>
+
+  <!-- ==== stage 1: what plays ============================================= -->
+  <g class="s-sources">
+    <g class="chip" transform="translate(8,26)">
+      <rect width="132" height="40" rx="9" />
+      <text x="16" y="24">AirPlay</text>
+    </g>
+    <g class="chip" transform="translate(8,96)">
+      <rect width="132" height="40" rx="9" />
+      <text x="16" y="24">Bluetooth</text>
+    </g>
+    <g class="chip" transform="translate(8,166)">
+      <rect width="132" height="40" rx="9" />
+      <text x="16" y="24">A PC</text>
+    </g>
+  </g>
+
+  <!-- in-wires: source → router -->
+  <g class="w-in">
+    <path class="wire music" d="M140,46 C200,46 210,105 262,113" />
+    <path class="wire music" d="M140,116 C200,116 214,118 262,121" />
+    <path class="wire music" d="M140,186 C200,186 210,137 262,129" />
+  </g>
+
+  <!-- ==== stage 2+3: the router, and the rooms it feeds ==================== -->
+  <g class="s-router">
+    <g class="box" transform="translate(262,88)">
+      <rect width="126" height="66" rx="12" />
+      <text class="box-t" x="63" y="28">PipeWire</text>
+      <text class="box-s" x="63" y="48">realtime graph</text>
+    </g>
+    <!-- The mixing beat: one pulse per bar, so the box reads as doing something. -->
+    <circle class="beat" cx="325" cy="121" r="30" />
+  </g>
+
+  <!-- out-wires: router → rooms -->
+  <g class="w-out">
+    <path class="wire music out" d="M388,110 C460,110 470,66 524,60" />
+    <path class="wire music out" d="M388,132 C460,132 470,176 524,182" />
+  </g>
+
+  <g class="s-rooms">
+    <!-- A ring *around* both speakers rather than a bracket beside them, which crossed the
+         wires feeding them and read as a third kind of line. -->
+    <rect class="bracket" x="512" y="28" width="146" height="186" rx="14" />
+    <text class="bracket-t" x="585" y="230">one group, in sync</text>
+    <g class="chip room" transform="translate(524,40)">
+      <rect width="124" height="40" rx="9" />
+      <text x="16" y="24">Kitchen</text>
+    </g>
+    <g class="chip room" transform="translate(524,162)">
+      <rect width="124" height="40" rx="9" />
+      <text x="16" y="24">Living room</text>
+    </g>
+  </g>
+
+  <!-- ==== the announcement, over the top ================================== -->
+  <g class="s-voice">
+    <g class="voice">
+      <path class="wire talk" d="M325,222 C325,190 325,170 325,156" />
+      <g class="chip talk-chip" transform="translate(232,222)">
+        <rect width="186" height="28" rx="8" />
+        <text x="14" y="19">“Someone’s at the door”</text>
+      </g>
+    </g>
+  </g>
+</svg>
