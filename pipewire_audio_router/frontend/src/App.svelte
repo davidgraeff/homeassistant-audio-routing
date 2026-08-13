@@ -28,14 +28,22 @@
   const tab = $derived(route.page);
   /** The tab bar, in `PAGES` order so the URL ids and the bar cannot drift apart. */
   const LABELS: Record<Page, string> = {
+    sources: 'Sources',
+    outputs: 'Outputs',
     music: 'Music groups',
     announcements: 'Announcements',
-    outputs: 'Outputs',
     alignment: 'Alignment',
-    sources: 'Sources',
     settings: 'Settings',
     diagnostics: 'Diagnostics',
   };
+
+  /** The pages that have to be visited *in this order* before anything plays — drawn as a
+   *  chevron flow rather than as three tabs among seven (see `PAGES`). Taken as the first
+   *  N of `PAGES` instead of listed again, so the bar cannot disagree with the route order
+   *  about which pages are the setup path. */
+  const SETUP_STEPS = 3;
+  const setup = $derived(PAGES.slice(0, SETUP_STEPS));
+  const rest = $derived(PAGES.slice(SETUP_STEPS));
 </script>
 
 <header class="app-header">
@@ -50,7 +58,25 @@
      "open in new tab" and the browser's own link affordances work without a handler. The
      fragment change is the navigation — nothing here writes the page state. -->
 <nav class="tabs" aria-label="Sections">
-  {#each PAGES as id (id)}
+  <!-- The setup path, as a chevron flow: the shape carries "in this order, and all three
+       before anything plays", which three tabs among seven cannot say. The numbers match
+       the wizard's stepper convention (AlignWizard's `.steps`) so the app has one visual
+       language for "step N of a sequence". -->
+  <span class="flow">
+    {#each setup as id, i (id)}
+      <a
+        href={route.href(id)}
+        class="step"
+        class:active={tab === id}
+        aria-current={tab === id ? 'page' : undefined}
+      >
+        <!-- Decorative: the label already names the page, and a screen reader announcing
+             "1 Sources" adds nothing a sighted user gets from the arrow. -->
+        <span class="n" aria-hidden="true">{i + 1}</span>{LABELS[id]}
+      </a>
+    {/each}
+  </span>
+  {#each rest as id (id)}
     <a href={route.href(id)} class:active={tab === id} aria-current={tab === id ? 'page' : undefined}>
       {LABELS[id]}
     </a>
@@ -123,6 +149,7 @@
 
   .tabs {
     display: flex;
+    align-items: stretch;
     gap: 4px;
     padding: 0 20px;
     background: var(--card-background-color);
@@ -145,6 +172,93 @@
     color: var(--primary-color);
     border-bottom-color: var(--primary-color);
     font-weight: 500;
+  }
+
+  /* --- the setup flow -------------------------------------------------- */
+
+  .flow {
+    display: flex;
+    align-items: stretch;
+    /* Reads as one object, then a gap before the ordinary tabs — without a rule, which
+       would compete with the active tab's underline for the eye. */
+    margin-right: 12px;
+  }
+  .flow .step {
+    position: relative;
+    /* So the chevron background (::before, z-index -1) cannot fall behind the bar. */
+    isolation: isolate;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    /* Asymmetric: the left notch eats into the padding, so the label still looks centred. */
+    padding: 12px 18px 12px 26px;
+    /* The fill is the "you are here", so no underline to fight with it. */
+    border-bottom: none;
+  }
+  /* The shape lives on a pseudo-element rather than on the anchor, so `clip-path` cannot
+     clip away the keyboard focus ring — which it does, invisibly, when applied directly. */
+  .flow .step::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    /* Mixed against the bar's own background rather than taken from a token: in the dark
+       theme `--secondary-background-color` and `--card-background-color` are the *same*
+       #1c1c1c, so the obvious choice made the chevrons invisible there. A percentage of the
+       text colour is a contrast that holds in both themes by construction. */
+    background: color-mix(in srgb, var(--primary-text-color) 9%, var(--card-background-color));
+    clip-path: polygon(0 0, calc(100% - 11px) 0, 100% 50%, calc(100% - 11px) 100%, 0 100%, 11px 50%);
+  }
+  /* First step: flat left edge, nothing points into it. */
+  .flow .step:first-child {
+    padding-left: 16px;
+  }
+  .flow .step:first-child::before {
+    clip-path: polygon(0 0, calc(100% - 11px) 0, 100% 50%, calc(100% - 11px) 100%, 0 100%);
+  }
+  /* 2px of the bar showing through is the separator; a border cannot follow the notch. */
+  .flow .step + .step {
+    margin-left: 2px;
+  }
+  .flow .step:hover::before {
+    background: color-mix(in srgb, var(--primary-color) 22%, var(--card-background-color));
+  }
+  .flow .step.active {
+    color: var(--text-on-primary);
+    font-weight: 500;
+  }
+  .flow .step.active::before,
+  .flow .step.active:hover::before {
+    background: var(--primary-color);
+  }
+  /* The numbered circle, matching the alignment wizard's stepper. */
+  .flow .n {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    font-size: 0.68rem;
+    /* One step darker than the chevron it sits on, by the same construction. */
+    background: color-mix(in srgb, var(--primary-text-color) 20%, var(--card-background-color));
+    color: var(--primary-text-color);
+  }
+  .flow .step.active .n {
+    background: var(--text-on-primary);
+    color: var(--primary-color);
+  }
+
+  /* Narrow (a phone in the Home Assistant app): the bar already scrolls, but the chevrons
+     are the widest thing in it, so they give up their generous padding first. */
+  @media (max-width: 640px) {
+    .flow .step {
+      padding: 12px 12px 12px 20px;
+      gap: 5px;
+    }
+    .flow .step:first-child {
+      padding-left: 12px;
+    }
   }
 
   main {

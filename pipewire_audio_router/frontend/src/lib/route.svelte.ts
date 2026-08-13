@@ -15,20 +15,32 @@
 // which is what a hash in the URL leads a user to expect. Normalising an empty or unknown
 // fragment replaces instead, so arriving at the app doesn't leave a dead entry behind.
 
-/** The pages, in tab-bar order. The fragment is one of these ids. */
+/** The pages, in tab-bar order. The fragment is one of these ids.
+ *
+ *  **The first three are the order in which the add-on becomes operational**, and the bar
+ *  draws them as a chevron flow to say so (App.svelte): audio has to come in (a source),
+ *  there has to be somewhere for it to go (an added output), and a speaker only gets a
+ *  source once it is in a music group. Nothing plays until all three are done, and the old
+ *  order — Music groups first, Sources *fifth* — asked a newcomer to start at the end.
+ *  The rest are the things you reach for later, in rough order of how often. */
 export const PAGES = [
+  'sources',
+  'outputs',
   'music',
   'announcements',
-  'outputs',
   'alignment',
-  'sources',
   'settings',
   'diagnostics',
 ] as const;
 
 export type Page = (typeof PAGES)[number];
 
-/** Where an empty or unrecognised fragment lands: music groups is the primary surface. */
+/** Where an empty or unrecognised fragment lands.
+ *
+ *  Deliberately *not* the first tab: music groups is the daily surface — who is playing
+ *  what — and someone opening the panel for the hundredth time should land there, not on
+ *  the first step of a setup they finished months ago. The chevron bar is what tells a
+ *  first-time visitor where to start instead. */
 export const DEFAULT_PAGE: Page = 'music';
 
 const isPage = (v: string): v is Page => (PAGES as readonly string[]).includes(v);
