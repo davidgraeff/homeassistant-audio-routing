@@ -35,15 +35,27 @@ export const PAGES = [
 
 export type Page = (typeof PAGES)[number];
 
+/** The front page, behind the app's own title: what this add-on is, and the three steps
+ *  above drawn as the flow they describe.
+ *
+ *  Deliberately **not** in `PAGES`: it is not a tab (the title is its affordance, as in
+ *  every other app), and putting it there would both add an eighth tab and shift the
+ *  setup-path slice the bar takes from the front of that list. */
+export const HOME = 'home' as const;
+
+/** Anything the fragment can name: a tab, or the front page. */
+export type Route = Page | typeof HOME;
+
 /** Where an empty or unrecognised fragment lands.
  *
- *  Deliberately *not* the first tab: music groups is the daily surface — who is playing
- *  what — and someone opening the panel for the hundredth time should land there, not on
- *  the first step of a setup they finished months ago. The chevron bar is what tells a
- *  first-time visitor where to start instead. */
-export const DEFAULT_PAGE: Page = 'music';
+ *  The front page: the one page that says what this add-on is and draws the three steps as
+ *  the flow they are. Opening the panel fresh therefore always starts here — Home Assistant
+ *  loads the panel iframe without a fragment — while a *reload* keeps whatever fragment the
+ *  URL already has, which is what the fragment is for (an add-on restart, or ingress
+ *  reloading the frame, still comes back to the page you were on). */
+export const DEFAULT_PAGE: Route = HOME;
 
-const isPage = (v: string): v is Page => (PAGES as readonly string[]).includes(v);
+const isRoute = (v: string): v is Route => v === HOME || (PAGES as readonly string[]).includes(v);
 
 /** The page a fragment names, or null if it names nothing we have.
  *
@@ -51,12 +63,12 @@ const isPage = (v: string): v is Page => (PAGES as readonly string[]).includes(v
  *  first, but a hand-typed or hand-edited URL should still work. A stale fragment from an
  *  older version (or a typo) is *not* an error state worth showing: it resolves to null
  *  and the caller falls back to the default page. */
-function parse(hash: string): Page | null {
+function parse(hash: string): Route | null {
   const id = decodeURIComponent(hash.replace(/^#\/?/, ''));
-  return isPage(id) ? id : null;
+  return isRoute(id) ? id : null;
 }
 
-const fragment = (p: Page) => `#/${p}`;
+const fragment = (p: Route) => `#/${p}`;
 
 const initial = parse(location.hash) ?? DEFAULT_PAGE;
 
@@ -68,7 +80,7 @@ if (location.hash !== fragment(initial)) {
   history.replaceState(null, '', fragment(initial));
 }
 
-let current = $state<Page>(initial);
+let current = $state<Route>(initial);
 
 // The back/forward buttons and a hand-edited URL both arrive here, which is why the state
 // is only ever written from this listener: `go()` changes the fragment and lets the
@@ -79,13 +91,13 @@ window.addEventListener('hashchange', () => {
 
 export const route = {
   /** The page to render. */
-  get page(): Page {
+  get page(): Route {
     return current;
   },
 
   /** Go to a page. A no-op when already there, so re-clicking the active tab doesn't
    *  stack history entries the back button then has to be pressed through. */
-  go(p: Page): void {
+  go(p: Route): void {
     if (p === current) return;
     location.hash = fragment(p);
   },
