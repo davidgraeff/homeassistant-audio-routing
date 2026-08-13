@@ -70,6 +70,33 @@
     </section>
 
     <section>
+      <h3>Presets</h3>
+      <p>
+        A house party wants different groups than a normal evening, and moving speakers twice per party is the tedious
+        way to get there. <strong>Work with presets</strong> lets you save several groupings — one click switches the
+        whole house over, and one click puts it back. Each preset also remembers what its groups were playing, so
+        returning to your everyday grouping restores the music too.
+      </p>
+      <p>
+        The <strong>music groups themselves are not per preset</strong>: a group keeps its name and its one Home
+        Assistant <code>media_player</code> whichever preset is in force, so nothing in your automations or dashboards
+        breaks when you switch. A group a preset says nothing about is simply empty in it. Within one preset a speaker
+        still belongs to one group — but it may be in <em>different</em> groups in different presets, which is what makes
+        the party layout a matter of building it once.
+      </p>
+      <p>
+        Clicking a chip picks a preset <em>to edit</em>, which does not change what is playing; the filled chip with the
+        ▶ is the one in force, and <strong>Activate</strong> switches to the one you are editing. While you edit a preset
+        that is not active there is no <strong>Source</strong> control, because it has no speakers to route yet.
+      </p>
+      <p>
+        Elsewhere: Home Assistant gets a <code>Music group preset</code> select entity and a
+        <code>pipewire_audio_router.activate_preset</code> service (by name — good for automations), and the dashboard
+        card grows a preset dropdown once you have more than one.
+      </p>
+    </section>
+
+    <section>
       <h3>And the graph below</h3>
       <p>
         The routing graph is this same routing one level lower: the per-speaker links a group-level source expands into.

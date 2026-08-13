@@ -33,14 +33,27 @@ export interface CardGroup {
   members: string[];
 }
 
+/** A music-group preset: the whole grouping of the house as one switchable thing.
+ *  Only the parts the card shows — picking one is what it can do, and what that
+ *  changes arrives as new `groups` and `links`. */
+export interface CardPreset {
+  id: string;
+  name: string;
+}
+
 export interface Snapshot {
   sources: CardNode[];
   outputs: CardNode[];
   links: CardLink[];
   groups: CardGroup[];
+  /** Empty unless the user works with presets (the add-on's own switch) — the card
+   *  then draws no picker at all. */
+  presets: CardPreset[];
+  /** Id of the preset in force, or `null` when presets are off. */
+  active_preset: string | null;
 }
 
-export const EMPTY_SNAPSHOT: Snapshot = { sources: [], outputs: [], links: [], groups: [] };
+export const EMPTY_SNAPSHOT: Snapshot = { sources: [], outputs: [], links: [], groups: [], presets: [], active_preset: null };
 
 /** Card YAML configuration. Everything is optional: with one router configured
  *  and no options, `type: custom:pipewire-router-card` is the whole card. */

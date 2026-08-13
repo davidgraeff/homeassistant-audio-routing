@@ -50,6 +50,14 @@ struct Settings {
     /// skip the restart. `serde(default)` = false.
     #[serde(default)]
     sendspin_delay_live: bool,
+    /// Whether the user works with **music-group presets** (several named
+    /// groupings of the house, switchable in one click — see
+    /// docs/music-group-presets-plan.md). Off by default, and off means the
+    /// add-on UI, the card and Home Assistant show no trace of them: the store
+    /// always has the `Default` preset, so this is a UI gate, not a second data
+    /// model. `serde(default)` = false.
+    #[serde(default)]
+    presets_enabled: bool,
     /// Whether the HA integration should additionally expose every individual
     /// output as its own `media_player` entity. By default the integration
     /// creates one entity per music group and per announcement group; turning
@@ -61,7 +69,13 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { default_duck: DEFAULT_DUCK, discovery_enabled: true, sendspin_delay_live: false, expose_outputs_as_media_players: false }
+        Self {
+            default_duck: DEFAULT_DUCK,
+            discovery_enabled: true,
+            sendspin_delay_live: false,
+            presets_enabled: false,
+            expose_outputs_as_media_players: false,
+        }
     }
 }
 
@@ -114,6 +128,18 @@ impl SettingsStore {
         self.persist()
     }
 
+    pub fn presets_enabled(&self) -> bool {
+        self.settings.presets_enabled
+    }
+
+    /// Set whether the preset UI is shown. Switching it *off* also puts the house
+    /// back on the `Default` preset — the caller (api/settings.rs) does that, since
+    /// it is a routing change and a store may not reach the routing state.
+    pub fn set_presets_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.settings.presets_enabled = enabled;
+        self.persist()
+    }
+
     pub fn expose_outputs_as_media_players(&self) -> bool {
         self.settings.expose_outputs_as_media_players
     }
@@ -153,6 +179,7 @@ mod tests {
         assert_eq!(store.default_duck(), DEFAULT_DUCK);
         assert!(store.discovery_enabled());
         assert!(!store.sendspin_delay_live());
+        assert!(!store.presets_enabled());
         assert!(!store.expose_outputs_as_media_players());
         let _ = std::fs::remove_file(&path);
     }

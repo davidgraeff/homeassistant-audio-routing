@@ -12,9 +12,11 @@ import logging
 from datetime import timedelta
 
 import aiohttp
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
@@ -25,6 +27,7 @@ from .api import (
     AnnouncementGroup,
     DaemonStatus,
     MusicGroup,
+    Preset,
     NowPlaying,
     NowPlayingFrame,
     OutputMeta,
@@ -35,12 +38,14 @@ from .api import (
     RtpSourceState,
 )
 from .const import (
+    ATTR_PRESET,
     CONF_HOST,
     CONF_PORT,
     DEFAULT_RTP_LATENCY_MSEC,
     DEFAULT_RTP_PORT,
     DOMAIN,
     ROUTING_WS_RECONNECT_SECONDS,
+    SERVICE_ACTIVATE_PRESET,
     SERVICE_CLEANUP_ENTITIES,
     UPDATE_INTERVAL_SECONDS,
 )
@@ -116,6 +121,14 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
         self.music_groups: list[MusicGroup] = []
         self.announcement_groups: list[AnnouncementGroup] = []
         self.expose_outputs: bool = False
+        # Music-group presets (docs/music-group-presets-plan.md), refreshed on the
+        # same poll. `presets_enabled` gates the preset select entity; `presets`
+        # and `active_preset` are what it offers and reports. With presets off the
+        # daemon still has exactly one (`Default`), which is why nothing else here
+        # has to branch on the flag.
+        self.presets: list[Preset] = []
+        self.active_preset: str = ""
+        self.presets_enabled: bool = False
         # Which daemon build is running, refreshed each poll (best-effort — an
         # older daemon without `/api/status` leaves this `None`). Only the service
         # device reads it, to show a version and to notice an add-on update.
@@ -172,7 +185,12 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
         try:
             self.music_groups = await self.client.async_get_music_groups()
             self.announcement_groups = await self.client.async_get_announcement_groups()
-            self.expose_outputs = (await self.client.async_get_settings()).expose_outputs_as_media_players
+            settings = await self.client.async_get_settings()
+            self.expose_outputs = settings.expose_outputs_as_media_players
+            self.presets_enabled = settings.presets_enabled
+            presets = await self.client.async_get_presets()
+            self.presets = presets.presets
+            self.active_preset = presets.active
         except PipewireRouterApiError as err:
             _LOGGER.debug("groups/settings unavailable: %s", err)
         # The running build, for the service device. Secondary, and re-registering
@@ -187,6 +205,28 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
             self.status = status
             if changed and self.config_entry is not None:
                 async_register_service_device(self.hass, self.config_entry, self)
+
+    async def async_activate_preset(self, preset: str) -> None:
+        """Put a preset in force, addressed by **id or name** (case-insensitively).
+
+        The one path the service, the select entity and the card all take, so they
+        cannot disagree about what "House party" means. A name is what an automation
+        will have been written with, and it is what the add-on UI shows."""
+        wanted = preset.strip().casefold()
+        match = next(
+            (p for p in self.presets if p.id.casefold() == wanted or p.name.casefold() == wanted),
+            None,
+        )
+        if match is None:
+            known = ", ".join(f"'{p.name}'" for p in self.presets) or "none"
+            raise HomeAssistantError(f"unknown preset '{preset}' (configured: {known})")
+        try:
+            await self.client.async_activate_preset(match.id)
+        except PipewireRouterApiError as err:
+            raise HomeAssistantError(str(err)) from err
+        # The grouping just changed, so the music-group entities are stale until the
+        # next poll — which is up to UPDATE_INTERVAL_SECONDS away.
+        await self.async_request_refresh()
 
     async def async_init_routing(self) -> None:
         """One-shot routing fetch so `source`/`source_list` are populated the
@@ -296,6 +336,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_register_cleanup_service(hass)
+    _async_register_preset_service(hass)
     return True
 
 
@@ -329,6 +370,41 @@ def _async_register_cleanup_service(hass: HomeAssistant) -> None:
         _LOGGER.info("cleanup_entities removed %d stale media_player entit%s", removed, "y" if removed == 1 else "ies")
 
     hass.services.async_register(DOMAIN, SERVICE_CLEANUP_ENTITIES, _handle_cleanup)
+
+
+@callback
+def _async_register_preset_service(hass: HomeAssistant) -> None:
+    """Register the domain-wide `activate_preset` service once.
+
+    `entry_id` is optional because the overwhelmingly common case is one daemon;
+    with several configured it must be named rather than guessed, since activating
+    the wrong house's party grouping is not a subtle mistake."""
+    if hass.services.has_service(DOMAIN, SERVICE_ACTIVATE_PRESET):
+        return
+
+    async def _handle_activate(call: ServiceCall) -> None:
+        coordinators: dict[str, PipewireRouterCoordinator] = hass.data.get(DOMAIN, {})
+        entry_id = call.data.get("entry_id")
+        if entry_id is not None:
+            coordinator = coordinators.get(entry_id)
+            if coordinator is None:
+                raise HomeAssistantError(f"no loaded config entry {entry_id}")
+        elif not coordinators:
+            raise HomeAssistantError("no PipeWire Audio Router config entry is loaded")
+        elif len(coordinators) > 1:
+            raise HomeAssistantError(
+                f"{len(coordinators)} routers are configured — name one with `entry_id`"
+            )
+        else:
+            coordinator = next(iter(coordinators.values()))
+        await coordinator.async_activate_preset(call.data[ATTR_PRESET])
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ACTIVATE_PRESET,
+        _handle_activate,
+        schema=vol.Schema({vol.Required(ATTR_PRESET): str, vol.Optional("entry_id"): str}),
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

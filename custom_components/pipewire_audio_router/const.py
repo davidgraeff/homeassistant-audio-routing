@@ -39,6 +39,14 @@ ATTR_SOURCE = "source"
 # reports (e.g. renamed/removed devices left behind as `unavailable`).
 SERVICE_CLEANUP_ENTITIES = "cleanup_entities"
 
+# Put a music-group preset in force — the whole grouping of the house in one call
+# (docs/music-group-presets-plan.md). A service *and* a select entity, on purpose:
+# this is what an automation wants (address it by name, no entity_id to look up),
+# while the select is the only thing a template or a stock dashboard can read to
+# find out which preset is on.
+SERVICE_ACTIVATE_PRESET = "activate_preset"
+ATTR_PRESET = "preset"
+
 # --- Voice-assistant ducking (voice_duck.py) ---------------------------------
 # Replaces the community "duck every media_player in the satellite's area via
 # volume_set" blueprint: the daemon holds a leased mixer-gain duck instead, so

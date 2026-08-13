@@ -134,6 +134,12 @@ export class RoutingModel {
   unrouteGroup(groupId: string): Promise<void> {
     return this.#call('unroute_group', { group_id: groupId });
   }
+
+  /** Put a whole preset in force: every group's membership *and* what it plays,
+   *  in one daemon operation. Accepts an id or a name. */
+  setPreset(preset: string): Promise<void> {
+    return this.#call('set_preset', { preset });
+  }
 }
 
 /** Home Assistant rejects a WebSocket command with `{code, message}`; anything

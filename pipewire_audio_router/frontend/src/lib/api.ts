@@ -28,6 +28,8 @@ import type {
   NodesResponse,
   OpResponse,
   OutputInfo,
+  Preset,
+  PresetsInfo,
   RoutingMatrix,
   RtpSourceCfg,
   RunDocument,
@@ -248,15 +250,29 @@ export const api = {
   settings: () => request<AppSettings>('GET', 'api/settings'),
   setSettings: (patch: AppSettingsUpdate) => request<OpResponse>('PUT', 'api/settings', patch),
 
-  // Named music/announcement groups (groups_store.rs).
+  // Named music/announcement groups (store/groups.rs). `musicGroups` answers for
+  // the **active** preset; a membership write may name another one (`preset` in
+  // the patch) — that is how the preset bar edits a grouping that isn't in force.
   musicGroups: () => request<MusicGroup[]>('GET', 'api/groups/music'),
-  createMusicGroup: (name: string, members: string[]) =>
-    request<{ ok: boolean; group?: MusicGroup; message?: string }>('POST', 'api/groups/music', { name, members }),
-  updateMusicGroup: (id: string, patch: { name?: string; members?: string[] }) =>
+  createMusicGroup: (name: string, members: string[], preset?: string) =>
+    request<{ ok: boolean; group?: MusicGroup; message?: string }>('POST', 'api/groups/music', { name, members, preset }),
+  updateMusicGroup: (id: string, patch: { name?: string; members?: string[]; preset?: string }) =>
     request<{ ok: boolean; group?: MusicGroup; message?: string }>('PUT', `api/groups/music/${id}`, patch),
   deleteMusicGroup: (id: string) => request<OpResponse>('DELETE', `api/groups/music/${id}`),
   routeMusicGroup: (id: string, source: string) => request<OpResponse>('POST', `api/groups/music/${id}/route`, { source }),
   unrouteMusicGroup: (id: string) => request<OpResponse>('DELETE', `api/groups/music/${id}/route`),
+  // Music-group presets: the whole grouping as a switchable thing. `activatePreset`
+  // is the only one that moves speakers — the rest are edits to stored intent.
+  presets: () => request<PresetsInfo>('GET', 'api/presets'),
+  /** `copyFrom` seeds the new preset with that preset's grouping — what the UI
+   *  passes by default, since a variant is nearly always an edit of one. */
+  createPreset: (name: string, copyFrom?: string) =>
+    request<{ ok: boolean; preset?: Preset; message?: string }>('POST', 'api/presets', { name, copy_from: copyFrom }),
+  renamePreset: (id: string, name: string) =>
+    request<{ ok: boolean; preset?: Preset; message?: string }>('PUT', `api/presets/${enc(id)}`, { name }),
+  deletePreset: (id: string) => request<OpResponse>('DELETE', `api/presets/${enc(id)}`),
+  activatePreset: (id: string) => request<OpResponse>('POST', `api/presets/${enc(id)}/activate`),
+
   announcementGroups: () => request<AnnouncementGroup[]>('GET', 'api/groups/announcement'),
   /** `duck` omitted ⇒ the daemon applies the configured default duck level. */
   createAnnouncementGroup: (name: string, targets: string[], priority: number, duck?: number) =>

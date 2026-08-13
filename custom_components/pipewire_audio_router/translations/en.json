@@ -46,6 +46,20 @@
           "description": "Name of the source to disconnect. Leave empty to disconnect all sources from the output."
         }
       }
+    },
+    "activate_preset": {
+      "name": "Activate music group preset",
+      "description": "Put a music-group preset in force: the speakers are regrouped and each group is put back on the source that preset plays.",
+      "fields": {
+        "preset": {
+          "name": "Preset",
+          "description": "Name of the preset to activate, as shown on the add-on's Music groups page."
+        },
+        "entry_id": {
+          "name": "Router",
+          "description": "Config entry id of the router to switch. Only needed when more than one PipeWire Audio Router is configured."
+        }
+      }
     }
   }
 }

@@ -30,3 +30,20 @@ unlink:
 # devices left behind as `unavailable`). No fields — cleans every configured
 # daemon. Run it while the daemon is reachable so its live matrix is accurate.
 cleanup_entities:
+
+# Put a music-group preset in force: one call regroups the speakers and routes
+# what the preset says (see docs/music-group-presets-plan.md). Addressed by name
+# so an automation reads like the add-on UI; `entry_id` is only needed when
+# several daemons are configured. The `select` entity beside this reports which
+# preset is on, for conditions and templates.
+activate_preset:
+  fields:
+    preset:
+      required: true
+      example: House party
+      selector:
+        text:
+    entry_id:
+      required: false
+      selector:
+        text:

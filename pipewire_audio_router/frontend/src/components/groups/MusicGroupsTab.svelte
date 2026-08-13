@@ -16,13 +16,15 @@
   import { flip } from 'svelte/animate';
   import { api } from '../../lib/api';
   import { run } from '../../lib/toast';
+  import { askConfirm } from '../../lib/confirm.svelte';
   import { createDnd } from '../../lib/dnd.svelte';
   import { routing } from '../../lib/routing';
   import DeviceChip from './DeviceChip.svelte';
   import GroupTitle from './GroupTitle.svelte';
+  import PresetBar from './PresetBar.svelte';
   import FlowGraph from '../routing/FlowGraph.svelte';
   import MusicGroupDocs from './MusicGroupDocs.svelte';
-  import type { MusicGroup, OutputInfo, RoutingNode } from '../../lib/types';
+  import { DEFAULT_PRESET_ID, type MusicGroup, type OutputInfo, type Preset, type RoutingNode } from '../../lib/types';
 
   const NONE = '(none)';
   const MIXED = '(mixed)';
@@ -32,6 +34,22 @@
   let music = $state<MusicGroup[]>([]);
   let docsOpen = $state(false);
 
+  // ── presets (docs/music-group-presets-plan.md) ────────────────────────────
+  // Off by default, and off means this page is exactly what it was: one grouping,
+  // no chips, no banner. The daemon always has the `Default` preset, so nothing
+  // below has to care which mode we are in — `scope()` is the whole difference.
+  let presetsEnabled = $state(false);
+  let presetsBusy = $state(false);
+  let presets = $state<Preset[]>([]);
+  let activePreset = $state(DEFAULT_PRESET_ID);
+  /** The preset being *edited*, which may not be the one in force. */
+  let selectedPreset = $state(DEFAULT_PRESET_ID);
+  let editingActive = $derived(!presetsEnabled || selectedPreset === activePreset);
+
+  /** Which preset a membership write applies to. `undefined` lets the daemon use
+   *  the active one — the right answer whenever presets are off. */
+  const scope = () => (presetsEnabled ? selectedPreset : undefined);
+
   // Live routing matrix (shared WebSocket store) — so link edits made in the
   // flow graph or via the API reflect on this page immediately and honestly,
   // rather than from a stale one-shot fetch.
@@ -40,8 +58,20 @@
   // Which mixed-routing groups have their per-member breakdown expanded.
   let expandedMixed = $state<Set<string>>(new Set());
 
+  // The group cards follow the *selected* preset: same identities (a group's name
+  // and its Home Assistant entity are global), the membership of whichever preset
+  // is being edited.
+  let groups = $derived.by(() => {
+    if (editingActive) return music;
+    const slots = presets.find((p) => p.id === selectedPreset)?.groups ?? {};
+    return music.map((g) => ({ ...g, members: slots[g.id]?.members ?? [] }));
+  });
+
   // Newest first: a group appears directly below the dock that created it.
-  let shown = $derived([...music].reverse());
+  let shown = $derived([...groups].reverse());
+  /** What the routing graph draws: the **active** preset, always. It is a picture
+   *  of what is playing where, so it may not follow an edit that isn't in force. */
+  let shownActive = $derived([...music].reverse());
 
   // The speaker currently being turned into a group (drives the dock animation),
   // and the group that just arrived (drives its drop-in animation). The dock is
@@ -55,8 +85,8 @@
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const flipMs = reduceMotion ? 0 : 220;
 
-  // Outputs claimed by some music group (exclusive).
-  let claimed = $derived(new Set(music.flatMap((g) => g.members)));
+  // Outputs claimed by some music group (exclusive — within one preset).
+  let claimed = $derived(new Set(groups.flatMap((g) => g.members)));
   // The "Available" pool: everything not yet in a group.
   let pool = $derived(outputs.filter((o) => !claimed.has(o.node_name)));
 
@@ -77,13 +107,72 @@
   async function refresh(quiet = false) {
     if (!quiet) loading = true;
     try {
-      const [o, m] = await Promise.all([api.outputs(), api.musicGroups()]);
+      const [o, m, s, p] = await Promise.all([api.outputs(), api.musicGroups(), api.settings(), api.presets()]);
       outputs = o;
       music = m;
+      presetsEnabled = s.presets_enabled;
+      presets = p.presets;
+      activePreset = p.active;
+      // Follow the active preset unless the user has deliberately selected another
+      // one that still exists — an activation elsewhere (Home Assistant, the card,
+      // an automation) should move the page with it.
+      if (!presetsEnabled || !presets.some((x) => x.id === selectedPreset) || selectedPreset === activePreset) {
+        selectedPreset = activePreset;
+      }
     } catch {
       // a toast already surfaced the error
     }
     loading = false;
+  }
+
+  // ── presets ───────────────────────────────────────────────────────────────
+
+  async function togglePresets() {
+    presetsBusy = true;
+    const next = !presetsEnabled;
+    // Switching off returns the house to the default grouping (the daemon does it,
+    // atomically), so say so before it happens rather than after.
+    const needsWarning = !next && activePreset !== DEFAULT_PRESET_ID;
+    const ok =
+      !needsWarning ||
+      (await askConfirm({
+        title: 'Stop working with presets?',
+        body: [
+          `The house goes back to the default grouping — '${presets.find((p) => p.id === activePreset)?.name ?? activePreset}' is in force right now.`,
+          'Your presets are kept, so switching this back on brings them all back.',
+        ],
+        confirmLabel: 'Switch off',
+      }));
+    if (ok && (await run(() => api.setSettings({ presets_enabled: next }), next ? 'Presets on' : 'Presets off'))) {
+      presetsEnabled = next;
+      await refresh(true);
+    }
+    presetsBusy = false;
+  }
+
+  async function createPreset(name: string, copyFrom?: string) {
+    if (await run(() => api.createPreset(name, copyFrom), `Preset "${name}" created`)) {
+      await refresh(true);
+      // Edit what was just made — it is why the button was pressed.
+      const made = presets.find((p) => p.name === name);
+      if (made) selectedPreset = made.id;
+    }
+  }
+
+  async function activatePreset(id: string) {
+    const name = presets.find((p) => p.id === id)?.name ?? id;
+    if (await run(() => api.activatePreset(id), `"${name}" is now playing`)) await refresh(true);
+  }
+
+  async function renamePreset(id: string, name: string) {
+    if (await run(() => api.renamePreset(id, name), `Renamed to "${name}"`)) await refresh(true);
+  }
+
+  async function deletePreset(id: string) {
+    if (await run(() => api.deletePreset(id), 'Preset deleted')) {
+      selectedPreset = activePreset;
+      await refresh(true);
+    }
   }
   onMount(() => {
     void refresh();
@@ -115,13 +204,13 @@
     const jobs: Promise<boolean>[] = [];
     const fromId = groupIdOf(from);
     if (fromId) {
-      const g = music.find((x) => x.id === fromId);
-      if (g) jobs.push(run(() => api.updateMusicGroup(fromId, { members: g.members.filter((m) => m !== node) })));
+      const g = groups.find((x) => x.id === fromId);
+      if (g) jobs.push(run(() => api.updateMusicGroup(fromId, { members: g.members.filter((m) => m !== node), preset: scope() })));
     }
     const toId = groupIdOf(to);
     if (toId) {
-      const g = music.find((x) => x.id === toId);
-      if (g && !g.members.includes(node)) jobs.push(run(() => api.updateMusicGroup(toId, { members: [...g.members, node] })));
+      const g = groups.find((x) => x.id === toId);
+      if (g && !g.members.includes(node)) jobs.push(run(() => api.updateMusicGroup(toId, { members: [...g.members, node], preset: scope() })));
     }
     if (jobs.length) {
       await Promise.all(jobs);
@@ -137,8 +226,8 @@
     creating = node;
     const fromId = groupIdOf(from);
     if (fromId) {
-      const g = music.find((x) => x.id === fromId);
-      if (g && !(await run(() => api.updateMusicGroup(fromId, { members: g.members.filter((m) => m !== node) })))) {
+      const g = groups.find((x) => x.id === fromId);
+      if (g && !(await run(() => api.updateMusicGroup(fromId, { members: g.members.filter((m) => m !== node), preset: scope() })))) {
         creating = null;
         await refresh(true);
         return;
@@ -147,7 +236,7 @@
     const name = defaultName();
     let created: MusicGroup | undefined;
     const ok = await run(async () => {
-      const res = await api.createMusicGroup(name, [node]);
+      const res = await api.createMusicGroup(name, [node], scope());
       created = res.group;
       return res;
     }, `Music group "${name}" created`);
@@ -224,7 +313,22 @@
     if (await run(() => api.routeMusicGroup(g.id, src.node_name), `"${g.name}" now playing ${displayName}`)) await refresh(true);
   }
 
+  /** Deleting a group deletes its *identity*, so it goes from every preset — and
+   *  its Home Assistant media_player goes with it. Worth asking about once there
+   *  is more than one preset, since the button sits on a page showing one. */
   async function remove(g: MusicGroup) {
+    if (presetsEnabled && presets.length > 1) {
+      const ok = await askConfirm({
+        title: `Delete the music group '${g.name}'?`,
+        body: [
+          'It is removed from every preset, not just this one, and its Home Assistant media player goes with it.',
+          'To take it out of this preset only, drag its speakers back to Available instead.',
+        ],
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!ok) return;
+    }
     if (await run(() => api.deleteMusicGroup(g.id), `Deleted "${g.name}"`)) await refresh(true);
   }
 </script>
@@ -238,11 +342,31 @@
       Explain music groups
     </button>
   </div>
-  <p class="card-sub" style="margin-bottom:0">
+  <p class="card-sub">
     Speakers that play the same audio in sync, and one Home Assistant <code>media_player</code> each. A speaker belongs
     to <strong>one</strong> music group; <strong>Source</strong> picks what the whole group plays.
   </p>
+  <!-- The gate (plan §6.1). Off is the default and this page is then exactly what
+       it has always been; it lives here, not in Settings, because this is where the
+       thought "I want a different set of groups for the party" occurs. -->
+  <label class="check" title="Several named groupings of the house, switchable in one click">
+    <input type="checkbox" checked={presetsEnabled} disabled={presetsBusy} onchange={togglePresets} />
+    Work with presets
+  </label>
 </div>
+
+{#if presetsEnabled && !loading}
+  <PresetBar
+    {presets}
+    active={activePreset}
+    selected={selectedPreset}
+    onSelect={(id) => (selectedPreset = id)}
+    onActivate={activatePreset}
+    onCreate={createPreset}
+    onRename={renamePreset}
+    onDelete={deletePreset}
+  />
+{/if}
 
 {#if loading}
   <div class="card"><p class="empty">Loading…</p></div>
@@ -288,7 +412,7 @@
         >
           <div class="grouptop">
             <GroupTitle name={g.name} onRename={(name) => rename(g, name)} />
-            {#if r.state === 'mixed'}
+            {#if r.state === 'mixed' && editingActive}
               <button
                 class="mixed"
                 onclick={() => toggleBreakdown(g.id)}
@@ -300,7 +424,7 @@
               </button>
             {/if}
           </div>
-          {#if r.state === 'mixed' && expandedMixed.has(g.id)}
+          {#if r.state === 'mixed' && editingActive && expandedMixed.has(g.id)}
             <div class="breakdown">
               {#each r.perMember as pm (pm.output)}
                 <div class="brow">
@@ -323,16 +447,23 @@
             {#if g.members.length === 0}<span class="drop-hint">Drop speakers here</span>{/if}
           </div>
           <div class="groupactions">
-            <label class="ctlrow">
-              <span class="ctllabel">Source</span>
-              <select value={selectValue(r)} onchange={(e) => setSource(g, e.currentTarget.value)}>
-                {#if r.state === 'mixed'}<option value={MIXED} disabled>Mixed</option>{/if}
-                <option value={NONE}>{NONE}</option>
-                {#each matrix.sources as s (s.node_name)}
-                  <option value={s.display_name}>{s.display_name}</option>
-                {/each}
-              </select>
-            </label>
+            <!-- Source is live routing, so it only appears for the preset in force
+                 (plan §6.4): an inactive preset has no speakers to route, and a
+                 dropdown that silently applied its grouping would be a trap. -->
+            {#if editingActive}
+              <label class="ctlrow">
+                <span class="ctllabel">Source</span>
+                <select value={selectValue(r)} onchange={(e) => setSource(g, e.currentTarget.value)}>
+                  {#if r.state === 'mixed'}<option value={MIXED} disabled>Mixed</option>{/if}
+                  <option value={NONE}>{NONE}</option>
+                  {#each matrix.sources as s (s.node_name)}
+                    <option value={s.display_name}>{s.display_name}</option>
+                  {/each}
+                </select>
+              </label>
+            {:else}
+              <span class="editingnote">Membership only — activate this preset to route it</span>
+            {/if}
             <button class="danger" onclick={() => remove(g)}>Delete</button>
           </div>
         </div>
@@ -340,9 +471,16 @@
     </div>
   {/if}
 
-  <!-- Same routing, drawn as wires: the graph's right column is these groups, so
-       a wire onto one is the same call as its Source dropdown above. -->
-  <FlowGraph groups={shown} />
+  {#if !editingActive}
+    <p class="graphnote">
+      The routing graph below shows what is <strong>playing</strong> — the active preset, not the one you are editing.
+    </p>
+  {/if}
+  <!-- Same routing, drawn as wires: the graph's right column is the ACTIVE
+       preset's groups, so a wire onto one is the same call as its Source dropdown
+       above. It is the one honest picture of what plays where, so it never follows
+       an edit that isn't in force. -->
+  <FlowGraph groups={shownActive} />
 {/if}
 
 {#if docsOpen}
@@ -418,6 +556,17 @@
     margin: 4px 0 0;
     font-size: 0.78rem;
     opacity: 0.75;
+  }
+  /* Stands in for the Source dropdown while an inactive preset is being edited,
+     so the row keeps its shape and the reason is on screen. */
+  .editingnote {
+    font-size: 0.8rem;
+    opacity: 0.7;
+  }
+  .graphnote {
+    margin: 12px 0 -4px;
+    font-size: 0.82rem;
+    opacity: 0.8;
   }
   /* The dock is one line high — a target, not a form. */
   .dockrow {

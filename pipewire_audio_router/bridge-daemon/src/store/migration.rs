@@ -90,19 +90,25 @@ fn migrate_groups(groups_path: &Path) {
         }
     };
 
-    // Music groups: rewrite member lists that contain a raop-out-* output.
-    let music_rewrites: Vec<(String, Vec<String>)> = store
-        .music()
+    // Music groups: rewrite member lists that contain a raop-out-* output. Per
+    // preset, since that is where membership lives — a file this old has only the
+    // `Default` preset the groups store just migrated it into, but a stale member
+    // in any other preset would come back when that preset is activated.
+    let preset_ids: Vec<String> = store.presets().iter().map(|p| p.id.clone()).collect();
+    let music_rewrites: Vec<(String, String, Vec<String>)> = preset_ids
         .iter()
-        .filter_map(|g| {
-            let has_raop = g.members.iter().any(|m| m.starts_with(RAOP_OUT_PREFIX));
-            has_raop.then(|| (g.id.clone(), g.members.iter().map(|m| rewrite(m).unwrap_or_else(|| m.clone())).collect()))
+        .flat_map(|preset| {
+            store.music_in(preset).into_iter().filter_map(move |g| {
+                let has_raop = g.members.iter().any(|m| m.starts_with(RAOP_OUT_PREFIX));
+                has_raop
+                    .then(|| (preset.clone(), g.id.clone(), g.members.iter().map(|m| rewrite(m).unwrap_or_else(|| m.clone())).collect()))
+            })
         })
         .collect();
-    for (id, members) in music_rewrites {
-        match store.update_music(&id, None, Some(members)) {
-            Ok(g) => tracing::info!("drop-raop migration: rewrote music group '{id}' members ⇒ {:?}", g.members),
-            Err(e) => tracing::warn!("drop-raop migration: failed to rewrite music group '{id}': {e}"),
+    for (preset, id, members) in music_rewrites {
+        match store.update_music(&id, None, Some(members), Some(&preset)) {
+            Ok(g) => tracing::info!("drop-raop migration: rewrote music group '{id}' members in preset '{preset}' ⇒ {:?}", g.members),
+            Err(e) => tracing::warn!("drop-raop migration: failed to rewrite music group '{id}' in preset '{preset}': {e}"),
         }
     }
 

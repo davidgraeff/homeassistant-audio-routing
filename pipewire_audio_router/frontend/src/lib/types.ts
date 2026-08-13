@@ -138,6 +138,34 @@ export interface MusicGroup {
   members: string[];
 }
 
+/** One music group's slot in one preset (docs/music-group-presets-plan.md). */
+export interface PresetGroup {
+  members: string[];
+  /** Source to put the members on when the preset is activated; `null` = leave
+   * their links alone, so a preset doesn't silence what it says nothing about. */
+  source: string | null;
+}
+
+/** A named grouping of the house: which speakers sit in which music group, and
+ * what each group plays. A group the preset doesn't mention is simply empty in
+ * it — the group identity (and its Home Assistant entity) exists regardless. */
+export interface Preset {
+  id: string;
+  name: string;
+  /** By music-group id. */
+  groups: Record<string, PresetGroup>;
+}
+
+export interface PresetsInfo {
+  /** Id of the preset in force. */
+  active: string;
+  presets: Preset[];
+}
+
+/** The preset every install has and nobody can delete — the state the "work with
+ * presets" switch returns the house to. */
+export const DEFAULT_PRESET_ID = 'default';
+
 /** A named announcement group: reusable target outputs for announcements, with a
  * priority and duck level. Overlaps music/other announcement groups freely. */
 export interface AnnouncementGroup {
@@ -363,6 +391,11 @@ export interface AppSettings {
    * Current ESPHome firmware does not, so a delay change restarts the group
    * stream; enable for future firmware that honors a live SetStaticDelay. */
   sendspin_delay_live: boolean;
+  /** Whether the music-group **preset** UI is shown (this page's chip bar, the
+   * dashboard card's dropdown, and Home Assistant's preset select entity). Off by
+   * default: the store always has the `Default` preset, so this gates the UI, not
+   * the data. Switching it off also puts the house back on `Default`. */
+  presets_enabled: boolean;
   /** Whether the HA integration also exposes each individual output as its own
    * media_player entity. Default off: the integration creates one entity per
    * music group and per announcement group; this adds a per-output entity for

@@ -205,6 +205,7 @@ pub(crate) struct SettingsInfo {
     pub(crate) default_duck: f32,
     pub(crate) discovery_enabled: bool,
     pub(crate) sendspin_delay_live: bool,
+    pub(crate) presets_enabled: bool,
     pub(crate) expose_outputs_as_media_players: bool,
 }
 
@@ -218,6 +219,8 @@ pub(crate) struct SetSettingsRequest {
     #[serde(default)]
     pub(crate) sendspin_delay_live: Option<bool>,
     #[serde(default)]
+    pub(crate) presets_enabled: Option<bool>,
+    #[serde(default)]
     pub(crate) expose_outputs_as_media_players: Option<bool>,
 }
 
@@ -227,6 +230,7 @@ pub(crate) fn settings_info(state: &AppState) -> SettingsInfo {
         default_duck: s.default_duck(),
         discovery_enabled: s.discovery_enabled(),
         sendspin_delay_live: s.sendspin_delay_live(),
+        presets_enabled: s.presets_enabled(),
         expose_outputs_as_media_players: s.expose_outputs_as_media_players(),
     }
 }

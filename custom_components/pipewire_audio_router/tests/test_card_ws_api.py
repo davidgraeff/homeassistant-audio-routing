@@ -22,11 +22,17 @@ from custom_components.pipewire_audio_router.api import (
     RoutingMatrix,
     RoutingNode,
     RtpSourceState,
+    Preset,
+    PresetsInfo,
 )
 from custom_components.pipewire_audio_router.const import DOMAIN
 
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
+
+# The one preset every daemon has; `presets_enabled` stays off, so no preset
+# entity is created unless a test asks for one.
+DEFAULT_PRESETS = PresetsInfo(active="default", presets=[Preset(id="default", name="Default")])
 DAEMON_STATUS = DaemonStatus(version="0.3.0", host_model="Raspberry Pi 4 Model B", host_arch="aarch64")
 RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 
@@ -43,7 +49,7 @@ def _matrix(links=(), sources=(AIRPLAY, BLUETOOTH), outputs=(KITCHEN, BATH, LOFT
     return RoutingMatrix(sources=list(sources), outputs=list(outputs), links=list(links))
 
 
-def _patch_daemon(routing: RoutingMatrix, groups=()):
+def _patch_daemon(routing: RoutingMatrix, groups=(), presets=DEFAULT_PRESETS, presets_enabled=False):
     """Offline setup: every polled endpoint mocked, and the daemon's own routing
     socket stubbed out so the only pushes are the ones a test makes."""
     stack = ExitStack()
@@ -54,23 +60,30 @@ def _patch_daemon(routing: RoutingMatrix, groups=()):
     stack.enter_context(patch(f"{API}.async_get_outputs", new=AsyncMock(return_value=[])))
     stack.enter_context(patch(f"{API}.async_get_music_groups", new=AsyncMock(return_value=list(groups))))
     stack.enter_context(patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=[])))
+    # Presets ride the same poll (they gate the preset select entity), so the
+    # offline story needs them too: one `Default`, which is what a fresh daemon has.
+    stack.enter_context(patch(f"{API}.async_get_presets", new=AsyncMock(return_value=presets)))
     stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=DAEMON_STATUS)))
     stack.enter_context(patch(f"{API}.async_get_agents", new=AsyncMock(return_value=[])))
     stack.enter_context(
         patch(
             f"{API}.async_get_settings",
-            new=AsyncMock(return_value=AppSettings(expose_outputs_as_media_players=False)),
+            new=AsyncMock(
+                return_value=AppSettings(
+                    expose_outputs_as_media_players=False, presets_enabled=presets_enabled
+                )
+            ),
         )
     )
     stack.enter_context(patch(f"{COORD}.async_events_ws_loop", new=AsyncMock()))
     return stack
 
 
-async def _setup(hass, routing: RoutingMatrix, groups=(), *, host="127.0.0.1"):
+async def _setup(hass, routing: RoutingMatrix, groups=(), *, host="127.0.0.1", presets=DEFAULT_PRESETS, presets_enabled=False):
     """Load one config entry and return its coordinator."""
     entry = MockConfigEntry(domain=DOMAIN, data={"host": host, "port": 8080})
     entry.add_to_hass(hass)
-    with _patch_daemon(routing, groups):
+    with _patch_daemon(routing, groups, presets, presets_enabled):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     return entry, hass.data[DOMAIN][entry.entry_id]
@@ -232,3 +245,57 @@ async def test_unknown_entry_id(hass, hass_ws_client):
     msg = await client.receive_json()
     assert not msg["success"]
     assert msg["error"]["code"] == "no_entry"
+
+
+PARTY_PRESETS = PresetsInfo(
+    active="default",
+    presets=[Preset(id="default", name="Default"), Preset(id="house_party", name="House party")],
+)
+
+
+async def test_presets_are_absent_until_the_user_works_with_them(hass, hass_ws_client):
+    """The add-on's "Work with presets" switch is off by default, and then the card
+    must see nothing at all — a one-option picker is noise for exactly the person
+    that switch protects."""
+    await _setup(hass, _matrix(), presets=PARTY_PRESETS, presets_enabled=False)
+    snapshot = await _subscribe(await hass_ws_client(hass))
+    assert snapshot["presets"] == []
+    assert snapshot["active_preset"] is None
+
+
+async def test_presets_and_the_active_one_reach_the_card(hass, hass_ws_client):
+    """With presets on, the card gets id + name per preset and which one is in
+    force — enough to draw a picker, and nothing about their membership (what a
+    preset put in force arrives as `groups`)."""
+    await _setup(hass, _matrix(), presets=PARTY_PRESETS, presets_enabled=True)
+    snapshot = await _subscribe(await hass_ws_client(hass))
+    assert snapshot["presets"] == [
+        {"id": "default", "name": "Default"},
+        {"id": "house_party", "name": "House party"},
+    ]
+    assert snapshot["active_preset"] == "default"
+
+
+async def test_set_preset_activates_by_name(hass, hass_ws_client):
+    """The card sends the name it displayed; the daemon is called with the id."""
+    _entry, coordinator = await _setup(hass, _matrix(), presets=PARTY_PRESETS, presets_enabled=True)
+    client = await hass_ws_client(hass)
+    coordinator.client.async_activate_preset = AsyncMock()
+
+    await client.send_json({"id": 11, "type": f"{DOMAIN}/set_preset", "preset": "House party"})
+    assert (await client.receive_json())["success"]
+    coordinator.client.async_activate_preset.assert_awaited_once_with("house_party")
+
+
+async def test_set_preset_rejects_an_unknown_name(hass, hass_ws_client):
+    """A stale card (or a renamed preset) must be told, not silently ignored — and
+    nothing may be activated on a guess."""
+    _entry, coordinator = await _setup(hass, _matrix(), presets=PARTY_PRESETS, presets_enabled=True)
+    client = await hass_ws_client(hass)
+    coordinator.client.async_activate_preset = AsyncMock()
+
+    await client.send_json({"id": 12, "type": f"{DOMAIN}/set_preset", "preset": "Rave"})
+    msg = await client.receive_json()
+    assert not msg["success"]
+    assert "Rave" in msg["error"]["message"]
+    coordinator.client.async_activate_preset.assert_not_awaited()

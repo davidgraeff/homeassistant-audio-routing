@@ -159,6 +159,12 @@ pub fn router(
         .route("/api/groups/music/{id}/route", post(route_music_group).delete(unroute_music_group))
         .route("/api/groups/announcement", get(list_announcement_groups).post(create_announcement_group))
         .route("/api/groups/announcement/{id}", put(update_announcement_group).delete(delete_announcement_group))
+        // Music-group presets: the grouping of the house as a switchable thing.
+        // Membership edits stay on /api/groups/music (with a `preset` field) —
+        // these are about the presets themselves, and about which one is in force.
+        .route("/api/presets", get(list_presets).post(create_preset))
+        .route("/api/presets/{id}", put(update_preset).delete(delete_preset))
+        .route("/api/presets/{id}/activate", post(activate_preset))
         .route("/api/align/groups", get(align_groups))
         .route("/api/align", get(align_status).delete(align_stop))
         // Pushed **session** state: one full `AlignState` on connect, then one per
@@ -253,6 +259,7 @@ pub(crate) mod measure;
 pub(crate) mod nodes;
 pub(crate) mod now_playing;
 pub(crate) mod outputs;
+pub(crate) mod presets;
 pub(crate) mod settings;
 pub(crate) mod sources;
 pub(crate) mod sync;
@@ -277,6 +284,7 @@ pub(crate) use crate::outputs::listing::*;
 pub(crate) use nodes::*;
 pub(crate) use now_playing::*;
 pub(crate) use outputs::*;
+pub(crate) use presets::*;
 pub(crate) use settings::*;
 pub(crate) use sources::*;
 pub(crate) use sync::*;

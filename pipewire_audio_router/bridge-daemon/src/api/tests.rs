@@ -73,6 +73,34 @@ fn a_report_body_may_carry_no_metadata_at_all() {
     assert!(req.metadata.is_empty());
 }
 
+/// The preset routes: `{id}/activate` is a parameter segment followed by a static
+/// one, beside the bare `{id}` CRUD — the same conflict trap as the pairings above,
+/// and a clash would panic at daemon startup where nothing catches it.
+#[test]
+fn the_preset_routes_coexist() {
+    let app: Router = Router::new()
+        .route("/api/presets", get(|| async { "listed" }).post(|| async { "created" }))
+        .route("/api/presets/{id}", put(|| async { "renamed" }).delete(|| async { "deleted" }))
+        .route("/api/presets/{id}/activate", post(|| async { "activated" }));
+    drop(app);
+}
+
+/// A membership write may name the preset it applies to, and must not have to:
+/// omitted means the active one, which is every call the UI made before presets
+/// existed (and every call it still makes with them switched off).
+#[test]
+fn a_music_group_write_may_omit_the_preset_scope() {
+    let scoped: UpdateMusicGroupRequest = serde_json::from_str(r#"{"members":["a"],"preset":"house_party"}"#).expect("parses");
+    assert_eq!(scoped.preset.as_deref(), Some("house_party"));
+    let unscoped: UpdateMusicGroupRequest = serde_json::from_str(r#"{"members":["a"]}"#).expect("parses");
+    assert_eq!(unscoped.preset, None);
+    // Creating a preset from nothing, and creating one as a copy.
+    let empty: CreatePresetRequest = serde_json::from_str(r#"{"name":"House party"}"#).expect("parses");
+    assert_eq!(empty.copy_from, None);
+    let copy: CreatePresetRequest = serde_json::from_str(r#"{"name":"House party","copy_from":"default"}"#).expect("parses");
+    assert_eq!(copy.copy_from.as_deref(), Some("default"));
+}
+
 fn airplay_entry() -> SourceEntry {
     SourceEntry {
         id: "kitchen-airplay".to_string(),

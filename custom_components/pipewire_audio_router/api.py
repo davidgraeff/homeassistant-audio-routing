@@ -220,10 +220,34 @@ class AnnouncementGroup:
 
 
 @dataclass
+class Preset:
+    """A music-group preset (store/groups.rs): a named grouping of the house.
+
+    Only what Home Assistant shows — the id and the name. The membership it holds
+    is the add-on UI's business; here a preset is something to *pick*, and the
+    grouping it puts in force then arrives as the usual music-group members."""
+
+    id: str
+    name: str
+
+
+@dataclass
+class PresetsInfo:
+    """`GET /api/presets` — every preset plus the one in force."""
+
+    active: str
+    presets: list[Preset]
+
+
+@dataclass
 class AppSettings:
     """Subset of the daemon's `/api/settings` the integration needs."""
 
     expose_outputs_as_media_players: bool
+    """Whether the user works with presets. Gates the preset select entity: with
+    presets off there is exactly one grouping, and an entity offering that one
+    choice is clutter on every device page."""
+    presets_enabled: bool = False
 
 
 @dataclass
@@ -587,7 +611,34 @@ class PipewireRouterApiClient:
                 data = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
-        return AppSettings(expose_outputs_as_media_players=bool(data.get("expose_outputs_as_media_players", False)))
+        return AppSettings(
+            expose_outputs_as_media_players=bool(data.get("expose_outputs_as_media_players", False)),
+            presets_enabled=bool(data.get("presets_enabled", False)),
+        )
+
+    async def async_get_presets(self) -> PresetsInfo:
+        """Music-group presets and which one is in force (`GET /api/presets`)."""
+        try:
+            async with self._session.get(f"{self._base_url}/api/presets") as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
+        return PresetsInfo(
+            active=str(data.get("active", "")),
+            presets=[Preset(id=str(p["id"]), name=str(p["name"])) for p in data.get("presets", [])],
+        )
+
+    async def async_activate_preset(self, preset_id: str) -> None:
+        """Put a preset in force (`POST /api/presets/{id}/activate`).
+
+        One daemon call, which regroups the speakers and routes what the preset
+        says in a single pass — so this never has to walk the groups itself."""
+        try:
+            async with self._session.post(f"{self._base_url}/api/presets/{quote(preset_id, safe='')}/activate") as resp:
+                await _raise_for_error(resp, "activating the preset")
+        except aiohttp.ClientError as err:
+            raise PipewireRouterApiError(f"could not activate preset: {err}") from err
 
     async def async_get_status(self) -> DaemonStatus:
         """Which daemon build is running, and on what (`GET /api/status`).

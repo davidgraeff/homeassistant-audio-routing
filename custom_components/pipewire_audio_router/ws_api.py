@@ -25,6 +25,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 
 from .api import PipewireRouterApiError
 from .const import DOMAIN
@@ -36,6 +37,7 @@ WS_LINK = f"{DOMAIN}/link"
 WS_UNLINK = f"{DOMAIN}/unlink"
 WS_ROUTE_GROUP = f"{DOMAIN}/route_group"
 WS_UNROUTE_GROUP = f"{DOMAIN}/unroute_group"
+WS_SET_PRESET = f"{DOMAIN}/set_preset"
 
 ERR_NO_ENTRY = "no_entry"
 ERR_AMBIGUOUS = "ambiguous_entry"
@@ -53,6 +55,7 @@ def async_register(hass: HomeAssistant) -> None:
         ws_unlink,
         ws_route_group,
         ws_unroute_group,
+        ws_set_preset,
     ):
         websocket_api.async_register_command(hass, handler)
 
@@ -70,12 +73,18 @@ def _node(node: Any) -> dict[str, Any]:
 
 @callback
 def _snapshot(coordinator: Any) -> dict[str, Any]:
-    """The card's whole world: inputs, outputs, links, music groups.
+    """The card's whole world: inputs, outputs, links, music groups, presets.
 
     Sent complete every time rather than as a diff — it is a few hundred bytes
     for a house-sized setup, and a diff protocol would be a second source of
-    truth about a matrix the daemon already sends whole."""
+    truth about a matrix the daemon already sends whole.
+
+    Presets are **empty unless the user works with them** (the add-on's "Work with
+    presets" switch): the card then draws no dropdown at all, which is the point of
+    the switch. Only the id and the name travel — the membership a preset holds is
+    the add-on UI's business, and what it puts in force arrives as `groups`."""
     matrix = coordinator.routing
+    presets_on = getattr(coordinator, "presets_enabled", False)
     return {
         "sources": [_node(n) for n in matrix.sources],
         "outputs": [_node(n) for n in matrix.outputs],
@@ -84,6 +93,8 @@ def _snapshot(coordinator: Any) -> dict[str, Any]:
             {"id": group.id, "name": group.name, "members": list(group.members)}
             for group in coordinator.music_groups
         ],
+        "presets": [{"id": p.id, "name": p.name} for p in coordinator.presets] if presets_on else [],
+        "active_preset": coordinator.active_preset if presets_on else None,
     }
 
 
@@ -250,3 +261,31 @@ async def ws_unroute_group(
     if coordinator is None:
         return
     await _call(connection, msg, coordinator.client.async_unroute_music_group(msg["group_id"]))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_SET_PRESET,
+        vol.Required("preset"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_preset(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Put a music-group preset in force — the whole grouping of the house at once.
+
+    Takes an id or a name, through the same coordinator path as the service and the
+    select entity. Unlike the calls above this one does not go straight to the
+    client: activation is one daemon operation, and the coordinator is what knows
+    the preset names."""
+    coordinator = _resolve(hass, connection, msg)
+    if coordinator is None:
+        return
+    try:
+        await coordinator.async_activate_preset(msg["preset"])
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], ERR_DAEMON, str(err))
+        return
+    connection.send_result(msg["id"])

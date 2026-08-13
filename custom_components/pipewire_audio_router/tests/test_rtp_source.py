@@ -17,11 +17,17 @@ from custom_components.pipewire_audio_router.api import (
     PipewireRouterApiClient,
     PipewireRouterApiError,
     RtpSourceState,
+    Preset,
+    PresetsInfo,
 )
 from custom_components.pipewire_audio_router.const import DOMAIN
 
 API = "custom_components.pipewire_audio_router.api.PipewireRouterApiClient"
 COORD = "custom_components.pipewire_audio_router.PipewireRouterCoordinator"
+
+# The one preset every daemon has; `presets_enabled` stays off, so no preset
+# entity is created unless a test asks for one.
+DEFAULT_PRESETS = PresetsInfo(active="default", presets=[Preset(id="default", name="Default")])
 DAEMON_STATUS = DaemonStatus(version="0.3.0", host_model="Raspberry Pi 4 Model B", host_arch="aarch64")
 
 SWITCH = "switch.pipewire_audio_router_bluetooth_bridge_rtp_source"
@@ -56,6 +62,9 @@ async def _setup(hass, stack, rtp=RTP_DISABLED):
     stack.enter_context(patch(f"{API}.async_get_outputs", new=AsyncMock(return_value=[])))
     stack.enter_context(patch(f"{API}.async_get_music_groups", new=AsyncMock(return_value=[])))
     stack.enter_context(patch(f"{API}.async_get_announcement_groups", new=AsyncMock(return_value=[])))
+    # Presets ride the same poll (they gate the preset select entity), so the
+    # offline story needs them too: one `Default`, which is what a fresh daemon has.
+    stack.enter_context(patch(f"{API}.async_get_presets", new=AsyncMock(return_value=DEFAULT_PRESETS)))
     from custom_components.pipewire_audio_router.api import AppSettings
 
     stack.enter_context(patch(f"{API}.async_get_status", new=AsyncMock(return_value=DAEMON_STATUS)))

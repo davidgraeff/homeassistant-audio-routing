@@ -7,6 +7,10 @@ pub(crate) struct CreateMusicGroupRequest {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) members: Vec<String>,
+    /// Which preset the members go into; omitted = the active one. The UI sends
+    /// the preset it is editing, which may not be the one in force.
+    #[serde(default)]
+    pub(crate) preset: Option<String>,
 }
 #[derive(Deserialize)]
 pub(crate) struct UpdateMusicGroupRequest {
@@ -14,6 +18,11 @@ pub(crate) struct UpdateMusicGroupRequest {
     pub(crate) name: Option<String>,
     #[serde(default)]
     pub(crate) members: Option<Vec<String>>,
+    /// Which preset the membership change applies to; omitted = the active one.
+    /// A rename ignores it — the name is the group's identity, shared by every
+    /// preset (store/groups.rs).
+    #[serde(default)]
+    pub(crate) preset: Option<String>,
 }
 #[derive(Deserialize)]
 pub(crate) struct CreateAnnouncementGroupRequest {
@@ -45,7 +54,7 @@ pub(crate) async fn create_music_group(
     State(state): State<AppState>,
     Json(req): Json<CreateMusicGroupRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.groups_config.lock_recover().create_music(&req.name, req.members) {
+    match state.groups_config.lock_recover().create_music(&req.name, req.members, req.preset.as_deref()) {
         Ok(mg) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": mg }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
     }
@@ -56,7 +65,7 @@ pub(crate) async fn update_music_group(
     Path(id): Path<String>,
     Json(req): Json<UpdateMusicGroupRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.groups_config.lock_recover().update_music(&id, req.name, req.members) {
+    match state.groups_config.lock_recover().update_music(&id, req.name, req.members, req.preset.as_deref()) {
         Ok(mg) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "group": mg }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "message": e.to_string() }))),
     }
@@ -74,37 +83,68 @@ pub(crate) struct RouteGroupRequest {
     pub(crate) source: String,
 }
 
+/// Put `members` exclusively on `source`: link each one to it and drop every other
+/// source feeding it. The one place group-level routing is expressed — the Source
+/// dropdown, the card's wire, HA's `select_source` and a preset activation all come
+/// through here, so they cannot drift apart. Caller sends `changes` once it is done
+/// (an activation routes several groups and wants one transition).
+pub(crate) fn route_members(state: &AppState, members: &[String], source: &str) -> Result<(), ApiError> {
+    let snapshot = crate::store::routing::snapshot(&state.routing);
+    let mut store = state.routing.lock_recover();
+    for member in members {
+        for l in snapshot.iter().filter(|l| &l.output == member && l.source != source) {
+            let _ = store.remove(&l.source, member);
+        }
+        if let Err(e) = store.add(source, member) {
+            return Err(ApiError::internal(format!("failed to persist: {e}")));
+        }
+    }
+    Ok(())
+}
+
+/// Drop every link feeding `members`.
+pub(crate) fn unroute_members(state: &AppState, members: &[String]) {
+    let snapshot = crate::store::routing::snapshot(&state.routing);
+    let mut store = state.routing.lock_recover();
+    for l in snapshot.iter().filter(|l| members.contains(&l.output)) {
+        let _ = store.remove(&l.source, &l.output);
+    }
+}
+
+/// The members of a music group in the *active* preset, or a 400 naming it.
+fn members_of(state: &AppState, id: &str) -> Result<Vec<String>, ApiError> {
+    state
+        .groups_config
+        .lock_recover()
+        .music()
+        .into_iter()
+        .find(|m| m.id == id)
+        .map(|m| m.members)
+        .ok_or_else(|| ApiError::bad_request(format!("no music group '{id}'")))
+}
+
 /// Route a source to a whole music group: the group's members are (re)linked from
 /// `source` (replacing any prior source per member), so they play it in sync. The
 /// group is the routable unit; individual member re-routing is left to the raw
 /// matrix. Reuses the per-output routing store + reconciler (no special-casing).
+///
+/// Also **records** the choice in the active preset (store/groups.rs
+/// `note_source`), so a preset remembers what its groups play and activating it
+/// later restores the music and not only the grouping.
 pub(crate) async fn route_music_group(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RouteGroupRequest>,
 ) -> OpResult {
     tracing::info!("USER ACTION: route music group '{}' (routing graph)", id);
-    let members = {
-        let g = state.groups_config.lock_recover();
-        match g.music().iter().find(|m| m.id == id) {
-            Some(m) => m.members.clone(),
-            None => return Err(ApiError::bad_request(format!("no music group '{id}'"))),
-        }
-    };
+    let members = members_of(&state, &id)?;
     if members.is_empty() {
         return Err(ApiError::bad_request("music group has no members"));
     }
-    let snapshot = crate::store::routing::snapshot(&state.routing);
-    {
-        let mut store = state.routing.lock_recover();
-        for member in &members {
-            for l in snapshot.iter().filter(|l| &l.output == member && l.source != req.source) {
-                let _ = store.remove(&l.source, member);
-            }
-            if let Err(e) = store.add(&req.source, member) {
-                return Err(ApiError::internal(format!("failed to persist: {e}")));
-            }
-        }
+    route_members(&state, &members, &req.source)?;
+    if let Err(e) = state.groups_config.lock_recover().note_source(&id, Some(&req.source)) {
+        // The routing landed; only the preset's memory of it didn't.
+        tracing::warn!("could not record the source of '{id}' in the active preset: {e}");
     }
     let _ = state.changes.send(());
     ok(format!("routed '{id}' ({} member(s)) from '{}'", members.len(), req.source))
@@ -113,19 +153,10 @@ pub(crate) async fn route_music_group(
 /// Un-route a whole music group: remove all links feeding its members.
 pub(crate) async fn unroute_music_group(State(state): State<AppState>, Path(id): Path<String>) -> OpResult {
     tracing::info!("USER ACTION: unroute music group '{}' (routing graph)", id);
-    let members = {
-        let g = state.groups_config.lock_recover();
-        match g.music().iter().find(|m| m.id == id) {
-            Some(m) => m.members.clone(),
-            None => return Err(ApiError::bad_request(format!("no music group '{id}'"))),
-        }
-    };
-    let snapshot = crate::store::routing::snapshot(&state.routing);
-    {
-        let mut store = state.routing.lock_recover();
-        for l in snapshot.iter().filter(|l| members.contains(&l.output)) {
-            let _ = store.remove(&l.source, &l.output);
-        }
+    let members = members_of(&state, &id)?;
+    unroute_members(&state, &members);
+    if let Err(e) = state.groups_config.lock_recover().note_source(&id, None) {
+        tracing::warn!("could not record the silence of '{id}' in the active preset: {e}");
     }
     let _ = state.changes.send(());
     ok(format!("un-routed music group '{id}'"))

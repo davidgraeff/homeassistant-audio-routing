@@ -34,6 +34,11 @@
   const snapshot = $derived(model.snapshot);
   const links = $derived(snapshot.links);
   const sources = $derived(snapshot.sources);
+  const presets = $derived(snapshot.presets);
+  /** The dropdown's value is a *name*, since that is what it offers; `null` while
+   *  the active preset is unknown, which shows an em dash rather than pretending
+   *  the first one is on. */
+  const activePresetName = $derived(presets.find((p) => p.id === snapshot.active_preset)?.name ?? null);
 
   /** A routing destination: a whole music group, or a single output that isn't in
    *  one. Groups route as a unit — the same exclusive call as their Source
@@ -251,6 +256,28 @@
     {#if model.error}
       <p class="error">{model.error}</p>
     {/if}
+    <!-- The preset picker: the whole grouping of the house in one control, which is
+         the one thing about routing that is worth a dashboard and cannot be
+         expressed as a wire. Only drawn when there is a *choice* — the integration
+         sends no presets unless the user works with them, and a lone `Default` is
+         nothing to pick. -->
+    {#if presets.length > 1}
+      <label class="presetrow">
+        <span>Preset</span>
+        <select
+          value={activePresetName ?? ''}
+          disabled={model.busy}
+          onchange={(e) => void model.setPreset(e.currentTarget.value)}
+        >
+          {#if activePresetName === null}
+            <option value="" disabled>—</option>
+          {/if}
+          {#each presets as p (p.id)}
+            <option value={p.name}>{p.name}</option>
+          {/each}
+        </select>
+      </label>
+    {/if}
     {#if !model.loaded}
       <p class="muted">Loading routing…</p>
     {:else if sources.length === 0 && targets.length === 0}
@@ -346,6 +373,26 @@
     color: var(--error-color, #db4437);
     font-size: 13px;
     margin: 0 4px 8px;
+  }
+  /* One row above the graph, deliberately quiet: it changes everything below it,
+     so it reads as a mode, not as an action. */
+  .presetrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 4px 10px;
+    font-size: 13px;
+    color: var(--secondary-text-color);
+  }
+  .presetrow select {
+    flex: 1 1 auto;
+    min-width: 0;
+    font: inherit;
+    color: var(--primary-text-color);
+    background: var(--card-background-color, transparent);
+    border: 1px solid var(--divider-color, rgba(127, 127, 127, 0.35));
+    border-radius: 8px;
+    padding: 5px 8px;
   }
   .canvas {
     position: relative;
