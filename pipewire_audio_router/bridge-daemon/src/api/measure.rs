@@ -586,29 +586,14 @@ pub(crate) async fn set_output_name(
     ok(message)
 }
 
-/// Set an output's per-output playout delay (ms), persisted per node name in
-/// routing/sync_settings.rs. `latency_ms: null` clears the override, back to the kind's
-/// default. Two kinds have such a knob, and both land here because they are the
-/// same decision — "this speaker plays too early/late, shift it":
-///
-/// * **AirPlay 2** — the **render delay**: no PipeWire module to reload, the
-///   value is applied *live* to the running stream (the PT=87 anchor offset the
-///   streamer reads per packet), and reused as the initial delay on the next
-///   (membership/rate) reconnect.
-/// * **pw-sink** — the remote receiver's **jitter buffer** (`sess.latency.msec`),
-///   pushed to that host's agent, which reloads its `module-rtp-session` with the
-///   new value. That reload is a sub-second gap in *that* target's audio only —
-///   there is no other lever on this path, so the gap is the price of the knob.
-///
-/// Only bounds are enforced, and only where the transport demands them (the AP2
-/// receiver's negotiated buffer; the module's refusal to run a buffer below its
-/// ptime). A *low* value is otherwise allowed straight through even though it
-/// risks dropouts: finding that threshold by ear is exactly what this knob is for,
-
 /// The AirPlay-2 half of `PUT /api/outputs/{node_name}/delay`: persist the render delay
 /// and push it to the running session.
 ///
 /// `None` clears the override, putting the receiver back on the sender's own default.
+///
+/// Only the upper bound is enforced, and only because the receiver's negotiated buffer
+/// demands it. A *low* value is allowed straight through even though it risks dropouts:
+/// finding that threshold by ear is exactly what this knob is for.
 pub(crate) async fn set_ap2_render_delay(state: AppState, node_name: String, requested: Option<u16>) -> OpResult {
     let clamped = requested.map(|ms| ms.min(crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS));
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_latency(&node_name, clamped) {
@@ -629,8 +614,8 @@ pub(crate) async fn set_ap2_render_delay(state: AppState, node_name: String, req
     ok(format!("set '{node_name}' render delay to {latency_label} (live)"))
 }
 
-/// The pw-sink half of [`set_output_latency`]: persist the playout delay and push
-/// it to the host's agent.
+/// The pw-sink half of [`crate::api::level::set_output_delay`]: persist the playout delay
+/// and push it to the host's agent.
 ///
 /// Clamped into [`PWSINK_JITTER_MIN_MS`]..=[`PWSINK_JITTER_MAX_MS`] and rounded up
 /// to a multiple of the sender's packet time ([`crate::outputs::pwsink::applemidi::PACKET_MS`]).

@@ -189,13 +189,13 @@ fn metering_is_armed_by_the_first_subscriber_and_disarmed_by_the_last() {
     let toggles = std::cell::RefCell::new(Vec::new());
     let record = |on: bool| toggles.borrow_mut().push(on);
 
-    arm(&meters, &watchers, &record, true);
+    arm(&meters, &watchers, record, true);
     assert_eq!(*toggles.borrow(), vec![true], "the first subscriber arms the profiler");
-    arm(&meters, &watchers, &record, true); // a second socket
+    arm(&meters, &watchers, record, true); // a second socket
     assert_eq!(*toggles.borrow(), vec![true], "the second must not re-arm it");
-    arm(&meters, &watchers, &record, false);
+    arm(&meters, &watchers, record, false);
     assert_eq!(*toggles.borrow(), vec![true], "…and must not disarm it while one is left");
-    arm(&meters, &watchers, &record, false);
+    arm(&meters, &watchers, record, false);
     assert_eq!(*toggles.borrow(), vec![true, false], "the last one out disarms it");
     assert_eq!(watchers.load(Ordering::SeqCst), 0, "and the count comes back to zero");
 }

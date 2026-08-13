@@ -99,9 +99,7 @@ pub(crate) fn no_transport_reason(output: &str) -> String {
         Some(kind @ (OutputKind::Airplay2 | OutputKind::PwSink)) => {
             format!("no session to this {} could be opened for the announcement", kind.human())
         }
-        None => {
-            "output has no per-device sender (only sendspin, AirPlay-2 and PipeWire targets can be announced to individually)".into()
-        }
+        None => "output has no per-device sender (only sendspin, AirPlay-2 and PipeWire targets can be announced to individually)".into(),
     }
 }
 

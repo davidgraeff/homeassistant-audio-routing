@@ -50,6 +50,13 @@ jobs:
       # dimensions; `include` only attaches the buildx platform to each arch — it must
       # match on a value of an existing key to do that, otherwise its pairs would be
       # merged into every combination instead of selecting one.
+      #
+      # `fail-fast: false` is what makes "names exactly what broke" true: the default
+      # cancels the surviving pairs, so a single bad (add-on, arch) — e.g. one whose
+      # GHCR package the token cannot write — reports as four broken builds and hides
+      # whether the other three would have published. Same reasoning as
+      # prune-packages.yml.
+      fail-fast: false
       matrix:
         slug: [pipewire_audio_router, ytmusic_receiver]
         arch: [amd64, aarch64]

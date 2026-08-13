@@ -964,8 +964,7 @@ impl GroupReconciler {
             let action = sendspin_server_action(SendspinServerState {
                 routed: !d.sendspin_node_names.is_empty(),
                 have_server,
-                config_changed: lead_rearm
-                    || sendspin_config_changed(prev_codec, prev_lead, d.sendspin_codec, d.sendspin_send_ahead_us),
+                config_changed: lead_rearm || sendspin_config_changed(prev_codec, prev_lead, d.sendspin_codec, d.sendspin_send_ahead_us),
             });
             let restart = action == ServerAction::Start;
             if matches!(action, ServerAction::Start | ServerAction::Stop) {

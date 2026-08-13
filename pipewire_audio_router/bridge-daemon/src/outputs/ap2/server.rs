@@ -440,10 +440,7 @@ impl MemberCtx {
     /// such member — which is how a request naming an output that belongs to a *different*
     /// group is refused rather than dialed.
     fn member(&self, name: &str) -> Option<(IpAddr, u32)> {
-        self.members
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, ip, delay)| (*ip, u32::from(delay.unwrap_or(AP2_RENDER_DELAY_MS as u16))))
+        self.members.iter().find(|(n, _, _)| n == name).map(|(_, ip, delay)| (*ip, u32::from(delay.unwrap_or(AP2_RENDER_DELAY_MS as u16))))
     }
 }
 
@@ -591,8 +588,7 @@ async fn reconnect_member(
         }
         Err(fail) => {
             tracing::warn!("AP2: could not rebuild '{name}' ({ip}) @ {}Hz: {}", ctx.rate, fail.msg);
-            crate::outputs::ap2::health::Ap2Health::global()
-                .set(name, format!("Reconnect failed ({reason}): {}", fail.msg));
+            crate::outputs::ap2::health::Ap2Health::global().set(name, format!("Reconnect failed ({reason}): {}", fail.msg));
             false
         }
     }
