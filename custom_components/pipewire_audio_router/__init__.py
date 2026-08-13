@@ -44,6 +44,7 @@ from .const import (
     UPDATE_INTERVAL_SECONDS,
 )
 from .frontend import async_register_card
+from .pwsink_hosts import async_reconcile_pwsink_host_devices
 from .service_device import async_register_service_device
 from .voice_duck import VoiceDucker
 
@@ -271,6 +272,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # created here rather than left to the entities so its version is right and a
     # later add-on update refreshes it (see service_device.py).
     async_register_service_device(hass, entry, coordinator)
+    # A device per pw-sink host, also before the platforms: a PC has no device in
+    # Home Assistant to inherit a room from, so this is the thing the user assigns
+    # an area to and the thing an output entity then links itself to.
+    async_reconcile_pwsink_host_devices(hass, entry, coordinator)
+    entry.async_on_unload(
+        # Hosts come and go with the routing matrix, which arrives on the
+        # WebSocket as well as the poll — both land here.
+        coordinator.async_add_listener(
+            lambda: async_reconcile_pwsink_host_devices(hass, entry, coordinator)
+        )
+    )
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_register_cleanup_service(hass)
     return True

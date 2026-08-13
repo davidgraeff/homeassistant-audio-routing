@@ -41,6 +41,7 @@ from homeassistant.util import dt as dt_util
 from . import PipewireRouterCoordinator
 from .api import AnnouncementGroup, MusicGroup, NowPlaying, RoutingMatrix, RoutingNode
 from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NONE
+from .pwsink_hosts import async_find_pwsink_host_device
 
 # Must match the bridge-daemon's node-name prefixes exactly — no shared source
 # of truth across the Rust/Python boundary, just this comment. The
@@ -276,12 +277,17 @@ def find_output_ha_device(
     Shared with `voice_duck.py`, which needs an output's **area** whether or not
     per-output `media_player` entities are exposed; keeping the rules in one place
     means ducking and adoption can never disagree about which device an output is.
-    `None` for kinds with no correlation rule (`pwsink-dev-`) or no match."""
+    `None` when nothing matches."""
     if node_name.startswith(SENDSPIN_DEV_PREFIX):
         return _find_ha_device(hass, node_name)
     if node_name.startswith(AP2_DEV_PREFIX):
         meta = outputs_meta.get(node_name)
         return _find_ap2_ha_device(hass, meta.ip if meta else None)
+    if node_name.startswith(PWSINK_DEV_PREFIX):
+        # No correlation at all for a PC: nothing in HA need represent the machine,
+        # so the integration creates the device itself and the user assigns its room
+        # (`pwsink_hosts.py` explains why guessing was rejected).
+        return async_find_pwsink_host_device(hass, node_name)
     return None
 
 
@@ -503,20 +509,13 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _S
 
         # Correlate a virtual output to its Home Assistant device once, at
         # creation, so the entity links to that device and takes HA's name +
-        # area. Two correlation rules by kind: sendspin matches the ESPHome
-        # device by mDNS hostname; AirPlay-2 matches a third-party AV device by
-        # the receiver's IP (`_find_ap2_ha_device`). Unmatched outputs fall back
-        # to the daemon-derived display name with no device link.
+        # area — one rule per kind, all of them in `find_output_ha_device` because
+        # voice ducking resolves rooms through the same rules. Unmatched outputs
+        # fall back to the daemon-derived display name with no device link.
         # Resolved here — matching devices are typically registered at HA start,
         # before this integration sets up — so one that only appears later is
         # picked up on the next reload.
-        if self._is_ap2:
-            meta = coordinator.outputs_meta.get(node_name)
-            self._ha_device = _find_ap2_ha_device(hass, meta.ip if meta else None)
-        elif self._is_sendspin:
-            self._ha_device = _find_ha_device(hass, node_name)
-        else:
-            self._ha_device = None
+        self._ha_device = find_output_ha_device(hass, node_name, coordinator.outputs_meta)
 
         if self._ha_device is None:
             self._attr_name = _display_name(node_name)
@@ -562,6 +561,22 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _S
         if self._is_pwsink:
             return PWSINK_DEV_PREFIX
         return None
+
+    @property
+    def suggested_object_id(self) -> str | None:
+        """The entity_id Home Assistant should derive.
+
+        Needed because the device link is written *after* registration
+        (`async_added_to_hass`), so Home Assistant derives the id from the entity
+        name alone — every adopted output would land on `media_player.audio_routing`
+        and then `_2`, `_3`. Suggest the id it would have produced with the device
+        attached: "<device name> Audio Routing". An unmatched output defers to Home
+        Assistant's own derivation, which uses the display name — returning `None`
+        here would instead drop it to the "unnamed device" fallback."""
+        if self._ha_device is None:
+            return super().suggested_object_id
+        device_name = self._ha_device.name_by_user or self._ha_device.name
+        return f"{device_name} {self._attr_name}" if device_name else super().suggested_object_id
 
     async def async_added_to_hass(self) -> None:
         """Attach this media_player to the matched Home Assistant device, so it is

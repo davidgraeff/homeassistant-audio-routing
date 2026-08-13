@@ -38,11 +38,20 @@ which add-on build is running and on what hardware, and its **Visit** link opens
 the add-on's own web UI, which is where the routing matrix, the outputs and the
 diagnostics actually live.
 
-The `media_player`s deliberately stay off it, because a device prefixes its
-entities' displayed names and that is wrong for a speaker:
+A second kind of device appears for every adopted **pw-sink host** — a PC running
+`pwrouter-agent` — named the way that machine reports itself, *"david-local
+(david)"*. Unlike a speaker, a PC has nothing in Home Assistant to inherit a room
+from, so this is the thing you **assign a room to**; voice ducking then covers it
+like any other output. It carries no entities of its own unless per-output players
+are exposed, which is fine: the room assignment lives on the device and survives
+restarts.
 
-- **per-output** players join the **real speaker's** device instead, inheriting its
-  name and area — and the area is what voice ducking below resolves a room against;
+The `media_player`s deliberately stay off the settings device, because a device
+prefixes its entities' displayed names and that is wrong for a speaker:
+
+- **per-output** players join the **real speaker's** device instead (or its
+  pw-sink host device), inheriting its name and area — and the area is what voice
+  ducking below resolves a room against;
 - **group** players stay standalone, so a group keeps the name you gave it
   (*"Everywhere"*, not *"PipeWire Audio Router Everywhere"*) in media cards,
   `tts.speak` targets and scripts.
@@ -99,8 +108,16 @@ satellite had an area and whether any output was found in it.
 
 Every `assist_satellite` is covered automatically, including ones added later.
 The room comes from Home Assistant's areas: the satellite's area (its entity's
-override if set, else its device's), matched against the area each router output
-adopted from the real speaker's device. A satellite in no area ducks nothing.
+override if set, else its device's), matched against each output's area. A
+satellite in no area ducks nothing, and neither does an output in no area — no
+per-output entities are needed for any of this, because an output's area is read
+from the device it belongs to:
+
+| Output | Whose area | If it has none |
+|---|---|---|
+| `sendspin-dev-*` | the speaker's ESPHome device, matched by its mDNS hostname (or the MAC fragment that name ends in) | give the ESPHome device a room |
+| `ap2-dev-*` | the HA device whose integration talks to the same IP (MusicCast, Onkyo, …) | give that device a room |
+| `pwsink-dev-*` | the host device this integration creates for that PC | **give it a room — it starts with none** |
 
 Why this beats ducking with `volume_set`: the add-on applies a gain inside its
 mix, so **your speakers' volume never moves** (no slider jumping, nothing to

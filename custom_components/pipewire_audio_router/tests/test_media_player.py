@@ -161,6 +161,10 @@ async def test_sendspin_device_adopts_matching_ha_device_name_and_area(hass):
     assert entity_id is not None
     reg_entry = ent_reg.async_get(entity_id)
     assert reg_entry.device_id == device.id
+    # The device link is written *after* registration, so without
+    # `suggested_object_id` Home Assistant would derive the same
+    # `media_player.audio_routing` for every adopted output and count from there.
+    assert entity_id == "media_player.home_assistant_voice_badezimmer_audio_routing"
     # ...so its friendly name is HA's device name and it lives in the same area
     # (inherited from the linked device, since the entity sets no area of its own).
     state = hass.states.get(entity_id)
@@ -363,7 +367,7 @@ async def test_pwsink_host_reports_its_own_master_volume(hass):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    host = hass.states.get("media_player.desk_dave")
+    host = hass.states.get("media_player.desk_dave_audio_routing")
     assert host is not None
     assert host.state == "playing"
     assert host.attributes["volume_level"] == 0.37
@@ -387,7 +391,7 @@ async def test_pwsink_volume_is_none_without_a_connected_agent(hass):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    host = hass.states.get("media_player.desk_dave")
+    host = hass.states.get("media_player.desk_dave_audio_routing")
     assert host is not None
     assert host.attributes.get("volume_level") is None
 
@@ -414,13 +418,13 @@ async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
             await hass.services.async_call(
                 "media_player",
                 "volume_set",
-                {"entity_id": "media_player.desk_dave", "volume_level": 0.6},
+                {"entity_id": "media_player.desk_dave_audio_routing", "volume_level": 0.6},
                 blocking=True,
             )
             await hass.services.async_call(
                 "media_player",
                 "volume_mute",
-                {"entity_id": "media_player.desk_dave", "is_volume_muted": True},
+                {"entity_id": "media_player.desk_dave_audio_routing", "is_volume_muted": True},
                 blocking=True,
             )
             mock_vol.assert_awaited_once_with("pwsink-dev-desk_dave", 0.6)
