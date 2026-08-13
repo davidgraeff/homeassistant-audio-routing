@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Spike: vertical input meter (FlowGraph source card)</title>
+    <!--
+      Standalone spike — open with file://, no build, no daemon. Explores moving the
+      source card's input meter from a horizontal bar sharing the name row (where a long
+      device name squeezes it to nothing) to a full-height vertical bar flush against the
+      card's left edge, clipped by the card's own border radius.
+
+      Everything below is a copy of FlowGraph's geometry and app.css's theme tokens, not
+      an import: the point is to be able to try shapes without touching the app. Numbers
+      that must match the real card are marked MATCHES.
+    -->
+    <style>
+      /* ---- theme tokens (mirrors src/app.css) ------------------------------- */
+      :root {
+        --primary-color: #03a9f4;
+        --error-color: #db4437;
+        --success-color: #43a047;
+        --warning-color: #ffa600;
+        --primary-background-color: #fafafa;
+        --card-background-color: #ffffff;
+        --primary-text-color: #212121;
+        --secondary-text-color: #727272;
+        --divider-color: rgba(0, 0, 0, 0.12);
+        color-scheme: light;
+      }
+      :root[data-theme='dark'] {
+        color-scheme: dark;
+        --primary-background-color: #111111;
+        --card-background-color: #1c1c1c;
+        --primary-text-color: #e1e1e1;
+        --secondary-text-color: #9b9b9b;
+        --divider-color: rgba(225, 225, 225, 0.12);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family: Roboto, 'Helvetica Neue', system-ui, sans-serif;
+        font-size: 14px;
+        background: var(--primary-background-color);
+        color: var(--primary-text-color);
+      }
+      h1 {
+        font-size: 1.1rem;
+        margin: 0 0 4px;
+      }
+      h2 {
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--secondary-text-color);
+        margin: 28px 0 10px;
+      }
+      p.lede {
+        margin: 0 0 8px;
+        max-width: 70ch;
+        color: var(--secondary-text-color);
+      }
+      .toolbar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin: 14px 0 0;
+      }
+      button {
+        font: inherit;
+        padding: 4px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--divider-color);
+        background: var(--card-background-color);
+        color: inherit;
+        cursor: pointer;
+      }
+      .note {
+        font-size: 0.78rem;
+        color: var(--secondary-text-color);
+        margin: 6px 0 0;
+        max-width: 70ch;
+      }
+      /* Each variant sits in the column width the real graph gives a card. */
+      .col {
+        width: 300px;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 28px;
+        align-items: flex-start;
+      }
+
+      /* ---- the card, as FlowGraph draws it --------------------------------- */
+      .node {
+        position: relative;
+        display: flex;
+        align-items: center;
+        padding: 6px 10px; /* MATCHES .node */
+        border: 1px solid color-mix(in srgb, var(--secondary-text-color) 25%, transparent);
+        border-radius: 10px; /* MATCHES .node */
+        background: var(--card-background-color);
+      }
+      .node + .node {
+        margin-top: 16px; /* MATCHES GAP */
+      }
+      .node.offline {
+        opacity: 0.5;
+      }
+      .sbody {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 4px;
+        min-width: 0;
+        flex: 1;
+      }
+      .body {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+        height: 40px; /* MATCHES ROW_SRC - 12 */
+      }
+      .nm {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-weight: 500;
+      }
+      .np {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        min-width: 0;
+        height: 24px; /* MATCHES NP_H */
+        font-size: 0.72rem;
+        color: var(--secondary-text-color);
+        overflow: hidden;
+        white-space: nowrap;
+      }
+      .np-title {
+        color: var(--primary-text-color);
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .np-sub::before {
+        content: '·';
+        margin-right: 5px;
+      }
+      .lat {
+        flex: none;
+        font-size: 0.68rem;
+        color: var(--secondary-text-color);
+        white-space: nowrap;
+      }
+      .tag {
+        flex: none;
+        font-size: 0.65rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        padding: 1px 5px;
+        border-radius: 6px;
+        letter-spacing: 0.03em;
+        background: color-mix(in srgb, var(--secondary-text-color) 18%, transparent);
+        color: var(--secondary-text-color);
+      }
+      /* The wire handle, so the meter can be judged against it. */
+      .handle {
+        position: absolute;
+        left: 100%;
+        top: 26px; /* MATCHES ROW_SRC / 2 */
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: var(--primary-color);
+        border: 2px solid var(--card-background-color);
+        transform: translate(-50%, -50%);
+      }
+
+      /* ---- today: horizontal meter sharing the name row ------------------- */
+      .meter {
+        flex: 1;
+        height: 4px;
+        border-radius: 2px;
+        background: color-mix(in srgb, var(--secondary-text-color) 20%, transparent);
+        overflow: hidden;
+      }
+      .meter-fill {
+        height: 100%;
+        width: calc(var(--lvl) * 100%);
+        background: var(--success-color);
+        transition: width 120ms linear;
+      }
+
+      /* ---- the spike: full-height vertical meter at the left edge ---------
+         The card keeps only its right padding, so the bar is flush against the left
+         border on all three sides, and `align-items: stretch` gives it the card's
+         full height whether or not there is a now-playing row.
+
+         The bar clips ITSELF (its own radius + overflow), rather than the card doing
+         it with `overflow: hidden`: the wire handle sits at `left: 100%` and half of
+         it hangs outside the card on purpose, so clipping at the card slices that dot
+         into a half-disc. 9px is the card's INNER radius — 10px outer less the 1px
+         border — so the bar's corner sits exactly inside the card's. */
+      .node.vm {
+        align-items: stretch;
+        padding: 0 10px 0 0;
+      }
+      .vmeter {
+        flex: none;
+        position: relative;
+        overflow: hidden;
+        width: var(--w, 24px);
+        margin-right: 10px;
+        border-radius: 9px 0 0 9px;
+        background: color-mix(in srgb, var(--secondary-text-color) 18%, transparent);
+      }
+      .vmeter .fill {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: calc(var(--lvl) * 100%);
+        transition: height 120ms linear;
+        background: var(--primary-color);
+      }
+      /* Variant fills. All blue — the graph's own hue — so a level reads as "signal",
+         not as a status colour competing with the badges. */
+      .fill.flat {
+        background: color-mix(in srgb, var(--primary-color) 62%, transparent);
+      }
+      .fill.grad {
+        background: linear-gradient(
+          to top,
+          color-mix(in srgb, var(--primary-color) 45%, transparent),
+          var(--primary-color)
+        );
+      }
+      /* Segmented: the classic meter read, drawn with a repeating gradient rather
+         than elements, so it still animates as one height. */
+      .fill.seg {
+        background:
+          repeating-linear-gradient(
+              to top,
+              var(--primary-color) 0 4px,
+              transparent 4px 6px
+            );
+      }
+      /* Blue up to ~-2 dBFS, the app's warning hue in the top fifth — the same
+         "danger zone" idea as the volume slider, damped the same way.
+         Painted on the TRACK, not on the fill: a gradient inside the fill would be
+         a fifth of *the current level*, so a quiet signal would show a warning band
+         at its own tip. Instead the full scale is coloured once and `.shade` covers
+         everything above the level with the (opaque) track colour. */
+      .vmeter.abs {
+        background: linear-gradient(
+          to top,
+          color-mix(in srgb, var(--primary-color) 55%, transparent) 0 55%,
+          var(--primary-color) 55% 80%,
+          color-mix(in srgb, var(--warning-color) 70%, var(--primary-color)) 80% 100%
+        );
+      }
+      .vmeter.abs .shade {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        bottom: calc(var(--lvl) * 100%);
+        background: color-mix(in srgb, var(--secondary-text-color) 18%, var(--card-background-color));
+        transition: bottom 120ms linear;
+      }
+      /* A held peak line, so a transient that has already decayed is still visible. */
+      .vmeter .peak {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: calc(var(--peak) * 100%);
+        height: 2px;
+        background: color-mix(in srgb, var(--primary-text-color) 45%, transparent);
+      }
+      /* Offline source: no signal to show, so the bar is the track alone (an empty
+         bar would otherwise read as "present and silent"). */
+      .node.offline .vmeter {
+        background: color-mix(in srgb, var(--secondary-text-color) 8%, transparent);
+      }
+      .cap {
+        font-size: 0.75rem;
+        color: var(--secondary-text-color);
+        margin: 0 0 8px;
+      }
+      .cap b {
+        color: var(--primary-text-color);
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Spike: vertical input meter on the source card</h1>
+    <p class="lede">
+      The meter moves out of the name row and becomes a full-height bar flush against the
+      card's left edge, clipped by the card's radius. The name gets the whole width back;
+      the level is readable at a glance down the column, and it is blue like the rest of
+      the graph instead of the one green thing in it.
+    </p>
+    <div class="toolbar">
+      <button id="theme" type="button">Toggle dark</button>
+      <button id="freeze" type="button">Freeze levels</button>
+      <span class="cap" id="hint">Levels are simulated (random walk, 4 Hz — the real meters frame rate).</span>
+    </div>
+
+    <h2>Today, for reference</h2>
+    <div class="row">
+      <div class="col">
+        <p class="cap"><b>Horizontal, in the name row.</b> A long name takes the space and the meter collapses to nothing.</p>
+        <div class="node" style="height: 80px">
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">Bluetooth über turnerstr-bluetooth.local</span>
+              <div class="meter" data-lvl><div class="meter-fill"></div></div>
+              <span class="lat">~200 ms</span>
+            </div>
+            <div class="np"><span class="np-title">Weightless</span><span class="np-sub">Marconi Union</span></div>
+          </div>
+          <div class="handle"></div>
+        </div>
+        <div class="node" style="height: 52px">
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">AirPlay</span>
+              <div class="meter" data-lvl><div class="meter-fill"></div></div>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+    </div>
+
+    <h2>The spike — width and fill variants (picked: 24 px, gradient + peak hold)</h2>
+    <div class="row">
+      <div class="col">
+        <p class="cap"><b>20 px, flat.</b> Quietest option; reads as a level, not a graphic.</p>
+        <div class="node vm" style="height: 80px">
+          <div class="vmeter" style="--w: 20px" data-lvl><div class="fill flat"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">Bluetooth über turnerstr-bluetooth.local</span>
+              <span class="lat">~200 ms</span>
+            </div>
+            <div class="np"><span class="np-title">Weightless</span><span class="np-sub">Marconi Union</span></div>
+          </div>
+          <div class="handle"></div>
+        </div>
+        <div class="node vm" style="height: 52px">
+          <div class="vmeter" style="--w: 20px" data-lvl><div class="fill flat"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">AirPlay – Apple TV Wohnzimmer</span>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+
+      <div class="col">
+        <p class="cap"><b>24 px, gradient + peak hold.</b> The line is the last peak, so a transient stays visible after it decays.</p>
+        <div class="node vm" style="height: 80px">
+          <div class="vmeter" style="--w: 24px" data-lvl data-peak>
+            <div class="fill grad"></div>
+            <div class="peak"></div>
+          </div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">Bluetooth über turnerstr-bluetooth.local</span>
+              <span class="lat">~200 ms</span>
+            </div>
+            <div class="np"><span class="np-title">Weightless</span><span class="np-sub">Marconi Union</span></div>
+          </div>
+          <div class="handle"></div>
+        </div>
+        <div class="node vm" style="height: 52px">
+          <div class="vmeter" style="--w: 24px" data-lvl data-peak>
+            <div class="fill grad"></div>
+            <div class="peak"></div>
+          </div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">AirPlay – Apple TV Wohnzimmer</span>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+
+      <div class="col">
+        <p class="cap"><b>30 px, segmented.</b> Most meter-like; also the most graphic.</p>
+        <div class="node vm" style="height: 80px">
+          <div class="vmeter" style="--w: 30px" data-lvl><div class="fill seg"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">Bluetooth über turnerstr-bluetooth.local</span>
+              <span class="lat">~200 ms</span>
+            </div>
+            <div class="np"><span class="np-title">Weightless</span><span class="np-sub">Marconi Union</span></div>
+          </div>
+          <div class="handle"></div>
+        </div>
+        <div class="node vm" style="height: 52px">
+          <div class="vmeter" style="--w: 30px" data-lvl><div class="fill seg"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">AirPlay – Apple TV Wohnzimmer</span>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+
+      <div class="col">
+        <p class="cap"><b>24 px, hot top.</b> Blue below, the warning hue in the top fifth — same idea as the volume slider's zone.</p>
+        <div class="node vm" style="height: 80px">
+          <div class="vmeter abs" style="--w: 24px" data-lvl><div class="shade"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">Bluetooth über turnerstr-bluetooth.local</span>
+              <span class="lat">~200 ms</span>
+            </div>
+            <div class="np"><span class="np-title">Weightless</span><span class="np-sub">Marconi Union</span></div>
+          </div>
+          <div class="handle"></div>
+        </div>
+        <div class="node vm" style="height: 52px">
+          <div class="vmeter abs" style="--w: 24px" data-lvl><div class="shade"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">AirPlay – Apple TV Wohnzimmer</span>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+    </div>
+
+    <h2>The states the column actually contains</h2>
+    <div class="row">
+      <div class="col">
+        <p class="cap"><b>Silent but present.</b> Empty track — the bar says "routed, nothing coming in".</p>
+        <div class="node vm" style="height: 52px">
+          <div class="vmeter" style="--w: 24px; --lvl: 0"><div class="fill grad"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">Spotify Connect (Küchenradio)</span>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+      <div class="col">
+        <p class="cap"><b>Offline.</b> Track only, dimmer still, with the badge that already exists.</p>
+        <div class="node vm offline" style="height: 52px">
+          <div class="vmeter" style="--w: 24px; --lvl: 0"><div class="fill grad"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">Spotify Connect (Küchenradio)</span>
+              <span class="tag">offline</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+      <div class="col">
+        <p class="cap"><b>Hot, at 95 %.</b> The same "hot top" bar with a loud signal — the band is at a fixed place on the scale, not at the tip of the level.</p>
+        <div class="node vm" style="height: 52px">
+          <div class="vmeter abs" style="--w: 24px; --lvl: 0.95"><div class="shade"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">AirPlay – Apple TV Wohnzimmer</span>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+      <div class="col">
+        <p class="cap"><b>Clipping check.</b> Level at 100 % — the fill must follow the card's top corners, not overshoot them.</p>
+        <div class="node vm" style="height: 52px">
+          <div class="vmeter" style="--w: 24px; --lvl: 1"><div class="fill grad"></div></div>
+          <div class="sbody">
+            <div class="body">
+              <span class="nm">AirPlay – Apple TV Wohnzimmer</span>
+              <span class="lat">~200 ms</span>
+            </div>
+          </div>
+          <div class="handle"></div>
+        </div>
+      </div>
+    </div>
+
+    <p class="note">
+      Notes for the port: the source card would take <code>align-items: stretch</code>,
+      <code>overflow: hidden</code> and <code>padding-left: 0</code>; the meter is the first
+      child, so nothing else in <code>FlowGraph</code>'s geometry moves — card heights,
+      <code>srcLayout</code> and the wire anchors are unchanged, and the handle stays on the
+      opposite edge. <code>overflow: hidden</code> on the card is safe here because the source
+      card has no children that hang outside it (the forget-confirm bubble is already rendered
+      outside the canvas).
+    </p>
+
+    <script>
+      // Simulated levels: a random walk per meter at the real meters-frame rate, so the
+      // shapes can be judged in motion. Initial values are deliberately non-zero — a
+      // headless screenshot fires at `load` and would otherwise catch every bar empty.
+      const meters = [...document.querySelectorAll('[data-lvl]')];
+      const state = meters.map((el, i) => ({ el, lvl: 0.25 + ((i * 0.17) % 0.6), peak: 0 }));
+      for (const s of state) {
+        s.peak = Math.min(1, s.lvl + 0.12);
+        s.el.style.setProperty('--lvl', s.lvl.toFixed(3));
+        s.el.style.setProperty('--peak', s.peak.toFixed(3));
+      }
+
+      let frozen = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const freeze = document.getElementById('freeze');
+      const hint = document.getElementById('hint');
+      if (frozen) hint.textContent = 'Levels frozen (prefers-reduced-motion).';
+      freeze.onclick = () => {
+        frozen = !frozen;
+        freeze.textContent = frozen ? 'Run levels' : 'Freeze levels';
+      };
+
+      setInterval(() => {
+        if (frozen) return;
+        for (const s of state) {
+          s.lvl = Math.min(1, Math.max(0.02, s.lvl + (Math.random() - 0.45) * 0.28));
+          s.el.style.setProperty('--lvl', s.lvl.toFixed(3));
+          // Peak hold: rises instantly, falls slowly, like a real PPM.
+          s.peak = Math.max(s.lvl, s.peak - 0.03);
+          if (s.el.hasAttribute('data-peak')) s.el.style.setProperty('--peak', s.peak.toFixed(3));
+        }
+      }, 250);
+
+      const root = document.documentElement;
+      const themeBtn = document.getElementById('theme');
+      // `?dark` so a headless screenshot can take the dark theme without clicking.
+      if (location.search.includes('dark')) {
+        root.setAttribute('data-theme', 'dark');
+        themeBtn.textContent = 'Toggle light';
+      }
+      themeBtn.onclick = () => {
+        const dark = root.getAttribute('data-theme') === 'dark';
+        root.setAttribute('data-theme', dark ? 'light' : 'dark');
+        themeBtn.textContent = dark ? 'Toggle dark' : 'Toggle light';
+      };
+    </script>
+  </body>
+</html>

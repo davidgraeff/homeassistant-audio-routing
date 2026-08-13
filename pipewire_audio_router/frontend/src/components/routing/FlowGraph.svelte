@@ -50,6 +50,16 @@
   /** Expert view: bypass groups and wire individual speakers. */
   let showSpeakers = $state(false);
 
+  // The ~ms estimates, off by default: they repeat on every card and every speaker row,
+  // and they only mean something to someone who is actually tuning buffers. Remembered
+  // like the card's own open state — whoever wants them wants them every session, and
+  // whoever doesn't never turns them on.
+  const LAT_KEY = 'par-graph-latency';
+  let showLatency = $state(localStorage.getItem(LAT_KEY) === '1');
+  $effect(() => {
+    localStorage.setItem(LAT_KEY, showLatency ? '1' : '0');
+  });
+
   // The graph is the lower-altitude view of routing the group cards above already
   // express, so it starts folded away and the choice is remembered — a returning
   // user gets the page they left, not the page we guessed.
@@ -69,7 +79,14 @@
   // Fixed geometry — every row is an exact pixel height, so handle positions are
   // pure arithmetic (no per-frame DOM measurement); only the canvas width is
   // measured (it drives where the right column sits).
-  const COL_W = 240; // node-card width
+  // The wires need a *predictable* amount of room, not everything left over: the
+  // cards carry the names, badges and sliders that get elided, so they are what
+  // should take the slack. So the link gutter is fixed and the two columns split
+  // the rest evenly. It narrows on a small canvas, where 200 px of empty middle
+  // costs more than the curves gain from it.
+  const LINK_W = 200; // link gutter at full width
+  const LINK_W_MIN = 110; // …and on a narrow canvas
+  const COL_MIN = 180; // below this the canvas scrolls instead (see .canvas min-width)
   const ROW_SRC = 52; // source card height
   const GAP = 16; // vertical gap between cards
   const TOP = 8; // top padding
@@ -84,6 +101,10 @@
 
   let canvasEl: HTMLDivElement | undefined = $state();
   let Wc = $state(0); // measured canvas width
+  /** Link gutter for the measured width, and the card width that leaves. The gutter
+   *  reaches its full 200 px at ~910 px of canvas and gives way below that. */
+  const linkW = $derived(Math.max(LINK_W_MIN, Math.min(LINK_W, Wc * 0.22)));
+  const colW = $derived(Math.max(COL_MIN, (Wc - linkW) / 2));
   // A drag in progress. `rewire` is empty for the ordinary "draw a new wire"
   // drag; non-empty when the handle was Ctrl-grabbed, in which case it holds the
   // *far* ends of the wires now in hand (target keys when a source handle was
@@ -130,7 +151,7 @@
     ];
   });
 
-  /** The full track, for the row's tooltip — the row itself elides at 240 px. */
+  /** The full track, for the row's tooltip — the row itself elides at the card width. */
   function npTitle(np: NowPlaying): string {
     const parts = [ np.title, np.artist, np.album ].filter(Boolean);
     const label = parts.join(' — ') || 'playing';
@@ -154,7 +175,7 @@
     let y = TOP;
     return S.map((n) => {
       const h = ROW_SRC + (nowPlayingOf($routing, n.node_name) ? NP_H + NP_GAP : 0);
-      const box = { n, top: y, h, x: COL_W, y: y + ROW_SRC / 2, name: n.node_name };
+      const box = { n, top: y, h, x: colW, y: y + ROW_SRC / 2, name: n.node_name };
       y += h + GAP;
       return box;
     });
@@ -162,7 +183,7 @@
   // Handle centers, by node name / target key. Source handles sit on the right
   // edge of the left column; target handles on the left edge of the right one.
   const srcPos = $derived(srcLayout.map(({ name, x, y }) => ({ name, x, y })));
-  const outX = $derived(Math.max(COL_W, Wc - COL_W));
+  const outX = $derived(Math.max(colW, Wc - colW));
   // Stacked top-to-bottom, each node as tall as its content needs.
   const layout = $derived.by(() => {
     let y = TOP;
@@ -261,9 +282,57 @@
       }
     });
   });
+  // Peak hold for the input meters: the bar follows the live level, a thin line marks
+  // the highest one recently seen and slides back down, so a transient is still
+  // visible after it has decayed (a plain bar at 4 Hz just flickers past it).
+  //
+  // The slide runs on its own timer rather than on incoming frames, because the
+  // `meters` frame stops arriving *entirely* while the house is silent (see
+  // `peakOf`) — driven by frames, the line would freeze at the last loud moment and
+  // stay there. The timer only exists while some line is still above zero.
+  const PEAK_FALL = 0.4; // full-scale fraction the line slides per second
+  const PEAK_TICK = 100; // ms between slides
+  let peakHold = $state<Record<string, number>>({});
+  let peakTimer: ReturnType<typeof setInterval> | null = null;
+
+  function slidePeaks() {
+    const step = (PEAK_FALL * PEAK_TICK) / 1000;
+    const next: Record<string, number> = {};
+    let anyLeft = false;
+    for (const [name, v] of Object.entries(peakHold)) {
+      next[name] = Math.max(0, v - step);
+      if (next[name] > 0) anyLeft = true;
+    }
+    peakHold = next;
+    if (anyLeft) return;
+    if (peakTimer !== null) clearInterval(peakTimer);
+    peakTimer = null;
+  }
+
+  // Rising edge only; the slide above owns the way down. Same meters-slice dependency
+  // as the wire animation, for the same reason.
+  $effect(() => {
+    const meters = $routing.meters;
+    untrack(() => {
+      let next = peakHold;
+      let changed = false;
+      for (const s of $routing.matrix.sources) {
+        const peak = meters[s.node_name]?.peak ?? 0;
+        if (peak <= (next[s.node_name] ?? 0)) continue;
+        if (!changed) next = { ...peakHold };
+        next[s.node_name] = peak;
+        changed = true;
+      }
+      if (!changed) return;
+      peakHold = next;
+      peakTimer ??= setInterval(slidePeaks, PEAK_TICK);
+    });
+  });
+
   onDestroy(() => {
     for (const t of Object.values(flowTimers)) clearTimeout(t);
     for (const t of Object.values(xrunTimers)) clearTimeout(t);
+    if (peakTimer !== null) clearInterval(peakTimer);
   });
 
   /** The far ends of every *drawn* wire on this handle — what a Ctrl-grab picks
@@ -435,8 +504,9 @@
   // the daemon reports (routing.rs `latency_ms`), not a measured figure.
   const fmtLat = (ms: number | null | undefined): string | null => (ms == null ? null : `~${ms} ms`);
 
-  // Whether any node carries a latency estimate — gates the explanation caption.
-  const anyLatency = $derived([...S, ...O].some((n) => n.latency_ms != null));
+  // Whether any node carries a latency estimate *and* the badges are on — the help
+  // explains a badge, so with them hidden its ~ms paragraph explains nothing on screen.
+  const anyLatency = $derived(showLatency && [...S, ...O].some((n) => n.latency_ms != null));
 
   // Per-node xrun (dropped-cycle) counts from the profiler — pw-top's ERR. The
   // count is cumulative, so a non-zero value alone means "has dropped at some
@@ -660,6 +730,10 @@
           <input type="checkbox" bind:checked={showSpeakers} />
           Show individual speakers
         </label>
+        <label class="expert" title="The ~ms estimate of the buffering each source and speaker adds (configured, not measured)">
+          <input type="checkbox" bind:checked={showLatency} />
+          Show latencies
+        </label>
         <button class="ghost help-btn" type="button" title="How to read and edit this graph" onclick={() => (helpOpen = true)}>
           Explain
         </button>
@@ -704,7 +778,20 @@
             {#each srcLayout as box (box.n.node_name)}
               {@const n = box.n}
               {@const np = nowPlayingOf($routing, n.node_name)}
-              <div class="node src" class:offline={!n.present} style="top:{box.top}px; height:{box.h}px; width:{COL_W}px">
+              {@const lvl = Math.min(1, peakOf($routing, n.node_name))}
+              {@const hold = Math.min(1, peakHold[n.node_name] ?? 0)}
+              <div class="node src" class:offline={!n.present} style="top:{box.top}px; height:{box.h}px; width:{colW}px">
+                <!-- The input level, as a full-height bar on the card's outer edge. It
+                     used to be a horizontal bar sharing the name row, where a long
+                     device name squeezed it to zero width and the card silently lost
+                     its level; here the two never compete. Always rendered, including
+                     for an absent source (whose level is 0 anyway) — the empty track is
+                     what says "routed, nothing coming in", and the card's own dimming
+                     covers offline. -->
+                <div class="vmeter" style="--lvl:{lvl}; --peak:{hold}" title="input level {Math.round(lvl * 100)}%">
+                  <div class="vfill"></div>
+                  {#if hold > 0}<div class="vpeak"></div>{/if}
+                </div>
                 <div class="sbody">
                   <div class="body" style="height:{ROW_SRC - 12}px">
                     <span class="nm" title={n.display_name}>{n.display_name}</span>
@@ -717,10 +804,7 @@
                         onclick={(e) => askForget(n, e.currentTarget)}>✕</button
                       >
                     {:else}
-                      <div class="meter" title="input level {Math.round(peakOf($routing, n.node_name) * 100)}%">
-                        <div class="meter-fill" style="width:{Math.min(100, Math.round(peakOf($routing, n.node_name) * 100))}%"></div>
-                      </div>
-                      {#if fmtLat(n.latency_ms)}
+                      {#if showLatency && fmtLat(n.latency_ms)}
                         <span class="lat" title="Estimated input jitter buffer this source adds">{fmtLat(n.latency_ms)}</span>
                       {/if}
                       {#if (xrunsOf($routing, n.node_name) ?? 0) > 0}
@@ -746,8 +830,13 @@
                   {/if}
                 </div>
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <!-- Pinned to the name row's center, which is where `srcLayout` anchors
+                     this card's wires — the CSS default (`top: 50%`) is the *card's*
+                     center, so a card carrying a now-playing row put the dot half that
+                     row below its own wire. -->
                 <div
                   class="handle right"
+                  style="top:{ROW_SRC / 2}px"
                   class:candidate={dropSide === 'source'}
                   class:rewirable={modHeld && busySources.has(n.node_name)}
                   role="button"
@@ -764,7 +853,7 @@
 
             {#each layout as box (box.t.key)}
               {@const t = box.t}
-              <div class="node out" class:group={t.kind === 'group'} style="top:{box.top}px; height:{box.h}px; width:{COL_W}px">
+              <div class="node out" class:group={t.kind === 'group'} style="top:{box.top}px; height:{box.h}px; width:{colW}px">
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
                 <div
                   class="handle left"
@@ -803,7 +892,7 @@
                         {#if showSpeakers && syncGroupOf.get(m.node_name)}
                           <span class="tag grp" title="Plays in sync with the other speakers on this source set">sync {syncGroupOf.get(m.node_name)}</span>
                         {/if}
-                        {#if fmtLat(m.latency_ms)}
+                        {#if showLatency && fmtLat(m.latency_ms)}
                           <span class="lat" title="Estimated playout buffer this speaker adds (group lead + any per-device delay)">{fmtLat(m.latency_ms)}</span>
                         {/if}
                         {#if (xrunsOf($routing, m.node_name) ?? 0) > 0}
@@ -962,7 +1051,10 @@
   }
   .canvas {
     position: relative;
-    min-width: 580px; /* two 240px columns + link gutter; scrolls below this */
+    /* Two COL_MIN columns + the narrow LINK_W_MIN gutter — the point at which the
+       cards stop shrinking and the canvas scrolls instead. Keep in step with those
+       two constants. */
+    min-width: 470px;
   }
   .canvas.dragging {
     user-select: none;
@@ -1066,8 +1158,20 @@
     border-radius: 10px;
     background: var(--card-background-color, var(--ha-card-background, #fff));
   }
+  /* Only the right padding survives: the input meter is the first child and has to sit
+     flush against the left border on all three sides. Dropping the vertical padding
+     doesn't move anything — `.sbody` centres the rows in whatever height it gets, and
+     it was symmetric, so the name row's centre (and with it every wire anchor) stays
+     exactly where `srcLayout` puts it. */
   .node.src {
     left: 0;
+    align-items: stretch;
+    padding: 0 10px 0 0;
+  }
+  /* The name row has no filler element any more (the meter used to be it), so push
+     everything after the name — latency, xruns, the offline badge — to the far edge. */
+  .node.src .body > .nm {
+    margin-right: auto;
   }
   .node.out {
     right: 0;
@@ -1125,7 +1229,7 @@
   .np-state {
     flex: none;
   }
-  /* The title has priority for the 240 px of card: it shrinks only after the
+  /* The title has priority for the card's width: it shrinks only after the
      artist has given up everything it can, and the full string is in the row's
      tooltip either way. */
   .np-title {
@@ -1179,6 +1283,11 @@
     justify-content: center;
     min-width: 0;
     overflow: hidden;
+    /* One slider per speaker means a dozen red track-ends on one screen, which
+       reads as decoration and drowns out the badges that *are* status. Damped
+       towards the track colour: still visibly the danger zone, no longer the
+       loudest thing in the graph. The Outputs page keeps the full red. */
+    --vol-danger: color-mix(in srgb, var(--error-color) 30%, var(--divider-color));
   }
   .member.offline {
     opacity: 0.55;
@@ -1198,7 +1307,9 @@
     gap: 4px;
     min-width: 0;
   }
-  /* Connection handles at the inner edge of each column. */
+  /* Connection handles at the inner edge of each column. `top: 50%` is right for a
+     target card (its wires anchor at the card's center); a source card overrides it
+     inline, since its wires anchor on the name row. */
   .handle {
     position: absolute;
     top: 50%;
@@ -1231,17 +1342,50 @@
     left: 0;
   }
 
-  .meter {
-    flex: 1;
-    height: 4px;
-    border-radius: 2px;
-    background: color-mix(in srgb, var(--secondary-text-color) 20%, transparent);
+  /* Input level: a full-height bar on the card's outer edge. Blue, like everything else
+     in the graph — as green it was the one status-coloured thing in here that wasn't
+     reporting a status. 24px with a gradient that follows the level, over flat,
+     segmented and warning-topped bars at 20 and 30px: the alternatives were either
+     invisible down a column of cards or graphic enough to out-shout the badges.
+     (`spikes/vertical-meter.html` is where those were compared; this comment is its
+     answer, so the file can go whenever it stops earning its keep.)
+
+     It clips ITSELF rather than letting the card do it with `overflow: hidden`: the
+     wire handle sits at `left: 100%` with half of it outside the card on purpose, and
+     clipping at the card slices that dot into a half-disc. 9px is the card's inner
+     radius (10px, less its 1px border), so this corner sits exactly inside that one. */
+  .vmeter {
+    position: relative;
+    flex: none;
+    width: 24px;
+    margin-right: 10px;
     overflow: hidden;
+    border-radius: 9px 0 0 9px;
+    background: color-mix(in srgb, var(--secondary-text-color) 18%, transparent);
   }
-  .meter-fill {
-    height: 100%;
-    background: var(--success-color, #2e7d32);
-    transition: width 120ms linear;
+  .vfill {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: calc(var(--lvl) * 100%);
+    background: linear-gradient(
+      to top,
+      color-mix(in srgb, var(--primary-color) 45%, transparent),
+      var(--primary-color)
+    );
+    transition: height 120ms linear;
+  }
+  /* The held peak. Only rendered while it is above zero (see the markup), so a silent
+     card is a plain empty track rather than a bar with a line pinned to its floor. */
+  .vpeak {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(var(--peak) * 100%);
+    height: 2px;
+    background: color-mix(in srgb, var(--primary-text-color) 45%, transparent);
+    transition: bottom 100ms linear;
   }
   .tag {
     flex: none;

@@ -62,14 +62,29 @@
 
 <div class="vol-control">
   {#if canMute}
+    <!-- Drawn, not emoji: the two emoji render in the platform's colour font, which
+         put the only saturated non-status colour in a card full of speaker rows.
+         Same 16-box stroke-on-currentColor idiom as the other icons here, so the
+         state is carried by the glyph (waves vs. a cross) and by weight. -->
     <button
       class="mute"
       class:on={muted}
       aria-pressed={muted}
+      aria-label={muted ? 'Unmute' : 'Mute'}
       title={muted ? 'Unmute' : 'Mute'}
       {disabled}
       onclick={onMute}
-    >{muted ? '🔇' : '🔊'}</button>
+    >
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path class="cone" d="M2.5 6h2.1L8 3.2v9.6L4.6 10H2.5z" />
+        {#if muted}
+          <path d="M10.6 6.2l3.4 3.6M14 6.2l-3.4 3.6" />
+        {:else}
+          <path d="M10.3 5.9a3 3 0 0 1 0 4.2" />
+          <path d="M12.4 4.2a6 6 0 0 1 0 7.6" />
+        {/if}
+      </svg>
+    </button>
   {/if}
   {#if canVolume}
     <input
@@ -101,6 +116,10 @@
   }
   /* Danger zone: AirPlay volume is a dB scale, so the top of a linear slider is
      near-max power — tint the last 20% (80–100%) of the TRACK red as a warning.
+     `--vol-danger` lets a surface that shows many of these at once damp that red
+     down (the routing graph does; see FlowGraph's `.member`) without losing the
+     zone: full strength on a page with one or two sliders, where it reads as the
+     warning it is rather than as decoration.
      We must opt out of the native control (`appearance: none`) and clear
      `accent-color` (set globally in app.css): otherwise the browser paints an
      opaque native track OVER this gradient and the red never shows. The track is
@@ -117,7 +136,7 @@
     background: linear-gradient(
       to right,
       var(--divider-color) 0 80%,
-      var(--error-color) 80% 100%
+      var(--vol-danger, var(--error-color)) 80% 100%
     );
     cursor: pointer;
   }
@@ -164,20 +183,37 @@
   }
   .mute {
     flex: none;
+    display: inline-flex;
     border: none;
     background: none;
     cursor: pointer;
-    font-size: 0.85rem;
     line-height: 1;
     padding: 2px;
     border-radius: 6px;
-    opacity: 0.75;
+    color: var(--secondary-text-color);
+  }
+  .ico {
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.4;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .ico .cone {
+    fill: currentColor;
   }
   .mute:hover:not(:disabled) {
-    opacity: 1;
+    color: var(--primary-text-color);
   }
+  /* Muted is the state worth spotting across a column of rows, so it gets the full
+     text colour — the difference is weight, not hue. */
   .mute.on {
-    opacity: 1;
+    color: var(--primary-text-color);
+  }
+  .mute.on .ico {
+    stroke-width: 1.7;
   }
   .mute:disabled {
     cursor: default;
