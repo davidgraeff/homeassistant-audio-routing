@@ -33,7 +33,13 @@
 
   const good = $derived(signal?.verdict === 'good');
   const tight = $derived(signal?.verdict === 'marginal');
-  const bad = $derived(signal?.verdict === 'too_quiet' || signal?.verdict === 'unusable');
+  const bad = $derived(
+    signal?.verdict === 'too_quiet' || signal?.verdict === 'silent' || signal?.verdict === 'unusable',
+  );
+  // `silent` gets its own headline rather than "Cannot measure": the two send the user
+  // to different places, and "cannot measure" on a capture that is simply hearing
+  // nothing reads as a fault in the tool.
+  const silent = $derived(signal?.verdict === 'silent');
 </script>
 
 {#if settling || !signal}
@@ -57,11 +63,15 @@
     <div class="verdict">
       <span class="dot"></span>
       <strong>
-        {#if good}Level good{:else if tight}Level tight{:else if signal.verdict === 'too_quiet'}Too quiet to measure{:else}Cannot measure{/if}
+        {#if good}Level good{:else if tight}Level tight{:else if silent}Nothing to hear{:else if signal.verdict === 'too_quiet'}Too quiet to measure{:else}Cannot measure{/if}
       </strong>
       {#if subject}<span class="subject">{subject}</span>{/if}
       {#if signal.worst_peak_snr_db !== null}
         <span class="snr">{signal.worst_peak_snr_db.toFixed(0)} dB on the weaker tone</span>
+      {:else if signal.capture_peak_dbfs !== null}
+        <!-- No SNR to show, so show the level there *was*: it is what separates "the
+             microphone hears nothing" from "it heard something that was not the click". -->
+        <span class="snr">peak {signal.capture_peak_dbfs.toFixed(0)} dBFS</span>
       {/if}
     </div>
     <!-- Verbatim: the daemon writes this sentence, and it names both the problem and

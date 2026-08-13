@@ -70,6 +70,32 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// readable speed instead of flickering: ×0.85 per block ≈ −20 dB in 300 ms.
 const PEAK_DECAY: f32 = 0.85;
 
+/// How far back the **reported** clipping state looks, in seconds.
+///
+/// Clipping used to be reported sticky-since-connect. That is a *record*, not a
+/// verdict: once a capture had clipped, the pre-flight strip kept accusing it for the
+/// rest of the session, so a user who turned the playback down — the exact remedy the
+/// message asks for — had no way to see that it had worked. Hardware-observed
+/// 2026-08-13.
+///
+/// 5 s rather than 2: it has to cover at least what the pre-flight *analyses* (two
+/// pattern periods, 4 s — `measure::signal::PREFLIGHT_PERIODS`), or the strip would
+/// call a capture clean while the verdict beside it refused the very same audio for
+/// clipping. It must also stay inside [`RING_SECS`], because a mark the ring can no
+/// longer return audio for is pruned.
+const CLIP_WINDOW_SECS: u32 = 5;
+
+const _: () = assert!(CLIP_WINDOW_SECS as usize <= RING_SECS, "the clip window cannot look further back than the ring keeps audio");
+
+/// Most clipped-sample marks retained.
+///
+/// A hard-clipping capture produces one mark per sample — 48 000 a second — and the
+/// marks only ever answer "did anything clip in this span?", so the newest few
+/// thousand are as good as all of them. The cap keeps the list at 32 KB instead of
+/// 3.8 MB, and it keeps [`Capture::prune_marks`] off a full walk of half a million
+/// entries fifty times a second.
+const MAX_CLIP_MARKS: usize = 4096;
+
 /// The client's opening frame. Both key styles are accepted — the browser sends
 /// camelCase (it is reading `AudioContext.sampleRate`), the rest of this API is
 /// snake_case, and there is no value in making that a failure mode.
@@ -117,12 +143,20 @@ pub struct MicStatus {
     pub gap_count: u64,
     /// Decaying peak level, 0.0–1.0, for the meter.
     pub peak: f32,
-    /// Whether *any* sample has hit full scale since the current capture
-    /// connected. Sticky on purpose: plan §7 refuses to measure on a clipped
-    /// capture, so the user has to see it happened even if it has stopped.
+    /// Whether a sample hit full scale within the last [`Self::clip_window_secs`]
+    /// seconds — a statement about the level *now*, which is what the user can act
+    /// on. **Not** sticky since connect any more: see [`CLIP_WINDOW_SECS`] for why
+    /// that reading was unusable in practice.
     pub clipped: bool,
-    /// Samples at/beyond full scale, counted.
+    /// Samples at/beyond full scale since this capture connected — the record.
+    /// Monotonic, and it must stay that way: `measure::Feeder` diffs it to attribute
+    /// clipping to the member whose window it was measuring.
     pub clip_count: u64,
+    /// Samples at/beyond full scale inside the window — what [`Self::clipped`] is
+    /// derived from, reported as a number so the strip can quote it.
+    pub recent_clip_count: u64,
+    /// How far back the two fields above look ([`CLIP_WINDOW_SECS`]).
+    pub clip_window_secs: u32,
     /// Frames currently retrievable as a window.
     pub buffered_frames: usize,
     /// Ring capacity in frames (0 before the first hello).
@@ -221,10 +255,10 @@ struct Capture {
     /// each gap), so a window can be told whether it spans one.
     gap_frames: Vec<u64>,
     /// Frame indices of clipped samples, same purpose. Both lists are pruned to
-    /// what the ring can still return, so neither grows without bound.
+    /// what the ring can still return, so neither grows without bound, and this one
+    /// is additionally capped at [`MAX_CLIP_MARKS`].
     clip_frames: Vec<u64>,
     clip_count: u64,
-    clipped: bool,
     peak: f32,
 }
 
@@ -239,7 +273,6 @@ impl Capture {
             gap_frames: Vec::new(),
             clip_frames: Vec::new(),
             clip_count: 0,
-            clipped: false,
             peak: 0.0,
         }
     }
@@ -283,7 +316,6 @@ impl Capture {
             // smoothed away.
             if raw == i16::MAX || raw == i16::MIN {
                 self.clip_count += 1;
-                self.clipped = true;
                 self.clip_frames.push(base + i as u64);
             }
             let s = i16_to_f32(raw);
@@ -296,11 +328,35 @@ impl Capture {
         Ok(())
     }
 
-    /// Drop gap/clip marks the ring can no longer return audio for.
+    /// Drop gap/clip marks the ring can no longer return audio for, and cap the clip
+    /// list at [`MAX_CLIP_MARKS`].
+    ///
+    /// Both lists are pushed in frame order, so the stale part is always a *prefix*:
+    /// one partition point and one drain, rather than the `retain` this used to do.
+    /// That matters only in the case it was written for — a hard-clipping capture
+    /// pushes 48 000 marks a second, and walking half a million of them fifty times a
+    /// second on the socket task is exactly the wrong place to spend a core.
     fn prune_marks(&mut self) {
         let oldest = self.ring.oldest();
-        self.gap_frames.retain(|f| *f >= oldest);
-        self.clip_frames.retain(|f| *f >= oldest);
+        let stale_gaps = self.gap_frames.partition_point(|f| *f < oldest);
+        self.gap_frames.drain(..stale_gaps);
+        let stale_clips = self.clip_frames.partition_point(|f| *f < oldest);
+        self.clip_frames.drain(..stale_clips);
+        // The cap drops the *oldest* marks, so "did anything clip recently" — the only
+        // question asked of them — keeps its answer. A window old enough to have lost
+        // its marks can only under-report, and a capture clipping hard enough to hit
+        // the cap has recent marks by construction.
+        if self.clip_frames.len() > MAX_CLIP_MARKS {
+            self.clip_frames.drain(..self.clip_frames.len() - MAX_CLIP_MARKS);
+        }
+    }
+
+    /// Clipped samples within the last [`CLIP_WINDOW_SECS`] — the reported state
+    /// ([`MicStatus::clipped`] / [`MicStatus::recent_clip_count`]).
+    fn recent_clips(&self) -> u64 {
+        let horizon = self.ring.total.saturating_sub(u64::from(CLIP_WINDOW_SECS) * u64::from(self.sample_rate));
+        let from = self.clip_frames.partition_point(|f| *f < horizon);
+        (self.clip_frames.len() - from) as u64
     }
 
     fn window(&self, first: u64, len: usize) -> Option<MicWindow> {
@@ -400,10 +456,13 @@ impl MicIngest {
                 peak: 0.0,
                 clipped: false,
                 clip_count: 0,
+                recent_clip_count: 0,
+                clip_window_secs: CLIP_WINDOW_SECS,
                 buffered_frames: 0,
                 capacity_frames: 0,
             };
         };
+        let recent = c.recent_clips();
         MicStatus {
             connected,
             sample_rate: c.sample_rate,
@@ -411,8 +470,10 @@ impl MicIngest {
             blocks_received: c.blocks,
             gap_count: c.gaps,
             peak: c.peak,
-            clipped: c.clipped,
+            clipped: recent > 0,
             clip_count: c.clip_count,
+            recent_clip_count: recent,
+            clip_window_secs: CLIP_WINDOW_SECS,
             buffered_frames: c.ring.filled,
             capacity_frames: c.ring.buf.len(),
         }
@@ -608,16 +669,53 @@ mod tests {
     }
 
     #[test]
-    fn clipping_is_counted_stuck_and_locatable() {
+    fn clipping_is_counted_and_locatable() {
         let mut c = capture(4_800);
         c.on_block(&block(0, &[0, 10])).unwrap();
         c.on_block(&block(1, &[i16::MAX, i16::MIN])).unwrap();
         c.on_block(&block(2, &[0, 0])).unwrap();
         assert_eq!(c.clip_count, 2);
-        assert!(c.clipped, "the flag is sticky: plan §7 refuses to measure a capture that clipped");
+        assert_eq!(c.recent_clips(), 2);
         assert!(c.window(2, 2).unwrap().clipped);
         assert!(!c.window(0, 2).unwrap().clipped);
         assert!(!c.window(4, 2).unwrap().clipped);
+    }
+
+    /// The reported state answers "is the level wrong *now*", so it has to expire.
+    /// The lifetime count must not: `measure::Feeder` diffs it per member window, and
+    /// a counter that went backwards would attribute one member's clipping to another.
+    #[test]
+    fn the_reported_clipping_expires_while_the_record_does_not() {
+        // A full-size ring (10 s at the 48 kHz `capture` uses), so what expires the
+        // mark is the clip window rather than the ring running out.
+        let mut c = capture(48_000 * RING_SECS);
+        c.on_block(&block(0, &[i16::MAX, i16::MIN])).unwrap();
+        assert_eq!((c.clip_count, c.recent_clips()), (2, 2));
+
+        // CLIP_WINDOW_SECS of clean audio in 100 ms blocks: the mark falls out of the
+        // reported window while the total stands.
+        let quiet = vec![0i16; 4_800];
+        for i in 0..(CLIP_WINDOW_SECS as usize * 10) {
+            c.on_block(&block(i as u32 + 1, &quiet)).unwrap();
+        }
+        assert_eq!(c.clip_count, 2, "the record is monotonic");
+        assert_eq!(c.recent_clips(), 0, "and the verdict is not: turning the playback down has to show");
+    }
+
+    /// A hard-clipping capture pushes one mark per sample. The list is what makes
+    /// "did this window clip" answerable, and it must not become a memory leak or a
+    /// per-block full walk to do it.
+    #[test]
+    fn clip_marks_are_capped_without_losing_the_recent_ones() {
+        let mut c = capture(48_000);
+        let rails = vec![i16::MAX; 1_000];
+        for i in 0..(MAX_CLIP_MARKS / 500) {
+            c.on_block(&block(i as u32, &rails)).unwrap();
+        }
+        assert!(c.clip_frames.len() <= MAX_CLIP_MARKS, "marks are capped, got {}", c.clip_frames.len());
+        assert!(c.clip_count > MAX_CLIP_MARKS as u64, "the count still sees every one of them");
+        assert!(c.recent_clips() > 0, "and what is kept is the newest, so a live capture still reads as clipping");
+        assert!(c.window(c.ring.total - 100, 100).unwrap().clipped);
     }
 
     #[test]

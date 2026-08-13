@@ -59,13 +59,79 @@ fn the_preflight_grades_on_a_shorter_window_than_the_gate() {
 /// them. The estimator then reports 0 dB from an empty median, which must not be
 /// shown as "far too quiet" — it would send the user to turn the speakers up for
 /// no reason.
+///
+/// It must not be shown as "still collecting audio" either, which is what it said
+/// until 2026-08-13: the window is *full*, so nothing arrives by waiting. The level
+/// that was in it goes in the sentence instead, because that is the number which says
+/// whether the microphone heard anything at all.
 #[test]
 fn a_preflight_window_with_no_complete_period_says_so_rather_than_too_quiet() {
     let aligned = signal_check_window(&signal_window_at(0, 48_000, 2000.0, PREFLIGHT_PERIODS, 0.15, 0.000_5), 2000.0);
     assert_eq!(aligned.periods, 0, "this is the case the guard exists for");
     assert_eq!(aligned.verdict, SignalVerdict::Unusable, "{}", aligned.message);
-    assert!(aligned.message.contains("Still collecting"), "{}", aligned.message);
     assert!(!aligned.message.contains("quiet"), "a loud capture must never be called quiet: {}", aligned.message);
+    assert!(!aligned.message.contains("Still collecting"), "the window is full — waiting cannot help: {}", aligned.message);
+    assert!(aligned.message.contains("dBFS"), "the level it did hear is the actionable part: {}", aligned.message);
+    assert!(aligned.capture_peak_dbfs.is_some_and(|db| db > -20.0), "a loud window reports a loud peak: {:?}", aligned.capture_peak_dbfs);
+}
+
+/// The field case that made the message above wrong (2026-08-13): a capture that is
+/// connected, gapless, and carrying **nothing**. No period can ever close, so the old
+/// code invited the user to wait indefinitely for audio that was never coming.
+///
+/// It is `Silent` rather than `TooQuiet` because the remedies are disjoint: nothing is
+/// playing on the soloed speaker, or the input is muted, or the device gates its own
+/// silence to exact zeros — and "turn the speakers up" answers none of them.
+#[test]
+fn a_capture_carrying_nothing_is_silent_not_still_collecting() {
+    let frames = (2000.0 / 1000.0 * 48_000.0 * PREFLIGHT_PERIODS as f64) as usize;
+    let silence =
+        crate::align::mic::MicWindow { samples: vec![0.0; frames], first_frame: 12_345, sample_rate: 48_000, gap: false, clipped: false };
+    let check = signal_check_window(&silence, 2000.0);
+    assert_eq!(check.verdict, SignalVerdict::Silent, "{}", check.message);
+    assert_eq!(check.periods, 0);
+    assert!(check.capture_peak_dbfs.is_none(), "there is no dB value for digital silence");
+    assert!(check.message.contains("soloed"), "the message has to name what to check: {}", check.message);
+    assert!(!check.message.contains("Still collecting"), "{}", check.message);
+    assert!(!check.message.to_lowercase().contains("turn the speakers up"), "{}", check.message);
+
+    // A stuck DC offset is the same fault for the same reason — a constant signal has
+    // no local maximum whatever its value — so it must not read as a loud capture.
+    let dc = crate::align::mic::MicWindow { samples: vec![0.5; frames], first_frame: 0, sample_rate: 48_000, gap: false, clipped: false };
+    let check = signal_check_window(&dc, 2000.0);
+    assert_eq!(check.verdict, SignalVerdict::Silent, "{}", check.message);
+    assert!(check.capture_peak_dbfs.is_some_and(|db| (db + 6.0).abs() < 0.1), "{:?}", check.capture_peak_dbfs);
+}
+
+/// Clipping is decided over the mic's own trailing window, which is wider than the 4 s
+/// the pre-flight analyses. Without that, one broken level produced three different
+/// diagnoses in as many polls depending on where a rail sample happened to land.
+#[test]
+fn recent_clipping_outranks_a_level_verdict_but_not_a_more_specific_one() {
+    let good = signal_check_window(&signal_window(48_000, 2000.0, GATE_MIN_PERIODS, 0.15, 0.000_5), 2000.0);
+    assert_eq!(good.verdict, SignalVerdict::Good);
+
+    let clipped = with_recent_clipping(good.clone(), 7, 5);
+    assert_eq!(clipped.verdict, SignalVerdict::Unusable, "{}", clipped.message);
+    assert!(clipped.clipped);
+    assert_eq!(clipped.recent_clip_count, 7);
+    assert!(clipped.message.contains("7 sample"), "it quotes what it counted: {}", clipped.message);
+    assert!(clipped.message.contains("last 5 s"), "and over what span: {}", clipped.message);
+    assert!(clipped.message.contains("down"), "the action must be the right one: {}", clipped.message);
+
+    // No recent clipping leaves the verdict alone, and only records the zero.
+    let kept = with_recent_clipping(good.clone(), 0, 5);
+    assert_eq!(kept.verdict, SignalVerdict::Good);
+    assert_eq!(kept.recent_clip_count, 0);
+
+    // A silent capture stays silent: a clip four seconds ago is the *previous* state,
+    // and "it clipped" would send the user to turn down a speaker that is now mute.
+    let frames = (2000.0 / 1000.0 * 48_000.0 * PREFLIGHT_PERIODS as f64) as usize;
+    let silence =
+        crate::align::mic::MicWindow { samples: vec![0.0; frames], first_frame: 0, sample_rate: 48_000, gap: false, clipped: false };
+    let silent = with_recent_clipping(signal_check_window(&silence, 2000.0), 3, 5);
+    assert_eq!(silent.verdict, SignalVerdict::Silent, "{}", silent.message);
+    assert_eq!(silent.recent_clip_count, 3, "still reported, just not the headline");
 }
 
 #[test]

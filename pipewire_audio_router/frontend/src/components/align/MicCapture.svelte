@@ -93,13 +93,19 @@
           : 'no gaps, no dropped blocks',
     },
     {
+      // Recent, never sticky: the daemon reports clipping over a trailing window
+      // (`clip_window_secs`), so turning the playback down clears this line within a
+      // few seconds. A sticky line said "✕" for the rest of the session and gave the
+      // user no way to see that the remedy it asked for had worked.
       what: 'Nothing clipping',
       state: !capturing ? 'pending' : st?.clipped ? 'bad' : 'ok',
       note: !capturing
         ? '—'
         : st?.clipped
-          ? `${st.clip_count} samples at full scale — turn the playback down`
-          : 'headroom left at the top',
+          ? `${st.recent_clip_count} samples at full scale in the last ${st.clip_window_secs} s — turn the playback down`
+          : st && st.clip_count > 0
+            ? `headroom at the top now (${st.clip_count} clipped earlier)`
+            : 'headroom left at the top',
     },
     {
       // §4.2: an explicit `true` already refused the capture, so what is left here is

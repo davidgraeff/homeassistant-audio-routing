@@ -566,15 +566,26 @@ export type LevelChannel =
  *  because `MicStatus.peak` is a decaying broadband peak read against an 8 ms
  *  burst once per second. `GET api/align/mic/signal`. */
 export interface SignalCheck {
-  verdict: 'good' | 'marginal' | 'too_quiet' | 'unusable';
+  /** `silent` is not a degree of `too_quiet`: it means the capture carries no signal
+   *  at all, so "turn it up" is the wrong remedy and the right one is to check what
+   *  is soloed and whether the input is muted or gated. */
+  verdict: 'good' | 'marginal' | 'too_quiet' | 'silent' | 'unusable';
   /** One sentence naming the problem and the action. Show it verbatim. */
   message: string;
   sample_rate: number;
+  /** Complete pattern periods in the analysed window. The pre-flight window is two
+   *  periods long and the estimator only keeps periods it saw whole, so **1 is the
+   *  maximum** — never present this as a number that should grow. */
   periods: number;
   gap: boolean;
   clipped: boolean;
   /** The channel that decides the verdict; null when nothing was analysed. */
   worst_peak_snr_db: number | null;
+  /** Peak level of the analysed window in dBFS (0 = full scale); null when no window
+   *  was analysed, or when every sample in it was exactly zero. */
+  capture_peak_dbfs: number | null;
+  /** Clipped samples in the mic's recent window — see `MicStatus.clip_window_secs`. */
+  recent_clip_count: number;
   channels: SignalChannel[];
 }
 
@@ -598,9 +609,16 @@ export interface MicStatus {
   gap_count: number;
   /** Decaying peak level, 0.0–1.0. */
   peak: number;
-  /** Sticky: a measurement is refused on a capture that clipped at all. */
+  /** Whether anything hit full scale within the last `clip_window_secs` — a statement
+   *  about the level *now*. It used to be sticky since connect, which meant turning
+   *  the playback down (the remedy the message asks for) could never clear it. */
   clipped: boolean;
+  /** Clipped samples since this capture connected — the record, not the verdict. */
   clip_count: number;
+  /** Clipped samples inside the window, i.e. what `clipped` is derived from. */
+  recent_clip_count: number;
+  /** How far back `clipped` / `recent_clip_count` look. */
+  clip_window_secs: number;
   buffered_frames: number;
   capacity_frames: number;
 }

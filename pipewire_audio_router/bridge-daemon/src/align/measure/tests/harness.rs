@@ -229,6 +229,8 @@ impl MicFeed for FakeMic {
             peak: 0.3,
             clipped: false,
             clip_count: 0,
+            recent_clip_count: 0,
+            clip_window_secs: 5,
             buffered_frames: self.rate as usize * 10,
             capacity_frames: self.rate as usize * 10,
         }

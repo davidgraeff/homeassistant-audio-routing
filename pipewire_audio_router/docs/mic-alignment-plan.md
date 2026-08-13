@@ -1330,6 +1330,44 @@ details that matter in practice:
   slider, so the pre-flight uses one or two periods — it needs a rough SNR, not a
   phase. A compile-time assertion pins that relationship.
 
+**Three of the pre-flight's own verdicts were wrong on hardware (2026-08-13), and all
+three were wrong in the same way: they described the instrument instead of the fault.**
+
+- **"Still collecting audio — no complete test-pattern period has been captured yet"
+  was a lie about a full window.** `PeriodAcc::close` drops a period for two reasons,
+  and the plan only ever considered one: not covered end to end (the grid corner, a
+  transient) *or* "no local maximum at all", which is a **constant** capture — digital
+  silence, or a stuck DC offset. The second is the one that happens: it stood for
+  minutes on a capture that was connected, gapless and carrying nothing, while telling
+  the user to wait for audio that could not arrive. Silence is therefore its own
+  verdict (`SignalVerdict::Silent`, "Nothing to hear"), because the remedies are
+  disjoint from `TooQuiet`'s — nothing is playing on the soloed speaker, the input is
+  muted, or the device gates its own silence — and "turn the speakers up" answers none
+  of them. Every refusal that analysed a window now also carries
+  `capture_peak_dbfs`, since the level *is* the discriminator between "heard nothing"
+  and "heard something that was not the click track".
+- **Clipping was decided by where the analysis window happened to land.** A capture
+  clipping on every click produced three different diagnoses in three consecutive
+  polls — `clipping`, then the silence branch above, then `good` — because
+  `MicWindow::clipped` only sees rail samples inside the 4 s it analysed. It is now
+  folded in from the mic's own trailing window (`with_recent_clipping`), which is
+  deliberately *wider* (5 s) than the analysed one so the gap between polls is covered.
+  Clipping outranks a level verdict (no level read off a clipped capture means
+  anything) but not silence or a gap, which are more specific.
+- **`MicStatus::clipped` was sticky since connect, which made the remedy invisible.**
+  Turning the playback down is exactly what the message asks for, and the strip went on
+  accusing the capture for the rest of the session. It is now windowed
+  (`CLIP_WINDOW_SECS`), with `recent_clip_count` beside it; `clip_count` stays
+  monotonic because `measure::Feeder` diffs it to attribute clipping to one member's
+  window. The marks behind it are capped (`MAX_CLIP_MARKS`) and pruned by prefix rather
+  than by `retain`, because a hard-clipping capture pushes one mark per sample — 48 000
+  a second — and the socket task should not walk half a million of them fifty times a
+  second.
+
+One thing the UI must not present as progress: the pre-flight window is two periods
+long and the estimator only keeps periods it saw whole, so **`periods: 1` is the
+maximum** it can ever report.
+
 **Near field breaks the two-phase shape.** Its level is only meaningful *at* each
 speaker, and the risk inverts from too-quiet to clipping — so level-setting folds
 into each arrival (walk up, it goes green, measure, move on), which also makes near
