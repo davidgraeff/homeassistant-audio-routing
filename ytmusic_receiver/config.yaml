@@ -5,9 +5,11 @@ description: >-
   Makes the Cast button in the YouTube Music app target the PipeWire Audio Router,
   by running a DIAL + Lounge receiver and feeding its audio in as an RTP source.
 url: "https://github.com/davidgraeff/homeassistant-audio-routing"
-# LOCAL/PRIVATE add-on, deliberately never published: it depends on unofficial
-# protocols and on yt-dlp keeping up with YouTube, and it plays from the owner's
-# own signed-in account. See docs/ytmusic-receiver.md.
+# Installable from THIS repository's store and deliberately no further: it depends on
+# unofficial protocols and on yt-dlp keeping up with YouTube, it plays from the owner's
+# own signed-in account, and wider distribution would be against YouTube's ToS — so it
+# is never submitted to a community store, and the visibility of its GHCR image package
+# stays the repository owner's call. See docs/ytmusic-receiver.md.
 #
 # Built on the workstation and pulled, exactly like the audio-router add-on. There
 # is no compiler involved here, but *assembling* the image still means apt +
@@ -36,8 +38,21 @@ host_network: true
 # No IPC_LOCK: unlike the router, nothing here mlocks the audio path.
 privileged:
   - SYS_NICE
-# No ingress/panel: the phone's YouTube Music app IS the control surface. There is
-# no web UI to serve, and adding one would only duplicate the app's transport.
+# Ingress, for the setup page — NOT a remote control. The phone's YouTube Music app
+# stays the control surface for playback; duplicating its transport here would be
+# pointless. What the page does is the two things outside that app which decide
+# whether a cast is audible at all: the RTP source on the router, and the cookie jar.
+# Both used to be workstation errands (the router's own UI, push_cookies.py over ssh
+# + docker exec), which is exactly what kept this add-on from being installable in
+# one click.
+#
+# `ingress_port` must equal the port receiver/admin.js listens on (run.sh exports
+# YTCR_ADMIN_PORT=8097): host networking means Supervisor proxies ingress straight to
+# that port on this host, so a mismatch is a panel that loads nothing.
+ingress: true
+ingress_port: 8097
+panel_icon: mdi:youtube
+panel_title: YouTube Music
 options:
   device_name: "Musik (Home Assistant)"
   rtp_host: "127.0.0.1"

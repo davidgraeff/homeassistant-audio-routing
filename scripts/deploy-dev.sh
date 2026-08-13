@@ -49,32 +49,11 @@ usage() {
   exit 1
 }
 
-# The YouTube Music receiver add-on shares its application code with the
-# Raspberry Pi deployment, which lives at firmware/pi-ytmusic/receiver/ and stays
-# canonical: that role is installed by `scp -r firmware/pi-ytmusic`, so it has to
-# remain self-contained. Docker cannot COPY from outside its build context, so the
-# app is staged into the add-on directory here, immediately before the build.
-#
-# Staged rather than symlinked (Docker does not follow symlinks out of context) and
-# rather than moved (that would break the Pi's install path).
+# Stage the shared cast-receiver app into the add-on's build context. Its own script,
+# because .github/workflows/build-addon.yml has to run the identical step before a
+# release build — the published image must be the one a dev push produces.
 stage_ytmusic_receiver() {
-  local src="$REPO_ROOT/firmware/pi-ytmusic/receiver"
-  local dst="$REPO_ROOT/ytmusic_receiver/receiver"
-  [ -f "$src/index.js" ] || { echo "ERROR: $src/index.js missing" >&2; exit 1; }
-  echo "--- staging shared receiver app from firmware/pi-ytmusic/receiver ---"
-  rm -rf "$dst"
-  mkdir -p "$dst"
-  # Only the app files. node_modules is npm's job inside the image, and copying a
-  # host build of it would mean armv7 binaries in an aarch64 image.
-  #
-  # The .py files are the long-lived resolver daemon and its resident JS-challenge
-  # provider, both spawned/imported by ytdlp.js's daemon rather than by node. Without
-  # them the image still plays, just with a per-track yt-dlp and a 15 s challenge —
-  # which is why the copy fails loudly if either is missing.
-  cp "$src"/*.js "$src"/*.py "$src"/package.json "$dst/"
-  for required in ytdlp_daemon.py jsc_resident.py jsc_worker.js; do
-    [ -f "$dst/$required" ] || { echo "ERROR: $src/$required missing" >&2; exit 1; }
-  done
+  "$REPO_ROOT/scripts/stage-ytmusic-receiver.sh"
 }
 
 # Map the target's `uname -m` to Home Assistant's arch name and the buildx

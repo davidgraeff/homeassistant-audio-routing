@@ -73,9 +73,13 @@ RUN npm install --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 COPY receiver/*.js ./
 # The long-lived resolver (ytdlp.js spawns it with the venv's interpreter, so it
-# imports yt_dlp as a library instead of paying a process start per track) and its
-# resident JS-challenge provider (jsc_worker.js arrives with the *.js above).
+# imports yt_dlp as a library instead of paying a process start per track), its
+# resident JS-challenge provider (jsc_worker.js arrives with the *.js above), and
+# cookie_jar.py — the jar rules the admin page and push_cookies.py share.
 COPY receiver/*.py ./
+# The admin page served on the ingress port. One static file, no build step: this app
+# is shared verbatim with the Pi role, which is installed by plain `scp -r`.
+COPY receiver/*.html ./
 
 COPY rootfs/ /
 

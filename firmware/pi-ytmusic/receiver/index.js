@@ -19,6 +19,7 @@ import os from 'os';
 import { existsSync } from 'fs';
 import YouTubeCastReceiver, { Constants } from 'yt-cast-receiver';
 import path from 'path';
+import startAdmin from './admin.js';
 import MetadataReporter from './metadata.js';
 import MpvClient from './mpv.js';
 import MpvPlayer from './player.js';
@@ -246,8 +247,12 @@ async function main() {
   // Now-playing reporting to the add-on (metadata.js). Off unless the add-on host
   // is configured: this role is otherwise a pure RTP sender that talks to nobody,
   // and it must stay able to run that way.
+  // Where the audio-router add-on's API lives. Also what the admin page talks to,
+  // so it is no longer only about metadata — `YTCR_REPORT_METADATA=false` turns the
+  // *reporting* off while leaving the host known (the add-on's `report_metadata`
+  // option). Unset means on, which is what the Pi's unit relies on.
   const addonHost = process.env.YTCR_ADDON_HOST;
-  const metadata = addonHost
+  const metadata = addonHost && process.env.YTCR_REPORT_METADATA !== 'false'
     ? new MetadataReporter({
       host: addonHost,
       apiPort: Number(process.env.YTCR_ADDON_API_PORT || 8099),
@@ -311,18 +316,30 @@ async function main() {
   ytdlpDaemon?.setLogger(receiver.logger);
   metadata?.attach(mpv);
 
+  /** The phone currently driving us, for the admin page to show. Kept from the
+   *  events rather than read out of the library, because these are the same two
+   *  moments the log already reports. */
+  let connectedSender = null;
+
   receiver.on('senderConnect', (sender) => {
     // Fresh session state for the first track. It expires in minutes (see
     // MAX_WARM_AGE_S), and the first play after a connect is the resolve least able to
     // absorb a retry — the user is waiting on it with nothing prefetched.
     ytdlpDaemon?.refresh('sender connected');
     const isYtMusic = sender.client?.key === Constants.CLIENTS.YTMUSIC.key;
+    connectedSender = {
+      name: sender.name,
+      client: sender.client?.name ?? null,
+      yt_music: isYtMusic,
+      since: Date.now(),
+    };
     receiver.logger.info(
       `[ytcr] sender connected: ${sender.name}` +
       `${sender.client?.name ? ` (${sender.client.name})` : ''}` +
       `${isYtMusic ? ' — YouTube Music' : ''}`);
   });
   receiver.on('senderDisconnect', (sender) => {
+    connectedSender = null;
     receiver.logger.info(`[ytcr] sender disconnected: ${sender.name}`);
   });
   receiver.on('error', (error) => {
@@ -347,6 +364,46 @@ async function main() {
     }
   }
   await receiver.start();
+
+  // The admin page (admin.js): the RTP source on the router and the cookie jar,
+  // which are the two things outside the phone's app that decide whether a cast is
+  // audible. Only when a port is set — in the add-on that is ingress, so Home
+  // Assistant has authenticated the visitor; on the Pi it is opt-in, because this
+  // page writes a Google credential and nothing there asks who is asking.
+  const admin = startAdmin({
+    port: Number(process.env.YTCR_ADMIN_PORT) || null,
+    bind: process.env.YTCR_ADMIN_BIND || undefined,
+    device: {
+      name: deviceName,
+      screenName,
+      dialPort,
+      bindAddress,
+      // `pipewire/ytm-out` is an mpv device spec; the node name is the part the
+      // PipeWire graph knows it by.
+      sinkName: audioDevice.replace(/^pipewire\//, ''),
+    },
+    router: {
+      host: addonHost ?? '127.0.0.1',
+      apiPort: Number(process.env.YTCR_ADDON_API_PORT || 8099),
+    },
+    rtpPort: Number(process.env.YTCR_RTP_PORT || 46001),
+    jar: {
+      file: process.env.YTCR_COOKIES,
+      // The jar helper is pure stdlib, so any python3 will do — unlike the resolver
+      // daemon, which needs the venv's interpreter to import yt_dlp.
+      python: process.env.YTCR_ADMIN_PYTHON || 'python3',
+      ytdlp: process.env.YTCR_YTDL_PATH,
+      jsRuntime: process.env.YTCR_JS_RUNTIME || 'quickjs',
+      probeUrl: process.env.YTCR_PROBE_URL || null,
+    },
+    probes: {
+      mpv,
+      resolverDaemon: () => !!ytdlpDaemon,
+      sender: () => connectedSender,
+    },
+    logger: receiver.logger,
+  });
+
   receiver.logger.info(
     `[ytcr] ready — DIAL name "${deviceName}" on ${bindAddress ?? 'all interfaces'}:${dialPort}, ` +
     `audio -> ${audioDevice}` +
@@ -360,6 +417,8 @@ async function main() {
     }
     stopping = true;
     receiver.logger.info(`[ytcr] ${signal} — shutting down`);
+    // First, so a page mid-refresh cannot hold the process open past its answer.
+    admin?.close();
     try {
       await receiver.stop();
     }

@@ -8,9 +8,11 @@ arrives in the router as an ordinary RTP source that can be routed to any set of
 protocols and on `yt-dlp` keeping pace with YouTube's anti-bot measures, it plays from the
 owner's signed-in account, and distributing it would be against YouTube's ToS. The
 Raspberry Pi role lives in [`firmware/pi-ytmusic/`](../firmware/pi-ytmusic/README.md) and
-the Home Assistant deployment in [`ytmusic_receiver/`](../ytmusic_receiver/README.md) — a
-**local, never-published add-on**. The audio-router add-on itself knows nothing about
-YouTube; from its point of view this is just another RTP source.
+the Home Assistant deployment in [`ytmusic_receiver/`](../ytmusic_receiver/README.md) — an
+add-on installable from **this repository's own store and nowhere else**: it is not submitted
+to any community store, and whether its GHCR image package is public at all is a decision for
+whoever owns the repository, not something the build workflow assumes. The audio-router add-on
+itself knows nothing about YouTube; from its point of view this is just another RTP source.
 
 If the routing side is unfamiliar, read
 [`architecture.md`](../pipewire_audio_router/docs/architecture.md) §3 (*Sources — audio into
@@ -175,32 +177,75 @@ contract with the add-on's Sources tab; this role is invisible to it by design.
 
 ### Home Assistant add-on
 
+Install it from the add-on store like any other add-on, start it, and open its panel — the
+[admin page](#the-admin-page) does the rest of the setup (the RTP source and the cookie jar),
+which is what makes this a click-to-install add-on rather than a workstation errand.
+`.github/workflows/build-addon.yml` publishes the image for `amd64`/`aarch64`, so Supervisor
+pulls rather than assembles it on the device.
+
+To push an uncommitted build from the workstation instead:
+
 ```bash
 ./scripts/deploy-dev.sh ytmusic
 ```
 
-That stages the shared app, builds the image on the workstation, pushes it to GHCR, and has
-Supervisor pull it (`image:` is set in `config.yaml`, which makes Supervisor treat a local
-add-on as image-based). Options are `device_name`, `rtp_host`/`rtp_port` (default
-`127.0.0.1:46002`), `dial_port` (8098), `cipher_url`, `bind_address`, `report_metadata` and
-`log_level`.
+That stages the shared app ([`scripts/stage-ytmusic-receiver.sh`](../scripts/stage-ytmusic-receiver.sh),
+the same step CI runs), builds the image, pushes it to GHCR, and has Supervisor pull it
+(`image:` is set in `config.yaml`, which makes Supervisor treat even a local add-on as
+image-based). Options are `device_name`, `rtp_host`/`rtp_port` (default `127.0.0.1:46002`),
+`dial_port` (8098), `cipher_url`, `bind_address`, `report_metadata` and `log_level`.
 
 The container needs `host_network: true` for two independent reasons — DIAL discovery is
 SSDP multicast on `239.255.255.250:1900`, so the phone can only find the receiver if it
 shares the host's LAN interface; and the RTP goes to the audio-router add-on, which is
 loopback on the same host. `SYS_NICE` lets PipeWire's realtime module raise its data loop to
-`SCHED_FIFO`. There is deliberately **no ingress panel**: the phone's app is the control
-surface.
+`SCHED_FIFO`. The ingress panel is a **setup** page, not a remote: the phone's app remains
+the control surface for playback.
 
 [`rootfs/run.sh`](../ytmusic_receiver/rootfs/run.sh) generates the `ytm-out` RTP sink from
 the options (a static drop-in cannot know the configured host/port), starts a private D-Bus
 + pipewire + wireplumber, kicks off a background `pip install --upgrade` of the resolver
 stack, and `exec`s node so it becomes PID 1 and receives Supervisor's `SIGTERM` directly.
 
+### The admin page
+
+Served by [`receiver/admin.js`](../firmware/pi-ytmusic/receiver/admin.js) on
+`YTCR_ADMIN_PORT` (8097 in the add-on, which `config.yaml` publishes as `ingress_port` — the
+two must agree or the panel proxies to nothing). One `http` server and one static
+[`admin.html`](../firmware/pi-ytmusic/receiver/admin.html): no framework and no build step,
+because the app is shared verbatim with the Pi role, which is installed by plain `scp -r`.
+
+It exists because casting is audible only if two things *outside* the phone's app are true,
+and both used to be workstation errands:
+
+- **the RTP source on the router.** The page finds it by the only thing both ends agree on —
+  the UDP port this receiver transmits to, not the label, which the user may rename. One
+  button creates it, or corrects `rate`/`ignore_ssrc` on an existing one; the correcting
+  `PUT` re-sends the whole config with only those fields replaced, because
+  `PUT /api/sources/{id}` *replaces* the config object and a partial body would silently
+  reset a tuned `latency_msec`.
+- **the cookie jar.** Upload a `cookies.txt`, and the page says whether it can authenticate
+  before storing it — same verdict `push_cookies.py` gives, because both call
+  [`cookie_jar.py`](../firmware/pi-ytmusic/receiver/cookie_jar.py). *Test playback* runs the
+  liveness probe locally, i.e. what `--check` does over ssh. The rollback guard is here too:
+  the browser sends `File.lastModified`, and an upload older than the jar on disk is refused
+  unless confirmed, because that jar rotates and overwriting it backwards can invalidate the
+  session.
+
+It also answers "why is nothing playing" without the log: whether the `ytm-out` sink actually
+loaded (run.sh only warns about that once, at boot), whether a phone is connected, what mpv
+is doing (asked over its IPC socket, so there is no second copy of the state to go stale),
+the yt-dlp version, and whether the long-lived resolver is running.
+
+**On the Pi it is off unless asked for** (`setup_pi_ytmusic.py --admin-port`). That is a
+security decision, not a default: in the add-on the page sits behind ingress, which
+authenticates the visitor, whereas on the Pi it would be an unauthenticated LAN endpoint that
+*writes a Google credential*. Nothing else about the two deployments differs here.
+
 ### The router side
 
-One-time, by hand in the add-on's Sources tab (or over the API): an RTP source per
-deployment —
+The add-on's admin page does this in one click (above). By hand in the router's Sources tab,
+or over its API, it is an RTP source per deployment —
 
 | | value |
 |---|---|
@@ -803,7 +848,13 @@ dumps the jar back into* FILE. Three consequences:
   This is yt-dlp's own documented advice and it is the difference between "works for months"
   and "broke by tomorrow".
 
-`push_cookies.py` runs **on the workstation** (that is where a browser and a login exist)
+**In the add-on, the [admin page](#the-admin-page) is the path**: export a jar with yt-dlp on
+whatever machine has the browser, upload it there, press *Test playback*. It applies the same
+rules as the tool below — both call `cookie_jar.py`, so a jar one accepts the other cannot
+refuse — and it needs no ssh, no `docker exec` and no repo checkout.
+
+`push_cookies.py` remains the path for the **Pi** (whose page is off by default, see above)
+and for scripting. It runs **on the workstation** (that is where a browser and a login exist)
 and does: extract (`--from-browser`, via yt-dlp so Firefox's sqlite *and* Chromium's
 keyring-encrypted store both work) or take an existing `--file`; **filter to Google/YouTube
 domains only** — a browser jar otherwise ships every site you have ever visited; report the

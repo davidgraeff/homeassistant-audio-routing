@@ -49,7 +49,7 @@ BIND_ADDRESS="$(opt bind_address)"
 REPORT_METADATA="$(opt report_metadata true)"
 LOG_LEVEL="$(opt log_level info)"
 
-echo "[run] YouTube Music receiver ${ADDON_VERSION:-dev}: DIAL '${DEVICE_NAME}' on :${DIAL_PORT}, audio -> ${RTP_HOST}:${RTP_PORT}"
+echo "[run] YouTube Music receiver ${ADDON_VERSION:-dev}: DIAL '${DEVICE_NAME}' on :${DIAL_PORT}, audio -> ${RTP_HOST}:${RTP_PORT}, admin page on :8097"
 
 # --- PipeWire ---------------------------------------------------------------
 export XDG_RUNTIME_DIR=/run/pipewire
@@ -137,12 +137,25 @@ export YTCR_LOG_LEVEL="$LOG_LEVEL"
 [ -n "$CIPHER_URL" ] && export YTCR_CIPHER_URL="$CIPHER_URL"
 [ -n "$POT_URL" ] && export YTCR_POT_URL="$POT_URL"
 [ -n "$BIND_ADDRESS" ] && export YTCR_BIND_ADDRESS="$BIND_ADDRESS"
-if [ "$REPORT_METADATA" = "true" ]; then
-  # The router add-on shares this host's network namespace, so its API is local.
-  export YTCR_ADDON_HOST="$RTP_HOST"
-  export YTCR_ADDON_API_PORT=8099
-  export YTCR_RTP_PORT="$RTP_PORT"
-fi
+# The router add-on shares this host's network namespace, so its API is local.
+# Exported unconditionally, because the admin page talks to that API too — it is how
+# the RTP source gets created — so only the *reporting* is gated by the option.
+export YTCR_ADDON_HOST="$RTP_HOST"
+export YTCR_ADDON_API_PORT=8099
+export YTCR_RTP_PORT="$RTP_PORT"
+export YTCR_REPORT_METADATA="$REPORT_METADATA"
+
+# The admin page (receiver/admin.js). This port MUST equal `ingress_port` in
+# config.yaml — with host networking Supervisor proxies ingress straight to it, and a
+# mismatch means a sidebar panel that loads nothing. Deliberately neither 8098 (this
+# add-on's DIAL server) nor 8099 (the router's API), both already on this host.
+export YTCR_ADMIN_PORT=8097
+# Left on every interface, matching the router add-on's own UI: host networking means
+# this page is then also reachable unauthenticated at <host>:8097, not just through
+# ingress. Supervisor may well proxy ingress via 127.0.0.1 for a host-network add-on,
+# in which case `export YTCR_ADMIN_BIND=127.0.0.1` would close that off entirely —
+# worth confirming against a real instance before relying on it, because getting it
+# wrong is a panel that loads nothing.
 
 if [ ! -f "$YTCR_COOKIES" ]; then
   echo "[run] no cookie jar at $YTCR_COOKIES — resolving anonymously."

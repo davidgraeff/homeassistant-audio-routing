@@ -564,7 +564,7 @@ def deploy_receiver(home: str) -> bool:
 def receiver_unit(home: str, *, device_name: str | None, dial_port: int,
                   bind_address: str | None, addon_host: str | None,
                   api_port: int, rtp_port: int, cipher_url: str | None,
-                  pot_url: str | None = None) -> str:
+                  pot_url: str | None = None, admin_port: int | None = None) -> str:
     app_dir = os.path.join(home, APP_DIR_REL)
     state_dir = os.path.join(home, STATE_DIR_REL)
     # Every value is QUOTED. systemd splits an unquoted `Environment=` line on
@@ -604,6 +604,14 @@ def receiver_unit(home: str, *, device_name: str | None, dial_port: int,
         env.append(f'Environment="YTCR_DEVICE_NAME={device_name}"')
     if bind_address:
         env.append(f'Environment="YTCR_BIND_ADDRESS={bind_address}"')
+    # The receiver's admin page (receiver/admin.js) — status, the router's RTP source,
+    # and cookie-jar upload. OFF unless a port is asked for, and that is a security
+    # decision rather than a default: in the Home Assistant add-on this page sits behind
+    # ingress, which authenticates the visitor, while here it would be an unauthenticated
+    # endpoint on the LAN that *writes a Google credential*. Anyone who wants it on a
+    # trusted network can pass --admin-port; push_cookies.py stays the safe path.
+    if admin_port:
+        env.append(f'Environment="YTCR_ADMIN_PORT={admin_port}"')
     env_block = "\n".join(env)
     return f"""\
 {MANAGED_MARKER}
@@ -640,14 +648,14 @@ WantedBy=default.target
 def install_receiver_service(home: str, *, device_name: str | None, dial_port: int,
                              bind_address: str | None, addon_host: str | None,
                              api_port: int, rtp_port: int, cipher_url: str | None,
-                             pot_url: str | None = None) -> None:
+                             pot_url: str | None = None, admin_port: int | None = None) -> None:
     print("== Installing the receiver service ==")
     os.makedirs(os.path.join(home, STATE_DIR_REL), exist_ok=True)
     unit_path = os.path.join(home, ".config/systemd/user", RECEIVER_UNIT)
     user_write(unit_path, receiver_unit(home, device_name=device_name, dial_port=dial_port,
                                         bind_address=bind_address, addon_host=addon_host,
                                         api_port=api_port, rtp_port=rtp_port, cipher_url=cipher_url,
-                                        pot_url=pot_url))
+                                        pot_url=pot_url, admin_port=admin_port))
     systemctl_user("daemon-reload", check=False)
     systemctl_user("enable", "--now", RECEIVER_UNIT, check=False)
     systemctl_user("restart", RECEIVER_UNIT, check=False)
@@ -1147,6 +1155,12 @@ def main() -> None:
                          f"(~3x faster than solving locally on this hardware; the local "
                          f"runtime stays as the automatic fallback). Pass 'none' to solve "
                          f"only locally. Default: {DEFAULT_CIPHER_URL}")
+    ap.add_argument("--admin-port", type=int, default=None,
+                    help="Serve the receiver's admin page (status, the router's RTP source, "
+                         "cookie-jar upload) on this port. OFF by default on purpose: the "
+                         "page writes a Google credential and nothing here authenticates a "
+                         "visitor, unlike the Home Assistant add-on where it sits behind "
+                         "ingress. Only enable it on a network you trust.")
     ap.add_argument("--no-service", action="store_true",
                     help="Set up only the audio path; skip installing/starting the "
                          "cast receiver service.")
@@ -1191,7 +1205,7 @@ def main() -> None:
                                  addon_host=None if args.no_metadata else args.host,
                                  api_port=args.api_port, rtp_port=args.port,
                                  cipher_url=cipher_url,
-                                 pot_url=args.pot_url)
+                                 pot_url=args.pot_url, admin_port=args.admin_port)
     verify(args.host, args.port, dial_port=args.dial_port, home=home, cipher_url=cipher_url)
     if args.test_tone:
         test_tone()

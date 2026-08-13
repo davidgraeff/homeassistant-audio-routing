@@ -10,9 +10,11 @@ YouTube Music app --DIAL/Lounge--> node /app/index.js
     --UDP/RTP:46002--> audio router --> routing matrix --> speakers
 ```
 
-**A local, deliberately never-published add-on.** It depends on unofficial protocols and on
-`yt-dlp` keeping pace with YouTube, and it plays from the owner's signed-in account. How it
-works, why it is shaped this way, and every measured gotcha behind it:
+**Installable in one click from this repository's store — and deliberately no further than
+that.** It depends on unofficial protocols and on `yt-dlp` keeping pace with YouTube, it plays
+from the owner's own signed-in account, and distributing it more widely would be against
+YouTube's ToS, so it is not submitted to any community store. How it works, why it is shaped
+this way, and every measured gotcha behind it:
 [`docs/ytmusic-receiver.md`](../docs/ytmusic-receiver.md).
 
 The receiver application is **shared** with the Raspberry Pi deployment and lives at
@@ -23,31 +25,39 @@ building, because Docker cannot `COPY` from outside its build context.
 
 ## Install
 
+Install it from the add-on store, start it, and open its panel. Everything else is on that
+page:
+
+1. **Audio route** — one button creates the RTP source this receiver sends to on the
+   [audio router](../pipewire_audio_router/README.md) (`port 46002`, `rate 48000`,
+   `ignore_ssrc true`), or corrects those settings on a source that already exists. Without
+   it the audio has nowhere to go and metadata reports come back `404`. Where it *plays* is
+   still yours to choose, in the router's own Routing page.
+2. **YouTube account** — upload a `cookies.txt`; the page tells you whether it can
+   authenticate *before* storing it, and *Test playback* proves it resolves a real video with
+   this box's own yt-dlp. The page also spells out how to export one with yt-dlp, including
+   the part that actually matters: use a browser profile you then abandon.
+
+With no jar the receiver resolves anonymously — no Premium, no ad-free playback, and YouTube
+stops answering before long. The jar is a live, rotating credential rather than a config
+file; the reasoning is in
+[`docs/ytmusic-receiver.md`](../docs/ytmusic-receiver.md#cookies), and the page enforces it
+(it refuses an export older than the jar already on disk unless you insist).
+
+The image is **prebuilt and pulled**, never assembled on the device: there is no compiler
+involved, but `apt` + `npm install` + a pip venv under emulation on a Pi 4 is the slow part.
+`.github/workflows/build-addon.yml` publishes it for `amd64`/`aarch64`, and `image:` in
+`config.yaml` is what makes Supervisor pull it.
+
+To push an uncommitted build from the workstation:
+
 ```bash
 ./scripts/deploy-dev.sh ytmusic
 ```
 
-The image is **built on the workstation and pulled**, not built on the device: there is no
-compiler involved, but assembling it still means `apt` + `npm install` + a pip venv, and
-doing that under emulation on a Pi 4 is the slow part. `image:` is set in `config.yaml`,
-which is what makes Supervisor treat this local add-on as image-based.
-
-Then, in the audio router, add an **RTP source** with `port 46002`, `rate 48000`,
-`source_addr 0.0.0.0` and `ignore_ssrc true`, and route it wherever the music should play.
-Without it the audio has nowhere to go and metadata reports come back `404`.
-
-Finally, provision the cookie jar from a workstation with a browser:
-
-```bash
-firmware/pi-ytmusic/push_cookies.py --from-browser firefox:ytm --addon
-firmware/pi-ytmusic/push_cookies.py --addon --check
-```
-
-With no jar the receiver resolves anonymously (which YouTube Music is unlikely to tolerate
-for long, and which means no Premium/ad-free playback). The jar is a live, rotating
-credential — read the rules in
-[`docs/ytmusic-receiver.md`](../docs/ytmusic-receiver.md#cookies) before pushing one,
-especially the one about exporting from a browser session you then never use again.
+`firmware/pi-ytmusic/push_cookies.py --addon` still works and is the scriptable path; the
+page and the tool judge a jar with the same code (`receiver/cookie_jar.py`), so they cannot
+disagree about what a valid jar is.
 
 ## Options
 

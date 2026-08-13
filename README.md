@@ -25,8 +25,8 @@ in the kitchen and the living room" is two taps and stays in sync.
 
 - **Play in from** an iPhone, Mac or PC over AirPlay · any Bluetooth device, via
   a small ESP32 or Raspberry Pi bridge box · a Linux PC, via a receiver agent ·
-  the YouTube Music app's own Cast button, via a side add-on you deploy
-  yourself.
+  the YouTube Music app's own Cast button, via a second add-on in this
+  repository.
 - **Play out to** AirPlay-2 receivers, AV receivers and HomePods · ESPHome
   speakers such as Home Assistant Voice PE · any Linux PC running the agent.
 - **Ordinary Home Assistant entities**: a `media_player` per output plus one per
@@ -75,32 +75,28 @@ original-ESP32 board (not S2/S3/C3/C6 — that README explains why), or use
 [`firmware/pi-bridge/`](firmware/pi-bridge/README.md) on a Raspberry Pi Zero 2 W
 for higher-quality codecs.
 
-### 4. YouTube Music's Cast button — optional, and not click-to-install
+### 4. YouTube Music's Cast button — optional
 
-Puts the house in the Cast menu of the YouTube Music app. This one is
-deliberately unpublished, because it leans on unofficial protocols, on `yt-dlp`
-keeping pace with YouTube, and on **your own signed-in account**: you build and
-push it from a workstation (`./scripts/deploy-dev.sh ytmusic`), then give it an
-RTP source in the router and a cookie jar. Steps in
-[`ytmusic_receiver/`](ytmusic_receiver/README.md), reasoning and every measured
-gotcha in [docs/ytmusic-receiver.md](docs/ytmusic-receiver.md).
+Puts the house in the Cast menu of the YouTube Music app. It is a second add-on
+in the same repository, so it is already in your store from step 1 — install it,
+start it, open its panel, and it walks you through the two things it needs: one
+button to create its audio route on the router, and an upload for the cookies
+that let it play as your own account (the page explains how to export those with
+yt-dlp).
 
-Each component's own README has the full detail; this page is the map.
+It plays from **your signed-in account** and leans on unofficial protocols and
+on `yt-dlp` keeping pace with YouTube, so treat it as the least stable thing
+here. Details in [`ytmusic_receiver/`](ytmusic_receiver/README.md), reasoning and
+every measured gotcha in
+[docs/ytmusic-receiver.md](docs/ytmusic-receiver.md).
 
 ## Status
 
 **Functionally complete for daily use; not yet cut over from Music
-Assistant.** Every phase through the manual routing UI is done and verified
-end-to-end against real hardware and signal measurements, not just unit tests.
-Still open: final latency/soak measurement on the real Pi 4, and the cutover
-itself.
+Assistant.**
 
-Last tested against **Home Assistant 2026.8.1** — CI and the local test runner
-both install exactly that, from the single pin in
-[`custom_components/pipewire_audio_router/tests/requirements.txt`](custom_components/pipewire_audio_router/tests/requirements.txt).
-The integration declares a **minimum of 2026.7.0** (`hacs.json`). How that pin
-is chosen and what past Home Assistant bumps broke:
-[docs/addon_maintenance.md](docs/addon_maintenance.md).
+Last tested against **Home Assistant 2026.8.1**.
+The integration declares a **minimum of 2026.7.0** (`hacs.json`).
 
 ## Documentation
 
@@ -117,7 +113,7 @@ is chosen and what past Home Assistant bumps broke:
   what past bumps broke, and the commands for testing and deploying against
   the real instance.
 - [**docs/ytmusic-receiver.md**](docs/ytmusic-receiver.md) — the YouTube Music
-  Cast receiver: how it works and every measured gotcha behind it.
+  Cast receiver.
 - [**docs/branding/**](docs/branding/README.md) — the icon and logo, and how to
   re-render them.
 - [**tests/**](tests/) — the runnable scripts backing those write-ups; nothing
@@ -148,7 +144,7 @@ README with install/config/usage details.
 | **Bluetooth bridge firmware** | ESP32 + ESPHome, turns any Bluetooth device into a whole-home-audio source | [`firmware/bt-bridge/`](firmware/bt-bridge/README.md) |
 | **Raspberry Pi bridge** | the same job on a Pi Zero 2 W, for higher-quality Bluetooth codecs | [`firmware/pi-bridge/`](firmware/pi-bridge/README.md) |
 | **pw-sink receiver agent** | makes a Linux PC an output the router can stream to, and duck | [`pipewire_audio_router/pwrouter-agent/`](pipewire_audio_router/pwrouter-agent/README.md) |
-| **YouTube Music Cast receiver** | the YouTube Music app's Cast button, as a source — a local, deliberately unpublished add-on | [`ytmusic_receiver/`](ytmusic_receiver/README.md) |
+| **YouTube Music Cast receiver** | the YouTube Music app's Cast button, as a source — an add-on in this repo's store, with its own setup page | [`ytmusic_receiver/`](ytmusic_receiver/README.md) |
 
 ## Repo layout
 

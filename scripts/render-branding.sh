@@ -10,6 +10,7 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 src="$repo/docs/branding"
 addon="$repo/pipewire_audio_router"
+ytmusic="$repo/ytmusic_receiver"
 brand="$repo/custom_components/pipewire_audio_router/brand"
 web="$addon/frontend/public"
 
@@ -27,6 +28,12 @@ render() { # svg width height out
 echo "add-on (Supervisor store + sidebar):"
 render "$src/icon.svg" 256 256 "$addon/icon.png"
 render "$src/logo.svg" 500 200 "$addon/logo.png"
+
+# Icon only, no logo: the store falls back to the icon on the detail page, and a
+# "YouTube Music" wordmark set in our own type would read as Google's branding on an
+# add-on that is not theirs.
+echo "YouTube Music receiver add-on:"
+render "$src/ytmusic-icon.svg" 256 256 "$ytmusic/icon.png"
 
 # custom_components/<domain>/brand/ — served by HA's own brands proxy since
 # 2026.3 and preferred over the CDN, so no home-assistant/brands PR is needed.

@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import pathlib
 import shlex
 import subprocess
 import sys
@@ -82,37 +83,29 @@ REMOTE_YTDLP = ".local/share/pi-ytmusic-venv/bin/yt-dlp"
 #: Only for printing a copy-pasteable diagnostic command.
 REMOTE_TARGET_HINT = DEFAULT_TARGET
 
-#: Only these domains are shipped. A browser jar contains every site you have
-#: ever visited; there is no reason for any of that to reach the Pi.
-KEEP_DOMAIN_SUFFIXES = (".youtube.com", "youtube.com", ".google.com", "google.com")
+#: Reading a jar — which domains are kept, which cookie families carry the login,
+#: how an expiry reads, and the verdict itself — lives in the receiver app, because
+#: the add-on's web UI judges an *uploaded* jar with the same vocabulary. A jar the
+#: UI accepts and this tool refuses would be a bug nobody could explain from either
+#: end. Everything below is transport and presentation.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "receiver"))
+from cookie_jar import (  # noqa: E402
+    DEFAULT_PROBE_URL,
+    JS_CHALLENGE_MARKERS,
+    PROBE_DEAD_MARKERS,
+    analyse,
+    filter_google,
+    parse_jar,
+    write_jar,
+)
 
-#: The cookies that actually carry the login. If none are present, the export came
-#: from a session that was not signed in and pushing it is pointless.
-#:
-#: Split by role because they are not interchangeable: yt-dlp builds YouTube's
-#: `SAPISIDHASH` authorization header from a SID-family *and* an APISID-family
-#: cookie, so having only one family is a half-authenticated jar that fails in
-#: confusing ways. `LOGIN_INFO` is YouTube's own and is a useful signal but not
-#: sufficient on its own.
-SID_FAMILY = ("__Secure-1PSID", "__Secure-3PSID", "SID")
-APISID_FAMILY = ("SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID", "APISID")
-OTHER_LOGIN = ("HSID", "SSID", "LOGIN_INFO")
-CRITICAL = SID_FAMILY + APISID_FAMILY + OTHER_LOGIN
-#: Short-lived companions that rotate constantly (hours). Their expiry says
-#: nothing about the life of the session, so they are reported separately.
-ROTATING = ("__Secure-1PSIDTS", "__Secure-3PSIDTS", "__Secure-1PSIDCC", "__Secure-3PSIDCC")
-#: Cookies a *signed-out* visit leaves behind. Recognised only so the report can
-#: say "this is an anonymous session" instead of listing absences.
-ANONYMOUS = ("VISITOR_INFO1_LIVE", "VISITOR_PRIVACY_METADATA", "YSC", "PREF", "GPS",
-             "CONSENT", "SOCS", "NID", "DEVICE_INFO", "__Secure-YEC", "wide")
+#: Named in the installed jar's header comment, so the copy on the far end says
+#: where it came from.
+INSTALLED_BY = "firmware/pi-ytmusic/push_cookies.py"
 
-#: A video used only to prove that resolution works. "Me at the zoo" — the oldest
-#: video on the platform, so about as unlikely to disappear as anything on
-#: YouTube. (The obvious choice, yt-dlp's own `BaW_jenozKc` test video, is *gone*:
-#: it now returns "Video unavailable", which made every probe fail for a reason
-#: that had nothing to do with cookies. Hence also `--probe-url`: when this one
-#: eventually dies too, that is a flag, not a code change.)
-DEFAULT_PROBE_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+#: The probe video and the markers for reading a failed probe are shared with the
+#: receiver's web UI (cookie_jar.py), which runs the same check with the add-on's
+#: own yt-dlp. `--probe-url` overrides this one per run.
 PROBE_URL = DEFAULT_PROBE_URL
 
 #: JS runtimes for YouTube's `n` signature challenge — **different on each side**,
@@ -129,70 +122,9 @@ PROBE_URL = DEFAULT_PROBE_URL
 LOCAL_JS_RUNTIME = "node"
 REMOTE_JS_RUNTIME = "quickjs"
 
-#: Substrings that mean "the JS challenge could not be solved" — a missing runtime
-#: or missing yt-dlp-ejs scripts, NOT a cookie problem.
-JS_CHALLENGE_MARKERS = ("No video formats found", "n challenge", "JavaScript runtime",
-                        "challenge solver")
-
-#: Substrings that mean "the probe video is the problem, not the credentials".
-PROBE_DEAD_MARKERS = ("Video unavailable", "Private video", "has been removed",
-                      "This video is not available", "video is unavailable")
-
-
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     print("  $", " ".join(cmd))
     return subprocess.run(cmd, text=True, **kw)
-
-
-# --- Netscape cookies.txt ----------------------------------------------------
-
-
-def parse_jar(text: str) -> list[list[str]]:
-    """Parse a Netscape cookie file into its 7-column rows.
-
-    `#HttpOnly_` is a *prefix on the domain field*, not a comment — dropping those
-    lines silently discards the most important cookies, so it is preserved.
-    """
-    rows = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        if line.startswith("#") and not line.startswith("#HttpOnly_"):
-            continue
-        parts = line.split("\t")
-        if len(parts) != 7:
-            continue
-        rows.append(parts)
-    return rows
-
-
-def write_jar(rows: list[list[str]]) -> str:
-    header = (
-        "# Netscape HTTP Cookie File\n"
-        "# Installed by firmware/pi-ytmusic/push_cookies.py — yt-dlp rewrites this\n"
-        "# file as cookies rotate, so it must stay writable by the receiver service.\n"
-    )
-    return header + "".join("\t".join(r) + "\n" for r in rows)
-
-
-def domain_of(row: list[str]) -> str:
-    return row[0].removeprefix("#HttpOnly_")
-
-
-def filter_google(rows: list[list[str]]) -> list[list[str]]:
-    return [r for r in rows if domain_of(r).endswith(KEEP_DOMAIN_SUFFIXES)]
-
-
-def fmt_expiry(value: str) -> str:
-    try:
-        ts = int(value)
-    except ValueError:
-        return "unparseable"
-    if ts == 0:
-        return "session cookie (no expiry)"
-    when = dt.datetime.fromtimestamp(ts, dt.timezone.utc).astimezone()
-    days = (when - dt.datetime.now(dt.timezone.utc).astimezone()).days
-    return f"{when:%Y-%m-%d %H:%M %Z} ({days:+d} days)"
 
 
 def list_firefox_profiles() -> list[str]:
@@ -226,32 +158,27 @@ def list_firefox_profiles() -> list[str]:
 def inspect(rows: list[list[str]]) -> bool:
     """Report what is in the jar. Returns whether it looks like a signed-in session.
 
+    The verdict is `cookie_jar.analyse()`; everything here is presentation — plus
+    the browser-profile hints, which only mean anything on a workstation.
+
     Never prints cookie values — only names, domains and expiry.
     """
-    by_name = {r[5]: r for r in rows}
-    print(f"\n  cookies for Google/YouTube: {len(rows)}")
+    verdict = analyse(rows)
+    print(f"\n  cookies for Google/YouTube: {verdict['count']}")
 
-    found = [n for n in CRITICAL if n in by_name]
-    if found:
+    if verdict["login"]:
         print("  login cookies:")
-        for name in found:
-            print(f"    {name:<20} expires {fmt_expiry(by_name[name][4])}")
-        for name in ROTATING:
-            if name in by_name:
-                print(f"    {name:<20} expires {fmt_expiry(by_name[name][4])}"
-                      f"   <- rotates hourly; not a session lifetime")
+        for entry in verdict["login"]:
+            print(f"    {entry['name']:<20} expires {entry['expiry']['text']}")
+        for entry in verdict["rotating"]:
+            print(f"    {entry['name']:<20} expires {entry['expiry']['text']}"
+                  f"   <- rotates hourly; not a session lifetime")
     else:
         # Say what IS there rather than listing what is absent: an anonymous jar
         # is a *recognisable* thing, and naming it points straight at the cause.
-        names = sorted(by_name)
-        anon = [n for n in names if n in ANONYMOUS]
         print("  login cookies:              NONE")
-        print(f"  cookies present:            {', '.join(names) if names else '(none)'}")
-        if anon and len(anon) == len(names):
-            print("\n  Every cookie here is one a *signed-out* visit leaves behind. That browser")
-            print("  profile has browsed YouTube, but is not logged in.")
-        else:
-            print("\n  No login cookies — this export is from a signed-out session.")
+        print(f"  cookies present:            {', '.join(verdict['names']) if verdict['names'] else '(none)'}")
+        print(f"\n  {verdict['summary']}")
         profiles = list_firefox_profiles()
         if profiles:
             print(f"\n  Firefox profiles registered in profiles.ini: {', '.join(profiles)}")
@@ -268,24 +195,13 @@ def inspect(rows: list[list[str]]) -> bool:
             "  only, never in cookies.sqlite, so there is nothing for yt-dlp to read."
         )
         return False
-    # Both halves of the SAPISIDHASH pair must be present or YouTube requests go
-    # out unauthenticated despite the jar "having login cookies".
-    if not any(n in by_name for n in SID_FAMILY):
-        print("\n  No SID-family cookie (__Secure-1PSID/__Secure-3PSID/SID) — yt-dlp cannot")
-        print("  build an auth header from this jar.")
+    if not verdict["ok"]:
+        # Login cookies, but not both halves of the SAPISIDHASH pair: requests would
+        # go out unauthenticated despite the jar "having login cookies".
+        print(f"\n  {verdict['summary']}")
         return False
-    if not any(n in by_name for n in APISID_FAMILY):
-        print("\n  No APISID-family cookie (SAPISID/__Secure-3PAPISID/...) — yt-dlp cannot")
-        print("  build an auth header from this jar.")
-        return False
-    present = found
-    # The useful headline number: the soonest expiry among the durable ones.
-    soonest = min(
-        (int(by_name[n][4]) for n in present if by_name[n][4].isdigit() and int(by_name[n][4]) > 0),
-        default=0,
-    )
-    if soonest:
-        print(f"\n  Session should last until {fmt_expiry(str(soonest))}")
+    if verdict["expiry"]:
+        print(f"\n  Session should last until {verdict['expiry']['text']}")
     print(
         "  ...but treat that as a LOWER BOUND only: Google invalidates server-side at\n"
         "  will, and logging this session out anywhere kills the jar immediately."
@@ -555,10 +471,10 @@ def main() -> None:
         return
 
     if args.addon:
-        addon_push(write_jar(rows), force=args.force)
+        addon_push(write_jar(rows, installed_by=INSTALLED_BY), force=args.force)
         ok = addon_check()
     else:
-        push(args.target, write_jar(rows), force=args.force)
+        push(args.target, write_jar(rows, installed_by=INSTALLED_BY), force=args.force)
         ok = check_remote(args.target)
     print(
         "\nNothing needs restarting: mpv passes --cookies to yt-dlp per track, so the new\n"

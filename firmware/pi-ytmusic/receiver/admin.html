@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>YouTube Music Cast Receiver</title>
+<!--
+  Served by admin.js. One file on purpose: the receiver app is shared verbatim with
+  the Raspberry Pi role (installed by `scp -r firmware/pi-ytmusic`), so it must stay
+  build-free — no bundler, no framework, no fonts to fetch.
+
+  Colours are the audio router's own (its frontend/src/app.css), so the two admin
+  pages read as one product inside Home Assistant.
+-->
+<style>
+  :root {
+    --primary: #03a9f4;
+    --primary-emphasis: #0288d1;
+    --accent: #ff9800;
+    --error: #db4437;
+    --success: #43a047;
+    --warning: #ffa600;
+    --bg: #fafafa;
+    --card: #ffffff;
+    --border: #e0e0e0;
+    --text: #212121;
+    --muted: #727272;
+    --code-bg: #f2f4f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111111;
+      --card: #1c1c1c;
+      --border: #2f2f2f;
+      --text: #e1e1e1;
+      --muted: #9b9b9b;
+      --code-bg: #232323;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 780px; margin: 0 auto; }
+  header { margin-bottom: 20px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  header p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+  }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  h3 { font-size: 0.9rem; margin: 18px 0 6px; color: var(--muted); font-weight: 600; }
+  p { margin: 8px 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 0.86rem; }
+
+  /* status pill */
+  .pill {
+    font-size: 0.75rem; font-weight: 600; letter-spacing: 0.02em;
+    padding: 2px 9px; border-radius: 999px; white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .pill.ok      { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
+  .pill.bad     { background: color-mix(in srgb, var(--error) 16%, transparent);   color: var(--error); }
+  .pill.warn    { background: color-mix(in srgb, var(--warning) 20%, transparent); color: #a06a00; }
+  .pill.unknown { background: color-mix(in srgb, var(--muted) 16%, transparent);  color: var(--muted); }
+  @media (prefers-color-scheme: dark) { .pill.warn { color: var(--warning); } }
+
+  /* fact table */
+  dl { display: grid; grid-template-columns: minmax(9rem, auto) 1fr; gap: 4px 14px; margin: 10px 0 0; }
+  dt { color: var(--muted); font-size: 0.86rem; }
+  dd { margin: 0; font-size: 0.86rem; overflow-wrap: anywhere; }
+
+  button {
+    font: inherit; font-weight: 600; font-size: 0.9rem;
+    padding: 8px 16px; border-radius: 8px; border: 1px solid transparent;
+    background: var(--primary); color: #fff; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--primary-emphasis); }
+  button:disabled { opacity: 0.55; cursor: default; }
+  button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
+  button.secondary:hover:not(:disabled) { background: var(--code-bg); }
+  button.danger { background: transparent; color: var(--error); border-color: var(--error); }
+  button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--error) 12%, transparent); }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+
+  input[type=file] { font: inherit; font-size: 0.9rem; max-width: 100%; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; overflow-x: auto; font-size: 0.82rem; margin: 8px 0;
+  }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.86em; }
+  pre code { background: none; padding: 0; }
+  ul { margin: 8px 0; padding-left: 20px; }
+  li { margin: 4px 0; }
+
+  .note {
+    border-left: 3px solid var(--accent); padding: 8px 12px; margin: 12px 0;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-radius: 0 6px 6px 0; font-size: 0.86rem;
+  }
+  .msg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 0.88rem; }
+  .msg.ok  { background: color-mix(in srgb, var(--success) 14%, transparent); }
+  .msg.bad { background: color-mix(in srgb, var(--error) 14%, transparent); }
+  .msg pre { margin: 8px 0 0; background: color-mix(in srgb, var(--text) 6%, transparent); }
+  [hidden] { display: none !important; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 0.86rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>YouTube Music Cast Receiver</h1>
+    <p id="subtitle">Loading…</p>
+  </header>
+
+  <!-- 1. the audio route ------------------------------------------------- -->
+  <section>
+    <h2>Audio route <span id="route-pill" class="pill unknown">checking…</span></h2>
+    <p class="small muted">
+      This receiver sends its audio to the PipeWire Audio Router over RTP. The router
+      only listens on a port it has been told about, so until a source exists here,
+      casting plays to nowhere.
+    </p>
+    <dl id="route-facts"></dl>
+    <div id="route-mismatch" hidden></div>
+    <div class="row">
+      <button id="route-fix">Configure the router</button>
+      <span id="route-hint" class="small muted"></span>
+    </div>
+    <div id="route-msg" class="msg" hidden></div>
+  </section>
+
+  <!-- 2. cookies --------------------------------------------------------- -->
+  <section>
+    <h2>YouTube account <span id="jar-pill" class="pill unknown">checking…</span></h2>
+    <p class="small muted">
+      Without cookies the receiver resolves anonymously: no Premium, no ad-free
+      playback, and YouTube stops answering at all before long. With them it plays
+      as your own signed-in account.
+    </p>
+    <dl id="jar-facts"></dl>
+    <div id="jar-cookies" hidden>
+      <h3>Login cookies</h3>
+      <dl id="jar-cookie-list"></dl>
+    </div>
+
+    <div class="row">
+      <input type="file" id="jar-file" accept=".txt,text/plain">
+      <button id="jar-upload" disabled>Upload jar</button>
+      <button id="jar-check" class="secondary">Test playback</button>
+      <button id="jar-remove" class="danger">Remove</button>
+    </div>
+    <div id="jar-msg" class="msg" hidden></div>
+
+    <h3>Getting a cookies.txt</h3>
+    <p class="small">
+      Log in to <code>music.youtube.com</code> in a browser, then export that
+      session with <a href="https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp"
+      target="_blank" rel="noreferrer">yt-dlp</a> on your computer:
+    </p>
+<pre><code id="export-cmd">yt-dlp --cookies-from-browser firefox:ytm \
+       --cookies ~/ytm-cookies.txt \
+       --skip-download --simulate \
+       "https://www.youtube.com/watch?v=jNQXAC9IVRw"</code></pre>
+    <div class="row"><button id="copy-cmd" class="secondary">Copy command</button></div>
+    <p class="small muted">
+      yt-dlp has no "just dump cookies" mode — it writes the jar as a side effect of
+      a request, so this fetches one video's metadata and downloads nothing. Then
+      upload <code>~/ytm-cookies.txt</code> above.
+    </p>
+    <div class="note">
+      <strong>Use a browser profile you then abandon.</strong> If the same login stays
+      live in your everyday browser <em>and</em> here, the two rotate cookies against
+      each other and Google invalidates both. Create a dedicated profile
+      (<code>firefox -CreateProfile ytm</code>), log in, quit <em>without logging
+      out</em>, and never open it again. A Private Window does not work: Firefox keeps
+      private cookies in memory only, so there is nothing for yt-dlp to read.
+    </div>
+    <details>
+      <summary>What happens to the file</summary>
+      <ul class="small">
+        <li>Only <code>google.com</code> and <code>youtube.com</code> cookies are kept — the
+          rest of your browsing never leaves your computer.</li>
+        <li>Stored mode <code>0600</code> in the add-on's own <code>/data</code>, which
+          survives restarts and updates. Cookie <em>values</em> are never displayed or logged.</li>
+        <li>It stays writable on purpose: yt-dlp refreshes the jar in place as cookies
+          rotate, which is what keeps the session alive for weeks.</li>
+        <li>Nothing needs restarting — the next track picks up the new jar.</li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- 3. the receiver itself --------------------------------------------- -->
+  <section>
+    <h2>Receiver <span id="recv-pill" class="pill unknown">checking…</span></h2>
+    <p class="small muted">
+      Open YouTube Music on your phone and pick this name from the Cast menu. Both
+      phone and receiver have to be on the same network — discovery is multicast.
+    </p>
+    <dl id="recv-facts"></dl>
+  </section>
+
+  <p class="small muted" id="footer"></p>
+</main>
+
+<script type="module">
+// Relative URLs throughout: this page is served both under Home Assistant ingress
+// (a dynamic /api/hassio_ingress/<token>/ prefix) and on a bare port.
+const REFRESH_MS = 5000;
+
+const $ = (id) => document.getElementById(id);
+const text = (s) => document.createTextNode(s);
+
+/** Fill a <dl> from [label, value] pairs; values may be nodes. */
+function facts(dl, pairs) {
+  dl.replaceChildren();
+  for (const [ label, value ] of pairs) {
+    if (value === null || value === undefined) continue;
+    const dt = document.createElement('dt');
+    dt.append(text(label));
+    const dd = document.createElement('dd');
+    dd.append(value instanceof Node ? value : text(String(value)));
+    dl.append(dt, dd);
+  }
+}
+
+function pill(el, kind, label) {
+  el.className = `pill ${kind}`;
+  el.textContent = label;
+}
+
+function message(el, ok, body, output) {
+  el.className = `msg ${ok ? 'ok' : 'bad'}`;
+  el.replaceChildren(text(body));
+  if (output) {
+    const pre = document.createElement('pre');
+    pre.textContent = output;
+    el.append(pre);
+  }
+  el.hidden = false;
+}
+
+const ms = (v) => (v === null ? null : `${(v / 1000).toFixed(0)} s`);
+const when = (epochMs) => (epochMs ? new Date(epochMs).toLocaleString() : null);
+
+async function api(path, init) {
+  const res = await fetch(path, init);
+  const body = await res.json().catch(() => ({}));
+  return { status: res.status, body };
+}
+
+/** Run an action with the button disabled, then refresh. */
+async function act(button, fn) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Working…';
+  try {
+    await fn();
+  }
+  finally {
+    button.textContent = label;
+    button.disabled = false;
+    await refresh();
+  }
+}
+
+// --- rendering -------------------------------------------------------------
+
+function renderRoute(s) {
+  const { router, rtp } = s;
+  const src = router.source;
+  const fixBtn = $('route-fix');
+  const mismatchBox = $('route-mismatch');
+
+  if (!router.reachable) {
+    pill($('route-pill'), 'bad', 'router unreachable');
+    facts($('route-facts'), [
+      [ 'Router API', router.base ],
+      [ 'Problem', router.error ],
+    ]);
+    $('route-hint').textContent = 'Is the PipeWire Audio Router add-on running?';
+    fixBtn.disabled = true;
+    mismatchBox.hidden = true;
+    return;
+  }
+  fixBtn.disabled = false;
+
+  const rows = [
+    [ 'Sends audio to', `${rtp.host}:${rtp.port} (RTP)` ],
+    [ 'Router API', router.base ],
+  ];
+  if (src) {
+    rows.push([ 'Source', `${src.label} (${src.node_name})` ]);
+    rows.push([ 'Loaded in the graph', src.present ? 'yes' : 'no — the router has it configured but not running' ]);
+    rows.push([ 'Settings', `${src.rtp.rate} Hz, ignore SSRC ${src.rtp.ignore_ssrc ? 'on' : 'off'}, listening on ${src.rtp.source_addr}` ]);
+  }
+
+  if (!src) {
+    pill($('route-pill'), 'bad', 'no source');
+    $('route-hint').textContent = 'Creates an RTP source on the router for this receiver.';
+    fixBtn.textContent = 'Create the RTP source';
+    mismatchBox.hidden = true;
+  }
+  else if (router.mismatch.length) {
+    pill($('route-pill'), 'warn', 'needs fixing');
+    fixBtn.textContent = 'Correct the settings';
+    $('route-hint').textContent = '';
+    const ul = document.createElement('ul');
+    ul.className = 'small';
+    for (const m of router.mismatch) {
+      const li = document.createElement('li');
+      li.textContent = m;
+      ul.append(li);
+    }
+    mismatchBox.replaceChildren(ul);
+    mismatchBox.hidden = false;
+  }
+  else {
+    pill($('route-pill'), src.present ? 'ok' : 'warn', src.present ? 'ready' : 'configured');
+    fixBtn.textContent = 'Re-check';
+    $('route-hint').textContent = 'Route it to speakers in the router’s own Routing page.';
+    mismatchBox.hidden = true;
+  }
+  facts($('route-facts'), rows);
+}
+
+function renderJar(s) {
+  const jar = s.cookies;
+  const v = jar.verdict;
+  const rows = [ [ 'File', jar.path ] ];
+  if (jar.present) {
+    rows.push([ 'Last written', when(jar.modified) ]);
+  }
+
+  if (!jar.present) {
+    pill($('jar-pill'), 'warn', 'anonymous');
+    rows.push([ 'Status', 'No jar installed — playback resolves anonymously.' ]);
+    $('jar-cookies').hidden = true;
+  }
+  else if (!v) {
+    pill($('jar-pill'), 'unknown', 'unreadable');
+    rows.push([ 'Status', 'A jar is installed, but it could not be inspected.' ]);
+    $('jar-cookies').hidden = true;
+  }
+  else {
+    pill($('jar-pill'), v.ok ? 'ok' : 'bad', v.ok ? 'signed in' : 'cannot authenticate');
+    rows.push([ 'Status', v.summary ]);
+    if (v.login.length) {
+      facts($('jar-cookie-list'), v.login.map((c) => [ c.name, c.expiry.text ]));
+      $('jar-cookies').hidden = false;
+    }
+    else {
+      $('jar-cookies').hidden = true;
+    }
+  }
+  facts($('jar-facts'), rows);
+  $('jar-remove').disabled = !jar.present;
+  $('jar-check').disabled = !jar.present;
+}
+
+function renderReceiver(s) {
+  const r = s.receiver;
+  const p = r.playback;
+  const playing = p.state === 'playing' || p.state === 'paused';
+
+  if (p.state === 'down') {
+    pill($('recv-pill'), 'bad', 'player down');
+  }
+  else if (r.sink_present === false) {
+    pill($('recv-pill'), 'bad', 'no audio sink');
+  }
+  else if (playing) {
+    pill($('recv-pill'), 'ok', p.state);
+  }
+  else {
+    pill($('recv-pill'), 'ok', r.sender ? 'connected' : 'idle');
+  }
+
+  const sinkLabel = r.sink_present === null
+    ? `${r.sink_name} (cannot check here)`
+    : `${r.sink_name} — ${r.sink_present ? 'loaded' : 'MISSING, audio has nowhere to go'}`;
+
+  facts($('recv-facts'), [
+    [ 'Cast name', r.device_name ],
+    [ 'Pairing name', r.screen_name ],
+    [ 'DIAL', `${r.bind_address ?? 'all interfaces'}:${r.dial_port}` ],
+    [ 'Phone connected', r.sender ? r.sender.name : 'no' ],
+    [ 'Playing', playing ? `${p.title ?? 'unknown title'} (${p.state}${p.position_ms !== null ? `, ${ms(p.position_ms)}` : ''})` : p.state ],
+    [ 'Audio sink', sinkLabel ],
+    [ 'yt-dlp', r.ytdlp_version ?? 'unknown' ],
+    [ 'Resolver', r.resolver_daemon ? 'long-lived yt-dlp' : 'one yt-dlp per track' ],
+  ]);
+
+  $('subtitle').textContent = `${r.device_name} · add-on ${r.version ?? 'dev'}`;
+  $('footer').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+// --- actions ---------------------------------------------------------------
+
+$('route-fix').addEventListener('click', () => act($('route-fix'), async () => {
+  const { body } = await api('api/rtp-source', { method: 'POST' });
+  message($('route-msg'), body.ok,
+    body.ok
+      ? { created: 'RTP source created on the router.',
+        corrected: 'Settings corrected.',
+        unchanged: 'Already correct — nothing to change.' }[body.action]
+      : `Could not configure the router: ${body.error}`);
+}));
+
+$('jar-file').addEventListener('change', () => {
+  $('jar-upload').disabled = !$('jar-file').files.length;
+});
+
+async function upload({ force }) {
+  const file = $('jar-file').files[0];
+  if (!file) return;
+  const { body } = await api(`api/cookies${force ? '?force=1' : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain', 'X-Jar-Modified': String(file.lastModified) },
+    body: await file.text(),
+  });
+  if (body.ok) {
+    message($('jar-msg'), true, `Installed. ${body.verdict.summary} The next track uses it.`);
+    $('jar-file').value = '';
+    $('jar-upload').disabled = true;
+    return;
+  }
+  message($('jar-msg'), false, body.error);
+  if (body.code === 'would_roll_back') {
+    const again = document.createElement('button');
+    again.className = 'danger';
+    again.textContent = 'Replace anyway';
+    again.style.marginTop = '10px';
+    again.addEventListener('click', () => act(again, () => upload({ force: true })));
+    $('jar-msg').append(document.createElement('br'), again);
+  }
+}
+
+$('jar-upload').addEventListener('click', () => act($('jar-upload'), () => upload({ force: false })));
+
+$('jar-check').addEventListener('click', () => act($('jar-check'), async () => {
+  message($('jar-msg'), true, 'Resolving a test video with this jar…');
+  const { body } = await api('api/cookies/check', { method: 'POST' });
+  message($('jar-msg'), body.ok,
+    body.ok ? `Works — resolved “${body.title}”.` : body.error, body.output);
+}));
+
+$('jar-remove').addEventListener('click', () => act($('jar-remove'), async () => {
+  const { body } = await api('api/cookies', { method: 'DELETE' });
+  message($('jar-msg'), body.ok, 'Jar removed. Playback resolves anonymously from the next track.');
+}));
+
+$('copy-cmd').addEventListener('click', async () => {
+  await navigator.clipboard?.writeText($('export-cmd').textContent);
+  $('copy-cmd').textContent = 'Copied';
+  setTimeout(() => { $('copy-cmd').textContent = 'Copy command'; }, 1500);
+});
+
+// --- poll ------------------------------------------------------------------
+
+async function refresh() {
+  try {
+    const { body } = await api('api/status');
+    renderRoute(body);
+    renderJar(body);
+    renderReceiver(body);
+  }
+  catch (e) {
+    $('subtitle').textContent = `Cannot reach the receiver: ${e.message}`;
+  }
+}
+
+await refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

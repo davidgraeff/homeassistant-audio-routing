@@ -71,6 +71,13 @@ back to* FILE. Provision it from a workstation with a browser:
 ./push_cookies.py --check                        # is the jar on the Pi still good?
 ```
 
+This is the path *here*. The shared receiver app also carries a web page that can take an
+upload (`receiver/admin.js`, which is how the Home Assistant add-on is set up), but on the Pi
+it stays **off unless you pass `--admin-port`** to `setup_pi_ytmusic.py`: in the add-on that
+page sits behind Home Assistant's ingress, which authenticates the visitor, whereas here it
+would be an unauthenticated LAN endpoint that writes a Google credential. Only turn it on for
+a network you trust — `push_cookies.py` needs no open port at all.
+
 **Export from a dedicated or private browser session, then close it without logging out and
 never use that session again.** If the same login stays live in your everyday browser *and*
 on the Pi, the two rotate against each other and Google invalidates both — usually within
@@ -165,6 +172,8 @@ add-on before making sound.
 | `receiver/mpv.js` | mpv JSON-IPC client (one long-lived `mpv --idle`) |
 | `receiver/resolver.js` | Pre-resolves the next track to a direct URL (30.7 s → 0.5 s per track change) |
 | `receiver/metadata.js` | Reports the playing track to the add-on (title from mpv, artwork from the video id) |
+| `receiver/admin.js` + `admin.html` | Status/setup page: the router's RTP source and cookie-jar upload. Off here unless `--admin-port` |
+| `receiver/cookie_jar.py` | The jar rules (what authenticates, when it expires), shared with `push_cookies.py` |
 | `receiver/singleton.js` | Single-instance lock, so a second mpv can never join `ytm-out` and mix into the stream |
 
 Installed on the Pi to `~/.local/share/pi-ytmusic-receiver` with state (including the DIAL
