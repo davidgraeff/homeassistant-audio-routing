@@ -73,8 +73,8 @@ Home Assistant itself. Click any shot for full size.
       <br><sub><b>Outputs</b> — what you added, with its protocol, whether it is online, its PTP lock, and its own volume. Discovered devices are only <i>offered</i> until you add them.</sub>
     </td>
     <td width="33%" align="center">
-      <a href="docs/images/screen_alignment.webp"><img src="docs/images/screen_alignment.webp" width="270" alt="Alignment tab: a five-step wizard, currently on the microphone check"></a>
-      <br><sub><b>Alignment</b> — speakers on one stream should land together, but each adds its own delay. The wizard lines them up, measured with your phone's microphone or by ear.</sub>
+      <a href="docs/images/screen_music_groups.webp"><img src="docs/images/screen_music_groups.webp" width="270" alt="Music groups tab: two groups built from speaker chips, each with a source picker"></a>
+      <br><sub><b>Music groups</b> — speakers that play the same audio in sync, one Home Assistant <code>media_player</code> each. <b>Source</b> picks what the whole group plays.</sub>
     </td>
   </tr>
   <tr valign="top">
@@ -83,8 +83,8 @@ Home Assistant itself. Click any shot for full size.
       <br><sub><b>Announcements</b> — a reusable set of speakers a clip is played to. <b>Duck</b> is how far the music drops, <b>Priority</b> who wins when two clips collide.</sub>
     </td>
     <td width="33%" align="center">
-      <a href="docs/images/screen_music_groups.webp"><img src="docs/images/screen_music_groups.webp" width="270" alt="Music groups tab: two groups built from speaker chips, each with a source picker"></a>
-      <br><sub><b>Music groups</b> — speakers that play the same audio in sync, one Home Assistant <code>media_player</code> each. <b>Source</b> picks what the whole group plays.</sub>
+      <a href="docs/images/screen_alignment.webp"><img src="docs/images/screen_alignment.webp" width="270" alt="Alignment tab: a five-step wizard, currently on the microphone check"></a>
+      <br><sub><b>Alignment</b> — speakers on one stream should land together, but each adds its own delay. The wizard lines them up, measured with your phone's microphone or by ear.</sub>
     </td>
     <td width="33%" align="center">
       <a href="docs/images/screen_ha_device.webp"><img src="docs/images/screen_ha_device.webp" width="270" alt="Home Assistant device page for the add-on, showing service information, configuration entities and recent activity"></a>
