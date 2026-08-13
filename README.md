@@ -25,7 +25,8 @@ in the kitchen and the living room" is two taps and stays in sync.
 
 - **Play in from** an iPhone, Mac or PC over AirPlay · any Bluetooth device, via
   a small ESP32 or Raspberry Pi bridge box · a Linux PC, via a receiver agent ·
-  the YouTube Music app's own Cast button, via a local side add-on.
+  the YouTube Music app's own Cast button, via a side add-on you deploy
+  yourself.
 - **Play out to** AirPlay-2 receivers, AV receivers and HomePods · ESPHome
   speakers such as Home Assistant Voice PE · any Linux PC running the agent.
 - **Ordinary Home Assistant entities**: a `media_player` per output plus one per
@@ -73,6 +74,16 @@ Flash [`firmware/bt-bridge/`](firmware/bt-bridge/README.md) onto an
 original-ESP32 board (not S2/S3/C3/C6 — that README explains why), or use
 [`firmware/pi-bridge/`](firmware/pi-bridge/README.md) on a Raspberry Pi Zero 2 W
 for higher-quality codecs.
+
+### 4. YouTube Music's Cast button — optional, and not click-to-install
+
+Puts the house in the Cast menu of the YouTube Music app. This one is
+deliberately unpublished, because it leans on unofficial protocols, on `yt-dlp`
+keeping pace with YouTube, and on **your own signed-in account**: you build and
+push it from a workstation (`./scripts/deploy-dev.sh ytmusic`), then give it an
+RTP source in the router and a cookie jar. Steps in
+[`ytmusic_receiver/`](ytmusic_receiver/README.md), reasoning and every measured
+gotcha in [docs/ytmusic-receiver.md](docs/ytmusic-receiver.md).
 
 Each component's own README has the full detail; this page is the map.
 
