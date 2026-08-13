@@ -829,10 +829,20 @@ pub(crate) async fn measure_member(
             if let Some(failed) = step.failed {
                 let mut r = failed;
                 r.member = Some(name.to_string());
-                inner.lock_recover().record(
-                    transcript::Event::for_member("gate_failed", name, r.message.clone())
-                        .detail(&serde_json::json!({ "refusal": r, "gate": step.progress })),
-                );
+                inner.lock_recover().record(transcript::Event::for_member("gate_failed", name, r.message.clone()).detail(
+                    &serde_json::json!({
+                        "refusal": r,
+                        "gate": step.progress,
+                        // The numbers behind the sentence. An accepted measurement has
+                        // always recorded its `observation`; a refusal recorded only prose,
+                        // which left the 2026-08-13 run unanswerable after the fact — and a
+                        // refusal is the case the transcript exists for (plan §8). The
+                        // per-period series is the part that decides *which* fault it was:
+                        // see `Estimator::period_series`.
+                        "estimate": e,
+                        "period_series": est.period_series(GATE_FAILURE_PERIODS),
+                    }),
+                ));
                 return Err(if r.kind == RefusalKind::MicReconnected { StepError::RestartSet(r) } else { StepError::Refuse(r) });
             }
             if step.restart {

@@ -175,6 +175,15 @@ const GATE_SILENCE_PEAK: f32 = 0.001;
 /// [`MUTE_GUARD`] + 4 periods (11 s) so a couple of restarts still fit.
 const GATE_TIMEOUT_SETTLE: Duration = Duration::from_secs(45);
 
+/// Per-period arrivals recorded with a gate **failure**
+/// ([`crate::align::estimator::Estimator::period_series`]).
+///
+/// Enough to see the shape of the instability — two clusters swapping, or a ramp — and
+/// bounded so one event cannot eat the transcript's byte budget. The estimator retains
+/// 512 periods; a 45 s gate window can only have produced ~22 of them anyway, so this is
+/// the whole window in practice and a cap only in the pathological case.
+const GATE_FAILURE_PERIODS: usize = 32;
+
 /// Gate timeout after a delay write. A reconnecting sendspin device takes **tens
 /// of seconds** to render again regardless of how the previous session ended
 /// (plan §2.3, hardware-confirmed), and a write wave reconnects several of them,

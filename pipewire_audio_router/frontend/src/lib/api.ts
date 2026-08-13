@@ -17,6 +17,7 @@ import type {
   AppSettings,
   AppSettingsUpdate,
   DuckHold,
+  MeasureChannels,
   MeasureLogList,
   MeasureMode,
   MeasureStatus,
@@ -323,6 +324,9 @@ export const api = {
   alignSelect: (reference: string, target: string) =>
     request<AlignState>('POST', 'api/align/select', { reference, target }),
   alignVolume: (volume: number) => request<AlignState>('POST', 'api/align/volume', { volume }),
+  /** Measure one member through one channel of its stereo pair, or both again. */
+  alignChannels: (node_name: string, channels: MeasureChannels) =>
+    request<AlignState>('POST', 'api/align/channel', { node_name, channels }),
   /** Postpone the session's idle teardown by one whole allowance, changing nothing else
    *  (`AlignState.closes_in_s`).
    *

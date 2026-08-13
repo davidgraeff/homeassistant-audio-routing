@@ -493,3 +493,106 @@ fn frame_conversion_rounds_to_nearest_and_round_trips() {
     }
     assert_eq!(F48.frame_bytes(), 4);
 }
+
+/// Plan §12.2's stereo-pair remedy: a member driving two speakers is two acoustic
+/// sources of the identical click, so its arrival is not one time. Emitting one channel
+/// makes it one source, and it has to be exactly that — the other channel silent, the
+/// chosen one bit-identical, and the block the same length so the sender's cadence,
+/// timestamps and backlog are untouched.
+#[test]
+fn a_channel_mask_keeps_one_channel_bit_exact_and_the_block_the_same_length() {
+    let rd = RelayDelay::new();
+    let src = frames(0, 8);
+    let mut out = Vec::new();
+
+    assert_eq!(rd.channels("spk"), MeasureChannels::Both, "both is the default and costs no entry");
+    assert!(!rd.any_active());
+    assert!(!rd.delay_into("spk", F48, &src, &mut out), "both channels ⇒ nothing to do");
+
+    rd.set_channels("spk", MeasureChannels::Left);
+    assert!(rd.any_active(), "a mask is an effect, so the RT gate has to be open");
+    assert!(rd.delay_into("spk", F48, &src, &mut out));
+    assert_eq!(out.len(), src.len());
+    for (i, frame) in out.as_chunks::<FRAME>().0.iter().enumerate() {
+        assert_eq!(&frame[..2], &src[i * FRAME..i * FRAME + 2], "left is untouched, frame {i}");
+        assert_eq!(&frame[2..], &[0, 0], "right is silent, frame {i}");
+    }
+
+    rd.set_channels("spk", MeasureChannels::Right);
+    assert!(rd.delay_into("spk", F48, &src, &mut out));
+    for (i, frame) in out.as_chunks::<FRAME>().0.iter().enumerate() {
+        assert_eq!(&frame[..2], &[0, 0], "left is silent, frame {i}");
+        assert_eq!(&frame[2..], &src[i * FRAME + 2..(i + 1) * FRAME], "right is untouched, frame {i}");
+    }
+
+    // Back to both, and the entry goes with it: nothing else was on this output.
+    rd.set_channels("spk", MeasureChannels::Both);
+    assert!(!rd.any_active());
+    assert!(!rd.delay_into("spk", F48, &src, &mut out));
+}
+
+/// The three effects are independent state on one output, which is what lets a run set a
+/// channel while a member is muted and expect both to still hold when it is unmuted.
+#[test]
+fn a_mask_composes_with_the_mute_and_the_delay_without_disturbing_either() {
+    let rd = RelayDelay::new();
+    let delay_frames = 480u64;
+    rd.set_delay_us("spk", us_for_frames(delay_frames, 48_000)).unwrap();
+    rd.set_channels("spk", MeasureChannels::Left);
+    let _ = run(&rd, "spk", 960, 2, 0);
+    let st = rd.status("spk").expect("an entry with all of it on");
+    assert!(st.primed, "the mask must not re-prime the ring");
+    assert_eq!(st.delay_frames, delay_frames);
+    assert_eq!(st.channels_emitted, MeasureChannels::Left);
+
+    // Delayed *and* masked: the emitted content is the delayed left channel, and the
+    // right one is silent — one buffer, not two copies.
+    let mut out = Vec::new();
+    let src = frames(2_000, 4);
+    assert!(rd.delay_into("spk", F48, &src, &mut out));
+    assert_eq!(out.len(), src.len());
+    assert!(out.as_chunks::<FRAME>().0.iter().all(|f| f[2..] == [0, 0]), "right silent");
+    assert!(out.as_chunks::<FRAME>().0.iter().any(|f| f[..2] != [0, 0]), "left is real, delayed content");
+
+    // A mute wins over the mask (silence has no channels), and dropping it brings the
+    // mask back rather than losing it.
+    rd.set_muted("spk", true);
+    assert!(rd.delay_into("spk", F48, &src, &mut out));
+    assert!(out.iter().all(|b| *b == 0), "muted ⇒ exact silence");
+    assert!(rd.set_muted("spk", false));
+    assert_eq!(rd.channels("spk"), MeasureChannels::Left, "the mask survived the mute");
+
+    // Clearing the delay leaves the mask, and clearing the mask leaves the delay.
+    assert!(rd.clear("spk"));
+    assert_eq!(rd.channels("spk"), MeasureChannels::Left);
+    rd.set_delay_us("spk", 4_000).unwrap();
+    assert_eq!(rd.unmask_all(["spk"]), 1);
+    assert_eq!(rd.delay_us("spk"), Some(4_000));
+    assert_eq!(rd.unmask_all(["spk"]), 0, "idempotent, and never a panic");
+}
+
+/// Only a stereo block has a left and a right. Anything else is left exactly as it is:
+/// masking "the second of six channels" is not what was asked for, and a mono member's
+/// wire is stereo anyway (that is why the choice is offered per member and labelled).
+#[test]
+fn a_mask_is_a_no_op_on_a_layout_that_has_no_left_and_right() {
+    let rd = RelayDelay::new();
+    rd.set_channels("spk", MeasureChannels::Right);
+    let mono = PcmFormat::new(48_000, 1);
+    let src = vec![1u8, 2, 3, 4, 5, 6];
+    let mut out = vec![0xAAu8; 3];
+    assert!(!rd.delay_into("spk", mono, &src, &mut out), "mono is untouched");
+    assert_eq!(out, vec![0xAAu8; 3], "and the caller's buffer is not even written");
+
+    // A partial trailing frame is refused for the same reason the delay line refuses
+    // one: it cannot be interpreted without inventing the missing samples.
+    let mut out = Vec::new();
+    let odd = vec![1u8, 2, 3];
+    assert!(rd.delay_into("spk", F48, &odd, &mut out));
+    assert_eq!(out, vec![1, 2, 3], "the whole frames in it are masked, the tail is copied as-is");
+
+    assert_eq!(MeasureChannels::parse("L"), Some(MeasureChannels::Left));
+    assert_eq!(MeasureChannels::parse("stereo"), Some(MeasureChannels::Both));
+    assert_eq!(MeasureChannels::parse("centre"), None);
+    assert_eq!(MeasureChannels::Right.as_str(), "right");
+}

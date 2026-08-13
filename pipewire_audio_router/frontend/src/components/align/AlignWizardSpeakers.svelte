@@ -442,6 +442,34 @@
           </p>
         {/if}
 
+        <!-- Which channel this member is measured through. Offered on every row rather
+             than only where the daemon "knows" it is a pair, because no output kind
+             reports its speaker layout — not even a PipeWire host, whose agent knows its
+             sink has two volume channels but does not send that. The label says what it
+             is for, and a wrong choice on a single speaker is self-announcing: it either
+             gets quieter or falls silent, and the run says "no tone reached the
+             microphone". -->
+        <div class="chan" class:dim={!on}>
+          <span class="chan-lbl">Measure through</span>
+          {#each [{ v: 'both', t: 'Both' }, { v: 'left', t: 'Left' }, { v: 'right', t: 'Right' }] as const as opt (opt.v)}
+            <button
+              class="chip"
+              class:sel={align.channelsOf(m.node_name) === opt.v}
+              disabled={align.busy}
+              onclick={() => void align.setChannels(m.node_name, opt.v)}
+            >
+              {opt.t}
+            </button>
+          {/each}
+        </div>
+        {#if align.channelsOf(m.node_name) !== 'both'}
+          <p class="hint">
+            Only the {align.channelsOf(m.node_name)} channel plays, so a stereo pair is one source instead of two and its
+            arrival is a single time the estimator can measure. The offset it finds is that speaker's; both channels come
+            back when the run ends.
+          </p>
+        {/if}
+
         {#if on}
           <AlignSignalVerdict signal={mic.signal} settling={mic.signalSettling} subject={label(m.node_name)} />
         {/if}
@@ -711,6 +739,44 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
     font-size: 0.82rem;
+  }
+  /* The channel choice sits under the level, on the same left edge, and dims with it
+     when the row is not the one playing — it is a property of the speaker, not of the
+     current solo, so it stays readable rather than disappearing. */
+  .chan {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+  }
+  .chan.dim {
+    opacity: 0.6;
+  }
+  .chan-lbl {
+    font-size: 0.75rem;
+    color: var(--secondary-text-color);
+    margin-right: 2px;
+  }
+  .chip {
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--divider-color);
+    background: var(--input-fill-color);
+    color: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .chip:hover:not(:disabled) {
+    border-color: var(--primary-color);
+  }
+  .chip.sel {
+    border-color: var(--primary-color);
+    background: color-mix(in srgb, var(--primary-color) 18%, transparent);
+  }
+  .chip:disabled {
+    cursor: default;
+    opacity: 0.6;
   }
   .hint {
     display: block;

@@ -39,6 +39,15 @@ pub(crate) struct Session {
     ///
     /// **Never persisted, and never a restore source** — see the module docs.
     pub(crate) levels: BTreeMap<String, u8>,
+    /// **Per-member wire channels** ([`crate::align::relay_delay::MeasureChannels`]),
+    /// keyed by node name — only members that are not on the default `both`, echoed as
+    /// [`AlignState::channels`].
+    ///
+    /// The session is the single copy for the same reason as `levels`: the choice belongs
+    /// to where the microphone is standing, so a reload mid-run must read it back rather
+    /// than forget it. The *effect* lives in `relay_delay`, which is also what teardown
+    /// clears — this map is what the UI renders and what a re-solo re-asserts.
+    pub(crate) channels: BTreeMap<String, crate::align::relay_delay::MeasureChannels>,
     /// Set to stop the looping player thread.
     pub(crate) stop: Arc<AtomicBool>,
     /// Last time the user did something that proves they are still there — any change
@@ -156,6 +165,7 @@ impl Session {
             unlevellable,
             level_channels: self.level_channels.clone(),
             audible: self.audible.iter().cloned().collect(),
+            channels: self.channels.clone(),
             interference: self.hold.interference(),
             displaced: self.hold.displaced().to_vec(),
             closes_in_s: Some(self.closes_in().as_secs()),
@@ -365,6 +375,7 @@ impl AlignManager {
             audible,
             volume: DEFAULT_ALIGN_LEVEL,
             levels,
+            channels: BTreeMap::new(),
             stop: stop.clone(),
             saved_sendspin,
             saved_sendspin_mutes,

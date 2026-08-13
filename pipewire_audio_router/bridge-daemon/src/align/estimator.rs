@@ -313,6 +313,29 @@ pub struct ChannelEstimate {
     pub quality: Quality,
 }
 
+/// One pattern period's own reading, as the estimator kept it
+/// ([`Estimator::period_series`]).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PeriodPoint {
+    /// Period index on the estimator's arbitrary grid — consecutive unless a period was
+    /// dropped for containing no burst at all.
+    pub p: u64,
+    /// This period's arrival, in ms inside the period. The *series* is the point: two
+    /// clusters mean two arrivals swapping places, a ramp means drift or a moving source.
+    pub arrival_ms: f64,
+    pub snr_db: f64,
+    pub ratio: f64,
+    /// Whether it cleared the per-period SNR gate and went into the fit.
+    pub usable: bool,
+}
+
+/// One channel's per-period series.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeriodSeries {
+    pub label: String,
+    pub points: Vec<PeriodPoint>,
+}
+
 /// The estimator's output for one measurement window.
 #[derive(Debug, Clone, Serialize)]
 pub struct Estimate {
@@ -768,6 +791,42 @@ impl Estimator {
         self.channels.iter().map(|c| c.obs.len()).max().unwrap_or(0)
     }
 
+    /// The **per-period arrivals** behind the aggregate, newest `last` of them per
+    /// channel — for diagnostics, never for a decision.
+    ///
+    /// It exists because the aggregate cannot distinguish the two things a refusal for
+    /// [`RejectReason::UnstablePhase`] can mean, and they have opposite remedies: a
+    /// series that **hops** between two clustered values is two arrivals of similar
+    /// strength swapping places (a reflection, or a stereo pair heard off-axis — move the
+    /// microphone), while one that **wanders or ramps** is the speaker not rendering each
+    /// block when it was told, or something genuinely moving. A standard error of
+    /// ±7.67 ms looks identical in both cases, which is exactly the position the
+    /// 2026-08-13 run left us in.
+    ///
+    /// Capped rather than complete: the estimator retains up to
+    /// [`MAX_RETAINED_PERIODS`] (512) periods, and a transcript event is not the place
+    /// for 17 minutes of them.
+    pub fn period_series(&self, last: usize) -> Vec<PeriodSeries> {
+        self.channels
+            .iter()
+            .map(|c| PeriodSeries {
+                label: c.spec.label.clone(),
+                points: c
+                    .obs
+                    .iter()
+                    .skip(c.obs.len().saturating_sub(last))
+                    .map(|o| PeriodPoint {
+                        p: o.p,
+                        arrival_ms: o.phase / self.geom.rate * 1000.0,
+                        snr_db: o.snr_db,
+                        ratio: o.ratio,
+                        usable: o.usable,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn estimate(&self) -> Estimate {
         // A single abscissa origin, shared by every channel, so the intercepts
         // are directly comparable even when the channels kept different
@@ -908,9 +967,11 @@ impl Estimator {
             return Quality::reject(
                 RejectReason::AmbiguousPeak,
                 format!(
-                    "two arrivals of the {l} tone are within {:.1}× of each other, so which one is the direct sound is a guess \
-                     (a strong reflection, or another speaker still audible in this band). Move the phone away from walls, \
-                     or align this pair by ear.",
+                    "two arrivals of the {l} tone are within {:.1}× of each other, so which one is the direct sound is a guess. \
+                     Three things cause that: a strong reflection (move the microphone away from walls and off hard surfaces), \
+                     another speaker still audible in this band, or — most often — this output driving a **stereo pair**, which \
+                     is two sources of the same click and has no single arrival time. For a pair, measure one channel (left or \
+                     right) or put the microphone on its axis of symmetry.",
                     e.second_peak_ratio
                 ),
             );
@@ -919,8 +980,12 @@ impl Estimator {
             return Quality::reject(
                 RejectReason::UnstablePhase,
                 format!(
-                    "the {l} tone's arrival moved by ±{:.2} ms between pattern repeats (limit {MAX_STD_ERROR_MS:.1} ms). \
-                     Hold the phone still — put it down if you can — and measure again.",
+                    "the {l} tone's arrival moved by ±{:.2} ms between pattern repeats (limit {MAX_STD_ERROR_MS:.1} ms), so no \
+                     single arrival time describes it. Either the microphone or a speaker moved, or two arrivals of similar \
+                     strength are swapping places (a reflection, or a stereo pair heard off-axis), or this speaker is not \
+                     rendering each block when it was told. If it happens on one speaker only while the others are steady, \
+                     suspect the speaker rather than the room — the run's transcript records the per-period arrivals, and two \
+                     clusters mean swapping while a wander means the speaker.",
                     e.std_error_ms
                 ),
             );

@@ -176,6 +176,9 @@ pub fn router(
         // for the sequential measurement, all of them for §7's all-play round.
         .route("/api/align/audible", post(align_audible))
         .route("/api/align/volume", post(align_volume))
+        // One member through one channel of its stereo pair (plan §12.2): a pair is two
+        // acoustic sources, so its arrival time is not a single number.
+        .route("/api/align/channel", post(align_channels))
         // Microphone-assisted alignment (align/mic.rs): the phone's capture socket
         // and the status the UI's level meter reads.
         .route("/api/align/mic/ws", get(crate::align::mic::mic_ws))

@@ -101,6 +101,20 @@ pub struct AlignState {
     /// The members currently audible — one for level-setting/measurement, two for
     /// the by-ear comparison, N for §7's all-play round.
     pub audible: Vec<String>,
+    /// **Which wire channels each member emits** while this session runs, keyed by node
+    /// name, for every member that is not on the default `both`
+    /// ([`crate::align::relay_delay::MeasureChannels`]).
+    ///
+    /// The remedy for a member that drives a **stereo pair**: the click is identical on
+    /// both channels, so such a member is two acoustic sources and its arrival time is
+    /// not a single number — the estimator refuses it as an ambiguous peak (observed on a
+    /// desktop pair, 1.1× between the two arrivals). Emitting one channel makes it one
+    /// source.
+    ///
+    /// Absent ⇒ `both`, so a consumer never distinguishes "not set" from "set to the
+    /// default", exactly like [`Self::levels`]. Session-owned and not persisted: it is a
+    /// property of where the microphone is, and teardown puts both channels back.
+    pub channels: BTreeMap<String, crate::align::relay_delay::MeasureChannels>,
     /// Exclusivity violations recorded so far (plan §12.3), newest last. A **peek**:
     /// the measurement state machine drains these, so the status endpoint must not.
     pub interference: Vec<Interference>,
@@ -158,6 +172,7 @@ impl AlignState {
             level_note: None,
             level_channels: BTreeMap::new(),
             audible: Vec::new(),
+            channels: BTreeMap::new(),
             interference: Vec::new(),
             displaced: Vec::new(),
             // No session, so nothing is counting down — but the two *rules* are still

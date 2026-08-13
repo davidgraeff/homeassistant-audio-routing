@@ -292,7 +292,9 @@ impl Gate {
                     GateReason::UnstableAmplitude,
                     format!(
                         "the tone's level moved by {spread:.1} dB across the last {} pattern periods (limit {tol:.1} dB) — \
-                         either a mute has not settled yet or the phone is moving; hold it still, or put it down",
+                         a mute that has not settled yet, a microphone or speaker that is moving, or a stream that is not \
+                         continuous. If it settles on its own, it was the mute; if it persists on one speaker only, it is that \
+                         speaker",
                         self.peaks.len()
                     ),
                     s.elapsed,

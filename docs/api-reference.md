@@ -70,6 +70,7 @@ handler name, which is the authoritative place to check the exact body shape.
 | `POST` | `/api/align/start` | begin the alignment wizard |
 | `POST` | `/api/align/select` | pick the device being aligned |
 | `POST` | `/api/align/volume` | set the alignment reference volume |
+| `POST` | `/api/align/channel` | measure one member through one channel of its stereo pair (`both`/`left`/`right`) |
 | `POST`/`DELETE` | `/api/spike/per-device` | dev-only spike harness |
 | `POST`/`DELETE` | `/api/spike/multi-device` | dev-only spike harness |
 | `POST`/`DELETE` | `/api/spike/overlay` | dev-only spike harness |

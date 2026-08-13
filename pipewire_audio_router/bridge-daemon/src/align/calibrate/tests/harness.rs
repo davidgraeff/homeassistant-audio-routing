@@ -197,6 +197,7 @@ impl UnionFixture {
             // Deliberately not the default: a reusing start must not reset it.
             volume: 33,
             levels: BTreeMap::new(),
+            channels: BTreeMap::new(),
             stop: Arc::new(AtomicBool::new(false)),
             saved_sendspin: HashMap::new(),
             saved_sendspin_mutes: HashMap::new(),

@@ -740,3 +740,46 @@ fn the_default_calibration_level_is_twenty() {
     // (W19 — a persisted level would be a promise about a phone position nobody made).
     assert!(AlignState::inactive().levels.is_empty());
 }
+
+/// Plan §12.2's stereo-pair remedy, through the session: the choice is per member, it is
+/// what the status reports, and **teardown gives both channels back**.
+///
+/// The last part is the one that would be silent if it broke: a mask left behind would
+/// keep half of somebody's stereo pair silent for as long as the daemon runs, which is
+/// the calibration mute's failure mode with a longer fuse.
+#[tokio::test]
+async fn a_member_can_be_measured_through_one_channel_and_gets_both_back() {
+    let f = UnionFixture::new("chan", &[("pwsink-dev-desk", MemberKind::PwSink), ("sendspin-dev-chana", MemberKind::Sendspin)]).await;
+    let relay = crate::align::relay_delay::RelayDelay::global();
+    relay.unmask_all(["pwsink-dev-desk", "sendspin-dev-chana"]); // a shared global: start clean
+
+    // Absent from the map ⇒ both, so a consumer never distinguishes "unset" from
+    // "set to the default".
+    assert!(f.mgr.status().await.channels.is_empty());
+    assert_eq!(relay.channels("pwsink-dev-desk"), MeasureChannels::Both);
+
+    let state = f.mgr.set_channels("pwsink-dev-desk".into(), MeasureChannels::Left).await.unwrap();
+    assert_eq!(state.channels.get("pwsink-dev-desk"), Some(&MeasureChannels::Left));
+    assert_eq!(state.channels.len(), 1, "one member's choice is not the group's");
+    assert_eq!(relay.channels("pwsink-dev-desk"), MeasureChannels::Left, "and it reached the relay hook");
+    assert_eq!(relay.channels("sendspin-dev-chana"), MeasureChannels::Both);
+
+    // A solo elsewhere must not disturb it: the choice belongs to the member, not to
+    // whoever is currently audible.
+    f.mgr.solo("sendspin-dev-chana".into(), 20).await.unwrap();
+    assert_eq!(f.mgr.status().await.channels.get("pwsink-dev-desk"), Some(&MeasureChannels::Left));
+    assert_eq!(relay.channels("pwsink-dev-desk"), MeasureChannels::Left);
+
+    // Back to both by hand: the entry goes, rather than being recorded as a default.
+    let state = f.mgr.set_channels("pwsink-dev-desk".into(), MeasureChannels::Both).await.unwrap();
+    assert!(state.channels.is_empty());
+
+    // And teardown clears it even when the user never did.
+    f.mgr.set_channels("pwsink-dev-desk".into(), MeasureChannels::Right).await.unwrap();
+    assert!(f.mgr.set_channels("nobody-dev-x".into(), MeasureChannels::Left).await.is_err(), "only members");
+    f.mgr.stop().await;
+    assert_eq!(relay.channels("pwsink-dev-desk"), MeasureChannels::Both, "teardown gives both channels back");
+    // Per-output, never `any_active()`: this is the process-global relay and the other
+    // tests in this file legitimately hold their own members' mutes at the same time.
+    assert!(relay.status("pwsink-dev-desk").is_none(), "and leaves no entry behind on it at all");
+}

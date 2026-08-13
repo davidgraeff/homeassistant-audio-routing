@@ -104,6 +104,16 @@ async fn a_run_whose_speaker_never_rendered_leaves_a_transcript_that_says_so() {
     // Named, and named as the speaker rather than as "a member".
     let failed = doc.events.iter().find(|e| e["kind"] == "gate_failed").unwrap();
     assert_eq!(failed["member"], "offline-speaker");
+    // **A refusal carries its numbers.** It used to carry only the sentence, which left a
+    // real 2026-08-13 refusal unanswerable afterwards: an unstable arrival cannot be told
+    // from two arrivals swapping places without the estimate and the per-period series,
+    // and those have opposite remedies (move the microphone vs suspect the speaker).
+    let detail = &failed["detail"];
+    assert!(detail["estimate"]["channels"].is_array(), "the estimate the gate judged: {detail}");
+    assert!(detail["estimate"]["periods_seen"].is_number(), "{detail}");
+    let series = detail["period_series"].as_array().expect("the per-period arrivals");
+    assert_eq!(series.len(), 2, "one series per measurement channel: {series:?}");
+    assert!(series.iter().all(|s| s["label"].is_string() && s["points"].is_array()));
     // The other speaker was measured, and its numbers are in the file — which is what
     // makes "one speaker was dead" distinguishable from "nothing worked".
     let measured: Vec<&serde_json::Value> = doc.events.iter().filter(|e| e["kind"] == "measurement").collect();

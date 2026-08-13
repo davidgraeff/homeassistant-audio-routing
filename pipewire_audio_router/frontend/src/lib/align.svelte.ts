@@ -21,6 +21,7 @@ import type {
   AlignSessionMode,
   AlignState,
   LevelChannel,
+  MeasureChannels,
   MeasureMode,
   OutputInfo,
   SignalCheck,
@@ -566,6 +567,24 @@ function createAlign() {
     /** The same answer as the wizard's three-way question. */
     levelControlOf(nodeName: string): LevelControl {
       return levelControl(session?.level_channels?.[nodeName]);
+    },
+    /** Which wire channels this member emits while the run measures it. Absent in the
+     *  daemon's map means the default, so this never returns undefined. */
+    channelsOf(nodeName: string): MeasureChannels {
+      return session?.channels?.[nodeName] ?? 'both';
+    },
+    /** Measure a member through one channel of its stereo pair, or both again.
+     *
+     *  Live and per member: no reconnect, nothing persisted, and the daemon puts both
+     *  channels back at teardown. It exists because a pair playing the identical click
+     *  from two places has no single arrival time — the estimator refuses it as an
+     *  ambiguous peak — and one channel makes it one source. */
+    async setChannels(nodeName: string, channels: MeasureChannels) {
+      if (!session?.active) return;
+      // What the microphone hears changes, so the trailing verdict is about the previous
+      // state — the same reason a level change disturbs it.
+      mic.disturbSignal();
+      await run(async () => adopt(await api.alignChannels(nodeName, channels)));
     },
     /** Held members with no level knob at all — the `none` channels above, as the daemon
      *  lists them. Its `level_note` beside them is deliberately *not* surfaced: it is

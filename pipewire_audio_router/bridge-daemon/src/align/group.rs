@@ -676,7 +676,7 @@ impl ExclusiveHold {
         tracing::info!("alignment hold {}: released; displaced routing restored", self.id);
     }
 
-    /// Drop the **calibration mutes** this hold's audibility took at the relay hook
+    /// Drop the **calibration mutes and channel masks** this hold took at the relay hook
     /// (`relay_delay`, plan §12.3.2/W17), for exactly the outputs it held.
     ///
     /// Kept in the same shape as the rest of teardown: synchronous, infallible,
@@ -687,9 +687,15 @@ impl ExclusiveHold {
     /// [`HoldRegistry::close`]: a hold that releases late can only ever unmute an output it
     /// held itself, never a newer session's member.
     fn unmute_relay(&self) {
-        let cleared = crate::align::relay_delay::RelayDelay::global().unmute_all(self.held.iter().map(String::as_str));
-        if cleared > 0 {
-            tracing::debug!("alignment hold {}: dropped {cleared} relay calibration mute(s)", self.id);
+        let relay = crate::align::relay_delay::RelayDelay::global();
+        let cleared = relay.unmute_all(self.held.iter().map(String::as_str));
+        // A channel mask is the same kind of state — this daemon's own, transient, and
+        // owned by the run — so it is dropped in the same step and under the same
+        // id-scoping. Leaving one behind would silence half of somebody's stereo pair for
+        // as long as the daemon runs, which is the worse half of the mute's failure mode.
+        let unmasked = relay.unmask_all(self.held.iter().map(String::as_str));
+        if cleared > 0 || unmasked > 0 {
+            tracing::debug!("alignment hold {}: dropped {cleared} relay calibration mute(s) and {unmasked} channel mask(s)", self.id);
         }
     }
 }

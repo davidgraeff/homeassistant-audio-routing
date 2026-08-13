@@ -390,6 +390,37 @@ impl AlignManager {
         self.set_audible(vec![node_name], level).await
     }
 
+    /// Emit only one wire channel for one member, or both again — the remedy for a member
+    /// that drives a **stereo pair** ([`MeasureChannels`]).
+    ///
+    /// A pair radiates the identical click from two places, so the microphone hears two
+    /// arrivals of near-equal amplitude and the member has no single arrival *time*: the
+    /// estimator refuses it as an ambiguous peak (hardware, 2026-08-13 — a desktop pair
+    /// read 1.1× between its two arrivals). One channel makes it one source.
+    ///
+    /// Live and free, like a mute: no reconnect, nothing persisted, and no effect on any
+    /// other member. It counts as activity, because choosing it is the user working the
+    /// run. What the *delay* solver then produces is that channel's speaker — which is
+    /// the honest answer, since a pair heard off-axis has no other one.
+    pub async fn set_channels(&self, node_name: String, channels: MeasureChannels) -> Result<AlignState, String> {
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or("no alignment session is running")?;
+        if !session.is_member(&node_name) {
+            return Err(format!("'{node_name}' is not a member of the active alignment group"));
+        }
+        // The map holds only the non-default choices, so `channels[node] ?? both` reads
+        // the same way `levels[node] ?? volume` does.
+        if channels == MeasureChannels::Both {
+            session.channels.remove(&node_name);
+        } else {
+            session.channels.insert(node_name.clone(), channels);
+        }
+        session.note_activity();
+        crate::align::relay_delay::RelayDelay::global().set_channels(&node_name, channels);
+        tracing::info!("alignment: '{node_name}' now emits {} channel(s) for this session", channels.as_str());
+        Ok(session.state())
+    }
+
     /// Silence **every** member while keeping everything else the session is doing:
     /// the exclusive hold, the click track, the levels, the reference/target pair.
     ///

@@ -189,6 +189,31 @@ pub(crate) async fn align_volume(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct AlignChannelsRequest {
+    pub(crate) node_name: String,
+    /// `both` (the default), `left` or `right` — which wire channels this member emits
+    /// for the rest of the session.
+    pub(crate) channels: String,
+}
+
+/// `POST /api/align/channel` — measure one member through **one channel** of its pair.
+///
+/// The click is identical on both channels, so a member driving a stereo pair is two
+/// acoustic sources and has no single arrival time; the estimator refuses it as an
+/// ambiguous peak. Live, per member, nothing persisted, both channels restored on
+/// teardown.
+pub(crate) async fn align_channels(
+    State(state): State<AppState>,
+    Json(req): Json<AlignChannelsRequest>,
+) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+    let bad = |message: String| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message }));
+    let channels = crate::align::relay_delay::MeasureChannels::parse(&req.channels)
+        .ok_or_else(|| bad(format!("'{}' is not a channel choice (expected both, left or right)", req.channels)))?;
+    tracing::info!("USER ACTION: measure '{}' through {} channel(s)", req.node_name, channels.as_str());
+    state.align.set_channels(req.node_name, channels).await.map(Json).map_err(bad)
+}
+
 /// Stop the session: click off, every member's level/mute restored, the temporary
 /// exclusive group released so the displaced music comes back.
 pub(crate) async fn align_stop(State(state): State<AppState>) -> Json<crate::align::calibrate::AlignState> {

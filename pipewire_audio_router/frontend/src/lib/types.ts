@@ -484,6 +484,10 @@ export interface AlignState {
   /** The members audible right now: one while a level is being set or a member
    *  measured, two for the by-ear comparison. */
   audible: string[];
+  /** Which wire channels each member emits, for the members that are not on the default
+   *  `both` — read it as `channels[node] ?? 'both'`, like `levels`. See
+   *  `MeasureChannels`. */
+  channels: Record<string, MeasureChannels>;
   /** Exclusivity violations recorded so far, newest last. A *peek* — reading this
    *  does not clear it. */
   interference: Interference[];
@@ -598,6 +602,19 @@ export interface SignalChannel {
   phase_ms: number;
   periods_used: number;
 }
+
+/** Which wire channels a member emits while a run measures it
+ *  (`POST /api/align/channel`, align/relay_delay.rs).
+ *
+ *  The click track is identical on both channels, so a member driving a **stereo pair**
+ *  is two acoustic sources and has no single arrival time — the estimator refuses it as
+ *  an ambiguous peak. Emitting one channel makes it one source. Live, per member,
+ *  nothing persisted, and both channels come back at teardown.
+ *
+ *  On a member that is *not* a pair it is honest rather than clever: a receiver that
+ *  downmixes plays ~6 dB quieter, and one that takes a single channel falls silent on
+ *  the other choice — which the run reports as "no tone reached the microphone". */
+export type MeasureChannels = 'both' | 'left' | 'right';
 
 export interface MicStatus {
   connected: boolean;

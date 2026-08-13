@@ -264,6 +264,7 @@
 // reconciler wiring was pending.
 #![allow(dead_code)]
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -352,6 +353,9 @@ pub struct DelayStatus {
     /// as exact silence while the delay line (if any) keeps advancing. Independent of
     /// the delay in both directions.
     pub muted: bool,
+    /// Which wire channels this output is emitting ([`MeasureChannels`]) — `both` unless
+    /// the run asked for one, to make a stereo pair a single acoustic source.
+    pub channels_emitted: MeasureChannels,
 }
 
 /// One output's delay line: a byte ring holding the recent past of that output's PCM,
@@ -480,7 +484,7 @@ impl DelayLine {
         true
     }
 
-    fn status(&self, muted: bool) -> DelayStatus {
+    fn status(&self, muted: bool, channels_emitted: MeasureChannels) -> DelayStatus {
         let delay_bytes = self.delay_bytes(self.fmt);
         let short = delay_bytes.saturating_sub(self.valid);
         DelayStatus {
@@ -492,33 +496,105 @@ impl DelayLine {
             prime_remaining_us: us_for_frames((short / self.fmt.frame_bytes()) as u64, self.fmt.rate),
             ring_bytes: self.ring.len(),
             muted,
+            channels_emitted,
+        }
+    }
+}
+
+/// Which wire channels an output emits during a measurement.
+///
+/// ## Why a member needs this at all
+///
+/// The click track is written **identically to both channels**
+/// (`calibrate::click::click_wav`), so a member that drives a *stereo pair* radiates the
+/// same burst from two places. Unless the microphone sits on the pair's axis of
+/// symmetry, it then hears two arrivals of near-equal amplitude, and "the arrival time
+/// of that member" is not a well-defined quantity — which is exactly what the estimator
+/// reports as [`crate::align::estimator::RejectReason::AmbiguousPeak`].
+/// Hardware-observed 2026-08-13: a desktop pair read `1.1×` between its two arrivals,
+/// and on the next run `1.53×` against a floor of `1.4`.
+///
+/// Emitting one channel makes that member a single source, which is the difference
+/// between "cannot be measured here" and a clean reading. It is a *measurement* choice,
+/// not a routing one: nothing is persisted, and teardown restores both channels with the
+/// rest of the session's state.
+///
+/// ## What it does on a member that is not a stereo pair
+///
+/// The mask is applied to the **wire** block, so it is honest but not clever: on a
+/// receiver that downmixes, one channel is ~6 dB quieter than both; on one that takes a
+/// single channel, the other choice is silence, which the gate reports as
+/// `GateReason::Silent` ("no tone from this speaker reached the microphone"). The daemon
+/// cannot tell those apart — no output kind reports its speaker layout today, including
+/// the pw-sink agent, whose `HostState` carries no channel count — so the UI offers the
+/// choice per member and says what it is for rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasureChannels {
+    /// Both channels, as the click track was built. The default.
+    #[default]
+    Both,
+    /// Left only — the right channel is zeroed on the wire.
+    Left,
+    /// Right only.
+    Right,
+}
+
+impl MeasureChannels {
+    /// The API/wire name, and what the transcript records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    /// Parse an API name; `None` if it is not one.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "both" | "stereo" => Some(Self::Both),
+            "left" | "l" => Some(Self::Left),
+            "right" | "r" => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    /// The interleaved channel index this keeps, or `None` for [`Self::Both`].
+    fn kept_index(self) -> Option<usize> {
+        match self {
+            Self::Both => None,
+            Self::Left => Some(0),
+            Self::Right => Some(1),
         }
     }
 }
 
 /// Everything this module applies to **one** output at the relay hook: a provisional
-/// delay, a calibration mute, or both.
+/// delay, a calibration mute, a channel mask, or any combination.
 ///
 /// One entry per affected output rather than a map per effect, so the hot path takes one
 /// lock and does one lookup no matter how many effects are live, and so the
-/// no-alignment gate stays a single atomic load. The entry exists while *either* effect
-/// does and is dropped when both are gone, which is what keeps that gate honest.
+/// no-alignment gate stays a single atomic load. The entry exists while *any* effect
+/// does and is dropped when all are gone, which is what keeps that gate honest.
 #[derive(Default)]
 struct DeviceEffect {
     /// `None` for an output that is only muted — no delay, so no ring is allocated.
     delay: Option<DelayLine>,
     /// Calibration mute (plan §12.3.2): emit exact silence, keep the ring advancing.
     muted: bool,
+    /// Which channels this output emits ([`MeasureChannels`]).
+    channels: MeasureChannels,
 }
 
 impl DeviceEffect {
     fn with_delay(delay_us: u64) -> Self {
-        Self { delay: Some(DelayLine::new(delay_us)), muted: false }
+        Self { delay: Some(DelayLine::new(delay_us)), muted: false, channels: MeasureChannels::Both }
     }
 
-    /// Neither effect left ⇒ the entry can go.
+    /// No effect left ⇒ the entry can go.
     fn is_empty(&self) -> bool {
-        self.delay.is_none() && !self.muted
+        self.delay.is_none() && !self.muted && self.channels == MeasureChannels::Both
     }
 
     fn set_delay(&mut self, delay_us: u64) {
@@ -541,7 +617,9 @@ impl DeviceEffect {
             None => false,
         };
         if !self.muted {
-            return delayed;
+            // A mute makes the mask moot (silence has no channels), so this only runs on
+            // an audible member — which is the only one being measured anyway.
+            return mask_channels(self.channels, fmt, src, out, delayed) || delayed;
         }
         if src.is_empty() {
             return false;
@@ -559,8 +637,8 @@ impl DeviceEffect {
 
     fn status(&self) -> DelayStatus {
         match &self.delay {
-            Some(line) => line.status(self.muted),
-            // A mute-only output: no delay, nothing to prime, no ring.
+            Some(line) => line.status(self.muted, self.channels),
+            // A mute-only (or mask-only) output: no delay, nothing to prime, no ring.
             None => DelayStatus {
                 delay_us: 0,
                 delay_frames: 0,
@@ -570,15 +648,52 @@ impl DeviceEffect {
                 prime_remaining_us: 0,
                 ring_bytes: 0,
                 muted: self.muted,
+                channels_emitted: self.channels,
             },
         }
     }
 }
 
-/// Per-output relay effects — provisional delay lines and calibration mutes. One
-/// process-global instance shared by every per-device relay and by whatever drives an
-/// alignment run; outputs are addressed by node name, exactly like `overlay_mixer`'s
-/// slots.
+/// **RT hot path.** Zero every channel but the chosen one, in place of a copy where it
+/// can be.
+///
+/// Returns whether `out` now holds the block to send. `already_written` says the delay
+/// line has filled `out`, in which case the mask edits that buffer instead of copying
+/// `src` again — so a delayed *and* masked output still costs one copy, not two.
+///
+/// Only a stereo block can have a left and a right, so any other layout is left exactly
+/// as it is: masking "the second of six channels" is not what the caller asked for, and
+/// guessing would be worse than the honest no-op the UI already warns about. A partial
+/// trailing frame is left alone for the same reason the delay line refuses one — it
+/// cannot be interpreted without inventing the missing samples.
+fn mask_channels(mask: MeasureChannels, fmt: PcmFormat, src: &[u8], out: &mut Vec<u8>, already_written: bool) -> bool {
+    let Some(keep) = mask.kept_index() else {
+        return false;
+    };
+    if fmt.channels != 2 || src.is_empty() {
+        return false;
+    }
+    let frame = fmt.frame_bytes();
+    if !already_written {
+        out.clear();
+        out.extend_from_slice(src);
+    }
+    let drop_at = if keep == 0 { 2 } else { 0 };
+    // One pass of 2-byte memsets over **whole** frames; the buffer is already the
+    // caller's, so nothing allocates once it has reached its steady capacity. A partial
+    // trailing frame is skipped rather than half-zeroed — half a frame has no channel.
+    for k in 0..out.len() / frame {
+        let at = k * frame + drop_at;
+        out[at] = 0;
+        out[at + 1] = 0;
+    }
+    true
+}
+
+/// Per-output relay effects — provisional delay lines, calibration mutes and channel
+/// masks. One process-global instance shared by every per-device relay and by whatever
+/// drives an alignment run; outputs are addressed by node name, exactly like
+/// `overlay_mixer`'s slots.
 #[derive(Default)]
 pub struct RelayDelay {
     /// Number of affected outputs (a delay, a mute, or both), so the idle hot path never
@@ -822,6 +937,56 @@ impl RelayDelay {
     /// Whether `output` is calibration-muted here.
     pub fn is_muted(&self, output: &str) -> bool {
         self.lines().get(output).is_some_and(|e| e.muted)
+    }
+
+    /// Emit only one wire channel for `output`, or both again
+    /// ([`MeasureChannels`] — the remedy for a member that drives a stereo pair).
+    ///
+    /// Independent of the mute and the delay in both directions, like they are of each
+    /// other: setting it does not unmute, clearing it does not drop a delay, and
+    /// [`MeasureChannels::Both`] removes the entry only when nothing else is left on it.
+    pub fn set_channels(&self, output: &str, channels: MeasureChannels) {
+        let mut lines = self.lines();
+        match lines.get_mut(output) {
+            Some(effect) => {
+                effect.channels = channels;
+                if effect.is_empty() {
+                    lines.remove(output);
+                }
+            }
+            None if channels != MeasureChannels::Both => {
+                lines.insert(output.to_string(), DeviceEffect { delay: None, muted: false, channels });
+            }
+            None => {}
+        }
+        self.publish(&lines);
+    }
+
+    /// Which channels `output` is emitting (both, unless a run asked otherwise).
+    pub fn channels(&self, output: &str) -> MeasureChannels {
+        self.lines().get(output).map(|e| e.channels).unwrap_or_default()
+    }
+
+    /// **Teardown.** Put these outputs back on both channels, returning how many were
+    /// masked. Scoped like [`Self::unmute_all`], and for the same id-guard reason: a
+    /// session releasing late must not touch a newer one's member.
+    pub fn unmask_all<'a>(&self, outputs: impl IntoIterator<Item = &'a str>) -> usize {
+        let mut lines = self.lines();
+        let mut cleared = 0;
+        for output in outputs {
+            let drop_entry = match lines.get_mut(output) {
+                Some(effect) => {
+                    cleared += usize::from(std::mem::take(&mut effect.channels) != MeasureChannels::Both);
+                    effect.is_empty()
+                }
+                None => false,
+            };
+            if drop_entry {
+                lines.remove(output);
+            }
+        }
+        self.publish(&lines);
+        cleared
     }
 
     /// Every calibration-muted output (sorted).

@@ -1368,6 +1368,64 @@ One thing the UI must not present as progress: the pre-flight window is two peri
 long and the estimator only keeps periods it saw whole, so **`periods: 1` is the
 maximum** it can ever report.
 
+### 12.2.1 A member that drives a stereo pair has no arrival time (2026-08-13)
+
+`click_wav` writes the burst **identically to both channels**, so a member driving a
+pair radiates the same click from two places. Unless the microphone sits on the pair's
+axis of symmetry it hears two arrivals of near-equal amplitude, and "that member's
+arrival" is not a quantity — it is two. Measured on a desktop pair on two consecutive
+runs: `1.1×` between the two arrivals (refused as `AmbiguousPeak`), then `1.53×` against
+a floor of `1.4` — accepted, but with a 4.12 ms cross-band split that §10.2 would have
+blocked the write on anyway. The estimator was right both times.
+
+**The remedy is to make it one source: emit one channel.** `POST /api/align/channel`
+sets a per-member `MeasureChannels` (`both` | `left` | `right`), applied at the same
+relay hook as the calibration mute and the provisional delay
+(`relay_delay::mask_channels`) — so it is transport-agnostic, live, costs no reconnect,
+persists nothing, and teardown puts both channels back with the rest of the session's
+state. What the solver then produces is *that speaker's* offset, which is the honest
+answer: a pair heard off-axis has no other one.
+
+Three things this deliberately does not do:
+
+- **It is not gated on a reported speaker layout, because there is none.** No output kind
+  tells the daemon how many speakers it drives. The pw-sink agent comes closest — it
+  knows its lever has two volume channels and even logs `2ch` — but `HostState` does not
+  carry it. So the wizard offers the choice on every member and says what it is for;
+  gating it becomes possible the day the agent reports channels.
+- **It does not try to be clever on a member that is not a pair.** The mask is applied to
+  the wire block, so a receiver that downmixes plays ~6 dB quieter and one that takes a
+  single channel falls silent on the other choice — which the gate already reports as
+  `GateReason::Silent`, "no tone from this speaker reached the microphone". Self-
+  announcing beats guessing.
+- **It does not change what a mute means.** A muted member emits silence, and silence has
+  no channels, so the mask only ever applies to an audible one — which is the only member
+  being measured anyway.
+
+### 12.2.2 A refusal has to carry its numbers, and the advice must not blame a hand
+
+The 2026-08-13 run refused `UnstablePhase` at ±7.67 ms on one speaker while another
+measured 0.040 ms on the same microphone thirteen seconds earlier — and the transcript
+recorded **only the sentence**, so afterwards it was impossible to tell which of two
+faults it had been:
+
+- the arrival **hopping** between two clustered values ⇒ two arrivals of similar strength
+  swapping places (a reflection, or §12.2.1's pair) ⇒ move the microphone;
+- the arrival **wandering or ramping** ⇒ the speaker is not rendering each block when it
+  was told (the `sendspin-open-items.md` item 4 family) ⇒ suspect the speaker.
+
+A standard error looks identical in both. So `gate_failed` now records the `Estimate` the
+gate judged **and** `Estimator::period_series` — the newest `GATE_FAILURE_PERIODS` (32)
+per-period arrivals, which is the series that separates the two. §8 said failures are
+what the transcript exists for; an accepted measurement recorded its whole observation
+and a refusal recorded prose, which was exactly backwards.
+
+The advice was wrong in a second way: it said *"Hold the phone still — put it down if you
+can"* to a microphone bolted to a PC, contradicted by the run's own data (the other
+member was steady to 0.040 ms). Both instability messages now name all three candidates
+and say which observation distinguishes them, and the ambiguity message names the stereo
+pair as the most common cause with the channel choice as its remedy.
+
 **Near field breaks the two-phase shape.** Its level is only meaningful *at* each
 speaker, and the risk inverts from too-quiet to clipping — so level-setting folds
 into each arrival (walk up, it goes green, measure, move on), which also makes near

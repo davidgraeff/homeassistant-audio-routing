@@ -145,6 +145,7 @@
 //!   event instead of being inferred from a poll that came back inactive.
 
 use crate::align::group::{AlignMode, ExclusiveHold, HoldDeps, Interference};
+use crate::align::relay_delay::MeasureChannels;
 use crate::outputs::ap2::volume::SharedAp2Control;
 use crate::outputs::sendspin::volume::SharedSendspinControl;
 use crate::routing::sync_group::SharedGroups;
