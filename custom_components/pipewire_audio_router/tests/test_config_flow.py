@@ -46,7 +46,7 @@ def _patch_setup():
             new=AsyncMock(return_value=AppSettings(expose_outputs_as_media_players=True)),
         )
     )
-    stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
+    stack.enter_context(patch(f"{COORD}.async_events_ws_loop", new=AsyncMock()))
     return stack
 
 

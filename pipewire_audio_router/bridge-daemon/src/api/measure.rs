@@ -9,7 +9,6 @@ use super::*;
 // deltas and their confidence before anything is written.
 
 use crate::align::measure::{DelayWriter, MeasureDeps, MeasureStatus, Mode, Refusal, RefusalKind, SendAheadContext, Timing};
-use crate::util::node_names::OutputKind;
 
 /// Writes one member's delay knob **through the existing endpoint handlers**.
 ///
@@ -30,21 +29,16 @@ impl DelayWriter for ApiDelayWriter {
         delay_ms: u16,
     ) -> crate::align::measure::Fut<'_, Result<String, String>> {
         Box::pin(async move {
-            let (status, Json(resp)) = match kind {
-                crate::align::calibrate::MemberKind::Sendspin => {
-                    set_sendspin_delay_handler(State(self.state.clone()), Json(SetSendspinDelayRequest { node_name, delay_ms })).await
-                }
-                // pw-sink shares AP2's per-output latency endpoint (its playout
-                // delay); the handler clamps to `PWSINK_JITTER_MIN_MS`.
-                crate::align::calibrate::MemberKind::Airplay2 | crate::align::calibrate::MemberKind::PwSink => {
-                    set_output_latency(
-                        State(self.state.clone()),
-                        Path(node_name),
-                        Json(SetOutputLatencyRequest { latency_ms: Some(delay_ms) }),
-                    )
-                    .await
-                }
-            };
+            // The very same code `PUT /api/outputs/{node}/delay` runs, so a written
+            // delay cannot diverge from a user-set one: the endpoint dispatches on the
+            // node's kind, and this asks for that kind's knob directly.
+            let (status, Json(resp)) = super::level::set_output_delay(
+                State(self.state.clone()),
+                Path(node_name),
+                Json(super::level::SetDelayRequest { delay_ms: Some(delay_ms) }),
+            )
+            .await;
+            let _ = kind;
             if status.is_success() && resp.ok {
                 Ok(resp.message)
             } else {
@@ -180,10 +174,27 @@ pub(crate) struct EquivalenceStartRequest {
     pub(crate) node_name: Option<String>,
 }
 
+/// `POST /api/align/equivalence` — let the daemon pick the member (it picks the one
+/// where the sign can actually be confirmed).
 pub(crate) async fn equivalence_start(
     State(state): State<AppState>,
-    Json(req): Json<EquivalenceStartRequest>,
 ) -> Result<Json<crate::align::measure::EquivalenceStatus>, (StatusCode, Json<Refusal>)> {
+    equivalence_start_on(state, None).await
+}
+
+/// `POST /api/align/equivalence/{node_name}` — run it on one named member instead.
+pub(crate) async fn equivalence_start_member(
+    State(state): State<AppState>,
+    Path(node_name): Path<String>,
+) -> Result<Json<crate::align::measure::EquivalenceStatus>, (StatusCode, Json<Refusal>)> {
+    equivalence_start_on(state, Some(node_name)).await
+}
+
+async fn equivalence_start_on(
+    state: AppState,
+    member: Option<String>,
+) -> Result<Json<crate::align::measure::EquivalenceStatus>, (StatusCode, Json<Refusal>)> {
+    let req = EquivalenceStartRequest { node_name: member };
     tracing::info!("USER ACTION: start the relay-vs-device equivalence experiment ({:?})", req.node_name);
     let deps = crate::align::measure::EquivalenceDeps {
         // The same deps a measurement run uses — including the provisional delay line the
@@ -262,8 +273,6 @@ pub(crate) async fn measure_finish() -> Result<Json<MeasureStatus>, (StatusCode,
 
 #[derive(Deserialize)]
 pub(crate) struct MeasureArrivalRequest {
-    /// The speaker the user is standing at, by node name.
-    pub(crate) node_name: String,
     /// Playback level (0–100) to measure it at. Omit to use the level the session last
     /// applied to this speaker — i.e. whatever the user settled on with
     /// `POST /api/align/audible` while standing there (plan §12.2).
@@ -280,9 +289,12 @@ pub(crate) struct MeasureArrivalRequest {
 ///
 /// Refused — never 500 — when the run is not a walk, is busy, has already measured
 /// this speaker, or has never heard of it.
-pub(crate) async fn measure_arrival(Json(req): Json<MeasureArrivalRequest>) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
-    tracing::info!("USER ACTION: near-field arrival at '{}'", req.node_name);
-    crate::align::measure::shared().arrival(req.node_name, req.level).map(Json).map_err(refused)
+pub(crate) async fn measure_arrival(
+    Path(node_name): Path<String>,
+    Json(req): Json<MeasureArrivalRequest>,
+) -> Result<Json<MeasureStatus>, (StatusCode, Json<Refusal>)> {
+    tracing::info!("USER ACTION: near-field arrival at '{node_name}'");
+    crate::align::measure::shared().arrival(node_name, req.level).map(Json).map_err(refused)
 }
 
 /// `POST /api/align/measure/close` — near field's closure reading.
@@ -353,8 +365,6 @@ pub(crate) async fn measure_abandon() -> Json<MeasureStatus> {
 
 #[derive(Deserialize)]
 pub(crate) struct SplitCalibrateRequest {
-    /// The speaker to calibrate. The user must be standing at it, phone in hand.
-    pub(crate) node_name: String,
     /// Playback level (0–100). Omit to use the level the session last applied to this
     /// speaker — i.e. whatever `POST /api/align/audible` settled on while the user was
     /// standing there watching `/api/align/mic/signal` (plan §12.2).
@@ -420,11 +430,12 @@ pub(crate) async fn measure_splits(State(state): State<AppState>) -> Json<BandSp
 /// one reading — and refuses while a measurement run is live.
 pub(crate) async fn measure_split_calibrate(
     State(state): State<AppState>,
+    Path(node_name): Path<String>,
     Json(req): Json<SplitCalibrateRequest>,
 ) -> Result<Json<crate::align::measure::SplitCalibration>, (StatusCode, Json<Refusal>)> {
-    tracing::info!("USER ACTION: calibrate '{}''s band split at close range", req.node_name);
+    tracing::info!("USER ACTION: calibrate '{node_name}''s band split at close range");
     let deps = measure_deps(&state, Mode::NearField, false, Vec::new());
-    let cal = crate::align::measure::shared().calibrate_split(deps, req.node_name, req.level).await.map_err(refused)?;
+    let cal = crate::align::measure::shared().calibrate_split(deps, node_name, req.level).await.map_err(refused)?;
     // Persisted here rather than in `align/measure/mod.rs` for the same reason the delay
     // writes are (plan §9.3): the store belongs to the API layer, and the measurement
     // module never sees `AppState`.
@@ -504,29 +515,18 @@ pub(crate) async fn measure_log(Query(q): Query<MeasureLogQuery>) -> Result<Resp
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct SetSendspinDelayRequest {
-    /// Virtual device node name, e.g. `sendspin-dev-voice_pe_kitchen`.
-    pub(crate) node_name: String,
-    /// Static delay in ms (0–5000); `0` clears it.
-    pub(crate) delay_ms: u16,
-}
-
 pub(crate) async fn get_sendspin_delays(State(state): State<AppState>) -> Json<std::collections::HashMap<String, u16>> {
     Json(state.sendspin_control.lock().await.delays())
 }
 
-pub(crate) async fn set_sendspin_delay_handler(
-    State(state): State<AppState>,
-    Json(req): Json<SetSendspinDelayRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn set_sendspin_delay(state: AppState, node_name: String, delay_ms: u16) -> (StatusCode, Json<OutputOpResponse>) {
     // Persist first (a calibrated offset must survive restarts), then push live.
-    if let Err(e) = state.sync_settings.lock_recover().set_sendspin_delay(&req.node_name, req.delay_ms) {
+    if let Err(e) = state.sync_settings.lock_recover().set_sendspin_delay(&node_name, delay_ms) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist delay: {e}") }));
     }
-    let pending = state.sendspin_control.lock().await.set_delay(&req.node_name, req.delay_ms);
+    let pending = state.sendspin_control.lock().await.set_delay(&node_name, delay_ms);
     let reached = pending.apply().await;
-    let ms = req.delay_ms.min(5000);
+    let ms = delay_ms.min(5000);
 
     // Current ESPHome firmware reads the static delay only at stream start, so the
     // live push above doesn't shift the running stream — the device has to reconnect
@@ -541,18 +541,18 @@ pub(crate) async fn set_sendspin_delay_handler(
     let live = state.settings.lock_recover().sendspin_delay_live();
     let mut reconnecting = false;
     if !live {
-        reconnecting = state.groups.lock().await.force_device_reconnect(&req.node_name);
+        reconnecting = state.groups.lock().await.force_device_reconnect(&node_name);
         if reconnecting {
             let _ = state.changes.send(());
         }
     }
 
     let message = if !reached {
-        format!("saved {ms} ms for '{}' (device not connected)", req.node_name)
+        format!("saved {ms} ms for '{}' (device not connected)", node_name)
     } else if reconnecting {
-        format!("set '{}' static delay to {ms} ms (reconnecting just this speaker to apply)", req.node_name)
+        format!("set '{}' static delay to {ms} ms (reconnecting just this speaker to apply)", node_name)
     } else {
-        format!("set '{}' static delay to {ms} ms", req.node_name)
+        format!("set '{}' static delay to {ms} ms", node_name)
     };
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
@@ -590,12 +590,6 @@ pub(crate) async fn set_output_name(
     (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
 }
 
-#[derive(Deserialize)]
-pub(crate) struct SetOutputLatencyRequest {
-    /// Receiver latency in ms; `null`/omitted resets to the type's default.
-    pub(crate) latency_ms: Option<u16>,
-}
-
 /// Set an output's per-output playout delay (ms), persisted per node name in
 /// routing/sync_settings.rs. `latency_ms: null` clears the override, back to the kind's
 /// default. Two kinds have such a knob, and both land here because they are the
@@ -614,42 +608,17 @@ pub(crate) struct SetOutputLatencyRequest {
 /// receiver's negotiated buffer; the module's refusal to run a buffer below its
 /// ptime). A *low* value is otherwise allowed straight through even though it
 /// risks dropouts: finding that threshold by ear is exactly what this knob is for,
-/// and the UI marks the low end red rather than forbidding it.
-pub(crate) async fn set_output_latency(
-    State(state): State<AppState>,
-    Path(node_name): Path<String>,
-    Json(req): Json<SetOutputLatencyRequest>,
+
+/// The AirPlay-2 half of `PUT /api/outputs/{node_name}/delay`: persist the render delay
+/// and push it to the running session.
+///
+/// `None` clears the override, putting the receiver back on the sender's own default.
+pub(crate) async fn set_ap2_render_delay(
+    state: AppState,
+    node_name: String,
+    requested: Option<u16>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    // Matched, not chained: sendspin has this knob too and it lives on its own endpoint
-    // (`PUT /api/sendspin/delay`, because it is an *advance* and costs a reconnect), so
-    // the refusal has to name where to go rather than claim the speaker has no knob.
-    match OutputKind::of(&node_name) {
-        Some(OutputKind::PwSink) => return set_pwsink_jitter(state, node_name, req.latency_ms).await,
-        Some(OutputKind::Airplay2) => {}
-        Some(OutputKind::Sendspin) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(OutputOpResponse {
-                    ok: false,
-                    message: format!(
-                        "'{node_name}' is a {} — its timing knob is an *advance*, not a playout delay, and it is set \
-                         through PUT /api/sendspin/delay",
-                        OutputKind::Sendspin.human()
-                    ),
-                }),
-            )
-        }
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(OutputOpResponse {
-                    ok: false,
-                    message: format!("'{node_name}' has no playout-delay knob (AirPlay 2 receivers and PipeWire hosts do)"),
-                }),
-            )
-        }
-    }
-    let clamped = req.latency_ms.map(|ms| ms.min(crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS));
+    let clamped = requested.map(|ms| ms.min(crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS));
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_latency(&node_name, clamped) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

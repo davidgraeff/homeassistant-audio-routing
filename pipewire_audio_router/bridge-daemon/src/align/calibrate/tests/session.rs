@@ -275,66 +275,44 @@ async fn an_idle_session_is_torn_down_by_its_watchdog_and_the_close_is_pushed() 
     assert!(f.groups.lock().await.align_hold_outputs().is_empty(), "…and released the exclusive hold with them");
 }
 
-/// Plan §11's requirement for the session socket: **one full state on connect**, so a
-/// client needs no separate initial fetch.
+/// Plan §11's requirement for the session status: **one full state on demand, and a
+/// frame for every change including the last one** — a client must need no separate
+/// initial fetch, and must be *told* when the session ends rather than discovering it.
 ///
-/// Driven over a real socket (a hand-rolled handshake — no test-only WebSocket client
-/// dependency) because the claim is about the transport: `status_socket` sends before it
-/// waits, and a version that waited for the first *change* would look fine in every
-/// unit test and leave a wizard blank until the user touched something.
+/// The transport that carries this is now the one events socket (`events.rs`, one
+/// connection for every topic); what belongs here is the half that is this module's:
+/// `status()` answers in full at any moment, and `subscribe()` bumps on every change up
+/// to and including the teardown. A version that only bumped on *some* changes would
+/// leave a wizard describing a session that no longer exists.
 #[tokio::test]
-async fn a_socket_opened_while_a_session_is_live_gets_the_current_state_at_once() {
+async fn the_session_answers_in_full_and_announces_every_change_including_its_end() {
     let (a, b) = ("sendspin-dev-wsa", "sendspin-dev-wsb");
     let f = UnionFixture::new("sessionws", &[(a, MemberKind::Sendspin), (b, MemberKind::Sendspin)]).await;
     f.mgr.solo(b.to_string(), 31).await.expect("solo");
+    // Subscribed *after* that solo: what a client gets first is the state as it stands,
+    // not a replay of how it got there.
+    let mut changes = f.mgr.subscribe();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().unwrap();
-    let mgr = f.mgr.clone();
-    // The same wiring `api::align::align_ws` does, minus `AppState`.
-    let app = axum::Router::new().route(
-        "/ws",
-        axum::routing::get(move |ws: axum::extract::ws::WebSocketUpgrade| {
-            let mgr = mgr.clone();
-            async move {
-                ws.on_upgrade(move |socket| async move {
-                    let changes = mgr.subscribe();
-                    crate::align::status_ws::status_socket(socket, changes, move || {
-                        let mgr = mgr.clone();
-                        Box::pin(async move { serde_json::to_string(&mgr.status().await).ok() })
-                    })
-                    .await;
-                })
-            }
-        }),
-    );
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-    let mut sock = ws_connect(addr).await;
-    // Not preceded by any request of ours: whatever arrives is unprompted. Read as a
-    // `Value` because `AlignState` is a serialise-only DTO — and because the assertions
-    // that matter are about the *wire* shape a client parses.
-    let first = ws_read_status(&mut sock).await;
-    assert_eq!(first["active"], serde_json::json!(true), "the socket describes the session that is already running");
+    let first = serde_json::to_value(f.mgr.status().await).expect("the state serialises");
+    assert_eq!(first["active"], serde_json::json!(true), "the status describes the session that is already running");
     assert_eq!(first["audible"], serde_json::json!([b]), "…including where the run currently is");
     assert_eq!(first["volume"], serde_json::json!(31));
     assert!(first["closes_in_s"].as_u64().is_some(), "and when it would close: {}", first["closes_in_s"]);
     assert_eq!(first["timeout_slack_s"], serde_json::json!(TIMEOUT_POLL.as_secs()));
     // Full state, not a delta: a client must not need a separate initial fetch.
     for field in ["members", "outputs", "levels", "level_channels", "hold_id", "displaced"] {
-        assert!(!first[field].is_null(), "the connect frame is a whole status; '{field}' is missing");
+        assert!(!first[field].is_null(), "the status is a whole state; '{field}' is missing");
     }
 
-    // Then one frame per change, ending with the one that says it is over — which is the
-    // frame the whole socket exists for.
+    // Then one bump per change …
     f.mgr.solo(a.to_string(), 44).await.expect("solo");
-    let next = ws_read_status(&mut sock).await;
-    assert_eq!(next["audible"], serde_json::json!([a]));
+    changes.changed().await.expect("a change is announced");
+    assert_eq!(serde_json::to_value(f.mgr.status().await).unwrap()["audible"], serde_json::json!([a]));
 
+    // … ending with the one that says it is over, which is the frame the socket exists for.
     f.mgr.stop().await;
-    let closed = ws_read_status(&mut sock).await;
-    assert_eq!(closed["active"], serde_json::json!(false), "the teardown arrives as an event");
+    changes.changed().await.expect("the teardown is announced too");
+    let closed = serde_json::to_value(f.mgr.status().await).unwrap();
+    assert_eq!(closed["active"], serde_json::json!(false));
     assert_eq!(closed["closes_in_s"], serde_json::Value::Null);
-
-    server.abort();
 }

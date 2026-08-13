@@ -1323,16 +1323,3 @@ pub(crate) const EQUIV_CANNOT_TELL: [&str; 6] = [
 ];
 
 // ---- Status push (plan §11: "progress should be pushed, not polled") ------
-
-/// `GET /api/align/equivalence/ws` — the experiment's status, pushed.
-///
-/// Worth a socket for the same reason the measurement is: it spends minutes inside
-/// gates, waiting for a speaker to come back, and the *message* is the only thing
-/// moving. Registered in `api/measure.rs`, which owns the router.
-#[allow(dead_code)] // the route belongs to api/measure.rs
-pub async fn equivalence_ws(ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(|socket| {
-        let m = equivalence();
-        status_socket(socket, m.subscribe(), || Box::pin(async { serde_json::to_string(&m.status()).ok() }))
-    })
-}

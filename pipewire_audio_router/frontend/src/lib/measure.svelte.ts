@@ -18,7 +18,8 @@
 //     `proposal.blocked`, both decided by the daemon — a client-side opinion about
 //     a good-enough standard error would be a second, quieter policy.
 
-import { MEASURE_WS_PATH, api, refusalOf, wsUrl } from './api';
+import { api, refusalOf } from './api';
+import { onTopic } from './events';
 import { toast } from './toast';
 import type {
   ChainAction,
@@ -52,11 +53,6 @@ const POLL_LIVE_MS = 1000;
 /** Parked (proposed / done / refused / idle): still polled, because a *second*
  *  browser or the HA integration can move the run, but slowly. */
 const POLL_IDLE_MS = 5000;
-
-/** How long to wait before trying the push socket again after it failed or dropped.
- *  Polling continues throughout, so this is a quiet upgrade attempt, not a retry the
- *  user is waiting on. */
-const WS_RETRY_MS = 15000;
 
 /** Phases in which the run is alive but the *user* is the one being waited on: a
  *  chain parked between listening positions, a walk parked between speakers. The
@@ -382,9 +378,10 @@ function createMeasure() {
   //   * the socket only *earns* the right to stop it by delivering an actual status —
   //     an upgrade that succeeds and then says nothing (a proxy that holds the
   //     connection open) therefore changes nothing;
-  //   * a close or an error puts polling back and re-tries the socket later.
-  let socket: WebSocket | null = null;
-  let retry: ReturnType<typeof setTimeout> | null = null;
+  //   * losing the socket puts polling back; `lib/events.ts` owns the reconnect.
+  /** Unsubscribe for the `measure` topic on the shared socket, or `null` when not
+   *  subscribed. */
+  let off: (() => void) | null = null;
   /** True once the socket has actually delivered a status, i.e. polling is off. */
   let pushing = $state(false);
 
@@ -409,36 +406,16 @@ function createMeasure() {
         : null;
   }
 
-  function scheduleRetry() {
-    if (retry || mounted === 0) return;
-    retry = setTimeout(() => {
-      retry = null;
-      openSocket();
-    }, WS_RETRY_MS);
-  }
-
   function openSocket() {
-    if (socket || mounted === 0) return;
-    let sock: WebSocket;
-    try {
-      sock = new WebSocket(wsUrl(MEASURE_WS_PATH));
-    } catch {
-      scheduleRetry();
-      return;
-    }
-    socket = sock;
-    sock.onmessage = (ev) => {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(String(ev.data));
-      } catch {
-        return; // not a status frame; polling is still running if we never adopted one
-      }
-      // Shape-checked rather than trusted: adopting `{}` would blank the whole
-      // wizard, and the fallback exists precisely because this route may not be the
-      // one we think it is yet.
-      if (!parsed || typeof parsed !== 'object' || typeof (parsed as MeasureStatus).phase !== 'string') return;
-      adopt(parsed as MeasureStatus);
+    if (off || mounted === 0) return;
+    // A *topic* on the app's one socket (`lib/events.ts`): leaving the wizard stops the
+    // daemon pushing run status, and the connection stays for whatever page comes next.
+    // Subscribing answers with the current status at once, which is what lets the poll
+    // stop as soon as a frame lands.
+    off = onTopic('measure', (payload) => {
+      // Shape-checked rather than trusted: adopting `{}` would blank the whole wizard.
+      if (!payload || typeof payload !== 'object' || typeof (payload as MeasureStatus).phase !== 'string') return;
+      adopt(payload as MeasureStatus);
       if (!pushing) {
         pushing = true;
         if (timer) {
@@ -446,32 +423,14 @@ function createMeasure() {
           timer = null;
         }
       }
-    };
-    sock.onclose = () => {
-      if (socket !== sock) return;
-      socket = null;
-      pushing = false;
-      // Straight back to polling, then a quiet attempt to get the socket back.
-      void poll();
-      scheduleRetry();
-    };
-    // `onerror` is always followed by `onclose`, which is where the recovery lives.
-    sock.onerror = () => {};
+    });
   }
 
   function closeSocket() {
-    if (retry) {
-      clearTimeout(retry);
-      retry = null;
-    }
     pushing = false;
-    if (!socket) return;
-    const sock = socket;
-    socket = null;
-    sock.onclose = null;
-    sock.onerror = null;
-    sock.onmessage = null;
-    sock.close(1000, 'wizard closed');
+    if (!off) return;
+    off();
+    off = null;
   }
 
   /** The speakers a pending revert belongs to. `revert_scope` is the contract; the

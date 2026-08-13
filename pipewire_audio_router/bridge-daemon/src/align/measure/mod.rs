@@ -105,7 +105,6 @@ use crate::align::levels::TARGET_PEAK_SNR_DB;
 use crate::align::mic::{MicStatus, MicWindow};
 // One push loop for all three alignment status sockets — see that module's docs for
 // why a fourth copy of it must not appear.
-use crate::align::status_ws::status_socket;
 use crate::align::transcript;
 use crate::util::locks::LockRecover;
 use serde::{Deserialize, Serialize};
@@ -679,7 +678,7 @@ impl MeasureManager {
     /// (plan §11: progress is pushed, not polled). Survives `abandon`/`start`,
     /// which replace the state but carry the notifier across.
     #[allow(dead_code)] // used by `measure_ws`, whose route api/measure.rs owns
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.inner.lock_recover().changes.subscribe()
     }
 
@@ -1418,24 +1417,6 @@ impl MeasureManager {
         inner.bump();
         (inner.status(), session)
     }
-}
-
-/// `GET /api/align/measure/ws` — the run status, pushed.
-///
-/// One full [`MeasureStatus`] on connect, then one on every change. Same shape a
-/// `GET /api/align/measure` poll returns, so a client can use either and the
-/// socket is purely a latency improvement: a measurement spends most of its time
-/// inside a gate whose *message* is the only thing moving, and polling that at any
-/// useful rate is what §11 objected to.
-///
-/// Registered in `api/measure.rs`, which owns the router.
-pub async fn measure_ws(ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(|socket| {
-        let m = shared();
-        // Subscribed *before* the first status is read, so a change that lands between
-        // the two is a redundant push rather than a missed one.
-        status_socket(socket, m.subscribe(), || Box::pin(async { serde_json::to_string(&m.status()).ok() }))
-    })
 }
 
 // The run's pieces, each with a matching test module in `tests/`.

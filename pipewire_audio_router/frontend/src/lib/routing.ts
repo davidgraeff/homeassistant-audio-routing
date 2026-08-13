@@ -1,14 +1,17 @@
-// Live daemon state over one WebSocket, as a Svelte store. Auto-connects when
-// first subscribed and reconnects on drop.
+// Live daemon state as a Svelte store, fed by the one push socket (`lib/events.ts`,
+// `GET /api/events`).
 //
-// The socket carries **typed frames** (bridge-daemon/src/routing.rs): the routing
-// matrix, the listings the Outputs page would otherwise have to re-fetch
-// (`outputs`, `discovered`, `agents`), per-source now-playing metadata
-// (`now_playing` — what each input is playing, shown on the source cards), and the
-// fast lane — `meters`, the peaks and xrun counts that move
-// without any graph change. **Every frame is deduped daemon-side**, so each arrives
-// only when its payload actually changed; a component may react to any of them
-// directly, but must never re-fetch on one.
+// It subscribes to the topics this store is about — the routing `matrix`, the listings
+// the Outputs page would otherwise re-fetch (`outputs`, `discovered`, `agents`),
+// per-source `now_playing` metadata, and the fast lane `meters` (peaks and xrun counts,
+// which move without any graph change). **Every topic is deduped daemon-side**, so a
+// frame arrives only when its payload actually changed; a component may react to any of
+// them directly, but must never re-fetch on one.
+//
+// The subscriptions live and die with this store's own subscribers, which is the point of
+// per-topic subscription: with nobody looking at the graph the daemon is not asked for a
+// matrix, and — because arming metering *is* the `meters` subscription — it is not taking
+// peak taps or running the PipeWire profiler either.
 //
 // `meters` is deliberately kept as its own slice rather than merged into
 // `matrix.sources`/`.outputs`: those arrays keep their identity between real graph
@@ -20,7 +23,7 @@
 // `null` until the daemon sends one — "nothing pushed yet", not "empty".
 
 import { readable } from 'svelte/store';
-import { wsUrl } from './api';
+import { onConnection, onTopic } from './events';
 import type { AgentInfo, NowPlaying, OutputInfo, RoutingMatrix } from './types';
 
 /** A node's live figures from the `meters` frame. A field is absent when it is
@@ -50,18 +53,6 @@ export interface RoutingState {
 
 const EMPTY: RoutingMatrix = { sources: [], outputs: [], links: [] };
 
-/** A frame as it comes off the wire, before we know which kind it is. `outputs`
- * means different things per kind — `RoutingNode[]` in a matrix frame,
- * `OutputInfo[]` in a listing frame — so it stays `unknown` here and is narrowed
- * once `type` is known. */
-interface Frame {
-  type?: 'matrix' | 'outputs' | 'discovered' | 'agents' | 'now_playing' | 'meters';
-  outputs?: unknown;
-  agents?: unknown;
-  sources?: unknown;
-  nodes?: unknown;
-}
-
 const INITIAL: RoutingState = {
   matrix: EMPTY,
   outputs: null,
@@ -73,79 +64,34 @@ const INITIAL: RoutingState = {
 };
 
 export const routing = readable<RoutingState>(INITIAL, (set) => {
-    let ws: WebSocket | null = null;
-    let stopped = false;
-    let retry: ReturnType<typeof setTimeout> | null = null;
-    // Held across reconnects so a dropped socket doesn't blank the page before the
-    // new one has re-sent everything.
-    let state: RoutingState = INITIAL;
+  // Held across reconnects so a dropped socket doesn't blank the page before the new
+  // one has re-sent everything.
+  let state: RoutingState = INITIAL;
+  const publish = (patch: Partial<RoutingState>) => {
+    state = { ...state, ...patch };
+    set(state);
+  };
 
-    const publish = (patch: Partial<RoutingState>) => {
-      state = { ...state, ...patch };
-      set(state);
-    };
+  const off = [
+    onConnection((connected) => publish({ connected })),
+    // The matrix frame is flat — it *was* the whole frame once — so the payload is the
+    // frame itself.
+    onTopic('matrix', (p) => publish({ matrix: p as RoutingMatrix })),
+    onTopic('outputs', (p) => publish({ outputs: p as OutputInfo[] })),
+    onTopic('discovered', (p) => publish({ discovered: p as OutputInfo[] })),
+    onTopic('agents', (p) => publish({ agents: p as AgentInfo[] })),
+    // Replaced wholesale, not merged: the frame is the complete picture, so a source
+    // that stopped playing is expressed by its absence.
+    onTopic('now_playing', (p) => publish({ nowPlaying: (p ?? {}) as Record<string, NowPlaying> })),
+    // Same rule, and it is what lets a level decay back to silence: a node absent from
+    // the frame has nothing to report, i.e. zero.
+    onTopic('meters', (p) => publish({ meters: (p ?? {}) as Record<string, MeterSample> })),
+  ];
 
-    const connect = () => {
-      ws = new WebSocket(wsUrl('api/routing/ws'));
-      ws.onopen = () => publish({ connected: true });
-      ws.onmessage = (ev) => {
-        let frame: Frame;
-        try {
-          frame = JSON.parse(ev.data) as Frame;
-        } catch {
-          return; // malformed frame: ignore rather than tear the socket down
-        }
-        switch (frame.type) {
-          case 'outputs':
-            publish({ outputs: frame.outputs as OutputInfo[], connected: true });
-            break;
-          case 'discovered':
-            publish({ discovered: frame.outputs as OutputInfo[], connected: true });
-            break;
-          case 'agents':
-            publish({ agents: frame.agents as AgentInfo[], connected: true });
-            break;
-          case 'now_playing':
-            // Per-source now-playing metadata (docs/source-metadata-plan.md).
-            // Replaced wholesale, not merged: the frame is the complete picture, so
-            // a source that stopped playing is expressed by its absence.
-            publish({ nowPlaying: (frame.sources ?? {}) as Record<string, NowPlaying>, connected: true });
-            break;
-          case 'meters':
-            // The fast lane. A node absent from `nodes` has nothing to report, i.e.
-            // zero — so this replaces the slice wholesale instead of merging into it,
-            // which is what lets a level decay back to silence.
-            publish({ meters: (frame.nodes ?? {}) as Record<string, MeterSample>, connected: true });
-            break;
-          case 'matrix':
-            publish({ matrix: frame as unknown as RoutingMatrix, connected: true });
-            break;
-          default:
-            // An untyped frame is a matrix from a daemon older than typed frames —
-            // which *was* the matrix, bare. Anything else is a frame kind newer than
-            // this UI: ignore it rather than mis-read it as a matrix.
-            if (frame.type === undefined) {
-              publish({ matrix: frame as unknown as RoutingMatrix, connected: true });
-            } else {
-              publish({ connected: true });
-            }
-        }
-      };
-      ws.onclose = () => {
-        publish({ connected: false });
-        if (!stopped) retry = setTimeout(connect, 2000);
-      };
-      ws.onerror = () => ws?.close();
-    };
-    connect();
-
-    return () => {
-      stopped = true;
-      if (retry) clearTimeout(retry);
-      ws?.close();
-    };
-  },
-);
+  return () => {
+    for (const stop of off) stop();
+  };
+});
 
 /** Whether a given (source, output) pair is routed, by stable node name. */
 export function isLinked(matrix: RoutingMatrix, source: string, output: string): boolean {

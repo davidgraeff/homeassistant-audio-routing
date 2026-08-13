@@ -237,3 +237,49 @@ fn create_request_config_defaults() {
     // The omitted-object fallback the handler uses.
     assert_eq!(default_rtp_config().port, DEFAULT_RTP_PORT);
 }
+
+/// The per-output knobs are parameterised siblings of the *static* `discovered` listing
+/// and of each other, and axum panics on a genuine conflict at build time — i.e. at
+/// daemon startup, where nothing would catch it. Registering the whole family must be
+/// accepted.
+#[test]
+fn the_per_output_knob_routes_coexist_with_the_static_siblings() {
+    let app: Router = Router::new()
+        .route("/api/outputs", get(|| async { "all" }))
+        .route("/api/outputs/discovered", get(|| async { "offered" }))
+        .route("/api/outputs/{node_name}", delete(|| async { "removed" }))
+        .route("/api/outputs/{node_name}/volume", put(|| async { "level" }))
+        .route("/api/outputs/{node_name}/mute", put(|| async { "mute" }))
+        .route("/api/outputs/{node_name}/delay", put(|| async { "delay" }))
+        .route("/api/outputs/{node_name}/resync", post(|| async { "resync" }))
+        .route("/api/outputs/{node_name}/adopt", post(|| async { "added" }));
+    drop(app);
+}
+
+/// A sender is addressed by its key one level below the listing, so `{key}` must not
+/// conflict with the collection above it — nor its own sub-paths with the key itself.
+#[test]
+fn the_client_key_routes_nest_under_the_listing() {
+    let app: Router = Router::new()
+        .route("/api/sources/{id}/clients", get(|| async { "list" }))
+        .route("/api/sources/{id}/clients/{key}", delete(|| async { "forget" }))
+        .route("/api/sources/{id}/clients/{key}/ban", put(|| async { "ban" }))
+        .route("/api/sources/{id}/clients/{key}/priority", put(|| async { "priority" }))
+        .route("/api/sources/{id}/clients/{key}/disconnect", post(|| async { "kick" }));
+    drop(app);
+}
+
+/// Two alignment paths where a *node name* and a bare collection share a prefix: the
+/// band-split listing beside one output's calibration, and the equivalence experiment
+/// with or without a named member.
+#[test]
+fn the_align_member_paths_coexist_with_their_collections() {
+    let app: Router = Router::new()
+        .route("/api/align/measure/split", get(|| async { "all" }))
+        .route("/api/align/measure/split/{node_name}", post(|| async { "one" }).delete(|| async { "clear" }))
+        .route("/api/align/measure/arrival/{node_name}", post(|| async { "here" }))
+        .route("/api/align/equivalence", get(|| async { "status" }).post(|| async { "auto" }))
+        .route("/api/align/equivalence/{node_name}", post(|| async { "member" }))
+        .route("/api/align/members/{node_name}/channel", post(|| async { "channel" }));
+    drop(app);
+}

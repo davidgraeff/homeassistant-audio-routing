@@ -12,7 +12,8 @@
 // `startSelection`, including by-ear, which is what stops `manual` being a special
 // case with its own entry point and its own lifecycle rules.
 
-import { ALIGN_WS_PATH, api, wsUrl } from './api';
+import { api } from './api';
+import { onTopic } from './events';
 import { run } from './toast';
 import { mic } from './mic.svelte';
 import type {
@@ -229,9 +230,10 @@ function createAlign() {
   //   * polling starts immediately on attach and keeps going;
   //   * the socket only *earns* the right to stop it by delivering an actual state, so an
   //     upgrade that succeeds and then says nothing changes nothing;
-  //   * a close or an error puts polling back and re-tries the socket later.
-  let socket: WebSocket | null = null;
-  let retry: ReturnType<typeof setTimeout> | null = null;
+  //   * losing the socket puts polling back; `lib/events.ts` owns the reconnect.
+  /** Unsubscribe for the `align` topic on the shared socket, or `null` when not
+   *  subscribed. Replaces the private socket this store used to own. */
+  let off: (() => void) | null = null;
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let watching = 0;
   /** True once the socket has actually delivered a state, i.e. polling is off. */
@@ -242,9 +244,6 @@ function createAlign() {
    *  back to the session's notifier — so this stays modest rather than becoming a
    *  once-a-minute formality. */
   const STATUS_POLL_MS = 3000;
-  /** Quiet upgrade attempt after the socket failed or dropped. Polling continues
-   *  throughout, so nobody is waiting on it. */
-  const WS_RETRY_MS = 15000;
 
   // ---- The idle countdown, ticked locally from a pushed deadline ---------------
   //
@@ -360,35 +359,17 @@ function createAlign() {
     statusTimer = watching > 0 && !pushing ? setTimeout(() => void pollStatus(), STATUS_POLL_MS) : null;
   }
 
-  function scheduleSocketRetry() {
-    if (retry || watching === 0) return;
-    retry = setTimeout(() => {
-      retry = null;
-      openSocket();
-    }, WS_RETRY_MS);
-  }
-
   function openSocket() {
-    if (socket || watching === 0) return;
-    let sock: WebSocket;
-    try {
-      sock = new WebSocket(wsUrl(ALIGN_WS_PATH));
-    } catch {
-      scheduleSocketRetry();
-      return;
-    }
-    socket = sock;
-    sock.onmessage = (ev) => {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(String(ev.data));
-      } catch {
-        return; // not a state frame; polling is still running if we never adopted one
-      }
+    if (off || watching === 0) return;
+    // One socket for the whole app (`lib/events.ts`); this is a *topic* on it, so
+    // leaving the wizard stops the daemon pushing session state without costing the
+    // connection the rest of the UI is using. Subscribing answers with the current
+    // state at once, which is why polling can stop as soon as a frame lands.
+    off = onTopic('align', (payload) => {
       // Shape-checked rather than trusted: adopting `{}` would report the session as
       // ended, which is the one thing this channel must never get wrong.
-      if (!parsed || typeof parsed !== 'object' || typeof (parsed as AlignState).active !== 'boolean') return;
-      adopt(parsed as AlignState);
+      if (!payload || typeof payload !== 'object' || typeof (payload as AlignState).active !== 'boolean') return;
+      adopt(payload as AlignState);
       if (!pushing) {
         pushing = true;
         if (statusTimer) {
@@ -396,33 +377,14 @@ function createAlign() {
           statusTimer = null;
         }
       }
-    };
-    sock.onclose = () => {
-      if (socket !== sock) return;
-      socket = null;
-      pushing = false;
-      // Straight back to polling — the session's *end* must not be missed because a
-      // proxy dropped a socket — then a quiet attempt to get the socket back.
-      void pollStatus();
-      scheduleSocketRetry();
-    };
-    // `onerror` is always followed by `onclose`, which is where the recovery lives.
-    sock.onerror = () => {};
+    });
   }
 
   function closeSocket() {
-    if (retry) {
-      clearTimeout(retry);
-      retry = null;
-    }
     pushing = false;
-    if (!socket) return;
-    const sock = socket;
-    socket = null;
-    sock.onclose = null;
-    sock.onerror = null;
-    sock.onmessage = null;
-    sock.close(1000, 'no longer watching the alignment session');
+    if (!off) return;
+    off();
+    off = null;
   }
 
   async function seedOffsets() {
@@ -917,8 +879,9 @@ function createAlign() {
       const clamped = Math.max(sliderMin(m), Math.min(sliderMax(m), Math.round(ms)));
       offsets = { ...offsets, [m.node_name]: clamped };
       try {
-        if (m.kind === 'sendspin') await api.setSendspinDelay(m.node_name, clamped);
-        else await api.setOutputLatency(m.node_name, clamped);
+        // One endpoint whatever the kind: the daemon knows this output's knob, its
+        // polarity and what writing it costs.
+        await api.setOutputDelay(m.node_name, clamped);
       } catch (e) {
         await run(() => Promise.reject(e));
       }

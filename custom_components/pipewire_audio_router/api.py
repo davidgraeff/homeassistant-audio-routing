@@ -6,6 +6,8 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from urllib.parse import quote
+
 import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
@@ -15,17 +17,16 @@ _LOGGER = logging.getLogger(__name__)
 # has no routing changes to push for a while.
 WS_HEARTBEAT_SECONDS = 25
 
-# Frame `type`s on /api/routing/ws this client consumes. The daemon multiplexes
-# several onto that socket (routing.rs `Frame`); the rest are listings this
-# integration re-fetches over REST instead, and are skipped.
-ROUTING_WS_FRAME_MATRIX = "matrix"
-ROUTING_WS_FRAME_NOW_PLAYING = "now_playing"
-# Live input levels and xrun counts, on a 250 ms tick while any client watches.
-# Named so it can be skipped *silently*: it is the only high-rate frame on the
-# socket and there is nothing an HA entity could do with a peak meter, so logging
-# it as an unrecognised frame would mean a debug line four times a second
-# throughout playback.
-ROUTING_WS_FRAME_METERS = "meters"
+# The daemon has **one** push socket, `/api/events`, and its frames are chosen by
+# subscribing to topics on it (bridge-daemon/src/events.rs). This integration wants
+# exactly two:
+EVENTS_TOPIC_MATRIX = "matrix"
+EVENTS_TOPIC_NOW_PLAYING = "now_playing"
+EVENTS_TOPICS = (EVENTS_TOPIC_MATRIX, EVENTS_TOPIC_NOW_PLAYING)
+# The acknowledgement the daemon answers a subscribe with. Consumed silently, except
+# for its `unknown` list — a topic this daemon does not have would otherwise be an
+# eternal silence.
+EVENTS_FRAME_SUBSCRIBED = "subscribed"
 
 
 class PipewireRouterApiError(Exception):
@@ -309,73 +310,35 @@ class PipewireRouterApiClient:
             raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
         return {str(k): int(v) for k, v in data.items()}
 
-    async def async_set_sendspin_volume(self, node_name: str, volume: int) -> None:
-        """Set one sendspin device's volume (`PUT /api/sendspin/volume`, 0–100).
-        Sent in-band to the device; stored daemon-side and re-applied on
-        reconnect. There is no PipeWire node volume for these virtual outputs."""
+    async def async_set_output_volume(self, node_name: str, volume: float) -> None:
+        """Set one output's volume (`PUT /api/outputs/{node_name}/volume`), 0.0–1.0 —
+        the same scale as HA's `volume_level`, whatever kind the output is.
+
+        The daemon converts and dispatches: in-band over the sendspin protocol, as an
+        RTSP `SET_PARAMETER` to an AirPlay-2 receiver, or through a PipeWire host's own
+        agent. This integration used to pick the endpoint itself from the node-name
+        prefix and convert the scale per branch, which is how a `pwsink-dev-*` write once
+        ended up stored as a sendspin intent and silently overwritten.
+
+        A kind with no volume knob answers 400 and an unknown name 404; a PipeWire host
+        with no live agent answers 503, because a host owns its level and reports it back
+        rather than having an intent saved for it."""
+        await self._async_output_op("put", node_name, "volume", {"volume": volume})
+
+    async def async_set_output_mute(self, node_name: str, muted: bool) -> None:
+        """Mute/unmute one output (`PUT /api/outputs/{node_name}/mute`), same dispatch
+        and the same failure modes as the volume."""
+        await self._async_output_op("put", node_name, "mute", {"muted": muted})
+
+    async def _async_output_op(self, method: str, node_name: str, op: str, payload: dict) -> None:
+        """One output-scoped write. The subject is in the path, so this is generic —
+        which is the point of addressing the output rather than its transport."""
+        url = f"{self._base_url}/api/outputs/{quote(node_name, safe='')}/{op}"
         try:
-            async with self._session.put(
-                f"{self._base_url}/api/sendspin/volume",
-                json={"node_name": node_name, "volume": volume},
-            ) as resp:
+            async with self._session.request(method.upper(), url, json=payload) as resp:
                 resp.raise_for_status()
         except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"could not set sendspin volume: {err}") from err
-
-    async def async_set_ap2_volume(self, node_name: str, volume: float) -> None:
-        """Set one AirPlay-2 receiver's volume (`PUT /api/ap2/volume`, 0.0–1.0).
-        Pushed in-band to the receiver as an RTSP SET_PARAMETER and stored
-        daemon-side (re-applied while streaming). Like the sendspin outputs
-        these are virtual — there's no PipeWire node volume to set."""
-        try:
-            async with self._session.put(
-                f"{self._base_url}/api/ap2/volume",
-                json={"node_name": node_name, "volume": volume},
-            ) as resp:
-                resp.raise_for_status()
-        except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"could not set AirPlay-2 volume: {err}") from err
-
-    async def async_set_pwsink_volume(self, node_name: str, volume: float) -> None:
-        """Set a pw-sink host's *master* volume (`PUT /api/pwsink/volume`,
-        0.0-1.0 cubic). Applied by that host's pwrouter-agent to the sink our
-        stream actually plays into, via the device's Route param — the same lever
-        the user's own volume applet uses, so the two agree.
-
-        Unlike sendspin/AirPlay-2 volume there is no store-and-replay: an
-        unreachable host is a failure, not a saved intent, because the host owns
-        the value and reports it back."""
-        try:
-            async with self._session.put(
-                f"{self._base_url}/api/pwsink/volume",
-                json={"node_name": node_name, "volume": volume},
-            ) as resp:
-                resp.raise_for_status()
-        except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"could not set pw-sink volume: {err}") from err
-
-    async def async_set_pwsink_mute(self, node_name: str, muted: bool) -> None:
-        """Mute/unmute a pw-sink host's master out (`PUT /api/pwsink/mute`)."""
-        try:
-            async with self._session.put(
-                f"{self._base_url}/api/pwsink/mute",
-                json={"node_name": node_name, "muted": muted},
-            ) as resp:
-                resp.raise_for_status()
-        except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"could not set pw-sink mute: {err}") from err
-
-    async def async_set_ap2_mute(self, node_name: str, muted: bool) -> None:
-        """Mute/unmute one AirPlay-2 receiver (`PUT /api/ap2/mute`). Daemon-side
-        this maps to volume 0; stored and re-applied like the volume."""
-        try:
-            async with self._session.put(
-                f"{self._base_url}/api/ap2/mute",
-                json={"node_name": node_name, "muted": muted},
-            ) as resp:
-                resp.raise_for_status()
-        except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"could not set AirPlay-2 mute: {err}") from err
+            raise PipewireRouterApiError(f"could not set {op} on '{node_name}': {err}") from err
 
     # The RTP source is now one entry in the daemon's source collection
     # (`/api/sources`), not the retired singular `/api/source/rtp`. This
@@ -472,7 +435,7 @@ class PipewireRouterApiClient:
     async def async_get_routing(self) -> RoutingMatrix:
         """Fetch the source×output routing matrix once (`GET /api/routing`).
         Used to seed state at setup; live updates come over the WebSocket
-        (`async_routing_ws_messages`)."""
+        (`async_event_messages`)."""
         try:
             async with self._session.get(f"{self._base_url}/api/routing") as resp:
                 resp.raise_for_status()
@@ -481,53 +444,53 @@ class PipewireRouterApiClient:
             raise PipewireRouterApiError(f"could not reach bridge daemon: {err}") from err
         return _parse_routing_matrix(data)
 
-    async def async_routing_ws_messages(self) -> AsyncIterator[RoutingMatrix | NowPlayingFrame]:
-        """Subscribe to the daemon's routing WebSocket (`/api/routing/ws`)
-        and yield a fresh `RoutingMatrix` for every matrix push — the daemon
-        sends one immediately on connect, then one on every registry change
-        (and on its own meter tick), so this replaces polling `GET /api/routing`.
+    async def async_event_messages(self) -> AsyncIterator[RoutingMatrix | NowPlayingFrame]:
+        """Subscribe to the daemon's one push socket (`/api/events`) and yield a fresh
+        `RoutingMatrix` for every `matrix` frame and a `NowPlayingFrame` for every
+        `now_playing` frame.
 
-        Also yields a `NowPlayingFrame` for every `now_playing` push (per-source
-        metadata, see the daemon's now_playing.rs). That frame is sent only when
-        something actually changed, which is why it is a *separate* frame from the
-        matrix and not a field on it.
+        **Topics are subscribed, not implied by the URL.** The daemon multiplexes every
+        push feed onto this one connection — the routing matrix, the output listings,
+        per-source metadata, live meters, and the speaker-alignment feeds — because four
+        separate sockets used to eat four of a browser's six per-host HTTP/1.1
+        connections. So this asks for the two topics an HA entity can act on and is sent
+        nothing else; in particular it never receives the 4 Hz `meters` frame, which the
+        previous single-socket version had to skip four times a second.
 
-        **That socket carries more than matrices.** `routing.rs`'s `Frame` enum is
-        internally tagged, and alongside `{"type": "matrix", …}` it pushes
-        `outputs`, `discovered` and `agents` listing frames — the first of them
-        immediately after the initial matrix, on every connect. Frames we don't
-        consume are skipped here rather than parsed: feeding a listing frame to
-        `_parse_routing_matrix` raised `KeyError: 'display_name'` (an `OutputInfo`
-        has `node_name`/`name`, no `display_name`), which the caller's catch-all
-        turned into a reconnect — so the socket never survived its first second
-        and the push path had quietly degraded to a 5-second reconnect poll with a
-        traceback each time.
-
-        A frame with no `type` at all is treated as a matrix: the matrix frame
-        historically *was* the whole frame, and the daemon tags it internally
-        precisely so that older readers keep working.
+        Subscribing answers with that topic's **current state at once**, so this still
+        replaces polling `GET /api/routing`: the first matrix arrives without waiting for
+        a change.
 
         Returns normally when the socket closes (the caller reconnects);
         raises `PipewireRouterApiError` on a connect/transport failure."""
         try:
             async with self._session.ws_connect(
-                f"{self._base_url}/api/routing/ws", heartbeat=WS_HEARTBEAT_SECONDS
+                f"{self._base_url}/api/events", heartbeat=WS_HEARTBEAT_SECONDS
             ) as ws:
+                await ws.send_json({"op": "subscribe", "topics": list(EVENTS_TOPICS)})
                 async for msg in ws:
                     if msg.type is aiohttp.WSMsgType.TEXT:
                         data = msg.json()
                         if not isinstance(data, dict):
                             continue
                         frame = data.get("type")
-                        if frame == ROUTING_WS_FRAME_METERS:
-                            continue
-                        if frame == ROUTING_WS_FRAME_NOW_PLAYING:
+                        if frame == EVENTS_TOPIC_MATRIX:
+                            yield _parse_routing_matrix(data)
+                        elif frame == EVENTS_TOPIC_NOW_PLAYING:
                             yield NowPlayingFrame(_parse_now_playing(data))
-                            continue
-                        if frame is not None and frame != ROUTING_WS_FRAME_MATRIX:
-                            _LOGGER.debug("ignoring '%s' frame on the routing socket", frame)
-                            continue
-                        yield _parse_routing_matrix(data)
+                        elif frame == EVENTS_FRAME_SUBSCRIBED:
+                            if unknown := data.get("unknown"):
+                                _LOGGER.warning(
+                                    "the daemon does not know these event topics: %s",
+                                    ", ".join(str(t) for t in unknown),
+                                )
+                        else:
+                            # A topic we never asked for, or one newer than this
+                            # integration: skipped rather than parsed. Feeding a listing
+                            # frame to `_parse_routing_matrix` used to raise `KeyError`,
+                            # which the caller's catch-all turned into a reconnect — so
+                            # the socket never survived its first second.
+                            _LOGGER.debug("ignoring an unsubscribed '%s' frame", frame)
                     elif msg.type in (
                         aiohttp.WSMsgType.CLOSE,
                         aiohttp.WSMsgType.CLOSING,
@@ -536,7 +499,7 @@ class PipewireRouterApiClient:
                     ):
                         break
         except aiohttp.ClientError as err:
-            raise PipewireRouterApiError(f"routing websocket error: {err}") from err
+            raise PipewireRouterApiError(f"events websocket error: {err}") from err
 
     async def async_link(self, source: str, output: str) -> None:
         """Link a source into an output by stable node name

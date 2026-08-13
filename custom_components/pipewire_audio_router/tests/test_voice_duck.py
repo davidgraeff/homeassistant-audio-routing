@@ -69,7 +69,7 @@ def _patch_daemon(routing, *, outputs=None, music_groups=None, expose_outputs=Tr
             new=AsyncMock(return_value=AppSettings(expose_outputs_as_media_players=expose_outputs)),
         )
     )
-    stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
+    stack.enter_context(patch(f"{COORD}.async_events_ws_loop", new=AsyncMock()))
     duck = stack.enter_context(patch(f"{API}.async_duck_start", new=AsyncMock(return_value=77)))
     renew = stack.enter_context(patch(f"{API}.async_duck_renew", new=AsyncMock(return_value=True)))
     release = stack.enter_context(patch(f"{API}.async_duck_release", new=AsyncMock()))

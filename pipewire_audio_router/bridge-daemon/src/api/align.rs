@@ -12,37 +12,6 @@ pub(crate) async fn align_status(State(state): State<AppState>) -> Json<crate::a
     Json(state.align.status().await)
 }
 
-/// `GET /api/align/ws` — the **session** state, pushed: one full `AlignState` on connect,
-/// then one on every change, and one on **teardown**.
-///
-/// The same shape and the same push loop as the run's socket
-/// (`align::status_ws::status_socket`), and worth having for a different reason. A
-/// measurement is pushed because it spends minutes inside gates where only the *message*
-/// moves; the session is pushed because the one state change a client cannot predict is
-/// the session **ending** — by the idle timeout, by a superseding `start`, or by a stop
-/// issued from another tab — and until it hears about that it is showing a wizard for a
-/// session that no longer exists while the speakers it named have already gone back to
-/// normal. `GET /api/align` stays, and the client falls back to it: a UI that shows
-/// nothing because this route 404'd would be worse than one that polls.
-///
-/// It takes no commands, and a frame sent on it is deliberately **not** activity — see
-/// `AlignManager::still_here` for why a held socket must never postpone the timeout.
-pub(crate) async fn align_ws(State(state): State<AppState>, ws: axum::extract::ws::WebSocketUpgrade) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        let align = state.align.clone();
-        // Subscribed *before* the first status is read, so a change that lands between
-        // the two is a redundant push rather than a missed one.
-        let changes = align.subscribe();
-        crate::align::status_ws::status_socket(socket, changes, move || {
-            // A clone per frame rather than a borrow: `AlignManager` is a bundle of
-            // `Arc`s, and owning one is what lets the snapshot future be `'static`.
-            let align = align.clone();
-            Box::pin(async move { serde_json::to_string(&align.status().await).ok() })
-        })
-        .await;
-    })
-}
-
 /// `POST /api/align/still-here` — postpone the idle teardown, changing nothing else.
 ///
 /// **Must be driven by a click, never by a timer.** The timeout exists so that a tab
@@ -64,14 +33,8 @@ pub(crate) fn hold_deps(state: &AppState) -> crate::align::group::HoldDeps<'_> {
 
 #[derive(Deserialize)]
 pub(crate) struct AlignStartRequest {
-    /// **Either**: source node names identifying an existing group to align (the
-    /// by-ear entry point from a source card — its present members are what gets
-    /// held).
-    #[serde(default)]
-    pub(crate) sources: Vec<String>,
-    /// **Or**: the speakers to align, picked on the Outputs page (plan §12.1). A
-    /// temporary exclusive group is formed around exactly these, independent of how
-    /// they are routed now.
+    /// The speakers to align (plan §12.1). A temporary exclusive group is formed around
+    /// exactly these, independent of how they are routed now.
     ///
     /// **This is the run's whole scope, not one position's** (plan §12.3.1). It reads
     /// counter-intuitively next to a wizard that then works on a subset, so:
@@ -90,9 +53,8 @@ pub(crate) struct AlignStartRequest {
     ///   happened, in words.
     #[serde(default)]
     pub(crate) outputs: Vec<String>,
-    /// Which acoustic promise the run makes (plan §1). Only meaningful with
-    /// `outputs`; a `sources` start is by-ear by construction. Changing it on a
-    /// reusing `start` is free — the mode describes the run, not the group.
+    /// Which acoustic promise the run makes (plan §1). Changing it on a reusing `start`
+    /// is free — the mode describes the run, not the group.
     #[serde(default)]
     pub(crate) mode: crate::align::group::AlignMode,
 }
@@ -107,15 +69,13 @@ pub(crate) async fn align_start(
     Json(req): Json<AlignStartRequest>,
 ) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
     let deps = hold_deps(&state);
-    let result = match (req.outputs.is_empty(), req.sources.is_empty()) {
-        (false, _) => {
-            tracing::info!("USER ACTION: start alignment ({:?}) on {} selected output(s)", req.mode, req.outputs.len());
-            state.align.start_outputs(&deps, req.outputs, req.mode).await
-        }
-        (true, false) => state.align.start(&deps, req.sources).await,
-        (true, true) => Err("give either `outputs` (the speakers to align) or `sources` (an existing group)".to_string()),
-    };
-    result.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+    tracing::info!("USER ACTION: start alignment ({:?}) on {} selected output(s)", req.mode, req.outputs.len());
+    state
+        .align
+        .start_outputs(&deps, req.outputs, req.mode)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
 }
 
 #[derive(Deserialize)]
@@ -191,7 +151,6 @@ pub(crate) async fn align_volume(
 
 #[derive(Deserialize)]
 pub(crate) struct AlignChannelsRequest {
-    pub(crate) node_name: String,
     /// `both` (the default), `left` or `right` — which wire channels this member emits
     /// for the rest of the session.
     pub(crate) channels: String,
@@ -205,13 +164,14 @@ pub(crate) struct AlignChannelsRequest {
 /// teardown.
 pub(crate) async fn align_channels(
     State(state): State<AppState>,
+    Path(node_name): Path<String>,
     Json(req): Json<AlignChannelsRequest>,
 ) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
     let bad = |message: String| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message }));
     let channels = crate::align::relay_delay::MeasureChannels::parse(&req.channels)
         .ok_or_else(|| bad(format!("'{}' is not a channel choice (expected both, left or right)", req.channels)))?;
-    tracing::info!("USER ACTION: measure '{}' through {} channel(s)", req.node_name, channels.as_str());
-    state.align.set_channels(req.node_name, channels).await.map(Json).map_err(bad)
+    tracing::info!("USER ACTION: measure '{node_name}' through {} channel(s)", channels.as_str());
+    state.align.set_channels(node_name, channels).await.map(Json).map_err(bad)
 }
 
 /// Stop the session: click off, every member's level/mute restored, the temporary

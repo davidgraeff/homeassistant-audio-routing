@@ -1,15 +1,16 @@
-"""Tests for the routing WebSocket client's frame handling.
+"""Tests for the events-socket client's frame handling.
 
-The daemon multiplexes several frame types onto `/api/routing/ws` (routing.rs's
-internally-tagged `Frame`): `matrix` on connect and on every change/meter tick,
-plus `outputs`/`discovered`/`agents` listings — the first listing arriving
-immediately after the initial matrix, on *every* connect.
+The daemon has one push socket, `/api/events`, and a client chooses what it receives by
+subscribing to topics on it (events.rs). This integration asks for `matrix` and
+`now_playing`, so most of what follows is about *not* mis-reading anything else: a frame
+for a topic we did not ask for (a daemon newer than this integration, or a stray),
+the subscribe acknowledgement, and the non-dict/close cases.
 
-This client consumes only the matrix. It used to parse every text frame as one,
-which raised `KeyError: 'display_name'` on the first listing frame (an
-`OutputInfo` has `node_name`/`name`), and the coordinator's catch-all turned that
-into a 5-second reconnect loop — so the socket never survived its first second
-and the "pushed, not polled" routing path silently became a polled one.
+The regression these protect is worth keeping in mind: this client used to parse every
+text frame as a matrix, which raised `KeyError: 'display_name'` on the first listing
+frame (an `OutputInfo` has `node_name`/`name`), and the coordinator's catch-all turned
+that into a 5-second reconnect loop — so the socket never survived its first second and
+the "pushed, not polled" routing path silently became a polled one.
 """
 
 from types import SimpleNamespace
@@ -41,9 +42,17 @@ def _text(payload):
 
 
 def _client(frames) -> PipewireRouterApiClient:
-    """A client whose routing socket replays `frames`, then closes."""
+    """A client whose events socket replays `frames`, then closes. `FakeWs.sent` records
+    the control messages, because *subscribing* is now part of the contract: without it
+    the daemon sends nothing at all."""
 
     class FakeWs:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
         def __aiter__(self):
             async def gen():
                 for frame in frames:
@@ -53,7 +62,9 @@ def _client(frames) -> PipewireRouterApiClient:
 
     class FakeWsCtx:
         async def __aenter__(self):
-            return FakeWs()
+            self.ws = FakeWs()
+            sent_control.append(self.ws)
+            return self.ws
 
         async def __aexit__(self, *exc):
             return False
@@ -63,9 +74,13 @@ def _client(frames) -> PipewireRouterApiClient:
     return PipewireRouterApiClient(session, "127.0.0.1", 8099)
 
 
+sent_control: list = []
+
+
 async def _collect(frames):
+    sent_control.clear()
     client = _client(frames)
-    return [matrix async for matrix in client.async_routing_ws_messages()]
+    return [matrix async for matrix in client.async_event_messages()]
 
 
 async def test_matrix_frame_is_parsed():
@@ -95,15 +110,6 @@ async def test_listing_frames_are_skipped_not_parsed():
     assert all(m.sources for m in matrices)
 
 
-async def test_untagged_frame_is_treated_as_a_matrix():
-    """The matrix frame historically *was* the whole frame; the daemon tags it
-    internally so that a reader predating the tag keeps working. Honour that in
-    reverse, so an older daemon's untagged frame still works here."""
-    untagged = {k: v for k, v in MATRIX_FRAME.items() if k != "type"}
-    [matrix] = await _collect([_text(untagged)])
-    assert [s.node_name for s in matrix.sources] == ["airplay-in"]
-
-
 async def test_unknown_frame_type_is_ignored():
     """A frame type added by a newer daemon must not break an older client —
     otherwise every future frame (e.g. per-source now-playing metadata) is a
@@ -111,13 +117,29 @@ async def test_unknown_frame_type_is_ignored():
     assert await _collect([_text({"type": "something_new", "payload": 1})]) == []
 
 
-async def test_meters_frames_are_skipped_and_do_not_disturb_the_matrix():
-    """`meters` is the socket's only high-rate frame (250 ms while watched) and
-    carries peaks and xrun counts — nothing an HA entity has any use for. It must be
-    dropped without being parsed as a matrix, which would otherwise blank every
-    entity's source four times a second. See docs/source-metadata-plan.md WP7."""
+async def test_the_subscription_is_sent_and_names_only_what_this_client_uses():
+    """Nothing arrives without it, and asking for less is the point: the daemon would
+    otherwise push `meters` at 4 Hz — peaks and xrun counts no HA entity can use, which
+    the previous single-socket version had to skip four times a second."""
+    await _collect([_text(MATRIX_FRAME)])
+    [ws] = sent_control
+    assert ws.sent == [{"op": "subscribe", "topics": ["matrix", "now_playing"]}]
+
+
+async def test_the_subscribe_ack_is_consumed_and_unknown_topics_are_logged(caplog):
+    """The ack is not a matrix and must not be parsed as one; an `unknown` topic is a
+    misconfiguration that would otherwise look like an eternally silent socket."""
+    ack = {"type": "subscribed", "topics": ["matrix"], "unknown": ["matrics"]}
+    assert await _collect([_text(ack), _text(MATRIX_FRAME)]) != []
+    assert "matrics" in caplog.text
+
+
+async def test_frames_for_unsubscribed_topics_are_skipped_not_parsed():
+    """Belt and braces: even though the daemon only sends what was asked for, a frame
+    for another topic must be dropped rather than parsed as a matrix — parsing an
+    `agents` frame would produce an *empty* matrix and blank every entity's source."""
     meters = {"type": "meters", "nodes": {"airplay-in": {"peak": 0.4, "xruns": 2}}}
-    matrices = await _collect([_text(MATRIX_FRAME), _text(meters), _text(meters)])
+    matrices = await _collect([_text(MATRIX_FRAME), _text(meters), _text(AGENTS_FRAME)])
     assert len(matrices) == 1
     assert [s.node_name for s in matrices[0].sources] == ["airplay-in"]
 

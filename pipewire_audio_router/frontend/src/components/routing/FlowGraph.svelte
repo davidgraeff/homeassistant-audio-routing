@@ -6,7 +6,7 @@
   import { askConfirm, removeOutputConfirm } from '../../lib/confirm.svelte';
   import type { MusicGroup, NowPlaying, RoutingNode } from '../../lib/types';
   import VolumeControl from '../ui/VolumeControl.svelte';
-  import { SENDSPIN_DEV_PREFIX, hasAnyLevelControl, levelCaps, setOutputMute, setOutputVolume } from '../../lib/outputs/level';
+  import { SENDSPIN_DEV_PREFIX, hasAnyLevelControl, levelCaps } from '../../lib/outputs/level';
   import RoutingHelp from './RoutingHelp.svelte';
 
   // Interactive bipartite routing graph: sources on the left, what they play on
@@ -613,7 +613,7 @@
   // to the sendspin endpoint, which stored them for a device that never connects.
   async function onVolume(nodeName: string, pct: number) {
     try {
-      await setOutputVolume(nodeName, pct);
+      await api.setOutputVolume(nodeName, pct / 100);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -622,7 +622,7 @@
     const next = !muted[nodeName];
     muted = { ...muted, [nodeName]: next }; // optimistic; matrix confirms
     try {
-      await setOutputMute(nodeName, next);
+      await api.setOutputMute(nodeName, next);
     } catch (e) {
       // Put the optimistic flip back: an unreachable host answers 503, and the
       // button must not keep claiming a mute that never landed.

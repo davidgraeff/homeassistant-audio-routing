@@ -68,7 +68,7 @@ def _patch_daemon(routing=EMPTY_ROUTING, rtp=RTP_DISABLED, sendspin_volumes=None
             new=AsyncMock(return_value=AppSettings(expose_outputs_as_media_players=True)),
         )
     )
-    stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
+    stack.enter_context(patch(f"{COORD}.async_events_ws_loop", new=AsyncMock()))
     return stack
 
 
@@ -397,9 +397,12 @@ async def test_pwsink_volume_is_none_without_a_connected_agent(hass):
     assert host.attributes.get("volume_level") is None
 
 
-async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
-    """pw-sink volume/mute go through `PUT /api/pwsink/volume|mute`, never the
-    node-volume, sendspin or AP2 paths."""
+async def test_set_volume_and_mute_on_pwsink_go_through_the_output(hass):
+    """Every kind's level is one endpoint now — `PUT /api/outputs/{node}/volume|mute`, on
+    HA's own 0.0–1.0 scale — so this asserts the *node name* reaches it unchanged. The
+    three-way ladder this replaced is how a pw-sink write once went to the sendspin
+    endpoint, was stored for a device that will never connect, and was answered
+    `ok: true`."""
     entry = _make_entry(hass)
     routing = RoutingMatrix(
         sources=[],
@@ -412,9 +415,8 @@ async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
         await hass.async_block_till_done()
 
         with (
-            patch(f"{API}.async_set_pwsink_volume", new=AsyncMock()) as mock_vol,
-            patch(f"{API}.async_set_pwsink_mute", new=AsyncMock()) as mock_mute,
-            patch(f"{API}.async_set_ap2_volume", new=AsyncMock()) as mock_ap2_vol,
+            patch(f"{API}.async_set_output_volume", new=AsyncMock()) as mock_vol,
+            patch(f"{API}.async_set_output_mute", new=AsyncMock()) as mock_mute,
         ):
             await hass.services.async_call(
                 "media_player",
@@ -430,12 +432,10 @@ async def test_set_volume_and_mute_on_pwsink_use_the_pwsink_api(hass):
             )
             mock_vol.assert_awaited_once_with("pwsink-dev-desk_dave", 0.6)
             mock_mute.assert_awaited_once_with("pwsink-dev-desk_dave", True)
-            mock_ap2_vol.assert_not_awaited()
 
 
-async def test_set_volume_on_ap2_device_uses_ap2_api(hass):
-    """AirPlay-2 volume_set must go through the AP2 control plane
-    (`PUT /api/ap2/volume`, 0.0–1.0), not the node-volume or sendspin paths."""
+async def test_set_volume_on_ap2_device_goes_through_the_output(hass):
+    """Same endpoint as every other kind, and 0.0–1.0 reaches it unconverted."""
     entry = _make_entry(hass)
     routing = RoutingMatrix(
         sources=[],
@@ -447,22 +447,18 @@ async def test_set_volume_on_ap2_device_uses_ap2_api(hass):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        with (
-            patch(f"{API}.async_set_ap2_volume", new=AsyncMock()) as mock_ap2_vol,
-            patch(f"{API}.async_set_sendspin_volume", new=AsyncMock()) as mock_sendspin_vol,
-        ):
+        with patch(f"{API}.async_set_output_volume", new=AsyncMock()) as mock_vol:
             await hass.services.async_call(
                 "media_player",
                 "volume_set",
                 {"entity_id": "media_player.dusche", "volume_level": 0.6},
                 blocking=True,
             )
-            mock_ap2_vol.assert_awaited_once_with("ap2-dev-dusche", 0.6)
-            mock_sendspin_vol.assert_not_awaited()
+            mock_vol.assert_awaited_once_with("ap2-dev-dusche", 0.6)
 
 
-async def test_mute_on_ap2_device_uses_ap2_api(hass):
-    """AirPlay-2 mute goes through `PUT /api/ap2/mute`."""
+async def test_mute_on_ap2_device_goes_through_the_output(hass):
+    """`PUT /api/outputs/{node}/mute`, like every other kind."""
     entry = _make_entry(hass)
     routing = RoutingMatrix(
         sources=[],
@@ -474,14 +470,14 @@ async def test_mute_on_ap2_device_uses_ap2_api(hass):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        with patch(f"{API}.async_set_ap2_mute", new=AsyncMock()) as mock_ap2_mute:
+        with patch(f"{API}.async_set_output_mute", new=AsyncMock()) as mock_mute:
             await hass.services.async_call(
                 "media_player",
                 "volume_mute",
                 {"entity_id": "media_player.dusche", "is_volume_muted": True},
                 blocking=True,
             )
-            mock_ap2_mute.assert_awaited_once_with("ap2-dev-dusche", True)
+            mock_mute.assert_awaited_once_with("ap2-dev-dusche", True)
 
 
 async def test_ap2_device_adopts_matching_ha_device_by_ip(hass):
@@ -568,7 +564,7 @@ async def test_ap2_group_membership_attribute(hass):
     assert "sendspin_group_members" not in dusche.attributes
 
 
-async def test_set_volume_on_sendspin_device_uses_sendspin_api(hass):
+async def test_set_volume_on_sendspin_device_goes_through_the_output(hass):
     """A sendspin device has no PipeWire node volume — volume_set must go
     through the in-band per-device sendspin volume API (0.0-1.0 -> 0-100)."""
     entry = _make_entry(hass)
@@ -581,16 +577,16 @@ async def test_set_volume_on_sendspin_device_uses_sendspin_api(hass):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-        with (
-            patch(f"{API}.async_set_sendspin_volume", new=AsyncMock()) as mock_sendspin_vol,
-        ):
+        with patch(f"{API}.async_set_output_volume", new=AsyncMock()) as mock_vol:
             await hass.services.async_call(
                 "media_player",
                 "volume_set",
                 {"entity_id": "media_player.bath", "volume_level": 0.4},
                 blocking=True,
             )
-            mock_sendspin_vol.assert_awaited_once_with("sendspin-dev-bath", 40)
+            # 0.4, not 40: the scale conversion is the daemon's now, so nothing here
+            # has to know that this device's protocol counts in whole percent.
+            mock_vol.assert_awaited_once_with("sendspin-dev-bath", 0.4)
 
 
 async def test_sendspin_group_membership_attribute(hass):
@@ -870,6 +866,12 @@ class _FakeWS:
 
     def __init__(self, messages):
         self._messages = messages
+        self.sent: list = []
+
+    async def send_json(self, payload):
+        """The client subscribes to its topics before reading; without this the socket
+        would receive nothing at all."""
+        self.sent.append(payload)
 
     async def __aenter__(self):
         return self
@@ -896,11 +898,12 @@ class _FakeSession:
         return self._ws
 
 
-async def test_async_routing_ws_messages_parses_pushes():
+async def test_async_event_messages_parses_pushes():
     """The WS client yields a parsed RoutingMatrix per TEXT frame and stops
     cleanly when the socket closes."""
     matrix_json = json.dumps(
         {
+            "type": "matrix",
             "sources": [{"node_id": 10, "node_name": "shairport-sync", "display_name": "shairport-sync", "present": True, "configured": True}],
             "outputs": [{"node_id": 50, "node_name": "ap2-dev-kitchen", "display_name": "Kitchen", "present": True, "configured": True}],
             "links": [{"source": "shairport-sync", "output": "ap2-dev-kitchen"}],
@@ -914,8 +917,9 @@ async def test_async_routing_ws_messages_parses_pushes():
     )
     client = PipewireRouterApiClient(_FakeSession(ws), "host", 8099)
 
-    received = [m async for m in client.async_routing_ws_messages()]
+    received = [m async for m in client.async_event_messages()]
 
+    assert ws.sent == [{"op": "subscribe", "topics": ["matrix", "now_playing"]}]
     assert len(received) == 1
     assert received[0].links == [("shairport-sync", "ap2-dev-kitchen")]
     assert [s.display_name for s in received[0].sources] == ["shairport-sync"]

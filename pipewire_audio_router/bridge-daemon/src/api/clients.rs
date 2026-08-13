@@ -119,25 +119,13 @@ pub(crate) fn policy_message(prevent_takeover: bool) -> &'static str {
 // --- legacy singular routes (target the legacy AirPlay id) ------------------
 
 #[derive(Deserialize)]
-pub(crate) struct ForgetClientRequest {
-    pub(crate) key: String,
-}
-
-#[derive(Deserialize)]
 pub(crate) struct BanClientRequest {
-    pub(crate) key: String,
     pub(crate) banned: bool,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct SetPriorityRequest {
-    pub(crate) key: String,
     pub(crate) priority: i32,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct DisconnectClientRequest {
-    pub(crate) key: String,
 }
 
 #[derive(Deserialize)]
@@ -151,36 +139,38 @@ pub(crate) async fn list_source_clients(State(state): State<AppState>, Path(id):
     Json(list_clients_for(&state, &id))
 }
 
+/// `DELETE /api/sources/{id}/clients/{key}` — forget a remembered sender.
 pub(crate) async fn forget_source_client(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<ForgetClientRequest>,
+    Path((id, key)): Path<(String, String)>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    forget_client_for(&state, &id, &req.key)
+    forget_client_for(&state, &id, &key)
 }
 
+/// `PUT /api/sources/{id}/clients/{key}/ban`.
 pub(crate) async fn ban_source_client(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((id, key)): Path<(String, String)>,
     Json(req): Json<BanClientRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    ban_client_for(&state, &id, &req.key, req.banned)
+    ban_client_for(&state, &id, &key, req.banned)
 }
 
+/// `PUT /api/sources/{id}/clients/{key}/priority`.
 pub(crate) async fn set_source_client_priority(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((id, key)): Path<(String, String)>,
     Json(req): Json<SetPriorityRequest>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    set_priority_for(&state, &id, &req.key, req.priority)
+    set_priority_for(&state, &id, &key, req.priority)
 }
 
+/// `POST /api/sources/{id}/clients/{key}/disconnect`.
 pub(crate) async fn disconnect_source_client(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<DisconnectClientRequest>,
+    Path((id, key)): Path<(String, String)>,
 ) -> (StatusCode, Json<OutputOpResponse>) {
-    disconnect_client_for(&state, &id, &req.key).await
+    disconnect_client_for(&state, &id, &key).await
 }
 
 /// Toggle one AirPlay source's anti-takeover policy: persist it into that

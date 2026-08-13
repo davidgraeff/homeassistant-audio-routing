@@ -739,29 +739,18 @@ class PipewireRouterMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _S
         return target.node_name
 
     async def async_set_volume_level(self, volume: float) -> None:
-        if self._is_ap2:
-            # 0.0–1.0 pushed in-band to the receiver via the AP2 control plane
-            # (no PipeWire node volume for a virtual AP2 output).
-            await self.coordinator.client.async_set_ap2_volume(self.node_name, volume)
-        elif self._is_sendspin:
-            # 0.0–1.0 → 0–100, sent in-band to the device (no PipeWire node vol).
-            await self.coordinator.client.async_set_sendspin_volume(self.node_name, round(volume * 100))
-        elif self._is_pwsink:
-            # Applied by the host's agent to its own master out (device Route).
-            await self.coordinator.client.async_set_pwsink_volume(self.node_name, volume)
-        else:
-            raise HomeAssistantError(f"volume is not supported for {self.entity_id}")
+        # One endpoint, one scale (HA's own 0.0–1.0): the daemon knows which transport
+        # this output's level rides on and converts. This used to be a three-way ladder
+        # on the node-name prefix with a scale conversion per branch.
+        await self.coordinator.client.async_set_output_volume(self.node_name, volume)
         await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
-        if self._is_ap2:
-            await self.coordinator.client.async_set_ap2_mute(self.node_name, mute)
-        elif self._is_pwsink:
-            await self.coordinator.client.async_set_pwsink_mute(self.node_name, mute)
-        else:
+        if not (self._is_ap2 or self._is_pwsink):
             # Only AirPlay-2 and pw-sink advertise VOLUME_MUTE; guard so a direct
             # service call on another kind fails loudly instead of no-op-ing.
             raise HomeAssistantError(f"mute is not supported for {self.entity_id}")
+        await self.coordinator.client.async_set_output_mute(self.node_name, mute)
         await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
@@ -893,18 +882,15 @@ class MusicGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], _Sourc
         await self.coordinator.async_request_refresh()
 
     async def async_set_volume_level(self, volume: float) -> None:
-        """Apply the master volume to every member, in-band per device: sendspin
-        through its per-device store, AirPlay-2 through the AP2 control plane."""
+        """Apply the master volume to every member — one per-output call each, which the
+        daemon dispatches to that member's own transport."""
         g = self._group()
         if not g:
             return
         for name in g.members:
-            if name.startswith(SENDSPIN_DEV_PREFIX):
-                await self.coordinator.client.async_set_sendspin_volume(name, round(volume * 100))
-            elif name.startswith(AP2_DEV_PREFIX):
-                await self.coordinator.client.async_set_ap2_volume(name, volume)
-            elif name.startswith(PWSINK_DEV_PREFIX):
-                await self.coordinator.client.async_set_pwsink_volume(name, volume)
+            # Per member, one call each: the daemon dispatches to whatever each one's
+            # transport is, so a group of mixed kinds needs no ladder here.
+            await self.coordinator.client.async_set_output_volume(name, volume)
         await self.coordinator.async_request_refresh()
 
 

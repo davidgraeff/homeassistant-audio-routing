@@ -2,6 +2,7 @@ mod align;
 mod announce;
 mod api;
 mod audio;
+mod events;
 mod outputs;
 mod pw;
 mod routing;

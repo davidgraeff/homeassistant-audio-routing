@@ -6,7 +6,7 @@
   import { askConfirm, removeOutputConfirm } from '../../lib/confirm.svelte';
   import type { OpResponse, OutputInfo, SendspinCodec } from '../../lib/types';
   import { delaySpec, hasDelayKnob } from '../../lib/outputs/delay';
-  import { levelCaps, setOutputMute, setOutputVolume } from '../../lib/outputs/level';
+  import { levelCaps } from '../../lib/outputs/level';
   import { canTest, kindLabel, ptpBadge, statusBadge, syncBadge, testHint } from '../../lib/outputs/labels';
   import GroupTitle from '../groups/GroupTitle.svelte';
   import OutputsDocs from './OutputsDocs.svelte';
@@ -123,7 +123,7 @@
   async function commitDelay(o: OutputInfo, ms: number) {
     const spec = delaySpec(o);
     await run(
-      () => (spec.store === 'sendspin' ? api.setSendspinDelay(o.node_name, ms) : api.setOutputLatency(o.node_name, ms)),
+      () => api.setOutputDelay(o.node_name, ms),
       `Set '${o.name}' ${spec.label.toLowerCase()} to ${ms} ms`,
     );
     // Adopt whatever the daemon actually stored — it clamps, and sendspin delays are
@@ -135,15 +135,12 @@
   // Silent on purpose: this fires several times a second while dragging, and `run()`
   // would raise a toast for each. The commit above reports, and a failure there says
   // the same thing about the same endpoint.
-  const liveDelay = (o: OutputInfo, ms: number) =>
-    void (delaySpec(o).store === 'sendspin' ? api.setSendspinDelay(o.node_name, ms) : api.setOutputLatency(o.node_name, ms)).catch(
-      () => {},
-    );
+  const liveDelay = (o: OutputInfo, ms: number) => void api.setOutputDelay(o.node_name, ms).catch(() => {});
 
   // Drop the override so the output follows the daemon default again. The slider
   // has no "empty" position, so clearing needs its own control.
   async function resetDelay(o: OutputInfo) {
-    if (await run(() => api.setOutputLatency(o.node_name, null), `Reset '${o.name}' ${delaySpec(o).label.toLowerCase()} to default`)) {
+    if (await run(() => api.setOutputDelay(o.node_name, null), `Reset '${o.name}' ${delaySpec(o).label.toLowerCase()} to default`)) {
       await refresh(); // the slider adopts the restored default from the listing
     }
   }
@@ -333,7 +330,8 @@
   async function resync(o: OutputInfo) {
     clearing = { ...clearing, [o.node_name]: true };
     try {
-      const res = o.kind === 'airplay2' ? await api.ap2Resync(o.node_name) : await api.sendspinClear(o.node_name);
+      // One endpoint, one intent: the daemon picks the mechanism its kind has.
+      const res = await api.resyncOutput(o.node_name);
       toast(res.ok ? 'success' : 'error', res.message);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
@@ -347,12 +345,13 @@
   // <VolumeControl>'s drag guard holds the thumb until it lands — so the value on
   // screen is always one the daemon confirmed.
   //
-  // Which endpoint that is belongs to lib/outputs/level.ts, not here: this page picking
-  // it by kind is what sent pw-sink levels to the sendspin endpoint, where they were
-  // stored for a device that does not exist and then overwritten by the next frame.
+  // One endpoint for every kind, on one scale (0.0–1.0): this page used to pick per kind
+  // through lib/outputs/level.ts, and picking wrongly is what sent pw-sink levels to the
+  // sendspin endpoint, where they were stored for a device that does not exist and then
+  // overwritten by the next frame.
   async function onVolume(o: OutputInfo, pct: number) {
     try {
-      await setOutputVolume(o.node_name, pct);
+      await api.setOutputVolume(o.node_name, pct / 100);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -361,7 +360,7 @@
     const next = !muted[o.node_name];
     muted = { ...muted, [o.node_name]: next }; // optimistic; the matrix confirms
     try {
-      await setOutputMute(o.node_name, next);
+      await api.setOutputMute(o.node_name, next);
     } catch (e) {
       // The optimistic flip has to go back: a host with no live agent answers 503,
       // and leaving the button "muted" would claim something that never happened.

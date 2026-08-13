@@ -63,7 +63,7 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
       lives in the attributes set up below, not in `.data` (which is unused:
       every value here has a different shape and its own staleness rules).
     - **Routing** (the source×output matrix) is *pushed* over the daemon's
-      `/api/routing/ws` WebSocket by a background task (`async_routing_ws_loop`)
+      the `/api/events` socket by a background task (`async_events_ws_loop`)
       and lives in `.routing`, so a re-wire is reflected instantly instead of
       up to one poll interval later.
     """
@@ -227,22 +227,22 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
             return None
         return entry
 
-    async def async_routing_ws_loop(self) -> None:
-        """Hold a routing WebSocket open for the life of the config entry,
-        applying each pushed matrix or metadata frame and reconnecting after a
-        drop. Ends when the entry is unloaded (the background task is
+    async def async_events_ws_loop(self) -> None:
+        """Hold the daemon's one push socket (`/api/events`) open for the life of the
+        config entry, applying each pushed matrix or metadata frame and reconnecting
+        after a drop. Ends when the entry is unloaded (the background task is
         cancelled)."""
         while True:
             try:
-                async for frame in self.client.async_routing_ws_messages():
+                async for frame in self.client.async_event_messages():
                     if isinstance(frame, NowPlayingFrame):
                         self._apply_now_playing(frame.sources)
                     else:
                         self._apply_routing(frame)
             except PipewireRouterApiError as err:
-                _LOGGER.debug("routing websocket disconnected: %s", err)
+                _LOGGER.debug("events websocket disconnected: %s", err)
             except Exception:  # noqa: BLE001 - never let the loop die on a bad frame
-                _LOGGER.exception("unexpected error in routing websocket loop")
+                _LOGGER.exception("unexpected error in the events websocket loop")
             # Socket closed/errored (or a bad frame) — back off, then reconnect.
             await asyncio.sleep(ROUTING_WS_RECONNECT_SECONDS)
 
@@ -269,7 +269,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Live routing over the WebSocket instead of polling /api/routing. Bound
     # to the entry, so it's cancelled automatically on unload.
     entry.async_create_background_task(
-        hass, coordinator.async_routing_ws_loop(), f"{DOMAIN}_routing_ws"
+        hass, coordinator.async_events_ws_loop(), f"{DOMAIN}_events_ws"
     )
 
     # Voice-assistant ducking: watches every `assist_satellite` and asks the

@@ -17,6 +17,7 @@ handler name, which is the authoritative place to check the exact body shape.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | plain-text liveness |
+| `GET` | `/api/events` | **the** push socket — every live feed, topics subscribed by message |
 | `GET` | `/api/nodes` | raw PipeWire node/port snapshot |
 | `GET` | `/api/status` | daemon status summary (`get_status`) |
 | `GET`/`PUT` | `/api/settings` | daemon settings (`get_settings` / `set_settings`) |
@@ -28,35 +29,32 @@ handler name, which is the authoritative place to check the exact body shape.
 | `POST` | `/api/outputs/{node_name}/unpair` | `pwsink` only: revoke the pairing *and* remove the output |
 | `DELETE` | `/api/outputs/{node_name}` | remove an output (back to discovered) |
 | `PUT` | `/api/outputs/{node_name}/name` | rename an output |
-| `PUT` | `/api/outputs/{node_name}/latency` | per-output latency |
+| `PUT` | `/api/outputs/{node_name}/volume` | one output's level, `0.0`–`1.0`, whatever its kind |
+| `PUT` | `/api/outputs/{node_name}/mute` | mute one output |
+| `PUT` | `/api/outputs/{node_name}/delay` | its timing knob in ms (polarity per kind, reported by `GET /api/outputs`) |
+| `POST` | `/api/outputs/{node_name}/resync` | ask it to recover (sendspin `stream/clear`, AP2 fresh session) |
 | `PUT` | `/api/outputs/{node_name}/ap2-rate` | AirPlay-2 rate mode |
 | `PUT` | `/api/outputs/{node_name}/sendspin-codec` | sendspin codec choice |
 | `GET`/`POST` | `/api/sources` | list / create a source |
 | `GET`/`PUT`/`DELETE` | `/api/sources/{id}` | read / update / remove a source |
 | `GET` | `/api/sources/{id}/clients` | connected senders (AirPlay) |
-| `POST` | `/api/sources/{id}/clients/ban` | ban / unban a sender |
-| `POST` | `/api/sources/{id}/clients/disconnect` | kick a sender |
-| `POST` | `/api/sources/{id}/clients/forget` | drop a remembered sender |
-| `POST` | `/api/sources/{id}/clients/priority` | set a sender's priority |
+| `DELETE` | `/api/sources/{id}/clients/{key}` | forget a remembered sender |
+| `PUT` | `/api/sources/{id}/clients/{key}/ban` | ban / unban a sender |
+| `PUT` | `/api/sources/{id}/clients/{key}/priority` | set a sender's priority |
+| `POST` | `/api/sources/{id}/clients/{key}/disconnect` | kick a sender |
 | `PUT` | `/api/sources/{id}/policy` | anti-takeover policy |
 | `GET` | `/api/now_playing` | what every source is playing |
 | `GET`/`PUT`/`DELETE` | `/api/now_playing/{node_name}` | read / update / clear one source's metadata |
 | `GET` | `/api/now_playing/{node_name}/artwork` | embedded cover-art bytes |
 | `POST` | `/api/now_playing/report` | self-identifying report from a remote producer |
 | `GET` | `/api/sendspin/volumes` | all sendspin volumes |
-| `PUT` | `/api/sendspin/volume` | set one sendspin volume |
-| `PUT` | `/api/sendspin/mute` | mute one sendspin device |
-| `POST` | `/api/sendspin/clear` | `stream/clear` one device — discard its buffers and re-anchor |
 | `GET` | `/api/sendspin/delays` | per-device sendspin delays |
-| `PUT` | `/api/sendspin/delay` | set one sendspin delay |
-| `PUT` | `/api/ap2/volume` | set an AirPlay-2 receiver's volume |
-| `PUT` | `/api/ap2/mute` | mute an AirPlay-2 receiver |
-| `POST` | `/api/ap2/resync` | rebuild one AirPlay-2 receiver's session (lost PTP lock) |
+| `GET` | `/api/agents` | paired and pending receiver hosts (diagnostics) |
+| `GET` | `/api/agent/ws` | the socket a `pwrouter-agent` dials in on — **agents only**, not a status feed |
 | `POST` | `/api/links` | low-level port link |
 | `GET` | `/api/routing` | routing matrix |
 | `POST` | `/api/routing/link` / `/api/routing/unlink` | edit the matrix |
 | `DELETE` | `/api/routing/entity/{node_name}` | forget an entity |
-| `GET` | `/api/routing/ws` | matrix change WebSocket |
 | `POST` | `/api/announce` | announce to explicit targets |
 | `GET`/`POST` | `/api/duck` | list duck holds / start one (voice ducking) |
 | `POST`/`DELETE` | `/api/duck/{hold_id}` | renew / release a duck hold |
@@ -66,21 +64,47 @@ handler name, which is the authoritative place to check the exact body shape.
 | `GET`/`POST` | `/api/groups/announcement` | list / create an Announcement group |
 | `PUT`/`DELETE` | `/api/groups/announcement/{id}` | edit / delete an Announcement group |
 | `GET` | `/api/align/groups` | groups available for alignment |
-| `GET`/`DELETE` | `/api/align` | alignment status / stop |
-| `POST` | `/api/align/start` | begin the alignment wizard |
-| `POST` | `/api/align/select` | pick the device being aligned |
-| `POST` | `/api/align/volume` | set the alignment reference volume |
-| `POST` | `/api/align/channel` | measure one member through one channel of its stereo pair (`both`/`left`/`right`) |
+| `GET`/`DELETE` | `/api/align` | session status / stop (restores levels, mutes and routing) |
+| `POST` | `/api/align/start` | hold these speakers exclusively — the run's **whole scope**, not one position's |
+| `POST` | `/api/align/still-here` | postpone the idle teardown by one whole allowance |
+| `POST` | `/api/align/select` | the by-ear reference/target pair |
+| `POST` | `/api/align/audible` | which held members are audible (one to measure, N for a level round) |
+| `POST` | `/api/align/volume` | playback level of the audible members (0–100) |
+| `POST` | `/api/align/members/{node_name}/channel` | measure one member through one channel of its stereo pair (`both`/`left`/`right`) |
+| `GET` | `/api/align/mic` | microphone-ingest status: frames, gaps, peak, recent clipping |
+| `GET` | `/api/align/mic/ws` | binary microphone ingest — one socket at a time |
+| `GET` | `/api/align/mic/signal` | the pre-flight verdict: is the level good enough to measure? |
+| `POST` | `/api/align/measure/start` | begin a measured run (`{mode, chain}`) |
+| `GET`/`DELETE` | `/api/align/measure` | run status / abandon (delays untouched) |
+| `POST` | `/api/align/measure/arrival/{node_name}` | near field: "I am at this speaker now" |
+| `POST` | `/api/align/measure/close` | near field: the closure reading that separates drift from real offsets |
+| `POST` | `/api/align/measure/position` | multi-position: measure one listening spot through its overlaps |
+| `POST` | `/api/align/measure/finish` | multi-position: renormalise the chain globally and propose one write |
+| `POST` | `/api/align/measure/apply` | write the solved delays — explicit, never automatic |
+| `POST` | `/api/align/measure/revert` | restore the start-of-session delay snapshot |
+| `GET` | `/api/align/measure/log` | the run transcripts (JSONL per run, bounded) |
+| `GET` | `/api/align/measure/split` | stored band-split calibrations |
+| `POST`/`DELETE` | `/api/align/measure/split/{node_name}` | measure one output's band split at close range / clear it |
+| `GET`/`POST`/`DELETE` | `/api/align/equivalence` | the relay-vs-device delay experiment (the daemon picks the member) |
+| `POST` | `/api/align/equivalence/{node_name}` | …run it on one named member instead |
 | `POST`/`DELETE` | `/api/spike/per-device` | dev-only spike harness |
 | `POST`/`DELETE` | `/api/spike/multi-device` | dev-only spike harness |
 | `POST`/`DELETE` | `/api/spike/overlay` | dev-only spike harness |
 | `POST`/`DELETE` | `/api/spike/ap2` | dev-only spike harness |
 | `POST`/`DELETE` | `/api/spike/pw-sink` | dev-only spike harness |
 
-> **Two-tier groups (`/api/groups/*`) and the alignment wizard (`/api/align/*`) are not
-> yet documented in detail here.** They are the newest subsystems; see
-> `bridge-daemon/src/api/` (one module per resource) for their bodies and
-> [architecture.md](../pipewire_audio_router/docs/architecture.md) for the concepts.
+> **Two-tier groups (`/api/groups/*`) and speaker alignment (`/api/align/*`) are listed
+> above but have no detail sections here.** They are the newest subsystems, and the
+> alignment API in particular is one long protocol rather than a set of independent
+> endpoints — a session holds speakers, a run walks the state machine of
+> `docs/mic-alignment-plan.md` §8, and the order matters more than any single body. That
+> plan's §11 is the authoritative description; `bridge-daemon/src/api/` (one module per
+> resource) has the exact shapes. Two rules from it that a caller cannot guess:
+> `POST /api/align/start` takes the run's **whole** scope and each position is chosen with
+> `/api/align/audible` (re-starting per position would cost two reconnect waves), and only
+> `/api/align/still-here` postpones the idle teardown — an open socket, a frame on it and a
+> status poll all deliberately count for nothing.
+>
 > The `/api/spike/*` routes are development harnesses, not a supported interface.
 
 ## Health & inspection
@@ -230,23 +254,79 @@ the device dropping off the network, and it is what every listing shows from the
 Assistant). Independent of the adoption verdict — removing or un-ignoring a device
 keeps the name you gave it. Nothing restarts.
 
-### `PUT /api/outputs/{node_name}/latency`
-Per-output playout delay in ms (`{"latency_ms": 40}`; `null` clears the override and
-returns the output to the add-on default). Persisted per node name and applied to the
-running sender. Two kinds have this knob:
+### `PUT /api/outputs/{node_name}/volume` / `mute`
+One output's level, `0.0`–`1.0`, and its mute — **the same call for every kind**. The
+daemon converts and dispatches: 0–100 in-band over the sendspin protocol, an RTSP
+`SET_PARAMETER` to an AirPlay-2 receiver, the host's own cubic lever through its agent for
+a PipeWire host.
 
-- **AirPlay 2** — the render delay (default 0, up to 2000 ms). Applied live to the
-  running stream, no reconnect.
-- **pw-sink** — the receiving host's jitter buffer (`sess.latency.msec`, default 100 ms
-  = the PipeWire module's own). Clamped to a multiple of the 5 ms packet time, 15–2000 ms,
-  and pushed to that host's
-  agent, which reloads its receiver — a sub-second gap in that one target's audio. A
-  disconnected host is not an error: the value applies when it reconnects.
+```json
+// PUT /api/outputs/ap2-dev-dusche/volume
+{ "volume": 0.42 }
+// PUT /api/outputs/sendspin-dev-kitchen/mute
+{ "muted": true }
+```
 
-Sendspin has no entry here; its equivalent is the static delay
-(`PUT /api/sendspin/delay`) over the group lead (`PUT /api/sync/settings`).
+* an unknown node name is a **404**, and a kind with no such knob a **400** naming the
+  kind. There used to be one endpoint per kind, and a name sent to the wrong one was
+  *stored as an intent for a device that will never connect* and answered `200 {ok:true}`
+  — so a click looked accepted and the next pushed frame put the old value back;
+* sendspin and AP2 **store** the value and re-apply it when the device reconnects
+  (`"saved … (device not connected)"`);
+* a PipeWire host does **not**: it owns its level and reports it back, so a host with no
+  live agent is a **503**, never a saved intent.
+
+The current values are in `GET /api/outputs` and on the `outputs`/`matrix` topics.
+
+### `PUT /api/outputs/{node_name}/delay`
+The output's timing knob in ms (`{"delay_ms": 40}`; `null` or omitted puts it back on its
+default). One path, and the **polarity and cost differ by kind** — which is why the
+response says what happened and `GET /api/outputs` reports the polarity, rather than the
+URL naming a mechanism:
+
+- **sendspin** — a static **advance**: the device subtracts it from every timestamp, so a
+  larger value plays *earlier*. Persisted, and it costs that one speaker a reconnect
+  (tens of seconds of silence), because current firmware reads it at stream start. Its
+  groupmates keep streaming.
+- **AirPlay 2** — the render delay (default 0, up to 2000 ms), applied live to the running
+  stream.
+- **pw-sink** — the receiving host's jitter buffer (`sess.latency.msec`, default 100 ms =
+  the PipeWire module's own). Clamped to a multiple of the 5 ms packet time, 15–2000 ms,
+  and pushed to that host's agent, which reloads its receiver — a sub-second gap in that
+  one target's audio. A disconnected host is not an error: the value applies when it
+  reconnects.
+
 `latency_ms` in a listing is the stored override (`null` = none) and
-`latency_effective_ms` is what the output is actually running.
+`latency_effective_ms` is what the output is actually running. The group-wide lead is a
+separate knob: `PUT /api/sync/settings`.
+
+### `POST /api/outputs/{node_name}/resync`
+Ask one output to recover — for one that is reachable and being sent audio yet plays
+nothing. One intent, and the daemon picks the mechanism its kind has:
+
+- **sendspin** — `stream/clear`: discard buffered-but-unplayed audio and re-anchor
+  *without* ending the stream. One frame, and deliberately per device: it does not reset
+  the group's shared timeline, so the groupmates keep playing.
+- **AirPlay 2** — release the session and build a fresh one, re-arming its PTP peer, while
+  its groupmates keep streaming.
+- **pw-sink** — a **400**: a host has no such lever of its own (its receiver reloads when
+  its playout delay changes).
+
+```json
+// Response
+{ "ok": true, "message": "cleared 'Kitchen' — it will re-anchor on the next audio" }
+```
+
+`ok: false` with a reason means there was nothing to act on — no live connection, or no
+live sender — reported rather than treated as success.
+
+The sendspin case is the recovery action for the 2026-08-03 failure where three of four
+devices went silent while the daemon, the graph and the clock sync were all healthy (see
+[sendspin-open-items.md](../pipewire_audio_router/docs/sendspin-open-items.md)); before it
+existed the only lever was restarting the add-on, which interrupted every other output and
+destroyed the evidence. The AP2 case is a lost PTP clock lock, which the daemon's liveness
+watchdog also handles by itself — this endpoint is for the cases it cannot see, and for
+not waiting.
 
 ### `PUT /api/outputs/{node_name}/ap2-rate`
 AirPlay-2 rate mode for one receiver — `auto` or a fixed rate (e.g. `fixed_44100`),
@@ -399,29 +479,22 @@ client as reported by `GET .../clients`.
 ### `GET /api/sources/{id}/clients`
 The senders this source has seen, as a JSON array of client info.
 
-### `POST /api/sources/{id}/clients/ban`
-```json
-{ "key": "<client key>", "banned": true }
-```
-Ban (or unban) a sender so it cannot connect.
+### `DELETE /api/sources/{id}/clients/{key}`
+Forget a remembered sender: drops its stored name/ban/priority. It reappears with
+defaults the next time it connects.
 
-### `POST /api/sources/{id}/clients/disconnect`
-```json
-{ "key": "<client key>" }
-```
-Kick a currently-connected sender.
+### `PUT /api/sources/{id}/clients/{key}/ban`
+`{"banned": true}` — refuse this sender. A live session is dropped immediately.
 
-### `POST /api/sources/{id}/clients/forget`
-```json
-{ "key": "<client key>" }
-```
-Drop a remembered sender from the list.
+### `PUT /api/sources/{id}/clients/{key}/priority`
+`{"priority": 5}` — how this sender is ranked against others competing for the same
+source (see the source's anti-takeover policy below).
 
-### `POST /api/sources/{id}/clients/priority`
-```json
-{ "key": "<client key>", "priority": 10 }
-```
-Set a sender's priority, used when several compete for the source.
+### `POST /api/sources/{id}/clients/{key}/disconnect`
+Kick the sender's current session without banning it.
+
+> **The key is in the path** — it used to be in the body of four `POST`s. `key` is a
+> sender identity from `GET …/clients`; percent-encode it.
 
 ### `PUT /api/sources/{id}/policy`
 ```json
@@ -441,7 +514,7 @@ from whichever producer can say. See
 persisted routing intent and the Home Assistant integration already share, and it is what
 the WebSocket frame below is keyed by — so a consumer never has to hold both keys.
 
-Live updates arrive as a **`now_playing` frame on `/api/routing/ws`** (see *Routing
+Live updates arrive as a **`now_playing` frame on `/api/events`** (see *Routing
 matrix*), pushed only when something changes. Two consumers read it: the Home Assistant
 integration (on each output's and each music group's `media_player`) and this add-on's own
 routing graph, which shows a second row on every source card. These REST routes are the cold-path
@@ -539,52 +612,7 @@ device with no entry is at full scale.
 { "sendspin-dev-home_assistant_voice_093ca8": 60 }
 ```
 
-### `PUT /api/sendspin/volume`
-```json
-// Request
-{ "node_name": "sendspin-dev-home_assistant_voice_093ca8", "volume": 60 }
-// Response
-{ "ok": true, "message": "set 'sendspin-dev-home_assistant_voice_093ca8' to 60%" }
-```
-Sends the volume to the device in-band and stores it (re-applied on the
-device's next reconnect). If the device isn't connected the value is still
-stored (`"saved … (device not connected)"`).
-
-### `PUT /api/sendspin/mute`
-Mute or unmute one sendspin device, same addressing as the volume call
-(`set_sendspin_mute`).
-
-### `POST /api/sendspin/clear`
-Ask one device to discard buffered-but-unplayed audio and re-anchor, **without ending
-its stream** — the protocol's `stream/clear`.
-
-```json
-// Request
-{ "node_name": "sendspin-dev-voice_pe_kitchen" }
-// Response
-{ "ok": true, "message": "cleared 'Kitchen' — it will re-anchor on the next audio" }
-```
-
-This is the recovery action for a device that is demonstrably being *sent* audio and
-renders none — the 2026-08-03 failure where three of four devices went silent while the
-daemon, the graph and the clock sync were all healthy (see
-[sendspin-open-items.md](../pipewire_audio_router/docs/sendspin-open-items.md)). Before it
-existed the only lever was restarting the add-on, which interrupted every other output
-and destroyed the evidence.
-
-It is one frame, and deliberately **per device**: it does *not* reset the group's shared
-timeline, so the other members of the group keep playing undisturbed. That is why it does
-not use the library's `Group::clear_stream` helper, which also re-anchors the timeline.
-
-Cheaper than the alternatives — a per-device *reconnect* (nudging its static delay) costs
-a full re-dial and a fresh clock filter for that device; a group restart costs that for
-everyone.
-
-`ok` is `false` with an explanatory message when the device has no live connection: there
-is nothing to clear, and its next stream starts fresh anyway. Exposed in the web UI as
-**Resync** on each connected sendspin output.
-
-### `GET /api/sendspin/delays` / `PUT /api/sendspin/delay`
+### `GET /api/sendspin/delays`
 Per-device playback delay in ms, used to time-align speakers within a group (a device
 with no entry has no extra delay). `GET` returns the sparse map keyed by device node
 name; `PUT` sets one entry. A delay edit is applied without restarting the group's
@@ -638,49 +666,67 @@ server is running restarts, so a *lower* value takes effect without restarting t
 (the previous workaround was to raise one speaker's static delay and put it back, which
 forced a group restart as a side effect). The response says how many groups that costs.
 
-## AirPlay-2 receiver volume
+## AirPlay-2 receivers
 
-AirPlay-2 receivers carry volume in-band over RTSP like sendspin devices do, so they
-get their own pair of endpoints rather than a PipeWire node volume. Current values are
-reported as `ap2_volume` / `ap2_muted` by [`GET /api/outputs`](#get-apioutputs).
+Volume, mute, render delay and resync are the ordinary per-output endpoints
+([`volume`](#put-apioutputsnode_namevolume--mute), [`delay`](#put-apioutputsnode_namedelay),
+[`resync`](#post-apioutputsnode_nameresync)); an AP2 receiver carries all of them in-band
+over RTSP rather than as a PipeWire node volume. Current values are reported as
+`ap2_volume` / `ap2_muted` by [`GET /api/outputs`](#get-apioutputs).
 
-### `PUT /api/ap2/volume`
-Set one receiver's volume (`set_ap2_volume`).
-
-### `PUT /api/ap2/mute`
-Mute or unmute one receiver (`set_ap2_mute`).
+Two AP2-specific things are worth knowing about those shared endpoints:
 
 > The daemon deliberately **does not impose** a volume on connect — an earlier version
 > force-sent maximum volume when a session opened, which made a receiver's real level
 > (e.g. −67 dB on a Pioneer) disagree with the UI slider after a restart.
 
-### `POST /api/ap2/resync`
-Release one receiver's AirPlay session and build a fresh one — re-arming its PTP peer on
-the way — while its groupmates keep streaming. The AP2 counterpart of
-[`POST /api/sendspin/clear`](#post-apisendspinclear), for the same symptom: an output that
-is reachable and being sent audio yet renders nothing.
+> `resync` on an AP2 receiver releases its session and builds a fresh one, re-arming its
+> PTP peer, while its groupmates keep streaming. On this hardware the fault it recovers is
+> a **lost PTP clock lock**: our PT=87 anchors are timestamps in the grandmaster's
+> timeline, so a receiver whose slaved clock has drifted off it plays nothing at all. A
+> Pioneer VSX-934 does this repeatedly, and until this existed the only fixes were
+> restarting the add-on or power-cycling the AVR — both of which work only because both
+> build a new session. The daemon also does it **by itself**: the AP2 liveness task
+> rebuilds the session of a receiver that had a lock, is still being streamed to, and has
+> gone quiet for 30 s (at most one attempt every two minutes, and never for a receiver
+> that has *never* locked — a Yamaha WX-021 never sends a `Delay_Req` and plays
+> perfectly). The endpoint is for the cases it cannot see, and for not waiting.
 
-```json
-// Request
-{ "node_name": "ap2-dev-pioneer_vsx_934_f11b89" }
-// Response
-{ "ok": true, "message": "rebuilding 'Pioneer''s session — it should be back in a few seconds" }
-```
+### `PUT /api/outputs/{node_name}/ap2-rate`
+The one knob that *is* AP2-only: the wire sample-rate mode, `auto` (negotiate 48 kHz, fall
+back to 44.1 kHz) or `fixed_44100`. Restarts that receiver's group at the new rate.
 
-`ok: false` means the receiver has no live sender, so there is no session to rebuild (the
-reconciler is what gives it one) — reported rather than treated as success.
+## PipeWire receiver hosts (agents)
 
-On this hardware the fault it recovers is a **lost PTP clock lock**: our PT=87 anchors are
-timestamps in the grandmaster's timeline, so a receiver whose slaved clock has drifted off
-it plays nothing at all. A Pioneer VSX-934 does this repeatedly, and until this existed
-the only fixes were restarting the add-on or power-cycling the AVR — both of which work
-only because both build a new session.
+A `pwsink-dev-*` output is a **remote machine running `pwrouter-agent`**
+(`outputs/pwsink/agent.rs`, [receiver-agent.md](../pipewire_audio_router/docs/receiver-agent.md)).
+The pairing *decisions* are ordinary output operations — [`adopt`](#post-apioutputsnode_nameadopt)
+pairs, [`unpair`](#post-apioutputsnode_nameunpair) revokes, `ignore` hides — because a host
+asking to pair **is** a discovered output and a second vocabulary for it would buy nothing.
+What is left here is the listing and the host's own master volume.
 
-The daemon also does this **by itself**: the AP2 liveness task watches each receiver's
-gPTP lock age and rebuilds the session of one that had a lock, is still being streamed to,
-and has gone quiet for 30 s (at most one attempt every two minutes, and never for a
-receiver that has *never* locked — a Yamaha WX-021 never sends a `Delay_Req` and plays
-perfectly). This endpoint is for the cases it cannot see, and for not waiting.
+### `GET /api/agent/ws`
+The socket each agent dials in on, authenticated with the bearer token minted when the
+host was adopted. **Not a UI feed** — the browser has no reason to open it, and a second
+connection for one identity replaces the first.
+
+### `GET /api/agents`
+Paired and pending hosts (`AgentInfo`), for diagnostics. The pairing UI does not need it:
+a host waiting to pair appears as a `discovered` `pwsink` output with a `pwsink_pair_code`.
+
+### The host's own volume and mute
+[`PUT /api/outputs/{node_name}/volume`](#put-apioutputsnode_namevolume--mute) and `mute`,
+like every other kind. What is specific to a host is the **failure mode**: there is no
+stored intent, because the host owns the value and reports it back, so a host with no live
+agent answers `503` (`"no agent connected for '<name>'"`) rather than saving it for later
+— receiver-agent §9.4.
+
+Its **playout delay** is [`PUT /api/outputs/{node_name}/delay`](#put-apioutputsnode_namedelay);
+`resync` does not apply (a host has no such lever, and says so).
+
+Two things read that level rather than setting it: `GET /api/outputs` reports it per host,
+and speaker alignment borrows it for the duration of a run and puts the host's own value
+back at teardown (`LevelChannel::OutOfBand`, plan §7).
 
 ## Announcements
 
@@ -826,7 +872,7 @@ a link already present between the same ports is reported as success
 (`ok: true`). Failure modes: either port name not found in the registry
 → 400; the PipeWire thread unreachable/dropped the request → 500.
 
-### `GET /api/routing` / `POST /api/routing/link` / `POST /api/routing/unlink` / `GET /api/routing/ws`
+### `GET /api/routing` / `POST /api/routing/link` / `POST /api/routing/unlink`
 The higher-level pairing used by the manual routing UI — pairs matching
 channel suffixes automatically instead of requiring literal port names.
 See "Routing matrix" below.
@@ -842,11 +888,10 @@ removed along with the node-volume code behind them (`volume.rs`).
 Announcements go to [`POST /api/announce`](#post-apiannounce), which ducks and overlays
 per device in the relay instead of moving node volumes.
 
-Take an output's state from the **routing matrix** ([`GET /api/routing`](#get-apirouting)),
-and its volume from the backend's own control:
-[`/api/sendspin/volume`](#put-apisendspinvolume) or
-[`/api/ap2/volume`](#put-apiap2volume), with current values from
-[`GET /api/outputs`](#get-apioutputs).
+Take an output's state from the **routing matrix** ([`GET /api/routing`](#get-apirouting))
+and set its level with the per-output
+[`PUT /api/outputs/{node_name}/volume`](#put-apioutputsnode_namevolume--mute) — one call
+for every kind — with current values from [`GET /api/outputs`](#get-apioutputs).
 
 ## Routing matrix (manual routing UI)
 
@@ -895,82 +940,58 @@ Forget an offline endpoint entirely — drops its saved routing intent so it
 stops appearing (grayed) in the matrix. A real device that later reappears
 comes back unrouted.
 
-### `GET /api/routing/ws`
-WebSocket. Carries **typed frames**, each a JSON object with a `type`:
+### `GET /api/events` — the one push socket
 
-| `type` | Payload | When it is sent |
+Every live feed the daemon has, on **one connection**, with topics chosen by message.
+
+```json
+// client → server
+{ "op": "subscribe",   "topics": ["matrix", "now_playing"] }
+{ "op": "unsubscribe", "topics": ["meters"] }
+// server → client, in reply
+{ "type": "subscribed", "topics": ["matrix", "now_playing"], "unknown": [] }
+```
+
+| Topic | Frame | What it carries |
 |---|---|---|
-| `matrix` | the `RoutingMatrix` fields at the top level (same shape as `GET /api/routing`, plus `type`) | on connect, then on every registry change **whose payload actually differs** |
-| `meters` | `{ nodes: { <node_name>: { peak?, xruns? } } }` — the live figures only | on connect, then on a 250 ms tick while watched, deduped |
-| `outputs` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs` | on connect, then on the first 250 ms tick after a change moves that listing's payload |
-| `discovered` | `{ outputs: OutputInfo[] }` — same as `GET /api/outputs/discovered` | ditto |
-| `agents` | `{ agents: AgentInfo[] }` — same as `GET /api/agents`; receiver hosts, paired and pending. Diagnostic: the pairing UI reads the two output listings, where a host waiting to pair is a `discovered` `pwsink` output | ditto |
-| `now_playing` | `{ sources: { <node_name>: NowPlaying } }` — same as `GET /api/now_playing` | ditto |
+| `matrix` | `{type:"matrix", sources, outputs, links}` | the routing matrix — **flat**, the fields sit beside `type` |
+| `outputs` | `{type:"outputs", outputs}` | `GET /api/outputs`, pushed |
+| `discovered` | `{type:"discovered", outputs}` | `GET /api/outputs/discovered`, pushed |
+| `agents` | `{type:"agents", agents}` | `GET /api/agents`, pushed |
+| `now_playing` | `{type:"now_playing", sources}` | per-source metadata, keyed by source node name |
+| `meters` | `{type:"meters", nodes}` | peaks + xrun counts, 250 ms tick, keyed by node name |
+| `align` | `{type:"align", state}` | the alignment session, including the frame that says it ended |
+| `measure` | `{type:"measure", status}` | the measurement run |
+| `equivalence` | `{type:"equivalence", status}` | the relay-vs-device experiment |
 
-**Every frame on this socket is deduped**, the matrix included: it is sent only when
-its serialized payload differs from the last one sent on that socket.
+`"all"` (or `"*"`) as a topic name means every topic — for a diagnostic client.
 
-**The matrix frame has no timer behind it** — it is pushed on a change notification and
-on nothing else. Daemon-side, that makes "anything that changes a routing node's fields
-or the link set must notify `changes`" an invariant rather than a nicety: a path that
-forgets leaves every client showing the old value indefinitely. That visible staleness
-is deliberate, and preferred to a periodic re-check that would hide the omission.
+Three rules a consumer can rely on:
 
-**`meters` is the only frame on a timer, and it is the reason the matrix is not.**
-The matrix used to be re-pushed every 250 ms so that peaks and xrun counts stayed
-live. Measured on a live instance: 2 210 bytes per frame of which the peaks were
-36 — 1.6 % — 73 % static configuration, **49 of 49 consecutive frames byte-identical
-at idle**, 9.0 KiB/s per client. The daemon's own cost was negligible (~0.2 % of a
-core per client); the cost was that every client re-read its whole view four times a
-second to learn nothing. So the two were split.
+* **subscribing sends that topic's current state at once**, so no separate initial fetch
+  is needed. `meters` is the exception: it has nothing to say until its next tick;
+* **frames are deduplicated per topic** — the daemon's change notifier fires for *any*
+  change, so without this every topic would wake for every one. A quiet house sends
+  nothing at all;
+* **a node absent from a `meters` frame has nothing to report, i.e. zero.** That is how a
+  level decaying to silence is expressed, so merge the frame wholesale rather than into
+  what you had.
 
-In `meters`, **a field absent means zero**: a node with no signal and no xruns is
-left out of `nodes` entirely, and a silent system therefore sends
-`{"type":"meters","nodes":{}}` once and then nothing until something moves. A client
-must read absence as zero (that is how a level decaying to silence is expressed) and
-must not treat `RoutingNode.peak`/`.xruns` from a matrix frame as live — those are
-just the sample taken when the matrix was last built. `GET /api/routing` still
-carries both, so a cold read is complete.
+> **Why one socket.** A browser gives a page **six** connections per host over HTTP/1.1.
+> There used to be four status sockets — routing, the alignment session, the measurement
+> run, the equivalence experiment — and the alignment wizard alone held three of them
+> while the routing graph held a fourth, so the REST calls those same pages make queued
+> behind idle sockets that would not close until the user navigated away.
+>
+> Subscription is per topic rather than per URL for the same reason in reverse: a page
+> that leaves **unsubscribes**, the daemon stops that work, and the connection stays for
+> the next page. `meters` is the sharp end of that — subscribing to it is what arms
+> per-source peak metering and the PipeWire profiler, and the last unsubscribe disarms
+> them.
 
-`nodes` only ever mentions nodes the last `matrix` frame showed. The profiler
-reports every active node in the graph, most of which the matrix does not display.
-
-The matrix frame is *internally* tagged so its fields stay at the top
-level: a client written against the older protocol, which parsed every
-frame as a bare `RoutingMatrix`, still works and simply ignores the
-listing frames.
-
-`now_playing` is deliberately its own frame rather than a field on `matrix`:
-the matrix is a large payload a client re-reads in full (the web UI recomputes
-its graph layout, the HA integration re-renders every entity), while a track
-changes once a song, and an artwork revision has nothing to do with routing.
-Keeping the descriptive payload off it is the design
-(see [source-metadata-plan.md](../pipewire_audio_router/docs/old/source-metadata-plan.md) §3.2), so do not move
-it back onto a routing node.
-
-**A client must switch on `type` and ignore frames it does not know.** Frame
-types get added; a client that parses every frame as a matrix will mis-read the
-listings (an `OutputInfo` has `name`, not `display_name`) or, for a payload with
-neither `sources` nor `outputs`, silently build an empty matrix.
-
-The listing frames exist so a UI does not have to poll those endpoints.
-They are only sent when the built payload differs from the last one sent
-on that socket — comparing the payload rather than tracking which events
-affect which listing, so a new field cannot be forgotten and a burst of
-unrelated changes stays quiet. The REST endpoints remain the way to get a
-listing on first paint; the socket keeps it fresh afterwards.
-
-A change does not rebuild the listings immediately: it marks them dirty
-and the next 250 ms tick does the work, so a reconcile burst costs one
-rebuild instead of one per notification (measured against 20 rapid
-mutations: 19 listing frames before coalescing, 1 after). The price is up
-to 250 ms of latency on a background change — a client that just made a
-mutation re-reads the endpoint itself and never waits for this path.
-
-Change frames are driven by a broadcast channel the registry-observer
-thread pings synchronously, not by polling. A slow client that misses a
-ping is caught up by the next frame it does receive; there is no event
-replay. The client never needs to send anything.
+Not on this socket, deliberately: `GET /api/align/mic/ws` (binary microphone ingest,
+client → server, one at a time, its own handshake) and `GET /api/agent/ws` (the
+receiver-agent protocol with its own bearer auth). Neither is a status feed.
 
 ## `GET /` (and other non-API paths)
 Serves the built web UI — a Vite + Svelte single-page app (source in
@@ -978,7 +999,7 @@ Serves the built web UI — a Vite + Svelte single-page app (source in
 `--static-dir`), styled to match Home Assistant with light/dark themes and
 also surfaced in the HA sidebar via ingress. It's a full admin console: the
 routing matrix (outputs as rows, sources as columns, live over
-`/api/routing/ws`, clickable link/unlink cells, per-output volume sliders
+the `matrix` topic on `/api/events`, clickable link/unlink cells, per-output volume sliders
 including sendspin devices, offline endpoints grayed with a forget button,
 synchronized-group badges, a `ducked NN%` badge while an output's music is
 attenuated for a voice turn, and a live input-level meter per source) plus

@@ -41,6 +41,10 @@ import type {
 
 const BASE = new URL('.', document.baseURI);
 
+/** Path-segment encoder. Node names and client keys go in the path now, so this is used
+ *  by most of the client rather than a handful of calls. */
+const enc = encodeURIComponent;
+
 function httpUrl(path: string): string {
   return new URL(path.replace(/^\//, ''), BASE).toString();
 }
@@ -52,19 +56,11 @@ export function wsUrl(path: string): string {
   return u.toString();
 }
 
-/** Push channel for the measurement run (plan §11: "progress should be pushed, not
- *  polled"). Sends one whole `MeasureStatus` on connect and one on every change.
- *  Kept here beside the REST client so both halves of the same endpoint are in one
- *  place; resolve it with `wsUrl()`, which handles HA ingress. */
-export const MEASURE_WS_PATH = 'api/align/measure/ws';
-
-/** Push channel for the alignment **session** (the speakers held, who is audible, and
- *  how long the session has left before its idle timeout gives them back). One whole
- *  `AlignState` on connect, then one per change — and one on **teardown**, which is the
- *  frame this socket exists for: a session can end without the UI doing anything, and
- *  until the UI hears about it, it is describing a session that no longer exists while
- *  the speakers have already gone back to normal. Poll `alignStatus()` as the fallback. */
-export const ALIGN_WS_PATH = 'api/align/ws';
+/** The one push socket. Topics are subscribed by message on it — see `lib/events.ts`,
+ *  which owns the connection, the reconnect and the topic refcounting. Named here beside
+ *  the REST client so both halves of the API are in one place; resolve it with `wsUrl()`,
+ *  which handles HA ingress. */
+export const EVENTS_WS_PATH = 'api/events';
 
 /** Shortest name an output may be renamed to, mirroring the daemon's rule
  *  (outputs_store.rs `MIN_NAME_CHARS`) so the UI can refuse before the round trip
@@ -129,7 +125,7 @@ export const api = {
     request<OpResponse>('POST', 'api/routing/unlink', { source, output }),
   /** Forget all routing for an offline entity (matrix remove-✕). */
   forgetEntity: (nodeName: string) =>
-    request<OpResponse>('DELETE', `api/routing/entity/${encodeURIComponent(nodeName)}`),
+    request<OpResponse>('DELETE', `api/routing/entity/${enc(nodeName)}`),
 
   // Receiver agents (pwrouter-agent). Diagnostics only: a host waiting to pair is a
   // discovered `pwsink` output, so the *decisions* are the output calls below —
@@ -150,39 +146,58 @@ export const api = {
    * For a receiver host this is also the pairing: the daemon mints its token first
    * (plan §8), so "Pair" and "Add" are one click rather than two decisions. */
   adoptOutput: (nodeName: string) =>
-    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/adopt`),
+    request<OpResponse>('POST', `api/outputs/${enc(nodeName)}/adopt`),
   /** Unpair a receiver host — the pw-sink form of removing. Revokes the token *and*
    * clears routing, group membership and adoption. Its agent keeps dialling in, so
    * the host returns under "Discovered" as pairable. */
   unpairOutput: (nodeName: string) =>
-    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/unpair`),
+    request<OpResponse>('POST', `api/outputs/${enc(nodeName)}/unpair`),
   /** Dismiss a discovered device — hidden unless "show ignored" is on. Also
    * clears any routing / group membership it had. */
   ignoreOutput: (nodeName: string) =>
-    request<OpResponse>('POST', `api/outputs/${encodeURIComponent(nodeName)}/ignore`),
+    request<OpResponse>('POST', `api/outputs/${enc(nodeName)}/ignore`),
   /** Remove an output: back to undecided. Stops being routable, loses its HA
    * media_player, and its routing + group membership are forgotten. Still on the
    * network ⇒ it reappears under "Discovered". */
   removeOutput: (nodeName: string) =>
-    request<OpResponse>('DELETE', `api/outputs/${encodeURIComponent(nodeName)}`),
+    request<OpResponse>('DELETE', `api/outputs/${enc(nodeName)}`),
   /** Rename an output. The name is shown everywhere the output appears (here, the
    * routing graph, group chips, the HA media_player); `null` drops the override so
    * it goes back to its discovered name. Rejected below MIN_OUTPUT_NAME_CHARS. */
   renameOutput: (nodeName: string, name: string | null) =>
-    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/name`, { name }),
-  /** Per-output render delay in ms (AirPlay 2); null resets to default. */
-  setOutputLatency: (nodeName: string, latencyMs: number | null) =>
-    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/latency`, { latency_ms: latencyMs }),
+    request<OpResponse>('PUT', `api/outputs/${enc(nodeName)}/name`, { name }),
+  /** One output's level, `0.0`–`1.0` on every kind — the daemon converts to whatever
+   *  that output's transport wants (sendspin 0–100 in-band, AP2's RTSP parameter, a
+   *  PipeWire host's own cubic lever through its agent). A name whose kind has no such
+   *  knob is a 400 and an unknown one a 404, so this can no longer be reached with the
+   *  wrong kind — which used to be stored as an intent and answered `ok: true`. */
+  setOutputVolume: (nodeName: string, volume: number) =>
+    request<OpResponse>('PUT', `api/outputs/${enc(nodeName)}/volume`, { volume }),
+  setOutputMute: (nodeName: string, muted: boolean) =>
+    request<OpResponse>('PUT', `api/outputs/${enc(nodeName)}/mute`, { muted }),
+  /** One output's timing knob in ms; `null` puts it back on its default.
+   *
+   *  **The polarity is per kind** and `GET /api/outputs` reports it: for sendspin this is
+   *  an *advance* (the device plays that much earlier) and writing it costs that speaker a
+   *  reconnect — tens of seconds of silence — while for AirPlay 2 and a PipeWire host it
+   *  is a delay applied live. */
+  setOutputDelay: (nodeName: string, delayMs: number | null) =>
+    request<OpResponse>('PUT', `api/outputs/${enc(nodeName)}/delay`, { delay_ms: delayMs }),
+  /** Ask one output to recover: a sendspin `stream/clear` (discard buffered audio and
+   *  re-anchor, one frame, groupmates untouched) or a fresh AirPlay-2 session with its
+   *  PTP peer re-armed. For an output that is reachable and being sent audio yet plays
+   *  nothing. */
+  resyncOutput: (nodeName: string) => request<OpResponse>('POST', `api/outputs/${enc(nodeName)}/resync`),
 
   // AirPlay-2 wire sample-rate mode: 'auto' (negotiate 48 kHz, fall back to
   // 44.1 kHz) or 'fixed_44100'. Restarts that receiver's group at the new rate.
   setAp2RateMode: (nodeName: string, mode: 'auto' | 'fixed_44100') =>
-    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/ap2-rate`, { mode }),
+    request<OpResponse>('PUT', `api/outputs/${enc(nodeName)}/ap2-rate`, { mode }),
 
   /** Per-sendspin-output wire codec. Rejected (with a reason) if that codec isn't
    * currently usable — the add-on can't encode it, or the device doesn't decode it. */
   setSendspinCodec: (nodeName: string, codec: SendspinCodec) =>
-    request<OpResponse>('PUT', `api/outputs/${encodeURIComponent(nodeName)}/sendspin-codec`, { codec }),
+    request<OpResponse>('PUT', `api/outputs/${enc(nodeName)}/sendspin-codec`, { codec }),
 
   // Per-device announcement (announce.rs). Plays a clip (built-in test/tone,
   // or a url) to a set of per-device-sender outputs with duck/overlay —
@@ -200,63 +215,23 @@ export const api = {
   // receiver, so these are scoped by the source id (encodeURIComponent'd).
   // `key` matches the sender by advertised name if known, else by IP.
   listSourceClients: (id: string) =>
-    request<AirplayClient[]>('GET', `api/sources/${encodeURIComponent(id)}/clients`),
+    request<AirplayClient[]>('GET', `api/sources/${enc(id)}/clients`),
   forgetSourceClient: (id: string, key: string) =>
-    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/forget`, { key }),
+    request<OpResponse>('DELETE', `api/sources/${enc(id)}/clients/${enc(key)}`),
   banSourceClient: (id: string, key: string, banned: boolean) =>
-    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/ban`, { key, banned }),
+    request<OpResponse>('PUT', `api/sources/${enc(id)}/clients/${enc(key)}/ban`, { banned }),
   setSourceClientPriority: (id: string, key: string, priority: number) =>
-    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/priority`, { key, priority }),
+    request<OpResponse>('PUT', `api/sources/${enc(id)}/clients/${enc(key)}/priority`, { priority }),
   disconnectSourceClient: (id: string, key: string) =>
-    request<OpResponse>('POST', `api/sources/${encodeURIComponent(id)}/clients/disconnect`, { key }),
+    request<OpResponse>('POST', `api/sources/${enc(id)}/clients/${enc(key)}/disconnect`),
   setSourcePolicy: (id: string, preventTakeover: boolean) =>
-    request<OpResponse>('PUT', `api/sources/${encodeURIComponent(id)}/policy`, { prevent_takeover: preventTakeover }),
+    request<OpResponse>('PUT', `api/sources/${enc(id)}/policy`, { prevent_takeover: preventTakeover }),
 
-  // Sendspin per-device volume (virtual outputs; volume is carried in-band over
-  // the sendspin protocol, not a PipeWire node volume). Map is node_name -> 0-100.
+  /** Desired sendspin volumes (0–100) by node name, sparse — the one listing that is
+   *  genuinely per-kind: only sendspin keeps intent for a device it cannot reach. */
   sendspinVolumes: () => request<Record<string, number>>('GET', 'api/sendspin/volumes'),
-  setSendspinVolume: (nodeName: string, volume: number) =>
-    request<OpResponse>('PUT', 'api/sendspin/volume', { node_name: nodeName, volume }),
-  setSendspinMute: (nodeName: string, muted: boolean) =>
-    request<OpResponse>('PUT', 'api/sendspin/mute', { node_name: nodeName, muted }),
-  /** Ask one sendspin device to discard buffered-but-unplayed audio and re-anchor
-   *  (`stream/clear`), without ending its stream or disturbing its groupmates.
-   *  The recovery action for a device that is being sent audio and renders none. */
-  sendspinClear: (nodeName: string) =>
-    request<OpResponse>('POST', 'api/sendspin/clear', { node_name: nodeName }),
-  /** Rebuild one AirPlay-2 receiver's session (release + fresh RTSP/SETUP/RECORD),
-   *  leaving its groupmates streaming — the AP2 counterpart of `sendspinClear`.
-   *  For a receiver that is reachable and being sent audio yet plays nothing, which on
-   *  this hardware is what a lost PTP clock lock looks like. The daemon does this by
-   *  itself when it can see the lock go; this is for when it cannot. */
-  ap2Resync: (nodeName: string) =>
-    request<OpResponse>('POST', 'api/ap2/resync', { node_name: nodeName }),
-
-  // AirPlay-2 per-device volume/mute (virtual outputs; volume is an in-band RTSP
-  // SET_PARAMETER to the receiver). Volume is 0.0–1.0. No receiver→daemon
-  // feedback yet, so the matrix reflects the last-set level.
-  setAp2Volume: (nodeName: string, volume: number) =>
-    request<OpResponse>('PUT', 'api/ap2/volume', { node_name: nodeName, volume }),
-  setAp2Mute: (nodeName: string, muted: boolean) =>
-    request<OpResponse>('PUT', 'api/ap2/mute', { node_name: nodeName, muted }),
-
-  // pw-sink per-host volume/mute (`pwsink-dev-*`): the *receiver host's own* master
-  // out, driven by its pwrouter-agent over the control WS (docs/receiver-agent.md §6).
-  // Volume is cubic 0.0–1.0, the scale `wpctl` and HA's `volume_level` use.
-  //
-  // Unlike sendspin/AP2 there is nothing to store for later: the host owns the value
-  // and reports it back, so a host with no live agent answers **503** rather than
-  // pretending it saved the intent — which is why these must never be reached with a
-  // `sendspin-dev-*`-shaped call (see lib/outputs/level.ts).
-  setPwsinkVolume: (nodeName: string, volume: number) =>
-    request<OpResponse>('PUT', 'api/pwsink/volume', { node_name: nodeName, volume }),
-  setPwsinkMute: (nodeName: string, muted: boolean) =>
-    request<OpResponse>('PUT', 'api/pwsink/mute', { node_name: nodeName, muted }),
-
-  // Sendspin per-device static delay (ms, 0-5000; 0 clears). Map node_name -> ms.
+  /** Desired sendspin static delays (ms) by node name, same rule. */
   sendspinDelays: () => request<Record<string, number>>('GET', 'api/sendspin/delays'),
-  setSendspinDelay: (nodeName: string, delayMs: number) =>
-    request<OpResponse>('PUT', 'api/sendspin/delay', { node_name: nodeName, delay_ms: delayMs }),
 
   // Group sync settings (daemon-wide presentation lead, ms).
   syncSettings: () => request<SyncSettingsInfo>('GET', 'api/sync/settings'),
@@ -325,8 +300,8 @@ export const api = {
     request<AlignState>('POST', 'api/align/select', { reference, target }),
   alignVolume: (volume: number) => request<AlignState>('POST', 'api/align/volume', { volume }),
   /** Measure one member through one channel of its stereo pair, or both again. */
-  alignChannels: (node_name: string, channels: MeasureChannels) =>
-    request<AlignState>('POST', 'api/align/channel', { node_name, channels }),
+  alignChannels: (nodeName: string, channels: MeasureChannels) =>
+    request<AlignState>('POST', `api/align/members/${enc(nodeName)}/channel`, { channels }),
   /** Postpone the session's idle teardown by one whole allowance, changing nothing else
    *  (`AlignState.closes_in_s`).
    *
@@ -359,7 +334,7 @@ export const api = {
   /** The whole run: phase, per-member progress, gate, observations, proposal,
    *  verification, refusal.
    *
-   *  The push channel is `wsUrl(MEASURE_WS_PATH)` — one full status on connect and
+   *  The push channel is the `measure` topic on `/api/events` — the current status on
    *  one per change. This stays the fallback rather than a legacy path: a wizard that
    *  shows nothing because the socket did not open is worse than one that polls, so
    *  `lib/measure.svelte.ts` polls until the socket has actually delivered something
@@ -389,10 +364,7 @@ export const api = {
    *  Refused — never a 500 — when the run is not a walk, is busy taking a reading, has
    *  already measured this speaker, or has never heard of it. */
   measureArrival: (nodeName: string, level?: number) =>
-    request<MeasureStatus>('POST', 'api/align/measure/arrival', {
-      node_name: nodeName,
-      ...(level == null ? {} : { level }),
-    }),
+    request<MeasureStatus>('POST', `api/align/measure/arrival/${enc(nodeName)}`, level == null ? {} : { level }),
   /** Near field's **closure** reading: "I have walked back to the speaker I started at."
    *
    *  The difference between the anchor's two readings is the mic-vs-audio clock drift
@@ -444,7 +416,7 @@ export const api = {
   /** One whole transcript, by id or `latest`. Refused (with a `Refusal`) when that run
    *  has already been dropped by retention. */
   measureLogRun: (run: string) =>
-    request<RunDocument>('GET', `api/align/measure/log?run=${encodeURIComponent(run)}`),
+    request<RunDocument>('GET', `api/align/measure/log?run=${enc(run)}`),
 
   // Dynamic input sources — collection CRUD (multi-source refactor). Supersedes
   // the singular /api/source/{airplay,rtp} endpoints above. The backend routes
@@ -465,7 +437,7 @@ export const api = {
   updateSource: (
     id: string,
     body: { label?: string; airplay?: Partial<AirplaySourceCfg>; rtp?: Partial<RtpSourceCfg> },
-  ) => request<SourceView>('PUT', `api/sources/${encodeURIComponent(id)}`, body),
+  ) => request<SourceView>('PUT', `api/sources/${enc(id)}`, body),
   deleteSource: (id: string) =>
-    request<OpResponse>('DELETE', `api/sources/${encodeURIComponent(id)}`),
+    request<OpResponse>('DELETE', `api/sources/${enc(id)}`),
 };

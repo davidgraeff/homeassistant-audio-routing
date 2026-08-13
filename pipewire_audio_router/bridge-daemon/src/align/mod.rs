@@ -25,5 +25,4 @@ pub(crate) mod measure;
 pub(crate) mod mic;
 pub(crate) mod relay_delay;
 /// The one push loop behind every `…/ws` status socket here (plan §11).
-pub(crate) mod status_ws;
 pub(crate) mod transcript;

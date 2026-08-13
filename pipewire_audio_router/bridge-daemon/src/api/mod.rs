@@ -93,6 +93,11 @@ pub fn router(
     };
     Router::new()
         .route("/health", get(health))
+        // THE push socket (events.rs). One connection, topics subscribed by message —
+        // four separate status sockets used to eat four of a browser's six per-host
+        // HTTP/1.1 connections, leaving the pages that opened them no headroom for
+        // their own REST calls.
+        .route("/api/events", get(crate::events::events_ws))
         .route("/api/nodes", get(list_nodes))
         .route("/api/links", post(create_link))
         .route("/api/outputs", get(list_outputs))
@@ -108,16 +113,25 @@ pub fn router(
         // pw-sink only: the removal that also revokes the pairing (plan §8).
         .route("/api/outputs/{node_name}/unpair", post(unpair_output))
         .route("/api/outputs/{node_name}/name", put(set_output_name))
-        .route("/api/outputs/{node_name}/latency", put(set_output_latency))
+        // The output's own knobs, addressed by the output and dispatched to whatever
+        // transport it has (api/level.rs). One scale for volume (0.0–1.0), one name for
+        // the timing knob whatever its polarity, one intent for "recover".
+        .route("/api/outputs/{node_name}/volume", put(set_output_volume))
+        .route("/api/outputs/{node_name}/mute", put(set_output_mute))
+        .route("/api/outputs/{node_name}/delay", put(set_output_delay))
+        .route("/api/outputs/{node_name}/resync", post(resync_output))
         .route("/api/outputs/{node_name}/ap2-rate", put(set_ap2_rate_mode))
         .route("/api/outputs/{node_name}/sendspin-codec", put(set_sendspin_codec))
         // Per-receiver AirPlay client/policy routes. `{id}` is the source id;
         // each receiver has its own client list + anti-takeover flag.
         .route("/api/sources/{id}/clients", get(list_source_clients))
-        .route("/api/sources/{id}/clients/forget", post(forget_source_client))
-        .route("/api/sources/{id}/clients/ban", post(ban_source_client))
-        .route("/api/sources/{id}/clients/priority", post(set_source_client_priority))
-        .route("/api/sources/{id}/clients/disconnect", post(disconnect_source_client))
+        // One sender, addressed by its key: forgetting it is a DELETE of that
+        // sub-resource, the two flags are PUTs on it, and disconnecting is the one real
+        // action.
+        .route("/api/sources/{id}/clients/{key}", delete(forget_source_client))
+        .route("/api/sources/{id}/clients/{key}/ban", put(ban_source_client))
+        .route("/api/sources/{id}/clients/{key}/priority", put(set_source_client_priority))
+        .route("/api/sources/{id}/clients/{key}/disconnect", post(disconnect_source_client))
         .route("/api/sources/{id}/policy", put(set_source_policy))
         // Per-source now-playing metadata (sources/now_playing.rs). Keyed by source NODE
         // NAME, not by source id: that is the key the routing matrix, the routing
@@ -133,14 +147,7 @@ pub fn router(
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/{id}", get(get_source).put(update_source).delete(delete_source))
         .route("/api/sendspin/volumes", get(get_sendspin_volumes))
-        .route("/api/sendspin/volume", put(set_sendspin_volume))
-        .route("/api/sendspin/mute", put(set_sendspin_mute))
-        .route("/api/sendspin/clear", post(clear_sendspin_stream))
-        .route("/api/ap2/volume", put(set_ap2_volume))
-        .route("/api/ap2/mute", put(set_ap2_mute))
-        .route("/api/ap2/resync", post(resync_ap2_receiver))
         .route("/api/sendspin/delays", get(get_sendspin_delays))
-        .route("/api/sendspin/delay", put(set_sendspin_delay_handler))
         .route("/api/sync/settings", get(get_sync_settings).put(set_sync_settings))
         .route("/api/settings", get(get_settings).put(set_settings))
         .route("/api/status", get(get_status))
@@ -165,7 +172,6 @@ pub fn router(
         // one, so an abandoned session hands the speakers back on its own; without this
         // the wizard would keep describing a session that no longer exists. The polling
         // `GET` above stays and the UI falls back to it.
-        .route("/api/align/ws", get(align_ws))
         .route("/api/align/start", post(align_start))
         // "I am still here": the one way to postpone that idle teardown. A deliberate
         // click, never a heartbeat — an open socket or a status poll counts for nothing,
@@ -178,7 +184,7 @@ pub fn router(
         .route("/api/align/volume", post(align_volume))
         // One member through one channel of its stereo pair (plan §12.2): a pair is two
         // acoustic sources, so its arrival time is not a single number.
-        .route("/api/align/channel", post(align_channels))
+        .route("/api/align/members/{node_name}/channel", post(align_channels))
         // Microphone-assisted alignment (align/mic.rs): the phone's capture socket
         // and the status the UI's level meter reads.
         .route("/api/align/mic/ws", get(crate::align::mic::mic_ws))
@@ -192,17 +198,16 @@ pub fn router(
         // Pushed run status (plan §11): one full `MeasureStatus` on connect, then one
         // per change. The polling `GET` above stays, and the UI falls back to it —
         // a run that looks frozen because a socket dropped is worse than a poll.
-        .route("/api/align/measure/ws", get(crate::align::measure::measure_ws))
         // The relay-vs-device equivalence experiment (plan §1.1.1). Separate from a
         // measurement run — and it refuses while one is live, since both drive the same
         // session.
         .route("/api/align/equivalence", get(equivalence_status).post(equivalence_start).delete(equivalence_abandon))
-        .route("/api/align/equivalence/ws", get(crate::align::measure::equivalence_ws))
+        .route("/api/align/equivalence/{node_name}", post(equivalence_start_member))
         .route("/api/align/measure/start", post(measure_start))
         // Near field only (plan §1, W8a). The daemon cannot see where the phone is, so
         // the walk is driven by the user: one `arrival` per speaker while standing at
         // it, then `close` back at the first one for the drift measurement.
-        .route("/api/align/measure/arrival", post(measure_arrival))
+        .route("/api/align/measure/arrival/{node_name}", post(measure_arrival))
         .route("/api/align/measure/close", post(measure_close))
         // Multi-position chaining (plan §1.1): one position per listening spot, then
         // finish — which renormalises the whole chain and proposes the single write.
@@ -213,8 +218,8 @@ pub fn router(
         // Per-output band-split calibration (plan §10.2): measured at the speaker,
         // subtracted from that speaker's cross-band split so a mixed-model group is
         // not refused for its hardware.
-        .route("/api/align/measure/split", get(measure_splits).post(measure_split_calibrate))
-        .route("/api/align/measure/split/{node_name}", delete(measure_split_clear))
+        .route("/api/align/measure/split", get(measure_splits))
+        .route("/api/align/measure/split/{node_name}", post(measure_split_calibrate).delete(measure_split_clear))
         // The persisted run transcripts (plan §11): the listing, or one whole run as
         // one document with `?run=<id>` / `?run=latest`.
         .route("/api/align/measure/log", get(measure_log))
@@ -222,15 +227,12 @@ pub fn router(
         .route("/api/routing/link", post(routing::link))
         .route("/api/routing/unlink", post(routing::unlink))
         .route("/api/routing/entity/{node_name}", delete(routing::forget_entity))
-        .route("/api/routing/ws", get(routing::routing_ws))
         // The receiver agents' own control plane: the agent dials in here.
         // Pairing decisions are *output* operations (`/adopt`, `/ignore`, `/unpair`)
         // — a host asking to pair is a discovered output, so it is decided where
         // every other output is. This listing is left for diagnostics.
         .route("/api/agent/ws", get(crate::outputs::pwsink::agent::agent_ws))
         .route("/api/agents", get(get_agents))
-        .route("/api/pwsink/volume", put(set_pwsink_volume))
-        .route("/api/pwsink/mute", put(set_pwsink_mute))
         // Everything else (`/`, `/assets/*`, favicon, …) is the built Svelte SPA,
         // read into memory ONCE at startup (below) and served from RAM. This
         // deliberately does NOT use `ServeDir`: the add-on's `/data` lives on a USB
@@ -249,6 +251,7 @@ pub(crate) mod announce;
 pub(crate) mod clients;
 pub(crate) mod duck;
 pub(crate) mod groups;
+mod level;
 pub(crate) mod measure;
 pub(crate) mod nodes;
 pub(crate) mod now_playing;
@@ -269,6 +272,7 @@ pub(crate) use announce::*;
 pub(crate) use clients::*;
 pub(crate) use duck::*;
 pub(crate) use groups::*;
+pub(crate) use level::*;
 pub(crate) use measure::*;
 // The output listing model lives in outputs/listing.rs, because the routing matrix
 // consumes it too; re-exported so the handlers address it by bare name as well.

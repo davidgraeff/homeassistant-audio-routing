@@ -66,7 +66,7 @@ async def _setup(hass, stack, rtp=RTP_DISABLED):
             new=AsyncMock(return_value=AppSettings(expose_outputs_as_media_players=False)),
         )
     )
-    stack.enter_context(patch(f"{COORD}.async_routing_ws_loop", new=AsyncMock()))
+    stack.enter_context(patch(f"{COORD}.async_events_ws_loop", new=AsyncMock()))
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
