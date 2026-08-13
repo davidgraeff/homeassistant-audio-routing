@@ -127,9 +127,18 @@ impl OverlayMixer {
         M.get_or_init(OverlayMixer::default)
     }
 
-    /// Start (or replace) an overlay on `output`. `pcm` is 48 kHz stereo S16LE; if
-    /// the output's capture runs at a different rate (a 44.1 kHz AP2 group), the
-    /// clip is resampled once here so it mixes sample-for-sample with the music.
+    /// Start (or replace) an overlay on `output` with the default stall grace. `pcm` is
+    /// 48 kHz stereo S16LE; if the output's capture runs at a different rate (a 44.1 kHz
+    /// AP2 group), the clip is resampled once here so it mixes sample-for-sample with the
+    /// music.
+    ///
+    /// **Tests only, deliberately.** Every production caller opens or checks a transport
+    /// first and therefore has an opinion about how long the clip may make no progress
+    /// before the watchdog drops it, so it calls [`Self::start_with_grace`] and passes
+    /// that opinion. Leaving a grace-less entry point in the shipped surface invites a
+    /// caller not to have one — which for an on-demand AP2 session means the watchdog
+    /// fires while the receiver is still pairing.
+    #[cfg(test)]
     pub fn start(&self, output: &str, id: u64, pcm: Vec<u8>, duck: f32) {
         self.start_with_grace(output, id, pcm, duck, OVERLAY_STALL_GRACE);
     }
@@ -412,7 +421,8 @@ fn mix_s16le(music: &[u8], overlay: &[u8], duck: f32) -> Vec<u8> {
 }
 
 /// Generate a stereo S16LE test tone at the capture format (48 kHz), for the
-/// overlay spike: `seconds` of a `freq` Hz sine at `amplitude` (0.0–1.0).
+/// overlay tests: `seconds` of a `freq` Hz sine at `amplitude` (0.0–1.0).
+#[cfg(test)]
 pub fn test_tone(seconds: f32, freq: f32, amplitude: f32) -> Vec<u8> {
     let rate = crate::pw::capture::SAMPLE_RATE as f32;
     let frames = (rate * seconds.max(0.0)) as usize;

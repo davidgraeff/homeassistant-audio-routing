@@ -122,11 +122,6 @@ handler name, which is the authoritative place to check the exact body shape.
 | `POST`/`DELETE` | `/api/align/measure/split/{node_name}` | measure one output's band split at close range / clear it |
 | `GET`/`POST`/`DELETE` | `/api/align/equivalence` | the relay-vs-device delay experiment (the daemon picks the member) |
 | `POST` | `/api/align/equivalence/{node_name}` | …run it on one named member instead |
-| `POST`/`DELETE` | `/api/spike/per-device` | dev-only spike harness |
-| `POST`/`DELETE` | `/api/spike/multi-device` | dev-only spike harness |
-| `POST`/`DELETE` | `/api/spike/overlay` | dev-only spike harness |
-| `POST`/`DELETE` | `/api/spike/ap2` | dev-only spike harness |
-| `POST`/`DELETE` | `/api/spike/pw-sink` | dev-only spike harness |
 
 > **Two-tier groups (`/api/groups/*`) and speaker alignment (`/api/align/*`) are listed
 > above but have no detail sections here.** They are the newest subsystems, and the
@@ -139,8 +134,7 @@ handler name, which is the authoritative place to check the exact body shape.
 > `/api/align/audible` (re-starting per position would cost two reconnect waves), and only
 > `/api/align/still-here` postpones the idle teardown — an open socket, a frame on it and a
 > status poll all deliberately count for nothing.
->
-> The `/api/spike/*` routes are development harnesses, not a supported interface.
+
 
 ## Health & inspection
 

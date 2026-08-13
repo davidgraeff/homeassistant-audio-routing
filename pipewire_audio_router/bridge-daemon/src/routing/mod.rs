@@ -630,29 +630,6 @@ fn matched_port_specs(state: &SharedState, source_node_id: u32, output_node_id: 
     matched_port_specs_impl(state, source_node_id, output_node_id, false)
 }
 
-/// Like [`ensure_link_by_name`] but links the `source` node's **monitor** output
-/// ports (a sink's `monitor_*` tap) into `output`'s inputs. Used to fan a group
-/// anchor's monitor into a follower sink (e.g. an rtp-sink for the pw-sink
-/// backend) — the anchor is the steady QUANT-1024 driver, the follower pulls
-/// from its monitor at its own rate. Idempotency is handled by PipeWire (a
-/// duplicate link is rejected); callers re-invoke freely.
-pub async fn ensure_monitor_link_by_name(pw: &SharedState, pw_cmd: &PwCommandSender, source: &str, output: &str) {
-    let ids = {
-        let st = pw.lock_recover();
-        node_id_for(&st, source).zip(node_id_for(&st, output))
-    };
-    let Some((source_id, output_id)) = ids else { return };
-    let specs = matched_port_specs_impl(pw, source_id, output_id, true);
-    if specs.is_empty() {
-        return;
-    }
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
-        return;
-    }
-    let _ = reply_rx.await;
-}
-
 /// `want_monitor` selects which of the source node's output ports to match:
 /// `false` = normal outputs (excluding `monitor_*`), `true` = only `monitor_*`.
 fn matched_port_specs_impl(state: &SharedState, source_node_id: u32, output_node_id: u32, want_monitor: bool) -> Vec<LinkSpec> {

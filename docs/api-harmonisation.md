@@ -18,7 +18,7 @@ no documentation of moved endpoints. `docs/api-reference.md` describes the surfa
 now; what each section below records is the *reasoning*, and where it says "proposal" read
 "what was done". §7's list is what remains.
 
-The route table went from **85 to 77** routes, the four status sockets became one, and
+The route table went from **85 to 72** routes (77 after the harmonisation, then five spike harnesses deleted), the four status sockets became one, and
 `{ok, message}` is gone from every response.
 
 The ranking at the end is by *consumer win per unit of churn*; §7 lists what should be
@@ -306,7 +306,7 @@ integration would have to speak both anyway.
 |---|---|
 | `/api/align/*`'s many small POSTs (`audible`, `volume`, `select`, `channel`, `still-here`) | They read as sprawl but they are *steps of one protocol* with different idle-timeout semantics — `still-here` postpones teardown, a status poll deliberately does not. A single `PATCH /api/align/session` would hide exactly that. (Full disclosure: `/api/align/channel` is mine, added yesterday, and a `PATCH` would have been the tidier choice — the timeout asymmetry is why it is not.) |
 | `POST /api/outputs/{n}/adopt` / `ignore` / `unpair` | RPC-shaped, but they are a state machine with a side effect (pairing mints a token). `PUT …/state` would make the token minting invisible. |
-| `/api/spike/*` | Development harnesses. Better: gate them behind a build feature so they are not in a shipped route table at all. |
+| `/api/spike/*` | **Gone** (2026-08-13). They were development harnesses in a shipped route table, documented as "not a supported interface" — five rows a reader had to skip and five request types nobody validated. The recipe for the next experiment, including what exposing one over HTTP costs, is now the module doc of `bridge-daemon/src/spike/mod.rs`, which is all that is left of them. |
 | `/api/links` vs `/api/routing/link` | Different layers (raw port link vs persisted intent). Worth renaming `/api/links` → `/api/pw/links` to stop it reading as the routing one. |
 | `/health` | Plain text, no envelope, on purpose. |
 | `/api/sendspin/delay`'s separateness | The *address* should join `/api/outputs/{n}/delay`, but the semantic difference must stay visible: it is an **advance**, not a delay, and writing it costs a device reconnect. Put that in the response and in `GET /api/outputs` (polarity + cost), not in the URL. |
@@ -330,8 +330,8 @@ integration would have to speak both anyway.
 **What remains is §7's list and §6's generation flag**, and neither is urgent: the
 `/api/groups/{tier}` merge is low value (the two shapes differ more than they look), and the
 generation flag only starts mattering when something outside this repo speaks to the daemon.
-The one thing worth doing *before* that day is deciding whether `/api/spike/*` should exist
-in a shipped route table at all — §7 says gate it behind a build feature.
+`/api/spike/*` is already dealt with: the harnesses are deleted, and `spike/mod.rs` keeps
+the recipe for the next experiment rather than the experiments.
 
 ---
 

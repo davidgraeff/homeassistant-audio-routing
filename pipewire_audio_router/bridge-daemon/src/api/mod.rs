@@ -151,11 +151,6 @@ pub fn router(
         .route("/api/sync/settings", get(get_sync_settings).put(set_sync_settings))
         .route("/api/settings", get(get_settings).put(set_settings))
         .route("/api/status", get(get_status))
-        .route("/api/spike/per-device", post(spike_per_device_start).delete(spike_per_device_stop))
-        .route("/api/spike/multi-device", post(spike_multi_device_start).delete(spike_per_device_stop))
-        .route("/api/spike/overlay", post(spike_overlay_start).delete(spike_overlay_stop))
-        .route("/api/spike/ap2", post(spike_ap2_start).delete(spike_ap2_stop))
-        .route("/api/spike/pw-sink", post(spike_pwsink_start).delete(spike_pwsink_stop))
         .route("/api/announce", post(ag_announce))
         .route("/api/duck", get(duck_list).post(duck_start))
         .route("/api/duck/{hold_id}", post(duck_renew).delete(duck_release))
@@ -260,7 +255,6 @@ pub(crate) mod now_playing;
 pub(crate) mod outputs;
 pub(crate) mod settings;
 pub(crate) mod sources;
-pub(crate) mod spike;
 pub(crate) mod sync;
 pub(crate) mod volume;
 
@@ -285,7 +279,6 @@ pub(crate) use now_playing::*;
 pub(crate) use outputs::*;
 pub(crate) use settings::*;
 pub(crate) use sources::*;
-pub(crate) use spike::*;
 pub(crate) use sync::*;
 pub(crate) use volume::*;
 

@@ -1,5 +1,56 @@
 use super::*;
 
+/// Announcement-group announce (announce/mod.rs): play a clip to a set of per-device
+/// outputs with per-device duck+overlay and scheduler policy (queue/barge/TTL).
+///
+/// Each target needs a per-device sender to *consume* its overlay, so the handler
+/// first ensures one exists — including opening an **on-demand AP2 session** for a
+/// receiver with nothing routed into it (routing/sync_group/mod.rs) — and reports any target
+/// nothing can carry instead of dropping the clip silently.
+#[derive(Deserialize)]
+pub(crate) struct AgAnnounceRequest {
+    /// Target output node names (`sendspin-dev-…`). Optional if
+    /// `announcement_group` is given (its targets are used).
+    #[serde(default)]
+    pub(crate) targets: Vec<String>,
+    /// Named announcement group (store/groups.rs) to resolve targets/priority/duck.
+    #[serde(default)]
+    pub(crate) announcement_group: Option<String>,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    /// Use the built-in test-announcement clip (no url needed).
+    #[serde(default)]
+    pub(crate) test: bool,
+    /// Use the built-in calibration tone (the `align/calibrate/mod.rs` click track) as a
+    /// quick "is this speaker alive and correctly wired" check.
+    #[serde(default)]
+    pub(crate) tone: bool,
+    #[serde(default)]
+    pub(crate) priority: i32,
+    /// "queue" (default) or "reject" when the targets are busy.
+    #[serde(default)]
+    pub(crate) on_busy: Option<String>,
+    #[serde(default)]
+    pub(crate) barge_in: bool,
+    #[serde(default)]
+    pub(crate) ttl_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) duck: Option<f32>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AgAnnounceResponse {
+    /// "playing" | "queued" | "rejected" — the *outcome*, on a 200. A rejection is the
+    /// arbiter's decision, not a failed request, so it is a value here rather than a
+    /// status (see `api::error` for where the line is).
+    pub(crate) admission: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) position: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+    pub(crate) message: String,
+}
+
 /// Acquire the announce audio as 48k/S16/stereo PCM from one of test/tone/url.
 pub(crate) async fn acquire_announce_pcm(req: &AgAnnounceRequest) -> Result<Vec<u8>, String> {
     if req.test {
