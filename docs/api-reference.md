@@ -8,6 +8,41 @@ both talk to — there is no other way to control the router.
 
 All request/response bodies are JSON unless noted.
 
+## How a call answers
+
+**The HTTP status carries success.** A 2xx means it happened; anything else carries a
+typed reason:
+
+```json
+// 200 — a write that happened. `message` is the sentence to show the user.
+{ "message": "set 'Kitchen' to 42%" }
+// 409 — it did not. `kind` is machine-readable; branch on it, not on the prose.
+{ "kind": "conflict", "message": "'Kitchen' has no live connection, so there is nothing to clear" }
+```
+
+| `kind` | Status | Means |
+|---|---|---|
+| `not_found` | 404 | no such output, source, hold or group |
+| `bad_request` | 400 | a value out of range, a kind with no such knob, a body that does not make sense |
+| `conflict` | 409 | the request is fine, the target is not in a state where it applies — no live connection to clear, no session to rebuild |
+| `unavailable` | 503 | a far end this daemon depends on is not answering: a PipeWire host with no agent, the PipeWire thread gone |
+| `internal` | 500 | this daemon broke — a store it could not persist |
+
+Reads answer with their resource and no envelope. A write that has something to return
+(a duck hold, an announcement's admission) returns *that*, on a 200.
+
+The alignment subsystem answers refusals in the same envelope with its own richer
+vocabulary — `kind` values like `mic_lost` or `estimator`, plus the member to blame and the
+estimator's own verdict — because each names a state the user can act on.
+
+> **There is no `ok` field.** There used to be, alongside the status, and they disagreed:
+> `POST /api/sendspin/clear` on a disconnected device answered `200 {ok:false}`,
+> `PUT /api/pwsink/volume` with no agent `503 {ok:false}`, a bad name `400 {ok:false}`. So
+> both consumers checked the status *and* the body on every call, and the rule was
+> unwritten. `message` was also the only carrier of *why*, so reacting differently to "no
+> agent connected" than to "unknown output" meant matching sentences — which is what `kind`
+> is for.
+
 ## Endpoint index
 
 The complete route table, as registered in `bridge-daemon/src/api/mod.rs`. Sections below
@@ -314,11 +349,10 @@ nothing. One intent, and the daemon picks the mechanism its kind has:
 
 ```json
 // Response
-{ "ok": true, "message": "cleared 'Kitchen' — it will re-anchor on the next audio" }
+{ "message": "cleared 'Kitchen' — it will re-anchor on the next audio" }
+// 409 when there was nothing to act on:
+{ "kind": "conflict", "message": "'Kitchen' has no live connection, so there is nothing to clear" }
 ```
-
-`ok: false` with a reason means there was nothing to act on — no live connection, or no
-live sender — reported rather than treated as success.
 
 The sendspin case is the recovery action for the 2026-08-03 failure where three of four
 devices went silent while the daemon, the graph and the clock sync were all healthy (see
@@ -741,14 +775,17 @@ Outputs tab's **Play tone** / **Play announcement** buttons use.
 { "targets": ["ap2-dev-dusche"], "test": true }
 { "announcement_group": "doorbell" }
 // Response
-{ "ok": true, "admission": "playing", "position": null, "reason": null,
+{ "admission": "playing", "position": null, "reason": null,
   "message": "announce to 1 target(s): playing" }
 ```
 
 Targets come from `targets`, or from a named group via `announcement_group` (an explicit
 `targets`/`duck` in the request still wins). `duck` defaults to the daemon setting;
 `on_busy` is `"queue"` (default) or `"reject"`; `barge_in` and `ttl_ms` are honoured by
-the arbiter. `admission` is `playing`, `queued` (with `position`) or `rejected`.
+the arbiter. `admission` is `playing`, `queued` (with `position`) or `rejected` — **on a
+200 either way**: a rejection is the arbiter's decision, not a failed request, so it is a
+value rather than a status. Only a malformed call (no audio source, an unknown group, every
+target unusable) is a `400`.
 
 Two audio sources are built in, and they are **not** interchangeable as a functional
 test:
@@ -802,7 +839,7 @@ names (see the integration's `voice_duck.py`).
 // Request — targets, or an announcement group's targets
 { "targets": ["sendspin-dev-kitchen"], "level": 0.25, "ttl_ms": 30000 }
 // Response
-{ "ok": true, "hold_id": 4, "ducked": ["sendspin-dev-kitchen"], "level": 0.25,
+{ "hold_id": 4, "ducked": ["sendspin-dev-kitchen"], "level": 0.25,
   "message": "ducking 1 target(s) to 0.25" }
 ```
 
@@ -862,7 +899,7 @@ Caller is responsible for pairing FL/FR etc. themselves.
 // Request
 { "from_port": "airplay-in:output_FL", "to_port": "ap2-dev-pioneer_vsx_934_f11b89:playback_FL" }
 // Response
-{ "ok": true, "message": "linked ... -> ..." }
+{ "message": "linked ... -> ..." }
 ```
 
 Created natively via `Core::create_object` on the PipeWire thread

@@ -63,48 +63,45 @@ pub(crate) fn list_clients_for(state: &AppState, id: &str) -> Vec<AirplayClientI
         .collect()
 }
 
-pub(crate) fn forget_client_for(state: &AppState, id: &str, key: &str) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) fn forget_client_for(state: &AppState, id: &str, key: &str) -> OpResult {
     if state.airplay_clients.registry(id).forget(key) {
-        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("forgot AirPlay client '{key}'") }))
+        ok(format!("forgot AirPlay client '{key}'"))
     } else {
         // Not found, or still connected (a live client can't be forgotten).
-        (
-            StatusCode::CONFLICT,
-            Json(OutputOpResponse { ok: false, message: format!("could not forget '{key}' (unknown or still connected)") }),
-        )
+        Err(ApiError::conflict(format!("could not forget '{key}' (unknown or still connected)")))
     }
 }
 
-pub(crate) fn ban_client_for(state: &AppState, id: &str, key: &str, banned: bool) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) fn ban_client_for(state: &AppState, id: &str, key: &str, banned: bool) -> OpResult {
     if state.airplay_clients.registry(id).set_banned(key, banned) {
         let verb = if banned { "banned" } else { "unbanned" };
-        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{verb} AirPlay client '{key}'") }))
+        ok(format!("{verb} AirPlay client '{key}'"))
     } else {
-        (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{key}'") }))
+        Err(ApiError::not_found(format!("unknown AirPlay client '{key}'")))
     }
 }
 
-pub(crate) fn set_priority_for(state: &AppState, id: &str, key: &str, priority: i32) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) fn set_priority_for(state: &AppState, id: &str, key: &str, priority: i32) -> OpResult {
     if state.airplay_clients.registry(id).set_priority(key, priority) {
-        (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set priority {priority} for '{key}'") }))
+        ok(format!("set priority {priority} for '{key}'"))
     } else {
-        (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("unknown AirPlay client '{key}'") }))
+        Err(ApiError::not_found(format!("unknown AirPlay client '{key}'")))
     }
 }
 
 /// Force-disconnect a currently-connected client on source `id` by dropping its
 /// RTSP connection (the receiver stops its stream shortly after).
-pub(crate) async fn disconnect_client_for(state: &AppState, id: &str, key: &str) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn disconnect_client_for(state: &AppState, id: &str, key: &str) -> OpResult {
     // Resolve the key to the live peer IP the RAOP server keys connections on.
     let Some(addr) = state.airplay_clients.registry(id).connected_addr(key) else {
-        return (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: format!("'{key}' is not currently connected") }));
+        return Err(ApiError::conflict(format!("'{key}' is not currently connected")));
     };
     match state.airplay.lock().await.get(id) {
         Some(handle) => {
             handle.disconnect_client(&addr);
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("disconnecting AirPlay client '{key}'") }))
+            ok(format!("disconnecting AirPlay client '{key}'"))
         }
-        None => (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: format!("AirPlay source '{id}' is not running") })),
+        None => Err(ApiError::conflict(format!("AirPlay source '{id}' is not running"))),
     }
 }
 
@@ -140,10 +137,7 @@ pub(crate) async fn list_source_clients(State(state): State<AppState>, Path(id):
 }
 
 /// `DELETE /api/sources/{id}/clients/{key}` — forget a remembered sender.
-pub(crate) async fn forget_source_client(
-    State(state): State<AppState>,
-    Path((id, key)): Path<(String, String)>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn forget_source_client(State(state): State<AppState>, Path((id, key)): Path<(String, String)>) -> OpResult {
     forget_client_for(&state, &id, &key)
 }
 
@@ -152,7 +146,7 @@ pub(crate) async fn ban_source_client(
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<BanClientRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+) -> OpResult {
     ban_client_for(&state, &id, &key, req.banned)
 }
 
@@ -161,15 +155,12 @@ pub(crate) async fn set_source_client_priority(
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<SetPriorityRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+) -> OpResult {
     set_priority_for(&state, &id, &key, req.priority)
 }
 
 /// `POST /api/sources/{id}/clients/{key}/disconnect`.
-pub(crate) async fn disconnect_source_client(
-    State(state): State<AppState>,
-    Path((id, key)): Path<(String, String)>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn disconnect_source_client(State(state): State<AppState>, Path((id, key)): Path<(String, String)>) -> OpResult {
     disconnect_client_for(&state, &id, &key).await
 }
 
@@ -179,21 +170,21 @@ pub(crate) async fn set_source_policy(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<SetAirplayPolicyRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+) -> OpResult {
     // Read the current AirPlay config for this id, flip prevent_takeover, save.
     let entry = state.sources.lock_recover().get(&id);
     let Some(entry) = entry else {
-        return (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("no source '{id}'") }));
+        return Err(ApiError::not_found(format!("no source '{id}'")));
     };
     let SourceConfig::Airplay(mut cfg) = entry.config else {
-        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("source '{id}' is not an AirPlay source") }));
+        return Err(ApiError::bad_request(format!("source '{id}' is not an AirPlay source")));
     };
     cfg.prevent_takeover = req.prevent_takeover;
     if let Err(e) = state.sources.lock_recover().update(&id, None, Some(SourceConfig::Airplay(cfg))) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+        return Err(ApiError::internal(format!("failed to persist: {e}")));
     }
     if let Some(handle) = state.airplay.lock().await.get(&id) {
         handle.set_prevent_takeover(req.prevent_takeover);
     }
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: policy_message(req.prevent_takeover).to_string() }))
+    ok(policy_message(req.prevent_takeover).to_string())
 }

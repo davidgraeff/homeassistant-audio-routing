@@ -32,18 +32,17 @@ impl DelayWriter for ApiDelayWriter {
             // The very same code `PUT /api/outputs/{node}/delay` runs, so a written
             // delay cannot diverge from a user-set one: the endpoint dispatches on the
             // node's kind, and this asks for that kind's knob directly.
-            let (status, Json(resp)) = super::level::set_output_delay(
+            let _ = kind;
+            // Success or refusal, straight from the endpoint: since the status carries
+            // it, this is a `Result` already and there is no second flag to consult.
+            super::level::set_output_delay(
                 State(self.state.clone()),
                 Path(node_name),
                 Json(super::level::SetDelayRequest { delay_ms: Some(delay_ms) }),
             )
-            .await;
-            let _ = kind;
-            if status.is_success() && resp.ok {
-                Ok(resp.message)
-            } else {
-                Err(resp.message)
-            }
+            .await
+            .map(|Json(ok)| ok.message)
+            .map_err(|e| e.message)
         })
     }
 }
@@ -454,14 +453,11 @@ pub(crate) async fn measure_split_calibrate(
 
 /// `DELETE /api/align/measure/split/{node_name}` — forget one speaker's calibration,
 /// which puts it back on the wider uncalibrated tolerance.
-pub(crate) async fn measure_split_clear(
-    State(state): State<AppState>,
-    Path(node_name): Path<String>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn measure_split_clear(State(state): State<AppState>, Path(node_name): Path<String>) -> OpResult {
     tracing::info!("USER ACTION: clear '{node_name}''s band-split calibration");
     match state.sync_settings.lock_recover().set_band_split(&node_name, None) {
-        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("'{node_name}' is uncalibrated again") })),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("could not clear it: {e}") })),
+        Ok(()) => ok(format!("'{node_name}' is uncalibrated again")),
+        Err(e) => Err(ApiError::internal(format!("could not clear it: {e}"))),
     }
 }
 
@@ -519,10 +515,10 @@ pub(crate) async fn get_sendspin_delays(State(state): State<AppState>) -> Json<s
     Json(state.sendspin_control.lock().await.delays())
 }
 
-pub(crate) async fn set_sendspin_delay(state: AppState, node_name: String, delay_ms: u16) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn set_sendspin_delay(state: AppState, node_name: String, delay_ms: u16) -> OpResult {
     // Persist first (a calibrated offset must survive restarts), then push live.
     if let Err(e) = state.sync_settings.lock_recover().set_sendspin_delay(&node_name, delay_ms) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist delay: {e}") }));
+        return Err(ApiError::internal(format!("failed to persist delay: {e}")));
     }
     let pending = state.sendspin_control.lock().await.set_delay(&node_name, delay_ms);
     let reached = pending.apply().await;
@@ -554,7 +550,7 @@ pub(crate) async fn set_sendspin_delay(state: AppState, node_name: String, delay
     } else {
         format!("set '{}' static delay to {ms} ms", node_name)
     };
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+    ok(message)
 }
 
 #[derive(Deserialize)]
@@ -577,17 +573,17 @@ pub(crate) async fn set_output_name(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetOutputNameRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+) -> OpResult {
     tracing::info!("USER ACTION: rename output '{}' to {:?}", node_name, req.name);
     if let Err(e) = state.outputs.lock_recover().set_name(&node_name, req.name.as_deref()) {
-        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e.to_string() }));
+        return Err(ApiError::bad_request(e.to_string()));
     }
     let _ = state.changes.send(());
     let message = match req.name {
         Some(_) => format!("renamed to '{}'", output_label(&state, &node_name)),
         None => format!("'{}' uses its discovered name again", output_label(&state, &node_name)),
     };
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+    ok(message)
 }
 
 /// Set an output's per-output playout delay (ms), persisted per node name in
@@ -613,17 +609,10 @@ pub(crate) async fn set_output_name(
 /// and push it to the running session.
 ///
 /// `None` clears the override, putting the receiver back on the sender's own default.
-pub(crate) async fn set_ap2_render_delay(
-    state: AppState,
-    node_name: String,
-    requested: Option<u16>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn set_ap2_render_delay(state: AppState, node_name: String, requested: Option<u16>) -> OpResult {
     let clamped = requested.map(|ms| ms.min(crate::outputs::ap2::server::AP2_RENDER_DELAY_MAX_MS));
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_latency(&node_name, clamped) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to persist latency: {e}") }),
-        );
+        return Err(ApiError::internal(format!("failed to persist latency: {e}")));
     }
     // Apply live to the streaming session (no-op if not currently streaming —
     // the persisted value then applies on the next connect).
@@ -637,7 +626,7 @@ pub(crate) async fn set_ap2_render_delay(
         Some(ms) => format!("{ms} ms"),
         None => "default".to_string(),
     };
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' render delay to {latency_label} (live)") }))
+    ok(format!("set '{node_name}' render delay to {latency_label} (live)"))
 }
 
 /// The pw-sink half of [`set_output_latency`]: persist the playout delay and push
@@ -652,7 +641,7 @@ pub(crate) async fn set_ap2_render_delay(
 /// A disconnected host is **not** an error: the value is stored and its agent
 /// picks it up in the `welcome` of its next connect, which is how every other
 /// setting for an absent device behaves here.
-pub(crate) async fn set_pwsink_jitter(state: AppState, node_name: String, requested: Option<u16>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn set_pwsink_jitter(state: AppState, node_name: String, requested: Option<u16>) -> OpResult {
     use crate::routing::sync_settings::{PWSINK_JITTER_MAX_MS, PWSINK_JITTER_MIN_MS};
 
     let packet_ms = crate::outputs::pwsink::applemidi::PACKET_MS as u16;
@@ -663,10 +652,7 @@ pub(crate) async fn set_pwsink_jitter(state: AppState, node_name: String, reques
         bounded.next_multiple_of(packet_ms).min(PWSINK_JITTER_MAX_MS)
     });
     if let Err(e) = state.sync_settings.lock_recover().set_pwsink_jitter(&node_name, clamped) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to persist the playout delay: {e}") }),
-        );
+        return Err(ApiError::internal(format!("failed to persist the playout delay: {e}")));
     }
     let effective = state.sync_settings.lock_recover().pwsink_jitter_effective(&node_name);
     // Push it now. `retune` reloads the receiver on that host — a brief gap in its
@@ -678,7 +664,7 @@ pub(crate) async fn set_pwsink_jitter(state: AppState, node_name: String, reques
         None => format!("default ({effective} ms)"),
     };
     let how = if pushed { "applied now" } else { "stored; the host is not connected, so it applies when it reconnects" };
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' playout delay to {label} ({how})") }))
+    ok(format!("set '{node_name}' playout delay to {label} ({how})"))
 }
 
 #[derive(serde::Deserialize)]
@@ -706,15 +692,12 @@ pub(crate) async fn set_sendspin_codec(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetSendspinCodecRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+) -> OpResult {
     if !node_name.starts_with(SENDSPIN_DEV_PREFIX) {
-        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not a sendspin output") }));
+        return Err(ApiError::bad_request(format!("'{node_name}' is not a sendspin output")));
     }
     let Some(codec) = crate::routing::sync_settings::SendspinCodec::parse(&req.codec) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse { ok: false, message: format!("unknown codec '{}' (use auto, pcm, opus or flac)", req.codec) }),
-        );
+        return Err(ApiError::bad_request(format!("unknown codec '{}' (use auto, pcm, opus or flac)", req.codec)));
     };
     // An explicit pick must be usable right now; `auto` always is.
     if let Some(name) = codec.explicit_codec() {
@@ -723,45 +706,36 @@ pub(crate) async fn set_sendspin_codec(
         if let Some(opt) = options.iter().find(|o| o.codec == name) {
             if !opt.available {
                 let why = opt.reason.clone().unwrap_or_else(|| "not available".into());
-                return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("{name} is not available: {why}") }));
+                return Err(ApiError::bad_request(format!("{name} is not available: {why}")));
             }
         }
     }
     if let Err(e) = state.sync_settings.lock_recover().set_sendspin_codec(&node_name, codec) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist codec: {e}") }));
+        return Err(ApiError::internal(format!("failed to persist codec: {e}")));
     }
     // Codec is part of the sendspin server's restart identity → the group restarts
     // and sends a fresh stream/start with the new format.
     let _ = state.changes.send(());
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("codec for '{node_name}' set to {}", codec.as_str()) }))
+    ok(format!("codec for '{node_name}' set to {}", codec.as_str()))
 }
 
 pub(crate) async fn set_ap2_rate_mode(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetAp2RateModeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+) -> OpResult {
     if !node_name.starts_with(AP2_DEV_PREFIX) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse { ok: false, message: format!("'{node_name}' is not an AirPlay-2 output") }),
-        );
+        return Err(ApiError::bad_request(format!("'{node_name}' is not an AirPlay-2 output")));
     }
     let mode = match req.mode.as_str() {
         "auto" => crate::routing::sync_settings::Ap2RateMode::Auto,
         "fixed_44100" | "fixed44100" | "44100" => crate::routing::sync_settings::Ap2RateMode::Fixed44100,
         other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(OutputOpResponse { ok: false, message: format!("unknown rate mode '{other}' (use 'auto' or 'fixed_44100')") }),
-            );
+            return Err(ApiError::bad_request(format!("unknown rate mode '{other}' (use 'auto' or 'fixed_44100')")));
         }
     };
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_rate_mode(&node_name, mode) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(OutputOpResponse { ok: false, message: format!("failed to persist rate mode: {e}") }),
-        );
+        return Err(ApiError::internal(format!("failed to persist rate mode: {e}")));
     }
     // Rate is part of the AP2 restart identity → the group re-negotiates + restarts.
     let _ = state.changes.send(());
@@ -769,7 +743,7 @@ pub(crate) async fn set_ap2_rate_mode(
         crate::routing::sync_settings::Ap2RateMode::Auto => "auto (negotiate 48 kHz)",
         crate::routing::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
     };
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{node_name}' sample rate to {label} (applies shortly)") }))
+    ok(format!("set '{node_name}' sample rate to {label} (applies shortly)"))
 }
 
 pub(crate) async fn fetch_to_file(url: &str, path: &std::path::Path) -> anyhow::Result<()> {

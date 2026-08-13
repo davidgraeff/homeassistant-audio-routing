@@ -480,16 +480,17 @@
     // Captured before the first unlink: `linkedMembers` reads the live matrix, and
     // the undo has to relink exactly the members this click took off.
     const members = linkedMembers(e.target, e.source);
-    const each = async (call: (output: string) => Promise<{ ok?: boolean; message?: string }>, failed: string) => {
+    // A refused call throws, with the daemon's reason — so this only has to stop at the
+    // first one rather than inspect a flag.
+    const each = async (call: (output: string) => Promise<unknown>) => {
       for (const m of members) {
-        const res = await call(m.node_name);
-        if (res.ok === false) throw new Error(res.message ?? failed);
+        await call(m.node_name);
       }
     };
     await runUndoable(
-      () => each((o) => api.unlink(e.source, o), 'Could not remove the route'),
+      () => each((o) => api.unlink(e.source, o)),
       `Removed route: ${disp(srcInfo, e.source)} → ${what}`,
-      () => each((o) => api.link(e.source, o), 'Could not restore the route'),
+      () => each((o) => api.link(e.source, o)),
       'Route restored',
     );
   }

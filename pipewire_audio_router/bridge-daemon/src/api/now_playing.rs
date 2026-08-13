@@ -35,7 +35,7 @@ pub(crate) async fn put_now_playing(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(update): Json<crate::sources::now_playing::MetadataUpdate>,
-) -> Result<Json<OutputOpResponse>, SourceError> {
+) -> Result<Json<OpOk>, SourceError> {
     if update.is_empty() {
         return Err(source_err(StatusCode::BAD_REQUEST, "no metadata fields supplied".to_string()));
     }
@@ -44,7 +44,7 @@ pub(crate) async fn put_now_playing(
         return Err(source_err(StatusCode::NOT_FOUND, format!("no source with node name '{node_name}'")));
     }
     state.now_playing.reporter(node_name.clone()).update(update);
-    Ok(Json(OutputOpResponse { ok: true, message: format!("now playing updated for '{node_name}'") }))
+    ok(format!("now playing updated for '{node_name}'"))
 }
 
 /// `DELETE /api/now_playing/{node_name}` — the session ended.
@@ -52,9 +52,9 @@ pub(crate) async fn put_now_playing(
 /// A producer that goes away should say so rather than leave the TTL to collect
 /// it, so Home Assistant's media card collapses instead of freezing on the last
 /// track. Idempotent: clearing something already gone is a success.
-pub(crate) async fn clear_now_playing(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+pub(crate) async fn clear_now_playing(State(state): State<AppState>, Path(node_name): Path<String>) -> OpResult {
     state.now_playing.reporter(node_name.clone()).clear();
-    Json(OutputOpResponse { ok: true, message: format!("now playing cleared for '{node_name}'") })
+    ok(format!("now playing cleared for '{node_name}'"))
 }
 
 /// `GET /api/now_playing/{node_name}/artwork` — the embedded cover art bytes.
@@ -92,7 +92,7 @@ pub(crate) async fn get_now_playing_artwork(State(state): State<AppState>, Path(
 pub(crate) async fn report_now_playing(
     State(state): State<AppState>,
     Json(req): Json<NowPlayingReportRequest>,
-) -> Result<Json<OutputOpResponse>, SourceError> {
+) -> Result<Json<OpOk>, SourceError> {
     let node_name = {
         let sources = state.sources.lock_recover();
         sources.list().iter().find(|e| matches!(&e.config, SourceConfig::Rtp(r) if r.port == req.rtp_port)).map(|e| e.node_name())
@@ -105,10 +105,10 @@ pub(crate) async fn report_now_playing(
     // needing a second endpoint — its BlueZ player object simply went away.
     if req.metadata.is_empty() {
         reporter.clear();
-        return Ok(Json(OutputOpResponse { ok: true, message: format!("now playing cleared for '{node_name}'") }));
+        return ok(format!("now playing cleared for '{node_name}'"));
     }
     reporter.update(req.metadata);
-    Ok(Json(OutputOpResponse { ok: true, message: format!("now playing updated for '{node_name}'") }))
+    ok(format!("now playing updated for '{node_name}'"))
 }
 
 #[derive(Serialize)]

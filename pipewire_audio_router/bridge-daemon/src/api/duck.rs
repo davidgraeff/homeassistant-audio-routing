@@ -32,11 +32,12 @@ pub(crate) struct DuckRequest {
     pub(crate) ttl_ms: Option<u64>,
 }
 
+/// A duck hold, as the caller needs it back. A *success* body: the status says it
+/// happened, so there is no `ok` — see `api::error`.
 #[derive(Serialize)]
 pub(crate) struct DuckResponse {
-    pub(crate) ok: bool,
-    /// The hold's id — pass it to renew/release. `None` when `ok` is false.
-    pub(crate) hold_id: Option<u64>,
+    /// The hold's id — pass it to renew/release.
+    pub(crate) hold_id: u64,
     /// Outputs this hold covers.
     #[serde(default)]
     pub(crate) ducked: Vec<String>,
@@ -58,23 +59,21 @@ pub(crate) fn duck_ttl(ttl_ms: Option<u64>) -> std::time::Duration {
 /// Start a duck hold on a set of outputs. Idempotent in the only sense that
 /// matters: holds compose (strongest gain wins), so two callers ducking the same
 /// output don't fight, and each releases only its own.
-pub(crate) async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>) -> (StatusCode, Json<DuckResponse>) {
-    let reject = |msg: String| {
-        (StatusCode::BAD_REQUEST, Json(DuckResponse { ok: false, hold_id: None, ducked: Vec::new(), level: None, message: msg }))
-    };
+pub(crate) async fn duck_start(State(state): State<AppState>, Json(req): Json<DuckRequest>) -> Result<Json<DuckResponse>, ApiError> {
+    let reject = ApiError::bad_request;
     let mut targets = req.targets.clone();
     if let Some(agid) = &req.announcement_group {
         let store = state.groups_config.lock_recover();
         match store.announcement_by_id(agid) {
             Some(ag) if targets.is_empty() => targets = ag.targets.clone(),
             Some(_) => {}
-            None => return reject(format!("no announcement group '{agid}'")),
+            None => return Err(reject(format!("no announcement group '{agid}'"))),
         }
     }
     targets.sort();
     targets.dedup();
     if targets.is_empty() {
-        return reject("no targets (provide `targets` or `announcement_group`)".into());
+        return Err(reject("no targets (provide `targets` or `announcement_group`)".into()));
     }
     let level = req.level.unwrap_or_else(|| state.settings.lock_recover().default_duck()).clamp(0.0, 1.0);
     let ttl = duck_ttl(req.ttl_ms);
@@ -103,40 +102,27 @@ pub(crate) async fn duck_start(State(state): State<AppState>, Json(req): Json<Du
         ttl.as_millis()
     );
     let message = format!("ducking {} target(s) to {level:.2}", targets.len());
-    (StatusCode::OK, Json(DuckResponse { ok: true, hold_id: Some(id), ducked: targets, level: Some(level), message }))
+    Ok(Json(DuckResponse { hold_id: id, ducked: targets, level: Some(level), message }))
 }
 
 /// Extend a hold's lease. 404 when the id is unknown (released or expired) so the
 /// caller starts a fresh hold instead of believing it is still ducking.
-pub(crate) async fn duck_renew(Path(hold_id): Path<u64>, Json(req): Json<DuckRequest>) -> (StatusCode, Json<DuckResponse>) {
+pub(crate) async fn duck_renew(Path(hold_id): Path<u64>, Json(req): Json<DuckRequest>) -> Result<Json<DuckResponse>, ApiError> {
     let ttl = duck_ttl(req.ttl_ms);
     if crate::outputs::overlay_mixer::OverlayMixer::global().renew_duck(hold_id, ttl) {
-        (
-            StatusCode::OK,
-            Json(DuckResponse {
-                ok: true,
-                hold_id: Some(hold_id),
-                ducked: Vec::new(),
-                level: None,
-                message: format!("renewed hold {hold_id} for {} ms", ttl.as_millis()),
-            }),
-        )
+        Ok(Json(DuckResponse {
+            hold_id,
+            ducked: Vec::new(),
+            level: None,
+            message: format!("renewed hold {hold_id} for {} ms", ttl.as_millis()),
+        }))
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(DuckResponse {
-                ok: false,
-                hold_id: None,
-                ducked: Vec::new(),
-                level: None,
-                message: format!("no duck hold {hold_id} (released or expired) — start a new one"),
-            }),
-        )
+        Err(ApiError::not_found(format!("no duck hold {hold_id} (released or expired) — start a new one")))
     }
 }
 
 /// Release a hold now (the normal end of a voice turn).
-pub(crate) async fn duck_release(Path(hold_id): Path<u64>) -> (StatusCode, Json<DuckResponse>) {
+pub(crate) async fn duck_release(Path(hold_id): Path<u64>) -> Result<Json<DuckResponse>, ApiError> {
     let affected = crate::outputs::overlay_mixer::OverlayMixer::global().release_duck(hold_id);
     let existed = !affected.is_empty();
     for output in &affected {
@@ -144,16 +130,12 @@ pub(crate) async fn duck_release(Path(hold_id): Path<u64>) -> (StatusCode, Json<
     }
     tracing::info!("USER ACTION: unduck -> hold {hold_id}{}", if existed { "" } else { " (already gone)" });
     // Releasing an already-gone hold is success: the caller wanted it not ducking.
-    (
-        StatusCode::OK,
-        Json(DuckResponse {
-            ok: true,
-            hold_id: Some(hold_id),
-            ducked: Vec::new(),
-            level: None,
-            message: if existed { format!("released hold {hold_id}") } else { format!("hold {hold_id} was already gone") },
-        }),
-    )
+    Ok(Json(DuckResponse {
+        hold_id,
+        ducked: Vec::new(),
+        level: None,
+        message: if existed { format!("released hold {hold_id}") } else { format!("hold {hold_id} was already gone") },
+    }))
 }
 
 /// Live holds — for the UI and for answering "why is this output quiet?".

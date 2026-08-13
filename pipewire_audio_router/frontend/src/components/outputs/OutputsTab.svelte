@@ -295,7 +295,9 @@
     testing = { ...testing, [o.node_name]: what };
     try {
       const res = await api.announce({ targets: [o.node_name], ...(what === 'tone' ? { tone: true } : { test: true }) });
-      toast(res.ok ? 'success' : 'error', res.message);
+      // `admission` is the outcome, not a failure — a rejection still arrives as a 200,
+      // because the request was carried out and the arbiter decided.
+      toast(res.admission === 'rejected' ? 'error' : 'success', res.message);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -331,8 +333,10 @@
     clearing = { ...clearing, [o.node_name]: true };
     try {
       // One endpoint, one intent: the daemon picks the mechanism its kind has.
+      // A refusal — nothing to clear, no session to rebuild — throws, and the catch
+      // below shows the daemon's reason.
       const res = await api.resyncOutput(o.node_name);
-      toast(res.ok ? 'success' : 'error', res.message);
+      toast('success', res.message);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -379,8 +383,8 @@
     deciding = { ...deciding, [o.node_name]: true };
     try {
       const res = await call();
-      toast(res.ok ? 'success' : 'error', res.ok ? (okText ?? res.message) : res.message);
-      if (res.ok) await refresh();
+      toast('success', okText ?? res.message);
+      await refresh();
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -446,8 +450,8 @@
   async function resetName(o: OutputInfo) {
     const previous = o.name;
     const restore = async () => {
-      const res = await api.renameOutput(o.node_name, previous);
-      if (res.ok === false) throw new Error(res.message ?? `Could not restore '${previous}'`);
+      // A failure throws by itself now, carrying the daemon's own reason.
+      await api.renameOutput(o.node_name, previous);
       await refresh();
     };
     await runUndoable(

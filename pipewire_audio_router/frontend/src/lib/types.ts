@@ -1423,10 +1423,21 @@ export interface SourcesResponse {
   discovered_bridges: BridgeInfo[];
 }
 
+/** What a write answers with on success: the sentence to show, and nothing else.
+ *
+ *  **There is no `ok`.** The HTTP status carries success and a failure body is
+ *  `{kind, message}` (`ApiError`), so `request()` throws on one — see `lib/api.ts`. Two
+ *  carriers for one fact is how they come to disagree, and they did: the daemon used to
+ *  answer `200 {ok:false}` for "there was nothing to act on", so every call site had to
+ *  check the status *and* the body. */
 export interface OpResponse {
-  ok: boolean;
   message: string;
 }
+
+/** Why a write was refused. The `kind` is the machine-readable part — branch on it
+ *  instead of matching prose. The alignment subsystem answers with its own richer
+ *  vocabulary in the same envelope (see `Refusal`). */
+export type ApiErrorKind = 'not_found' | 'bad_request' | 'conflict' | 'unavailable' | 'internal';
 
 /** One live duck hold (`GET /api/duck`, overlay_mixer.rs): an output whose music
  * is attenuated with no clip of its own — voice ducking, while an assistant in

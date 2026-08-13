@@ -1,12 +1,6 @@
 use super::*;
 use crate::outputs::listing::{output_label, outputs_listings, OutputInfo};
 
-#[derive(Serialize)]
-pub(crate) struct OutputOpResponse {
-    pub(crate) ok: bool,
-    pub(crate) message: String,
-}
-
 /// Build a sendspin output's codec picker: the stored choice, what it resolves to
 /// right now, and per-codec availability.
 ///
@@ -68,7 +62,7 @@ pub(crate) fn forget_output_intent(state: &AppState, node_name: &str) -> String 
 /// intention — a human ran the agent on that host and a human is clicking Add here,
 /// so asking twice would only be ceremony. Pairing that fails leaves the output
 /// unadopted rather than adopting a host the daemon cannot drive.
-pub(crate) async fn adopt_output(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+pub(crate) async fn adopt_output(State(state): State<AppState>, Path(node_name): Path<String>) -> OpResult {
     tracing::info!("USER ACTION: add output '{}'", node_name);
     let mut paired_note = String::new();
     if node_name.starts_with(PWSINK_DEV_PREFIX) {
@@ -79,23 +73,18 @@ pub(crate) async fn adopt_output(State(state): State<AppState>, Path(node_name):
                 if !agents.is_paired(&identity) {
                     match agents.approve(&identity) {
                         Ok(agent) => paired_note = format!(" (paired '{}')", agent.label),
-                        Err(e) => return Json(OutputOpResponse { ok: false, message: format!("failed to pair '{node_name}': {e}") }),
+                        Err(e) => return Err(ApiError::internal(format!("failed to pair '{node_name}': {e}"))),
                     }
                 }
             }
-            None => {
-                return Json(OutputOpResponse {
-                    ok: false,
-                    message: format!("no receiver agent is asking to pair as '{node_name}' — is it still running?"),
-                })
-            }
+            None => return Err(ApiError::conflict(format!("no receiver agent is asking to pair as '{node_name}' — is it still running?"))),
         }
     }
     if let Err(e) = state.outputs.lock_recover().adopt(&node_name) {
-        return Json(OutputOpResponse { ok: false, message: format!("failed to add '{node_name}': {e}") });
+        return Err(ApiError::internal(format!("failed to add '{node_name}': {e}")));
     }
     let _ = state.changes.send(());
-    Json(OutputOpResponse { ok: true, message: format!("added '{}'{paired_note}", output_label(&state, &node_name)) })
+    ok(format!("added '{}'{paired_note}", output_label(&state, &node_name)))
 }
 
 /// Unpair a receiver host: revoke its token, forget its routing and group
@@ -105,7 +94,7 @@ pub(crate) async fn adopt_output(State(state): State<AppState>, Path(node_name):
 /// Its agent keeps dialling in, so the host comes back under Discovered as pairable,
 /// exactly like an un-added speaker that is still on the network. Ignore it there if
 /// it should stay out of the way.
-pub(crate) async fn unpair_output(State(state): State<AppState>, Path(node_name): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn unpair_output(State(state): State<AppState>, Path(node_name): Path<String>) -> OpResult {
     tracing::info!("USER ACTION: unpair output '{}'", node_name);
     let label = output_label(&state, &node_name);
     {
@@ -130,35 +119,35 @@ pub(crate) async fn unpair_output(State(state): State<AppState>, Path(node_name)
         tracing::warn!("unpaired '{node_name}' but could not reset its adoption: {e}");
     }
     let _ = state.changes.send(());
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("unpaired '{label}'{cleaned}") }))
+    ok(format!("unpaired '{label}'{cleaned}"))
 }
 
 /// Dismiss a discovered device: hidden from the Outputs page unless "show
 /// ignored" is ticked. The stronger form of remove — so it also clears any
 /// routing/group references it had.
-pub(crate) async fn ignore_output(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+pub(crate) async fn ignore_output(State(state): State<AppState>, Path(node_name): Path<String>) -> OpResult {
     tracing::info!("USER ACTION: ignore output '{}'", node_name);
     let cleaned = forget_output_intent(&state, &node_name);
     if let Err(e) = state.outputs.lock_recover().ignore(&node_name) {
-        return Json(OutputOpResponse { ok: false, message: format!("failed to ignore '{node_name}': {e}") });
+        return Err(ApiError::internal(format!("failed to ignore '{node_name}': {e}")));
     }
     let _ = state.changes.send(());
-    Json(OutputOpResponse { ok: true, message: format!("ignoring '{}'{cleaned}", output_label(&state, &node_name)) })
+    ok(format!("ignoring '{}'{cleaned}", output_label(&state, &node_name)))
 }
 
 /// Remove an output: back to undecided. It stops being routable, loses its HA
 /// media_player, and its routing + group membership are forgotten. A device
 /// that's still on the network reappears under "Discovered" (where it can be
 /// added again or ignored); one that's offline/gone simply disappears.
-pub(crate) async fn remove_output(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<OutputOpResponse> {
+pub(crate) async fn remove_output(State(state): State<AppState>, Path(node_name): Path<String>) -> OpResult {
     tracing::info!("USER ACTION: remove output '{}'", node_name);
     let cleaned = forget_output_intent(&state, &node_name);
     if let Err(e) = state.outputs.lock_recover().reset(&node_name) {
-        return Json(OutputOpResponse { ok: false, message: format!("failed to remove '{node_name}': {e}") });
+        return Err(ApiError::internal(format!("failed to remove '{node_name}': {e}")));
     }
     // Un-adopting changes what the group reconciler is allowed to drive, so the
     // device's stream/session has to be torn down now, not on the next unrelated
     // registry event.
     let _ = state.changes.send(());
-    Json(OutputOpResponse { ok: true, message: format!("removed '{}'{cleaned}", output_label(&state, &node_name)) })
+    ok(format!("removed '{}'{cleaned}", output_label(&state, &node_name)))
 }

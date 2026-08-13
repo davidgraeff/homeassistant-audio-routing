@@ -62,10 +62,10 @@ pub(crate) async fn update_music_group(
     }
 }
 
-pub(crate) async fn delete_music_group(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn delete_music_group(State(state): State<AppState>, Path(id): Path<String>) -> OpResult {
     match state.groups_config.lock_recover().delete_music(&id) {
-        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("deleted music group '{id}'") })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e.to_string() })),
+        Ok(()) => ok(format!("deleted music group '{id}'")),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
 }
 
@@ -82,17 +82,17 @@ pub(crate) async fn route_music_group(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RouteGroupRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+) -> OpResult {
     tracing::info!("USER ACTION: route music group '{}' (routing graph)", id);
     let members = {
         let g = state.groups_config.lock_recover();
         match g.music().iter().find(|m| m.id == id) {
             Some(m) => m.members.clone(),
-            None => return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("no music group '{id}'") })),
+            None => return Err(ApiError::bad_request(format!("no music group '{id}'"))),
         }
     };
     if members.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: "music group has no members".into() }));
+        return Err(ApiError::bad_request("music group has no members"));
     }
     let snapshot = crate::store::routing::snapshot(&state.routing);
     {
@@ -102,28 +102,22 @@ pub(crate) async fn route_music_group(
                 let _ = store.remove(&l.source, member);
             }
             if let Err(e) = store.add(&req.source, member) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
-                );
+                return Err(ApiError::internal(format!("failed to persist: {e}")));
             }
         }
     }
     let _ = state.changes.send(());
-    (
-        StatusCode::OK,
-        Json(OutputOpResponse { ok: true, message: format!("routed '{id}' ({} member(s)) from '{}'", members.len(), req.source) }),
-    )
+    ok(format!("routed '{id}' ({} member(s)) from '{}'", members.len(), req.source))
 }
 
 /// Un-route a whole music group: remove all links feeding its members.
-pub(crate) async fn unroute_music_group(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn unroute_music_group(State(state): State<AppState>, Path(id): Path<String>) -> OpResult {
     tracing::info!("USER ACTION: unroute music group '{}' (routing graph)", id);
     let members = {
         let g = state.groups_config.lock_recover();
         match g.music().iter().find(|m| m.id == id) {
             Some(m) => m.members.clone(),
-            None => return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("no music group '{id}'") })),
+            None => return Err(ApiError::bad_request(format!("no music group '{id}'"))),
         }
     };
     let snapshot = crate::store::routing::snapshot(&state.routing);
@@ -134,7 +128,7 @@ pub(crate) async fn unroute_music_group(State(state): State<AppState>, Path(id):
         }
     }
     let _ = state.changes.send(());
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("un-routed music group '{id}'") }))
+    ok(format!("un-routed music group '{id}'"))
 }
 
 pub(crate) async fn list_announcement_groups(State(state): State<AppState>) -> Json<Vec<crate::store::groups::AnnouncementGroup>> {
@@ -163,13 +157,10 @@ pub(crate) async fn update_announcement_group(
     }
 }
 
-pub(crate) async fn delete_announcement_group(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn delete_announcement_group(State(state): State<AppState>, Path(id): Path<String>) -> OpResult {
     match state.groups_config.lock_recover().delete_announcement(&id) {
-        Ok(()) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("deleted announcement group '{id}'") })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e.to_string() })),
+        Ok(()) => ok(format!("deleted announcement group '{id}'")),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
 }
 

@@ -41,14 +41,15 @@ export function dismiss(id: number): void {
   toasts.update((list) => list.filter((t) => t.id !== id));
 }
 
-/** Runs an async API call, surfacing success/error as toasts. Returns whether it succeeded. */
-export async function run(action: () => Promise<{ ok?: boolean; message?: string } | unknown>, okText?: string): Promise<boolean> {
+/** Runs an async API call, surfacing success/error as toasts. Returns whether it succeeded.
+ *
+ *  A **throw is the only failure**: the daemon's status carries success and `request()`
+ *  raises `ApiError` with the reason on anything else. This used to also inspect an `ok`
+ *  flag in the body, because some endpoints answered `200 {ok:false}` — and every call
+ *  site that wanted to react had to remember which. */
+export async function run(action: () => Promise<unknown>, okText?: string): Promise<boolean> {
   try {
-    const res = (await action()) as { ok?: boolean; message?: string } | null;
-    if (res && typeof res === 'object' && 'ok' in res && res.ok === false) {
-      toast('error', res.message ?? 'Request failed');
-      return false;
-    }
+    await action();
     if (okText) toast('success', okText);
     return true;
   } catch (e) {

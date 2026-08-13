@@ -95,7 +95,7 @@
     // lead field may be holding an edit the user hasn't applied yet.
     try {
       const res = await api.setGroupLead(appliedGroupLeadMs, ms);
-      toast(res.ok === false ? 'error' : 'success', res.message ?? `Opus headroom set to ${ms} ms`);
+      toast('success', res.message ?? `Opus headroom set to ${ms} ms`);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }
@@ -109,7 +109,7 @@
     // floor and which speaker raised it, rather than us implying the number took.
     try {
       const res = await api.setGroupLead(Number(groupLeadMs));
-      toast(res.ok === false ? 'error' : 'success', res.message ?? `Group lead set to ${groupLeadMs} ms`);
+      toast('success', res.message ?? `Group lead set to ${groupLeadMs} ms`);
     } catch (e) {
       toast('error', e instanceof Error ? e.message : String(e));
     }

@@ -120,12 +120,6 @@ pub(crate) struct CreateLinkRequest {
     pub(crate) to_port: String,
 }
 
-#[derive(Serialize)]
-pub(crate) struct CreateLinkResponse {
-    pub(crate) ok: bool,
-    pub(crate) message: String,
-}
-
 /// Resolves a full `"node.name:port.name"` string to its `(node_id, port_id)`
 /// in the live registry, or `None` if either isn't present. Splits on the last
 /// `:` so a node name containing `:` still resolves (port names never do).
@@ -137,31 +131,22 @@ pub(crate) fn resolve_port(pw: &SharedState, full_name: &str) -> Option<(u32, u3
     Some((node_id, port_id))
 }
 
-pub(crate) async fn create_link(State(app): State<AppState>, Json(req): Json<CreateLinkRequest>) -> (StatusCode, Json<CreateLinkResponse>) {
+pub(crate) async fn create_link(State(app): State<AppState>, Json(req): Json<CreateLinkRequest>) -> OpResult {
     let Some((out_node, out_port)) = resolve_port(&app.pw, &req.from_port) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(CreateLinkResponse { ok: false, message: format!("unknown output port: {}", req.from_port) }),
-        );
+        return Err(ApiError::bad_request(format!("unknown output port: {}", req.from_port)));
     };
     let Some((in_node, in_port)) = resolve_port(&app.pw, &req.to_port) else {
-        return (StatusCode::BAD_REQUEST, Json(CreateLinkResponse { ok: false, message: format!("unknown input port: {}", req.to_port) }));
+        return Err(ApiError::bad_request(format!("unknown input port: {}", req.to_port)));
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
     let cmd = PwCommand::CreateLinks { specs: vec![LinkSpec { out_node, out_port, in_node, in_port }], reply: reply_tx };
     if app.pw_cmd.send(cmd).is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CreateLinkResponse { ok: false, message: "pipewire thread unavailable".to_string() }),
-        );
+        return Err(ApiError::unavailable("the PipeWire thread is unavailable"));
     }
     match reply_rx.await {
-        Ok(Ok(message)) => (StatusCode::OK, Json(CreateLinkResponse { ok: true, message })),
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, Json(CreateLinkResponse { ok: false, message })),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CreateLinkResponse { ok: false, message: "pipewire thread dropped the request".to_string() }),
-        ),
+        Ok(Ok(message)) => ok(message),
+        Ok(Err(message)) => Err(ApiError::bad_request(message)),
+        Err(_) => Err(ApiError::unavailable("the PipeWire thread dropped the request")),
     }
 }

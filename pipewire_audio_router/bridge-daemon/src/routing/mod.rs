@@ -765,17 +765,11 @@ pub struct LinkPairRequest {
     output: String,
 }
 
-#[derive(Serialize)]
-pub struct LinkOpResponse {
-    ok: bool,
-    message: String,
-}
-
 pub async fn get_routing(State(state): State<AppState>) -> Json<RoutingMatrix> {
     Json(build_snapshot(&state).await)
 }
 
-pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
+pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> crate::api::OpResult {
     // Human-initiated (routing-graph / API) — logged distinctly so a person's
     // actions can be told apart from stack-driven churn (reconcile, discovery,
     // source cycling) when reading logs. Grep `USER ACTION`.
@@ -786,15 +780,15 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
     // than persisted, or the link would sit in the store and quietly take effect
     // the moment the device were added.
     if !state.outputs.lock_recover().is_adopted(&req.output) {
-        return Json(LinkOpResponse {
-            ok: false,
-            message: format!("'{}' isn't one of your outputs — add it on the Outputs page first", req.output),
-        });
+        return Err(crate::api::ApiError::bad_request(format!(
+            "'{}' isn't one of your outputs — add it on the Outputs page first",
+            req.output
+        )));
     }
     // Persist the desired route first; it's the source of truth and reconcile()
     // (re)applies it whenever both endpoints are present.
     if let Err(e) = state.routing.lock_recover().add(&req.source, &req.output) {
-        return Json(LinkOpResponse { ok: false, message: format!("failed to persist routing intent: {e}") });
+        return Err(crate::api::ApiError::internal(format!("failed to persist routing intent: {e}")));
     }
     // Nudge the reconcilers (routing/groups/anchor) so intent changes take
     // effect promptly, not only on the next PipeWire registry event.
@@ -808,31 +802,31 @@ pub async fn link(State(state): State<AppState>, Json(req): Json<LinkPairRequest
         node_id_for(&st, &req.source).zip(node_id_for(&st, &req.output))
     };
     let Some((source_id, output_id)) = ids else {
-        return Json(LinkOpResponse { ok: true, message: "saved; routing via sync group".to_string() });
+        return crate::api::ok("saved; routing via sync group".to_string());
     };
     let specs = matched_port_specs(&state.pw, source_id, output_id);
     if specs.is_empty() {
-        return Json(LinkOpResponse { ok: true, message: "saved; no matching channel ports yet".to_string() });
+        return crate::api::ok("saved; no matching channel ports yet".to_string());
     }
     let (reply_tx, reply_rx) = oneshot::channel();
     if state.pw_cmd.send(PwCommand::CreateLinks { specs, reply: reply_tx }).is_err() {
-        return Json(LinkOpResponse { ok: false, message: "pipewire thread unavailable".to_string() });
+        return Err(crate::api::ApiError::unavailable("the PipeWire thread is unavailable"));
     }
     match reply_rx.await {
-        Ok(Ok(message)) => Json(LinkOpResponse { ok: true, message }),
-        Ok(Err(message)) => Json(LinkOpResponse { ok: false, message }),
-        Err(_) => Json(LinkOpResponse { ok: false, message: "pipewire thread dropped the request".to_string() }),
+        Ok(Ok(message)) => crate::api::ok(message),
+        Ok(Err(message)) => Err(crate::api::ApiError::internal(message)),
+        Err(_) => Err(crate::api::ApiError::unavailable("the PipeWire thread dropped the request")),
     }
 }
 
-pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> Json<LinkOpResponse> {
+pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairRequest>) -> crate::api::OpResult {
     // Human-initiated (routing-graph "remove link") — logged distinctly (grep
     // `USER ACTION`) so it's not confused with stack-driven teardown.
     tracing::info!("USER ACTION: unlink '{}' → '{}' (routing graph)", req.source, req.output);
     // Drop the intent first so reconcile() won't re-create what we remove.
     // Works for offline pairs too — this is purely by name.
     if let Err(e) = state.routing.lock_recover().remove(&req.source, &req.output) {
-        return Json(LinkOpResponse { ok: false, message: format!("failed to persist routing intent: {e}") });
+        return Err(crate::api::ApiError::internal(format!("failed to persist routing intent: {e}")));
     }
     // Wake the reconcilers: for an RTP→RAOP route the live links live on the
     // anchor (not a direct source→output link), so the anchor reconciler must
@@ -844,7 +838,7 @@ pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairReque
         node_id_for(&st, &req.source).zip(node_id_for(&st, &req.output))
     };
     let Some((source_id, output_id)) = ids else {
-        return Json(LinkOpResponse { ok: true, message: "unlinked (endpoint offline; intent cleared)".to_string() });
+        return crate::api::ok("unlinked (endpoint offline; intent cleared)".to_string());
     };
     // Node-level unlink: remove every channel link feeding this output from this
     // source. Destroy is idempotent, so any that raced away are harmless.
@@ -853,16 +847,16 @@ pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairReque
         st.links.values().filter(|l| l.output_node == source_id && l.input_node == output_id).map(|l| l.link_id).collect()
     };
     if link_ids.is_empty() {
-        return Json(LinkOpResponse { ok: true, message: "no live links to remove".to_string() });
+        return crate::api::ok("no live links to remove".to_string());
     }
     let (reply_tx, reply_rx) = oneshot::channel();
     if state.pw_cmd.send(PwCommand::DestroyLinks { link_ids, reply: reply_tx }).is_err() {
-        return Json(LinkOpResponse { ok: false, message: "pipewire thread unavailable".to_string() });
+        return Err(crate::api::ApiError::unavailable("the PipeWire thread is unavailable"));
     }
     match reply_rx.await {
-        Ok(Ok(message)) => Json(LinkOpResponse { ok: true, message }),
-        Ok(Err(message)) => Json(LinkOpResponse { ok: false, message }),
-        Err(_) => Json(LinkOpResponse { ok: false, message: "pipewire thread dropped the request".to_string() }),
+        Ok(Ok(message)) => crate::api::ok(message),
+        Ok(Err(message)) => Err(crate::api::ApiError::internal(message)),
+        Err(_) => Err(crate::api::ApiError::unavailable("the PipeWire thread dropped the request")),
     }
 }
 
@@ -871,11 +865,11 @@ pub async fn unlink(State(state): State<AppState>, Json(req): Json<LinkPairReque
 /// previously-routed but currently absent). Purely intent-side: nothing live
 /// to touch. After this the entity drops out of the matrix (no references
 /// left); if it's a real device it'll reappear on its own, unrouted.
-pub async fn forget_entity(State(state): State<AppState>, Path(node_name): Path<String>) -> Json<LinkOpResponse> {
+pub async fn forget_entity(State(state): State<AppState>, Path(node_name): Path<String>) -> crate::api::OpResult {
     tracing::info!("USER ACTION: forget entity '{}' (routing graph)", node_name);
     match state.routing.lock_recover().remove_entity(&node_name) {
-        Ok(()) => Json(LinkOpResponse { ok: true, message: format!("forgot routing for '{node_name}'") }),
-        Err(e) => Json(LinkOpResponse { ok: false, message: format!("failed to forget '{node_name}': {e}") }),
+        Ok(()) => crate::api::ok(format!("forgot routing for '{node_name}'")),
+        Err(e) => Err(crate::api::ApiError::internal(format!("failed to forget '{node_name}': {e}"))),
     }
 }
 

@@ -14,7 +14,6 @@ pub(crate) struct SpikeStartRequest {
 
 #[derive(Serialize)]
 pub(crate) struct SpikeStartResponse {
-    pub(crate) ok: bool,
     pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) spike: Option<crate::spike::per_device::SpikeInfo>,
@@ -23,7 +22,7 @@ pub(crate) struct SpikeStartResponse {
 pub(crate) async fn spike_per_device_start(
     State(state): State<AppState>,
     Json(req): Json<SpikeStartRequest>,
-) -> (StatusCode, Json<SpikeStartResponse>) {
+) -> Result<Json<SpikeStartResponse>, ApiError> {
     let send_ahead_us = state.sync_settings.lock_recover().group_lead_us();
     match crate::spike::per_device::start(
         &req.device,
@@ -38,15 +37,15 @@ pub(crate) async fn spike_per_device_start(
     )
     .await
     {
-        Ok(info) => (StatusCode::OK, Json(SpikeStartResponse { ok: true, message: info.message.clone(), spike: Some(info) })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(SpikeStartResponse { ok: false, message: e, spike: None })),
+        Ok(info) => Ok(Json(SpikeStartResponse { message: info.message.clone(), spike: Some(info) })),
+        Err(e) => Err(ApiError::bad_request(e)),
     }
 }
 
-pub(crate) async fn spike_per_device_stop(State(state): State<AppState>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn spike_per_device_stop(State(state): State<AppState>) -> OpResult {
     match crate::spike::per_device::stop(&state.pw_cmd, &state.changes, &state.routing).await {
-        Ok(msg) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+        Ok(msg) => ok(msg),
+        Err(e) => Err(ApiError::bad_request(e)),
     }
 }
 
@@ -84,10 +83,7 @@ pub(crate) struct Ap2SpikeRequest {
     pub(crate) clip: Option<String>,
 }
 
-pub(crate) async fn spike_ap2_start(
-    State(state): State<AppState>,
-    Json(req): Json<Ap2SpikeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn spike_ap2_start(State(state): State<AppState>, Json(req): Json<Ap2SpikeRequest>) -> OpResult {
     // Resolve targets: explicit IPs, else every present discovered AP2 receiver.
     let targets: Vec<(String, std::net::IpAddr)> = if !req.ips.is_empty() {
         req.ips.iter().filter_map(|s| s.parse::<std::net::IpAddr>().ok().map(|ip| (s.clone(), ip))).collect()
@@ -101,10 +97,7 @@ pub(crate) async fn spike_ap2_start(
             .collect()
     };
     if targets.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(OutputOpResponse { ok: false, message: "no target receivers (none discovered/present and no valid ips given)".into() }),
-        );
+        return Err(ApiError::bad_request("no target receivers (none discovered/present and no valid ips given)"));
     }
 
     let freq = req.freq.unwrap_or(440.0);
@@ -118,25 +111,21 @@ pub(crate) async fn spike_ap2_start(
     let (live, file_wav) = if voice {
         match crate::audio::decode::decode_bytes_to_wav(include_bytes!("../../assets/test-announcement.mp3"), "mp3").await {
             Ok(wav) => (false, Some(wav)),
-            Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("decode test clip: {e}") }))
-            }
+            Err(e) => return Err(ApiError::internal(format!("decode test clip: {e}"))),
         }
     } else {
         (req.mode.as_deref() == Some("live"), None)
     };
 
     match crate::spike::ap2::start(targets, &state.ap2_ptp, freq, secs, delay, live, rate, file_wav).await {
-        Ok(info) => {
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{} — {}", info.message, info.targets.join(", ")) }))
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+        Ok(info) => ok(format!("{} — {}", info.message, info.targets.join(", "))),
+        Err(e) => Err(ApiError::bad_request(e)),
     }
 }
 
-pub(crate) async fn spike_ap2_stop() -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn spike_ap2_stop() -> OpResult {
     let msg = crate::spike::ap2::stop().await;
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: msg }))
+    ok(msg)
 }
 
 /// pw-sink transport spike (spike/pwsink.rs). Streams a self-driving test tone
@@ -156,24 +145,21 @@ pub(crate) struct PwSinkSpikeRequest {
     pub(crate) ifname: Option<String>,
 }
 
-pub(crate) async fn spike_pwsink_start(
-    State(state): State<AppState>,
-    Json(req): Json<PwSinkSpikeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn spike_pwsink_start(State(state): State<AppState>, Json(req): Json<PwSinkSpikeRequest>) -> OpResult {
     if req.target_ip.parse::<std::net::IpAddr>().is_err() {
-        return (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: format!("invalid target_ip '{}'", req.target_ip) }));
+        return Err(ApiError::bad_request(format!("invalid target_ip '{}'", req.target_ip)));
     }
     let freq = req.freq.unwrap_or(440.0);
     let ifname = req.ifname.as_deref().or(Some("end0"));
     match crate::spike::pwsink::start(&state.pw, &state.pw_cmd, &req.target_ip, freq, ifname).await {
-        Ok(info) => (StatusCode::OK, Json(OutputOpResponse { ok: true, message: info.message })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })),
+        Ok(info) => ok(info.message),
+        Err(e) => Err(ApiError::bad_request(e)),
     }
 }
 
-pub(crate) async fn spike_pwsink_stop() -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn spike_pwsink_stop() -> OpResult {
     crate::spike::pwsink::stop().await;
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message: "pw-sink spike stopped".into() }))
+    ok("pw-sink spike stopped")
 }
 
 /// Multi-device shared-timeline spike (S1): one anchor + one timeline driving one
@@ -189,7 +175,7 @@ pub(crate) struct SpikeMultiRequest {
 pub(crate) async fn spike_multi_device_start(
     State(state): State<AppState>,
     Json(req): Json<SpikeMultiRequest>,
-) -> (StatusCode, Json<SpikeStartResponse>) {
+) -> Result<Json<SpikeStartResponse>, ApiError> {
     let send_ahead_us = state.sync_settings.lock_recover().group_lead_us();
     match crate::spike::per_device::start_multi(
         &req.devices,
@@ -204,8 +190,8 @@ pub(crate) async fn spike_multi_device_start(
     )
     .await
     {
-        Ok(info) => (StatusCode::OK, Json(SpikeStartResponse { ok: true, message: info.message.clone(), spike: Some(info) })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(SpikeStartResponse { ok: false, message: e, spike: None })),
+        Ok(info) => Ok(Json(SpikeStartResponse { message: info.message.clone(), spike: Some(info) })),
+        Err(e) => Err(ApiError::bad_request(e)),
     }
 }
 
@@ -225,7 +211,7 @@ pub(crate) struct OverlayStartRequest {
     pub(crate) duck: Option<f32>,
 }
 
-pub(crate) async fn spike_overlay_start(Json(req): Json<OverlayStartRequest>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn spike_overlay_start(Json(req): Json<OverlayStartRequest>) -> OpResult {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let seconds = req.seconds.unwrap_or(6.0);
     let freq = req.freq.unwrap_or(660.0);
@@ -233,31 +219,16 @@ pub(crate) async fn spike_overlay_start(Json(req): Json<OverlayStartRequest>) ->
     let pcm = crate::outputs::overlay_mixer::test_tone(seconds, freq, 0.3);
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::outputs::overlay_mixer::OverlayMixer::global().start(&req.device, id, pcm, duck);
-    (
-        StatusCode::OK,
-        Json(OutputOpResponse {
-            ok: true,
-            message: format!(
-                "overlay {freq}Hz for {seconds}s on '{}' (duck {duck}); audible only if that device is on per-device senders",
-                req.device
-            ),
-        }),
-    )
+    ok(format!("overlay {freq}Hz for {seconds}s on '{}' (duck {duck}); audible only if that device is on per-device senders", req.device))
 }
 
-pub(crate) async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn spike_overlay_stop(Query(q): Query<std::collections::HashMap<String, String>>) -> OpResult {
     match q.get("device") {
         Some(device) => {
             let stopped = crate::outputs::overlay_mixer::OverlayMixer::global().stop(device).is_some();
-            (
-                StatusCode::OK,
-                Json(OutputOpResponse {
-                    ok: true,
-                    message: format!("overlay on '{device}': {}", if stopped { "stopped" } else { "none active" }),
-                }),
-            )
+            ok(format!("overlay on '{device}': {}", if stopped { "stopped" } else { "none active" }))
         }
-        None => (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: "missing ?device=".to_string() })),
+        None => Err(ApiError::bad_request("missing ?device=".to_string())),
     }
 }
 
@@ -301,8 +272,9 @@ pub(crate) struct AgAnnounceRequest {
 
 #[derive(Serialize)]
 pub(crate) struct AgAnnounceResponse {
-    pub(crate) ok: bool,
-    /// "playing" | "queued" | "rejected".
+    /// "playing" | "queued" | "rejected" — the *outcome*, on a 200. A rejection is the
+    /// arbiter's decision, not a failed request, so it is a value here rather than a
+    /// status (see `api::error` for where the line is).
     pub(crate) admission: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) position: Option<usize>,

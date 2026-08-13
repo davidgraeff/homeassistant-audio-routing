@@ -61,21 +61,11 @@ fn to_percent(v: f32) -> u8 {
     (clamp_unit(v) * 100.0).round() as u8
 }
 
-fn bad_request(message: String) -> (StatusCode, Json<OutputOpResponse>) {
-    (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message }))
-}
-
 /// The one refusal every handler here shares: a node name that is not an output kind
 /// this daemon drives at all.
-fn kind_of(node_name: &str) -> Result<OutputKind, (StatusCode, Json<OutputOpResponse>)> {
+pub(super) fn kind_of(node_name: &str) -> Result<OutputKind, ApiError> {
     OutputKind::of(node_name).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(OutputOpResponse {
-                ok: false,
-                message: format!("'{node_name}' is not an output this daemon drives (sendspin, AirPlay 2 or a PipeWire host)"),
-            }),
-        )
+        ApiError::not_found(format!("'{node_name}' is not an output this daemon drives (sendspin, AirPlay 2 or a PipeWire host)"))
     })
 }
 
@@ -84,11 +74,8 @@ pub(crate) async fn set_output_volume(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetVolumeRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let kind = match kind_of(&node_name) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+) -> OpResult {
+    let kind = kind_of(&node_name)?;
     let display = output_label(&state, &node_name);
     let volume = clamp_unit(req.volume);
     match kind {
@@ -104,22 +91,19 @@ pub(crate) async fn set_output_volume(
                 // answer that used to hide an out-of-kind write.
                 format!("saved {}% for '{display}' (device not connected)", to_percent(volume))
             };
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+            ok(message)
         }
         OutputKind::Airplay2 => {
             state.ap2_control.lock().await.set_volume(&node_name, volume);
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{display}' to {:.0}%", volume * 100.0) }))
+            ok(format!("set '{display}' to {:.0}%", volume * 100.0))
         }
         OutputKind::PwSink => {
             // A host owns its level and reports it back, so there is nothing to store:
             // an unreachable host is an error, never a queued intent.
             if state.agents.lock().await.set_volume(&node_name, volume) {
-                (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("set '{display}' to {:.0}%", volume * 100.0) }))
+                ok(format!("set '{display}' to {:.0}%", volume * 100.0))
             } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(OutputOpResponse { ok: false, message: format!("no agent connected for '{display}'") }),
-                )
+                Err(ApiError::unavailable(format!("no agent connected for '{display}'")))
             }
         }
     }
@@ -130,11 +114,8 @@ pub(crate) async fn set_output_mute(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetMuteRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let kind = match kind_of(&node_name) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+) -> OpResult {
+    let kind = kind_of(&node_name)?;
     let display = output_label(&state, &node_name);
     let verb = if req.muted { "muted" } else { "unmuted" };
     match kind {
@@ -143,20 +124,17 @@ pub(crate) async fn set_output_mute(
             let reached = pending.apply().await;
             let message =
                 if reached { format!("{verb} '{display}'") } else { format!("saved {verb} for '{display}' (device not connected)") };
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+            ok(message)
         }
         OutputKind::Airplay2 => {
             state.ap2_control.lock().await.set_muted(&node_name, req.muted);
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{verb} '{display}'") }))
+            ok(format!("{verb} '{display}'"))
         }
         OutputKind::PwSink => {
             if state.agents.lock().await.set_mute(&node_name, req.muted) {
-                (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("{verb} '{display}'") }))
+                ok(format!("{verb} '{display}'"))
             } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(OutputOpResponse { ok: false, message: format!("no agent connected for '{display}'") }),
-                )
+                Err(ApiError::unavailable(format!("no agent connected for '{display}'")))
             }
         }
     }
@@ -169,11 +147,8 @@ pub(crate) async fn set_output_mute(
 /// that.* For sendspin it is a `stream/clear` (discard buffered audio, re-anchor, one
 /// frame); for AirPlay 2 it is a fresh RTSP session with its PTP peer re-armed; a
 /// pw-sink host has no such lever, and says so rather than pretending.
-pub(crate) async fn resync_output(State(state): State<AppState>, Path(node_name): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
-    let kind = match kind_of(&node_name) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+pub(crate) async fn resync_output(State(state): State<AppState>, Path(node_name): Path<String>) -> OpResult {
+    let kind = kind_of(&node_name)?;
     let display = output_label(&state, &node_name);
     match kind {
         OutputKind::Sendspin => {
@@ -189,7 +164,7 @@ pub(crate) async fn resync_output(State(state): State<AppState>, Path(node_name)
             } else {
                 format!("'{display}' has no live connection, so there is nothing to clear")
             };
-            (StatusCode::OK, Json(OutputOpResponse { ok: reached, message }))
+            ok_if(reached, message)
         }
         OutputKind::Airplay2 => {
             let queued = state.ap2_control.lock().await.reconnect(&node_name, "you asked for a resync");
@@ -201,12 +176,12 @@ pub(crate) async fn resync_output(State(state): State<AppState>, Path(node_name)
             } else {
                 format!("'{display}' has no live sender, so there is no session to rebuild")
             };
-            (StatusCode::OK, Json(OutputOpResponse { ok: queued, message }))
+            ok_if(queued, message)
         }
-        OutputKind::PwSink => bad_request(format!(
+        OutputKind::PwSink => Err(ApiError::bad_request(format!(
             "'{display}' is a PipeWire host: it has no resync lever of its own — its receiver reloads when its playout \
              delay changes (PUT /api/outputs/{node_name}/delay)"
-        )),
+        ))),
     }
 }
 
@@ -225,11 +200,8 @@ pub(crate) async fn set_output_delay(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<SetDelayRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
-    let kind = match kind_of(&node_name) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+) -> OpResult {
+    let kind = kind_of(&node_name)?;
     match kind {
         // A sendspin advance has no "default" other than none at all, so an omitted
         // value clears it — which is exactly what 0 means to the device.

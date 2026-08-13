@@ -30,7 +30,35 @@ EVENTS_FRAME_SUBSCRIBED = "subscribed"
 
 
 class PipewireRouterApiError(Exception):
-    """Raised when the bridge daemon's API returns an error or is unreachable."""
+    """Raised when the bridge daemon's API returns an error or is unreachable.
+
+    `kind` is the daemon's machine-readable reason when it sent one (`not_found`,
+    `bad_request`, `conflict`, `unavailable`, `internal`, or one of the alignment
+    subsystem's own kinds) — branch on it rather than on the message text."""
+
+    def __init__(self, message: str, kind: str | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+async def _raise_for_error(resp: aiohttp.ClientResponse, what: str) -> None:
+    """Turn a refusal into `PipewireRouterApiError`, carrying the daemon's own sentence.
+
+    **The status carries success.** The daemon answers `{kind, message}` on anything but a
+    2xx, and nothing else — no `ok` flag to consult. That is worth a helper rather than a
+    line per call site, because the previous shape (status *and* a flag, inconsistently)
+    meant every one of these had to remember which endpoints lied."""
+    if resp.status < 400:
+        return
+    kind = message = None
+    try:
+        body = await resp.json()
+        if isinstance(body, dict):
+            kind = body.get("kind")
+            message = body.get("message")
+    except (aiohttp.ClientError, ValueError):
+        pass
+    raise PipewireRouterApiError(message or f"{what} failed: HTTP {resp.status}", kind)
 
 
 @dataclass
@@ -410,13 +438,9 @@ class PipewireRouterApiClient:
             request = self._session.post
         try:
             async with request(url, json=payload) as resp:
-                body = await resp.json()
+                await _raise_for_error(resp, "enabling the RTP source")
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not enable RTP source: {err}") from err
-        # POST returns the created SourceView (no `ok` field = success); PUT and
-        # error responses carry `ok`. Only an explicit `ok: false` is a failure.
-        if isinstance(body, dict) and body.get("ok") is False:
-            raise PipewireRouterApiError(body.get("message") or "could not enable RTP source")
 
     async def async_disable_rtp_source(self) -> None:
         """Disable the RTP source by removing it from the collection
@@ -426,11 +450,9 @@ class PipewireRouterApiClient:
             return
         try:
             async with self._session.delete(f"{self._base_url}/api/sources/{src['id']}") as resp:
-                body = await resp.json()
+                await _raise_for_error(resp, "disabling the RTP source")
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not disable RTP source: {err}") from err
-        if isinstance(body, dict) and body.get("ok") is False:
-            raise PipewireRouterApiError(body.get("message") or "could not disable RTP source")
 
     async def async_get_routing(self) -> RoutingMatrix:
         """Fetch the source×output routing matrix once (`GET /api/routing`).
@@ -521,12 +543,9 @@ class PipewireRouterApiClient:
                 f"{self._base_url}/api/routing/{op}",
                 json={"source": source, "output": output},
             ) as resp:
-                resp.raise_for_status()
-                body = await resp.json()
+                await _raise_for_error(resp, op)
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not {op}: {err}") from err
-        if not body.get("ok", False):
-            raise PipewireRouterApiError(body.get("message") or f"{op} failed")
 
     async def async_get_music_groups(self) -> list[MusicGroup]:
         """Named music groups (`GET /api/groups/music`)."""
@@ -622,21 +641,17 @@ class PipewireRouterApiClient:
                 f"{self._base_url}/api/groups/music/{group_id}/route",
                 json={"source": source},
             ) as resp:
-                body = await resp.json()
+                await _raise_for_error(resp, "routing the group")
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not route group: {err}") from err
-        if not body.get("ok", False):
-            raise PipewireRouterApiError(body.get("message") or "route failed")
 
     async def async_unroute_music_group(self, group_id: str) -> None:
         """Un-route a whole music group (`DELETE /api/groups/music/{id}/route`)."""
         try:
             async with self._session.delete(f"{self._base_url}/api/groups/music/{group_id}/route") as resp:
-                body = await resp.json()
+                await _raise_for_error(resp, "un-routing the group")
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not un-route group: {err}") from err
-        if not body.get("ok", False):
-            raise PipewireRouterApiError(body.get("message") or "un-route failed")
 
     # --- Duck holds (voice ducking, overlay_mixer.rs) ---
     #
@@ -653,11 +668,13 @@ class PipewireRouterApiClient:
                 f"{self._base_url}/api/duck",
                 json={"targets": targets, "level": level, "ttl_ms": ttl_ms},
             ) as resp:
+                await _raise_for_error(resp, "ducking")
                 body = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not duck: {err}") from err
-        if not body.get("ok", False) or body.get("hold_id") is None:
-            raise PipewireRouterApiError(body.get("message") or "duck rejected")
+        # A 2xx *is* the hold: `hold_id` is not optional on success any more.
+        if body.get("hold_id") is None:
+            raise PipewireRouterApiError(body.get("message") or "duck answered without a hold id")
         return int(body["hold_id"])
 
     async def async_duck_renew(self, hold_id: int, ttl_ms: int) -> bool:
@@ -695,8 +712,12 @@ class PipewireRouterApiClient:
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
+                await _raise_for_error(resp, "announcing")
                 body = await resp.json()
         except aiohttp.ClientError as err:
             raise PipewireRouterApiError(f"could not announce to group: {err}") from err
-        if not body.get("ok", False):
+        # `admission` is the outcome on a 200 — the arbiter can legitimately reject an
+        # announcement (the output is busy and the group says so) without the request
+        # having failed.
+        if body.get("admission") == "rejected":
             raise PipewireRouterApiError(body.get("message") or body.get("reason") or "announce rejected")

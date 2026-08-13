@@ -136,14 +136,8 @@ pub(crate) async fn get_sync_settings(State(state): State<AppState>) -> Json<Syn
         (ss.group_lead_ms(), ss.opus_floor_ms())
     };
     let (floor, sources) = lead_floor(&state);
-    let running: Vec<RunningLead> = state
-        .groups
-        .lock()
-        .await
-        .running_sendspin_leads()
-        .into_iter()
-        .map(|(anchor, lead_ms)| RunningLead { anchor, lead_ms })
-        .collect();
+    let running: Vec<RunningLead> =
+        state.groups.lock().await.running_sendspin_leads().into_iter().map(|(anchor, lead_ms)| RunningLead { anchor, lead_ms }).collect();
     Json(SyncSettingsInfo {
         group_lead_ms: configured,
         group_lead_floor_ms: floor,
@@ -156,21 +150,15 @@ pub(crate) async fn get_sync_settings(State(state): State<AppState>) -> Json<Syn
     })
 }
 
-pub(crate) async fn set_sync_settings(
-    State(state): State<AppState>,
-    Json(req): Json<SetSyncSettingsRequest>,
-) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn set_sync_settings(State(state): State<AppState>, Json(req): Json<SetSyncSettingsRequest>) -> OpResult {
     {
         let mut ss = state.sync_settings.lock_recover();
         if let Err(e) = ss.set_group_lead_ms(req.group_lead_ms) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }));
+            return Err(ApiError::internal(format!("failed to persist: {e}")));
         }
         if let Some(ms) = req.opus_floor_ms {
             if let Err(e) = ss.set_opus_floor_ms(ms) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") }),
-                );
+                return Err(ApiError::internal(format!("failed to persist: {e}")));
             }
         }
     }
@@ -207,7 +195,7 @@ pub(crate) async fn set_sync_settings(
             " — {rearmed} group(s) restart to apply it, so each speaker reconnects (a few seconds of silence per speaker)"
         ));
     }
-    (StatusCode::OK, Json(OutputOpResponse { ok: true, message }))
+    ok(message)
 }
 
 /// General app settings (store/settings.rs) — the Settings page's General

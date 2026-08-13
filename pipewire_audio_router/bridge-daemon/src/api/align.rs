@@ -17,11 +17,9 @@ pub(crate) async fn align_status(State(state): State<AppState>) -> Json<crate::a
 /// **Must be driven by a click, never by a timer.** The timeout exists so that a tab
 /// nobody is watching cannot leave a room muted, and renewing the session automatically
 /// would put that hazard straight back — invisibly. See `AlignManager::still_here`.
-pub(crate) async fn align_still_here(
-    State(state): State<AppState>,
-) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+pub(crate) async fn align_still_here(State(state): State<AppState>) -> Result<Json<crate::align::calibrate::AlignState>, ApiError> {
     tracing::info!("USER ACTION: keep the alignment session open");
-    state.align.still_here().await.map(Json).map_err(|e| (StatusCode::CONFLICT, Json(OutputOpResponse { ok: false, message: e })))
+    state.align.still_here().await.map(Json).map_err(ApiError::conflict)
 }
 
 /// The shared handles an alignment session needs to form and hold its temporary
@@ -67,15 +65,10 @@ pub(crate) struct AlignStartRequest {
 pub(crate) async fn align_start(
     State(state): State<AppState>,
     Json(req): Json<AlignStartRequest>,
-) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+) -> Result<Json<crate::align::calibrate::AlignState>, ApiError> {
     let deps = hold_deps(&state);
     tracing::info!("USER ACTION: start alignment ({:?}) on {} selected output(s)", req.mode, req.outputs.len());
-    state
-        .align
-        .start_outputs(&deps, req.outputs, req.mode)
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+    state.align.start_outputs(&deps, req.outputs, req.mode).await.map(Json).map_err(ApiError::bad_request)
 }
 
 #[derive(Deserialize)]
@@ -98,17 +91,12 @@ pub(crate) struct AlignAudibleRequest {
 pub(crate) async fn align_audible(
     State(state): State<AppState>,
     Json(req): Json<AlignAudibleRequest>,
-) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
+) -> Result<Json<crate::align::calibrate::AlignState>, ApiError> {
     let level = match req.level {
         Some(l) => l,
         None => state.align.status().await.volume,
     };
-    state
-        .align
-        .set_audible(req.audible, level)
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+    state.align.set_audible(req.audible, level).await.map(Json).map_err(ApiError::bad_request)
 }
 
 #[derive(Deserialize)]
@@ -122,13 +110,8 @@ pub(crate) struct AlignSelectRequest {
 pub(crate) async fn align_select(
     State(state): State<AppState>,
     Json(req): Json<AlignSelectRequest>,
-) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
-    state
-        .align
-        .select(req.reference, req.target)
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+) -> Result<Json<crate::align::calibrate::AlignState>, ApiError> {
+    state.align.select(req.reference, req.target).await.map(Json).map_err(ApiError::bad_request)
 }
 
 #[derive(Deserialize)]
@@ -140,13 +123,8 @@ pub(crate) struct AlignVolumeRequest {
 pub(crate) async fn align_volume(
     State(state): State<AppState>,
     Json(req): Json<AlignVolumeRequest>,
-) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
-    state
-        .align
-        .set_level(req.volume)
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message: e })))
+) -> Result<Json<crate::align::calibrate::AlignState>, ApiError> {
+    state.align.set_level(req.volume).await.map(Json).map_err(ApiError::bad_request)
 }
 
 #[derive(Deserialize)]
@@ -166,8 +144,8 @@ pub(crate) async fn align_channels(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
     Json(req): Json<AlignChannelsRequest>,
-) -> Result<Json<crate::align::calibrate::AlignState>, (StatusCode, Json<OutputOpResponse>)> {
-    let bad = |message: String| (StatusCode::BAD_REQUEST, Json(OutputOpResponse { ok: false, message }));
+) -> Result<Json<crate::align::calibrate::AlignState>, ApiError> {
+    let bad = ApiError::bad_request;
     let channels = crate::align::relay_delay::MeasureChannels::parse(&req.channels)
         .ok_or_else(|| bad(format!("'{}' is not a channel choice (expected both, left or right)", req.channels)))?;
     tracing::info!("USER ACTION: measure '{node_name}' through {} channel(s)", channels.as_str());

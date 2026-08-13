@@ -283,3 +283,21 @@ fn the_align_member_paths_coexist_with_their_collections() {
         .route("/api/align/members/{node_name}/channel", post(|| async { "channel" }));
     drop(app);
 }
+
+/// The convention, through a real handler rather than the type alone: a name whose kind
+/// has no such knob is a typed `bad_request`, an unknown name a `not_found`, and neither
+/// is a 200 with a flag saying otherwise.
+///
+/// `level::kind_of` is where every per-output handler starts, so this pins the two
+/// refusals every one of them can produce without needing an `AppState`.
+#[test]
+fn a_per_output_write_refuses_by_kind_and_says_which() {
+    let unknown = level::kind_of("what-even-is-this").expect_err("not an output");
+    assert_eq!(unknown.kind, error::ErrorKind::NotFound);
+    assert!(unknown.message.contains("not an output this daemon drives"), "{}", unknown.message);
+
+    // And the three real kinds resolve, so the dispatch below them is reachable.
+    for name in ["sendspin-dev-kitchen", "ap2-dev-dusche", "pwsink-dev-desk"] {
+        assert!(level::kind_of(name).is_ok(), "{name}");
+    }
+}

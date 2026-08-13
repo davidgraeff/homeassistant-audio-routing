@@ -172,13 +172,21 @@ pub(crate) struct UpdateSourceRequest {
     pub(crate) rtp: Option<RtpSourceConfig>,
 }
 
-/// A source-CRUD error as a `{ok:false, message}` body + status code. Both the
-/// success and error arms implement `IntoResponse`, so handlers return
-/// `Result<_, SourceError>`.
-pub(crate) type SourceError = (StatusCode, Json<OutputOpResponse>);
+/// A source-CRUD failure. The one convention: the status comes from the kind and the
+/// body is `{kind, message}` — see `api::error`.
+pub(crate) type SourceError = ApiError;
 
+/// Kept as a helper because the source handlers refuse in a dozen places; the `code` is
+/// mapped to the kind rather than sent raw, so a new call site cannot invent a status the
+/// vocabulary does not cover.
 pub(crate) fn source_err(code: StatusCode, message: String) -> SourceError {
-    (code, Json(OutputOpResponse { ok: false, message }))
+    match code {
+        StatusCode::NOT_FOUND => ApiError::not_found(message),
+        StatusCode::CONFLICT => ApiError::conflict(message),
+        StatusCode::SERVICE_UNAVAILABLE => ApiError::unavailable(message),
+        StatusCode::INTERNAL_SERVER_ERROR => ApiError::internal(message),
+        _ => ApiError::bad_request(message),
+    }
 }
 
 pub(crate) async fn list_sources(State(state): State<AppState>) -> Json<SourcesListResponse> {
@@ -263,7 +271,7 @@ pub(crate) async fn update_source(
     Ok(Json(source_view(&entry, present, &bridges)))
 }
 
-pub(crate) async fn delete_source(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<OutputOpResponse>) {
+pub(crate) async fn delete_source(State(state): State<AppState>, Path(id): Path<String>) -> OpResult {
     // Bind the result so the std MutexGuard drops HERE — a match scrutinee holds
     // its temporaries for the whole match, which would keep the guard alive
     // across the `.await` below and make the handler future `!Send`.
@@ -273,9 +281,9 @@ pub(crate) async fn delete_source(State(state): State<AppState>, Path(id): Path<
             // Unload/stop the removed source now, then nudge downstream.
             reconcile_sources(&state).await;
             let _ = state.changes.send(());
-            (StatusCode::OK, Json(OutputOpResponse { ok: true, message: format!("removed source '{id}'") }))
+            ok(format!("removed source '{id}'"))
         }
-        Ok(false) => (StatusCode::NOT_FOUND, Json(OutputOpResponse { ok: false, message: format!("no source with id '{id}'") })),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(OutputOpResponse { ok: false, message: format!("failed to persist: {e}") })),
+        Ok(false) => Err(ApiError::not_found(format!("no source with id '{id}'"))),
+        Err(e) => Err(ApiError::internal(format!("failed to persist: {e}"))),
     }
 }

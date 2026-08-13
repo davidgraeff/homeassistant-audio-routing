@@ -240,27 +240,41 @@ async def test_get_rtp_source_parses_shape():
     assert (state.enabled, state.port, state.latency_msec, state.loaded) == (True, 46000, 250, True)
 
 
-async def test_set_rtp_source_raises_daemon_message_on_ok_false():
-    # set reads the collection (GET → existing source), then PUTs the update; a
-    # 502 with ok:false on the PUT carries the daemon's reason — surfaced.
+async def test_set_rtp_source_raises_the_daemons_reason_and_keeps_its_kind():
+    """The status carries success and the body says why, typed: `{kind, message}`. The
+    message is surfaced to the user and the `kind` is kept for a caller that wants to
+    branch — which is what replaced an `ok` flag nobody could rely on."""
     client = PipewireRouterApiClient(
         _FakeHttpSession(
             _FakeResp(_sources_list()),
-            _FakeResp({"ok": False, "message": "failed to load module"}, status=502),
+            _FakeResp({"kind": "internal", "message": "failed to load module"}, status=500),
         ),
         "h",
         8099,
     )
-    with pytest.raises(PipewireRouterApiError, match="failed to load module"):
+    with pytest.raises(PipewireRouterApiError, match="failed to load module") as raised:
+        await client.async_set_rtp_source(46000, 200)
+    assert raised.value.kind == "internal"
+
+
+async def test_a_refusal_without_a_body_still_names_the_operation():
+    """A proxy or a panic can answer non-JSON; the caller must still get a sentence
+    rather than an unhandled parse error."""
+    client = PipewireRouterApiClient(
+        _FakeHttpSession(_FakeResp(_sources_list()), _FakeResp(None, status=502)),
+        "h",
+        8099,
+    )
+    with pytest.raises(PipewireRouterApiError, match="HTTP 502"):
         await client.async_set_rtp_source(46000, 200)
 
 
 async def test_disable_rtp_source_ok():
-    # disable finds the source (GET) then DELETEs it (ok:true).
+    # disable finds the source (GET) then DELETEs it (a 200 *is* the success).
     client = PipewireRouterApiClient(
         _FakeHttpSession(
             _FakeResp(_sources_list()),
-            _FakeResp({"ok": True, "message": "removed source 'bt-bridge-rtp'"}),
+            _FakeResp({"message": "removed source 'bt-bridge-rtp'"}),
         ),
         "h",
         8099,

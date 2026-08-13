@@ -250,6 +250,8 @@ pub(crate) mod align;
 pub(crate) mod announce;
 pub(crate) mod clients;
 pub(crate) mod duck;
+/// The one way to fail (and to say a write worked) — see its module docs.
+pub(crate) mod error;
 pub(crate) mod groups;
 mod level;
 pub(crate) mod measure;
@@ -271,6 +273,7 @@ pub(crate) use align::*;
 pub(crate) use announce::*;
 pub(crate) use clients::*;
 pub(crate) use duck::*;
+pub(crate) use error::*;
 pub(crate) use groups::*;
 pub(crate) use level::*;
 pub(crate) use measure::*;

@@ -11,14 +11,15 @@ it from the consumers' own code rather than from taste — every proposal below 
 motivated by a place where a caller is currently forced to know something the daemon
 already knows.
 
-**Status: §1, §2, §3 and §5 are implemented** (2026-08-13), with no compatibility layer —
+**Status: §1–§5 are implemented** (2026-08-13), with no compatibility layer —
 there are no external consumers yet and both in-repo ones were changed in the same step,
 which is the policy this was done under: consistency over compatibility, no aliases, and
 no documentation of moved endpoints. `docs/api-reference.md` describes the surface as it is
 now; what each section below records is the *reasoning*, and where it says "proposal" read
-"what was done". §4 (the error convention) and §7's list are still open.
+"what was done". §7's list is what remains.
 
-The route table went from **85 to 77** routes, and the four status sockets to one.
+The route table went from **85 to 77** routes, the four status sockets became one, and
+`{ok, message}` is gone from every response.
 
 The ranking at the end is by *consumer win per unit of churn*; §7 lists what should be
 left alone and why, because a harmonisation pass that touches everything is how a working
@@ -189,13 +190,34 @@ Two concrete problems, not stylistic:
   output" has to match prose. The alignment subsystem already has the better answer in
   `Refusal` (a `kind` plus a sentence); the older half of the API predates it.
 
-### Proposal
+### Done
 
-One rule, written down: **HTTP status carries success; a failure body is a `Refusal`**
-(`{kind, message, …}`); a success body is either the affected resource or `204`. Adopt it
-for new endpoints and migrate `OutputOpResponse` behind an accept-either window — the
-envelope's `ok` becomes derived, then dropped. `Refusal` already serialises the way this
-needs, so the type work is mostly deletion.
+One rule, written down in `api/error.rs` and in the reference's own "How a call answers":
+**the status carries success; a failure body is `{kind, message}`; a success body is the
+affected resource or just the message.** `OutputOpResponse`, `LinkOpResponse` and
+`CreateLinkResponse` are deleted; `DuckResponse`, `SpikeStartResponse` and
+`AgAnnounceResponse` kept their data and lost their `ok`.
+
+`ErrorKind` is deliberately five values about the *caller's* situation, not the daemon's
+internals — and the one that did the real work is **`conflict`**, which is what every
+`200 {ok:false}` turned into: "the request is fine, the target is not in a state where it
+applies." `ok_if(happened, message)` is that shape as a helper, because every
+tell-a-device-something handler has it.
+
+Where the line falls, and it is not always obvious: an **announcement's rejection stays a
+200**. The arbiter decided; the request was carried out. `admission` (`playing` / `queued` /
+`rejected`) is the machine-readable outcome, which is what the `ok` flag beside it had been
+reaching for. Same for a duck release of a hold that was already gone — the caller wanted it
+not ducking, and it is not ducking.
+
+The alignment subsystem keeps its own richer `Refusal` vocabulary (`mic_lost`,
+`estimator`, plus the member to blame), because those name states a user can act on. Same
+envelope, so a consumer has one shape.
+
+Consumers, which is where the win is: the web UI's `run()` no longer inspects a flag —
+**a throw is the only failure** — and `OpResponse` is `{message}`; the integration got one
+`_raise_for_error(resp, what)` helper that carries the daemon's sentence *and* keeps
+`kind` on the exception, replacing seven hand-written `if not body.get("ok")` checks.
 
 ---
 
@@ -301,14 +323,15 @@ integration would have to speak both anyway.
 | 2 | One socket, topics by message (§5) | high — one reconnect implementation instead of four, and four fewer HTTP/1.1 connections | **done** |
 | 3 | Subject in the path, values in the body (§2) | medium — a generic per-output call becomes expressible | **done** |
 | 4 | `outputs` as the one field name; drop `align/start`'s `sources` (§3) | medium | **done** |
-| 5 | One error convention, `Refusal` everywhere (§4) | high — every call site stops double-checking status *and* body | open, 36 handlers |
+| 5 | One error convention (§4) | high — every call site stops double-checking status *and* body | **done** |
 | 6 | `/api/groups/{tier}` instead of two parallel trees | low — the shapes differ more than they look (`members` vs `targets`, priority, duck) | open |
 | 7 | API generation in `/api/status` (§6) | only matters once there is an external consumer | not needed yet |
 
-**§4 is the one worth doing next**, and it is the only remaining item that touches
-consumer code everywhere: `200 {ok:false}` still exists, so both clients still check the
-status *and* the body on every call. It is also the largest single diff (36 handlers), which
-is why it was left out of a pass that already moved every path.
+**What remains is §7's list and §6's generation flag**, and neither is urgent: the
+`/api/groups/{tier}` merge is low value (the two shapes differ more than they look), and the
+generation flag only starts mattering when something outside this repo speaks to the daemon.
+The one thing worth doing *before* that day is deciding whether `/api/spike/*` should exist
+in a shipped route table at all — §7 says gate it behind a build feature.
 
 ---
 
