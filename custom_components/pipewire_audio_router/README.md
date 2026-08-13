@@ -12,7 +12,9 @@ somewhere reachable — install and configure that first.
 
 ## Installing
 
-Not HACS-packaged (no `hacs.json`) — install manually:
+The repo root carries a `hacs.json`, so HACS can download this — see the
+[buttons in the root README](../../README.md#2-the-integration--recommended).
+By hand instead:
 
 1. Copy (or symlink) this directory into your Home Assistant config's
    `custom_components/pipewire_audio_router/`.

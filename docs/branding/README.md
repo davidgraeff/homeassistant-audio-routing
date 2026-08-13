@@ -30,6 +30,7 @@ It stays readable down to 24 px (sidebar size); verified by rasterising at 24 /
 | `pipewire_audio_router/frontend/public/favicon.svg` | browser tab of the add-on web UI |
 | `pipewire_audio_router/frontend/public/apple-touch-icon.png` (180×180) | iOS/Android home-screen shortcut to the UI |
 | `custom_components/pipewire_audio_router/brand/*` | the integration, via HA's brands proxy — see below |
+| `docs/branding/logo.png` (800×320) | the root README header — raster, not `logo.svg`, so a viewer's fallback font can't reflow the Inter wordmark |
 
 The add-on picks `icon.png`/`logo.png` up by convention — no `config.yaml` entry
 needed. The add-on's *sidebar panel* icon stays the MDI glyph

@@ -38,6 +38,12 @@ render "$src/icon.svg" 512 512 "$brand/icon@2x.png"
 render "$src/logo.svg" 400 160 "$brand/logo.png"
 render "$src/logo.svg" 800 320 "$brand/logo@2x.png"
 
+# The README embeds the raster, not logo.svg: the wordmark is set in Inter, and
+# a viewer's browser substituting its own fallback font would reflow the tuned
+# letter-spacing. Rasterising here pins the typography.
+echo "README:"
+render "$src/logo.svg" 800 320 "$src/logo.png"
+
 echo "add-on web UI:"
 cp "$src/icon.svg" "$web/favicon.svg"
 printf '  %-72s %s\n' "${web#"$repo"/}/favicon.svg" "vector"
