@@ -20,6 +20,7 @@
 //! That is presentation only: the log lines remain the record, and a host without a
 //! desktop behaves exactly as before.
 
+use crate::autostart;
 use crate::config::{self, Config};
 use crate::desktop::{Desktop, Request};
 use crate::proto::{AgentMsg, DaemonMsg, HostState, PROTOCOL_VERSION};
@@ -203,6 +204,10 @@ pub async fn run(
                 backoff = BACKOFF_START;
                 continue;
             }
+            // The only way out of this loop other than a fatal error: returning lets
+            // `main` drop the PipeWire handle, which restores the host's level and
+            // unloads the receiver exactly as a signal would.
+            Ok(Outcome::Quit) => return Ok(()),
             Ok(Outcome::Denied(reason)) => {
                 // Never fatal. A token we hold that the daemon does not honour is
                 // worthless — it was revoked by an unpair, or its store was lost —
@@ -260,7 +265,12 @@ pub async fn run(
             tokio::select! {
                 _ = tokio::time::sleep_until(until) => break,
                 request = requests.recv() => match request {
-                    Some(request) => apply_request(request, &mut config, &handle, &desktop).await,
+                    // Quitting has to work here too — a host that cannot reach the add-on
+                    // is exactly when someone reaches for the tray.
+                    Some(request) => match apply_request(request, &mut config, &handle, &desktop).await {
+                        std::ops::ControlFlow::Continue(()) => {}
+                        std::ops::ControlFlow::Break(()) => return Ok(()),
+                    },
                     // The tray is gone (it never existed, or its task ended); just wait.
                     None => { tokio::time::sleep_until(until).await; break }
                 },
@@ -282,8 +292,40 @@ pub async fn run(
 /// the same `Cmd`s the add-on's `SetVolume`/`SetMute` produce — and the resulting graph
 /// change comes back as a `Master` event, which is what corrects the value the tray
 /// painted optimistically and what tells the add-on (§9.4).
-async fn apply_request(request: Request, config: &mut Config, handle: &Handle, desktop: &Desktop) {
+/// `Break` means the agent was asked to stop and this loop must return, so `main`'s
+/// shutdown runs (dropping the PipeWire handle restores the host and unloads the
+/// receiver — plan §9.1, the same path SIGTERM takes).
+async fn apply_request(
+    request: Request,
+    config: &mut Config,
+    handle: &Handle,
+    desktop: &Desktop,
+) -> std::ops::ControlFlow<()> {
     match request {
+        Request::Quit => {
+            // The service instance must not merely exit: its unit is `Restart=always`,
+            // so systemd would bring it straight back and the menu item would look
+            // broken. Ask systemd to stop the unit instead and keep running — the
+            // SIGTERM it sends in reply is what ends us, through the ordinary path.
+            if autostart::is_the_running_service().await {
+                match autostart::stop().await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "quit from the tray: asked systemd to stop {}",
+                            autostart::UNIT_NAME
+                        );
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    // Falling through to a plain exit is better than ignoring the click:
+                    // a respawn is at least visible, whereas nothing happening is not.
+                    Err(e) => {
+                        tracing::warn!("could not stop the unit ({e:#}); exiting directly instead")
+                    }
+                }
+            }
+            tracing::info!("quit from the tray; restoring host state");
+            return std::ops::ControlFlow::Break(());
+        }
         Request::SetVolume(volume) => {
             tracing::debug!("volume set to {:.0}% on this machine", volume * 100.0);
             handle.send(Cmd::SetMasterVolume(volume));
@@ -297,7 +339,7 @@ async fn apply_request(request: Request, config: &mut Config, handle: &Handle, d
         }
         Request::SetTarget(target) => {
             if config.target_sink == target {
-                return;
+                return std::ops::ControlFlow::Continue(());
             }
             config.target_sink = target.clone();
             if let Err(e) = config::save(config) {
@@ -311,6 +353,7 @@ async fn apply_request(request: Request, config: &mut Config, handle: &Handle, d
             desktop.set_target(target).await;
         }
     }
+    std::ops::ControlFlow::Continue(())
 }
 
 enum Outcome {
@@ -320,6 +363,8 @@ enum Outcome {
     Paired,
     /// The daemon refused us. Handled, not fatal — see `run`.
     Denied(String),
+    /// The tray asked the agent to stop. The one outcome that ends `run`.
+    Quit,
 }
 
 /// Six uppercase hex characters, the shape the daemon validates. Read straight
@@ -436,7 +481,10 @@ async fn session(
 
             request = requests.recv() => {
                 match request {
-                    Some(request) => apply_request(request, config, handle, desktop).await,
+                    Some(request) => match apply_request(request, config, handle, desktop).await {
+                        std::ops::ControlFlow::Continue(()) => {}
+                        std::ops::ControlFlow::Break(()) => return Ok(Outcome::Quit),
+                    },
                     // Tray gone: stop selecting on a closed channel, which would
                     // otherwise return immediately forever and spin this loop.
                     None => std::future::pending::<()>().await,

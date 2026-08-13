@@ -225,7 +225,11 @@ impl Graph {
             .iter()
             .filter(|(out, _)| *out == stream_id)
             .map(|(_, inp)| *inp)
-            .find(|inp| self.node(*inp).map(|n| n.media_class.as_deref() == Some("Audio/Sink")).unwrap_or(false))
+            .find(|inp| {
+                self.node(*inp)
+                    .map(|n| n.media_class.as_deref() == Some("Audio/Sink"))
+                    .unwrap_or(false)
+            })
     }
 
     pub fn node(&self, id: u32) -> Option<&NodeInfo> {
@@ -484,7 +488,11 @@ mod tests {
         // module-rtp-session publishes a send and a receive stream with the same
         // node.name; only the receive one is linked to a sink.
         let graph = Graph {
-            nodes: vec![node(40, "pwsink-in", None), node(41, "pwsink-in", None), sink(50, "alsa-sink")],
+            nodes: vec![
+                node(40, "pwsink-in", None),
+                node(41, "pwsink-in", None),
+                sink(50, "alsa-sink"),
+            ],
             links: vec![(41, 50)],
         };
         assert_eq!(graph.find_receive_stream("pwsink-in", None).unwrap().id, 41);
@@ -514,7 +522,10 @@ mod tests {
         // that changes nothing an ear can hear.
         let mut meter = node(60, "peak-meter", None);
         meter.media_class = Some("Stream/Input/Audio".into());
-        let graph = Graph { nodes: vec![node(41, "pwsink-in", None), meter], links: vec![(41, 60)] };
+        let graph = Graph {
+            nodes: vec![node(41, "pwsink-in", None), meter],
+            links: vec![(41, 60)],
+        };
         assert_eq!(graph.linked_sink(41), None);
     }
 

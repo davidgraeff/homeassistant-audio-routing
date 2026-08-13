@@ -74,6 +74,8 @@ const ICON: &str = "audio-speakers";
 const ATTENTION_ICON: &str = "dialog-password";
 /// Icon on the mute row. Legacy spelling for the same reason as [`ICON`].
 const MUTE_ICON: &str = "audio-volume-muted";
+/// Icon on the Quit row — the freedesktop name every theme carries.
+const QUIT_ICON: &str = "application-exit";
 
 /// Percentage points one wheel notch over the icon moves the volume. 5 is what
 /// desktop volume applets use: fine enough to land on a level, coarse enough that a
@@ -103,6 +105,16 @@ pub enum Request {
     /// disagree about what "50 %" means.
     SetVolume(f32),
     SetMute(bool),
+    /// Stop this agent: restore the host's level, unload the receiver, exit.
+    ///
+    /// The one control the tray was originally refused (§8.1), on the grounds that a
+    /// `Restart=always` unit would undo it. That reasoning covered the *service* and
+    /// missed every other way this binary runs — started by hand to try it out, or after
+    /// its unit was stopped — where the tray is the only interface there is and the only
+    /// way out was finding the PID. So it exists, and it does the honest thing in both
+    /// cases: the service instance asks systemd to stop the unit (see
+    /// [`crate::autostart::stop`]), anything else just exits.
+    Quit,
 }
 
 /// Where the pairing stands, as far as this process knows.
@@ -273,6 +285,14 @@ impl AgentTray {
         self.host.muted = Some(muted);
         if let Some(requests) = &self.requests {
             let _ = requests.try_send(Request::SetMute(muted));
+        }
+    }
+
+    /// Ask the agent to stop. Split out from the menu row so it can be tested, like
+    /// the level requests above.
+    fn request_quit(&mut self) {
+        if let Some(requests) = &self.requests {
+            let _ = requests.try_send(Request::Quit);
         }
     }
 
@@ -636,6 +656,22 @@ impl ksni::Tray for AgentTray {
             items.push(MenuItem::Separator);
             items.extend(actions);
         }
+
+        // Quit last, under its own separator, where every desktop menu puts it — and
+        // unconditionally, because the case it exists for is precisely the one where
+        // nothing else about this session is working. `client::run` decides what quitting
+        // means here (stop the unit vs. exit); the row only reports the choice, like
+        // every other actionable row.
+        items.push(MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: "Quit".into(),
+                icon_name: QUIT_ICON.into(),
+                activate: Box::new(|this: &mut Self| this.request_quit()),
+                ..Default::default()
+            }
+            .into(),
+        );
         items
     }
 
@@ -1063,6 +1099,17 @@ mod tests {
         let (mut t, mut rx) = tray_with_level(0.02);
         t.scroll(-1, ksni::Orientation::Vertical);
         assert_eq!(asked_pct(rx.try_recv().expect("a request")), 0);
+    }
+
+    #[test]
+    fn quit_is_offered_whatever_state_the_agent_is_in() {
+        // Unconditional on purpose: the case it exists for is an agent nobody can reach
+        // any other way — unpaired, refused, or started by hand with no unit to stop.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::client::REQUEST_DEPTH);
+        let mut t = tray(Pairing::Unpaired);
+        t.requests = Some(tx);
+        t.request_quit();
+        assert_eq!(rx.try_recv().expect("a request"), Request::Quit);
     }
 
     #[test]

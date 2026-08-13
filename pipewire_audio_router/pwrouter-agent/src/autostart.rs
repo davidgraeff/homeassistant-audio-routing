@@ -185,6 +185,64 @@ pub async fn enable() -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// Is *this* process the unit systemd is running — the same PID it calls the
+/// service's `MainPID`?
+///
+/// The question the tray's Quit has to answer, and it cannot be answered by
+/// `INVOCATION_ID`: a graphical terminal is itself a unit on modern systemd, so a
+/// hand-launched agent inherits an `INVOCATION_ID` of its own and would think it is the
+/// service. Comparing PIDs is exact, and gets the two cases that matter right — a
+/// manually started agent must not stop *another* instance's unit, and the real service
+/// must not simply exit into a `Restart=always` respawn.
+///
+/// `None` whenever the answer is "not us": no session bus, no systemd, the unit not
+/// loaded, or a different PID.
+pub async fn is_the_running_service() -> bool {
+    let Ok(reply) = manager_call("GetUnit", &(UNIT_NAME,)).await else {
+        return false;
+    };
+    let Ok(path) = reply
+        .body()
+        .deserialize::<zbus::zvariant::OwnedObjectPath>()
+    else {
+        return false;
+    };
+    let Ok(conn) = zbus::Connection::session().await else {
+        return false;
+    };
+    let reply = conn
+        .call_method(
+            Some(SYSTEMD),
+            path.as_str(),
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.freedesktop.systemd1.Service", "MainPID"),
+        )
+        .await;
+    let Ok(reply) = reply else { return false };
+    match reply.body().deserialize::<zbus::zvariant::Value>() {
+        Ok(value) => u32::try_from(&value)
+            .map(|pid| pid == std::process::id())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Asks systemd to stop the unit, and lets it do the stopping.
+///
+/// This is what "quit" has to mean for the service instance: the unit is
+/// `Restart=always`, so exiting on our own would have the manager start us again
+/// within seconds — which reads as a menu item that does not work. systemd answers a
+/// stop by sending SIGTERM, so the ordinary shutdown path (restore the host's volume,
+/// unload the receiver) is the one that runs, exactly as it does for `systemctl stop`.
+/// Autostart is untouched, so a login still brings the agent back.
+pub async fn stop() -> anyhow::Result<()> {
+    manager_call("StopUnit", &(UNIT_NAME, "replace"))
+        .await
+        .with_context(|| format!("stopping {UNIT_NAME}"))?;
+    Ok(())
+}
+
 /// Disables the unit and removes the file. Leaves a running agent running.
 pub async fn disable() -> anyhow::Result<()> {
     // Disable before deleting: with the file gone, systemd has nothing to resolve

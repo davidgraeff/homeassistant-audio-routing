@@ -386,7 +386,12 @@ impl State {
             .values()
             .filter(|(out, _)| *out == stream)
             .map(|(_, inp)| *inp)
-            .find(|inp| self.nodes.get(inp).map(|n| n.media_class.as_deref() == Some("Audio/Sink")).unwrap_or(false))
+            .find(|inp| {
+                self.nodes
+                    .get(inp)
+                    .map(|n| n.media_class.as_deref() == Some("Audio/Sink"))
+                    .unwrap_or(false)
+            })
     }
 
     /// Master volume/mute of the target sink, read from whichever lever applies.
@@ -560,7 +565,9 @@ impl State {
             "another router's session '{session}' is also being received on this host; \
              the agent leaves it alone (see receiver-agent.md §7.1)"
         );
-        let _ = self.events.try_send(Event::ForeignSession(session.to_string()));
+        let _ = self
+            .events
+            .try_send(Event::ForeignSession(session.to_string()));
     }
 }
 
@@ -900,10 +907,9 @@ fn on_global(
                 .info({
                     let state = state.clone();
                     move |info| {
-                        let readable_route = info
-                            .params()
-                            .iter()
-                            .any(|p| p.id() == ParamType::Route && p.flags().contains(ParamInfoFlags::READ));
+                        let readable_route = info.params().iter().any(|p| {
+                            p.id() == ParamType::Route && p.flags().contains(ParamInfoFlags::READ)
+                        });
                         if !readable_route {
                             return;
                         }
@@ -912,7 +918,8 @@ fn on_global(
                         // finds nothing and needs nothing — `subscribe_params` delivers
                         // the first value anyway.
                         if let Some(dev) = state.borrow().devices.get(&id) {
-                            dev.proxy.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
+                            dev.proxy
+                                .enum_params(0, Some(ParamType::Route), 0, u32::MAX);
                         }
                     }
                 })
@@ -941,7 +948,11 @@ fn on_global(
                             // ALSA device), and collapsing them made two routes clobber
                             // each other — so which value the agent held depended on
                             // which param arrived last.
-                            match dev.routes.iter_mut().find(|r| r.index == entry.index && r.device == entry.device) {
+                            match dev
+                                .routes
+                                .iter_mut()
+                                .find(|r| r.index == entry.index && r.device == entry.device)
+                            {
                                 Some(existing) => *existing = entry,
                                 None => dev.routes.push(entry),
                             }

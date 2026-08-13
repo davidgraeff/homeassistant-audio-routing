@@ -129,6 +129,12 @@ systemctl --user start pwrouter-agent</code
       volume.
     </p>
     <p class="card-sub hint">
+      To stop it, the tray menu's <strong>Quit</strong> is enough: on a machine where it runs as the
+      systemd service it asks systemd to stop the unit (so it does not immediately come back), and
+      otherwise it just exits. Either way it puts the machine's audio back and unloads its receiver, and
+      autostart is untouched — so it returns at your next login unless you turn that off too.
+    </p>
+    <p class="card-sub hint">
       A <em>user</em> service, not a system one: the helper controls the audio of one logged-in session,
       so it runs as you and uses your PipeWire. Two people sharing a machine each install their own and
       appear as two separate outputs; neither can touch the other's audio.

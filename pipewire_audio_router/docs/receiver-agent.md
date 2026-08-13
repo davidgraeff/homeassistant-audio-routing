@@ -511,12 +511,24 @@ Three deliberate limits:
    goes to the journal at `warn`.
 2. **The menu is a display, plus the things only this machine can answer.** Every
    status row is disabled; the only rows that do anything are volume, mute, Play to,
-   Autostart and "show the notification again". No unpair and no quit: those would be
-   a second, divergent way to manage a `Restart=always` unit, and a control surface
-   competing with the add-on, which is the thing that is supposed to drive this host.
-   Volume and mute are not a competing surface for the same reason §9.4 exists: the
-   level is the *host's own* and neither end owns it (see §8.2).
-3. **Legacy icon names** (`audio-speakers`, `dialog-password`) resolve in both
+   Autostart, "show the notification again" and Quit. Still no **unpair**: that is the
+   add-on's decision to make about a host, and a second place to make it could only
+   disagree with the first. Volume and mute are not a competing surface for the same
+   reason §9.4 exists: the level is the *host's own* and neither end owns it (§8.2).
+3. **Quit exists, and it stops the unit rather than the process.** It was refused at
+   first on the grounds that `Restart=always` would undo it — true for the *service*,
+   and irrelevant to every other way this binary runs: started by hand to try it out,
+   or after its unit was stopped, the tray is the only interface there is and the only
+   way out was finding the PID (which is exactly how it was asked for). So the row
+   exists and does the honest thing in both cases. It asks systemd to stop the unit
+   when [`autostart::is_the_running_service`] says this process *is* the service —
+   comparing systemd's `MainPID` to our own, because `INVOCATION_ID` is inherited by
+   anything launched from a terminal that is itself a unit, and a hand-started agent
+   must not stop another instance. systemd answers with SIGTERM, so the ordinary
+   shutdown path runs; autostart is untouched, so a login brings it back. Anything else
+   exits directly, and a failed stop falls back to exiting (a respawn is at least
+   visible; a click that does nothing is not).
+4. **Legacy icon names** (`audio-speakers`, `dialog-password`) resolve in both
    Breeze and Adwaita (via its `Inherits=AdwaitaLegacy`), whereas the two
    `-symbolic` spellings wanted here are not present in both themes.
 
@@ -751,8 +763,13 @@ A daemon built from this tree plus the real agent, both on the author's desktop:
   the UI was sending it to the wrong endpoint (`pipewire-sink-output.md` §4), so
   `apply_master` had never been asked to do anything on that host. Both ends now send
   it; the write is what to watch on the next deploy.
-- **The tray's volume/mute rows and the wheel gesture** (§8.2) — the state → menu
-  logic has tests, but nothing has yet confirmed a KDE/Xfce/GNOME host actually
-  *delivers* `Scroll` and `SecondaryActivate` to us, and hosts differ on both.
+- **The tray's wheel gesture and middle click** (§8.2) — the state → menu logic has
+  tests, but nothing has yet confirmed a KDE/Xfce/GNOME host actually *delivers*
+  `Scroll` and `SecondaryActivate` to us, and hosts differ on both. The menu rows
+  themselves are proven: the whole layout was read back over `com.canonical.dbusmenu`
+  on a live KDE session, and **Quit** was exercised by calling that interface's `Event`
+  method — the agent logged the request, unloaded its receiver (4 `pwsink-in` nodes → 0)
+  and exited. The *service* branch of Quit (systemd `StopUnit`) is not yet proven live;
+  it needs an installed unit running a build that has the row.
 - **An audible duck of foreign streams** (P3), and **sleep/resume** (§13.4) — both
   need normal day-to-day use rather than a test rig.
