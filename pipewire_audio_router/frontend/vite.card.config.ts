@@ -14,6 +14,9 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 // injected at runtime; an emitted .css file would simply never be fetched.
 export default defineConfig({
   plugins: [svelte({ emitCss: false })],
+  // `public/` holds the admin UI's favicon set; it must not be copied next to
+  // the card, since outDir here is a directory inside the integration.
+  publicDir: false,
   build: {
     lib: {
       entry: 'src/card/card.ts',

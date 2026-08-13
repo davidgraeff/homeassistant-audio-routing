@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 320" width="800" height="320">
+  <title>PipeWire Audio Router</title>
+  <!--
+    Horizontal lockup: icon glyph + wordmark. Carries its own dark surface so it
+    stays legible on both the light and the dark add-on store / brands pages.
+    Master file; render with scripts/render-branding.sh.
+  -->
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#143753"/>
+      <stop offset="1" stop-color="#091d2f"/>
+    </linearGradient>
+    <linearGradient id="source" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb23a"/>
+      <stop offset="1" stop-color="#ff8f00"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="800" height="320" rx="56" fill="url(#surface)"/>
+  <rect x="2" y="2" width="796" height="316" rx="54" fill="none"
+        stroke="#ffffff" stroke-opacity="0.07" stroke-width="4"/>
+
+  <!-- glyph: icon artwork at 0.5 scale, left-aligned -->
+  <g transform="translate(38,32) scale(0.5)">
+    <g transform="translate(-6,0)">
+      <path fill="url(#source)"
+            d="M96 214 h40 l70 -60 a14 14 0 0 1 24 11 v182 a14 14 0 0 1 -24 11 l-70 -60 h-40
+               a18 18 0 0 1 -18 -18 v-48 a18 18 0 0 1 18 -18 z"/>
+      <g fill="none" stroke="#ffffff" stroke-width="21" stroke-linecap="round">
+        <path d="M256 256 C 296 256 308 126 368 126"/>
+        <path d="M256 256 H 368"/>
+        <path d="M256 256 C 296 256 308 386 368 386"/>
+      </g>
+      <g fill="#ffffff">
+        <circle cx="414" cy="126" r="30"/>
+        <circle cx="414" cy="256" r="30"/>
+        <circle cx="414" cy="386" r="30"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="Inter, 'Helvetica Neue', Arial, sans-serif">
+    <text x="291" y="166" fill="#ffffff" font-size="84" font-weight="700"
+          letter-spacing="-2">PipeWire</text>
+    <text x="293" y="217" fill="#ff9800" font-size="47" font-weight="500"
+          letter-spacing="7.3">AUDIO ROUTER</text>
+  </g>
+</svg>

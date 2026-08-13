@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>PipeWire Audio Router</title>
+  <!--
+    One source, many rooms: a speaker/source glyph whose signal fans out to
+    three independent outputs — the routing matrix in a single mark.
+    Palette matches the add-on UI (frontend/src/app.css): HA accent orange on
+    the dark surface, white signal paths.
+    Master file; render with scripts/render-branding.sh (do not hand-edit PNGs).
+  -->
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#143753"/>
+      <stop offset="1" stop-color="#091d2f"/>
+    </linearGradient>
+    <linearGradient id="source" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb23a"/>
+      <stop offset="1" stop-color="#ff8f00"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#surface)"/>
+  <rect x="2" y="2" width="508" height="508" rx="110" fill="none"
+        stroke="#ffffff" stroke-opacity="0.07" stroke-width="4"/>
+
+  <g transform="translate(-6,0)">
+    <!-- source -->
+    <path fill="url(#source)"
+          d="M96 214 h40 l70 -60 a14 14 0 0 1 24 11 v182 a14 14 0 0 1 -24 11 l-70 -60 h-40
+             a18 18 0 0 1 -18 -18 v-48 a18 18 0 0 1 18 -18 z"/>
+    <!-- signal paths -->
+    <g fill="none" stroke="#ffffff" stroke-width="21" stroke-linecap="round">
+      <path d="M256 256 C 296 256 308 126 368 126"/>
+      <path d="M256 256 H 368"/>
+      <path d="M256 256 C 296 256 308 386 368 386"/>
+    </g>
+    <!-- outputs -->
+    <g fill="#ffffff">
+      <circle cx="414" cy="126" r="30"/>
+      <circle cx="414" cy="256" r="30"/>
+      <circle cx="414" cy="386" r="30"/>
+    </g>
+  </g>
+</svg>
