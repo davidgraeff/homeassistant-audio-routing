@@ -14,15 +14,17 @@ PipeWire module loading, RAOP/AP2 output, Sendspin, container packaging,
 announce ducking, and more) live with the add-on in
 [`../pipewire_audio_router/docs/decisions.md`](../pipewire_audio_router/docs/decisions.md).
 
-## Why replace Music Assistant at all
+## Why a separate audio engine
 
-MA's audio engine is pure Python (asyncio + soundfile/ffmpeg
-subprocesses), which on a Raspberry Pi 4 caused audible stutter,
-multi-second stream startup, and noticeable output delay. PipeWire's
-graph is a compiled C daemon with realtime scheduling (rtkit) and mature
-routing tooling — the goal was to keep MA's *idea* (unified sources →
-mixed room outputs → HA entities) while reimplementing the engine on top
-of PipeWire instead of Python audio processing.
+Mixing and re-clocking several streams in Python (asyncio +
+soundfile/ffmpeg subprocesses) on a Raspberry Pi 4 that also runs
+everything else in this house caused audible stutter, multi-second stream
+startup, and noticeable output delay. PipeWire's graph is a compiled C
+daemon with realtime scheduling (rtkit) and mature routing tooling — the
+goal was to keep that *idea* (unified sources → mixed room outputs → HA
+entities) on a graph built for realtime, and to leave the library, queue
+and provider work to Music Assistant, which is written for it
+([music_assistant_compatibility.md](music_assistant_compatibility.md)).
 
 ## No MQTT `media_player` platform — a custom integration is required
 

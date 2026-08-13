@@ -1,8 +1,10 @@
 # Architecture
 
-This project replaces Music Assistant's Python audio engine with a native
-PipeWire graph for whole-home audio routing, controlled by a small Rust
-daemon and exposed to Home Assistant as ordinary `media_player` entities.
+This project moves whole-home audio routing onto a native PipeWire graph,
+controlled by a small Rust daemon and exposed to Home Assistant as ordinary
+`media_player` entities. It sits below a music library such as Music Assistant
+rather than in place of one — see
+[music_assistant_compatibility.md](music_assistant_compatibility.md).
 The reasoning behind *why* it's built this way — the investigations,
 dead ends, and hardware-specific findings — lives in
 [decisions.md](decisions.md). This document describes the system as it

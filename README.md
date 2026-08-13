@@ -7,11 +7,13 @@ phone, your PC or any Bluetooth device, send it to any speakers in the house
 from one dashboard card, and let Home Assistant talk over the top of it —
 ducked, not interrupted.
 
-It replaces Music Assistant's Python audio engine with PipeWire's own realtime
-graph, driven by a small Rust daemon: the same speakers, the same
-`media_player` entities, but the audio path is native. That is the whole point
-— on a Raspberry Pi 4 the Python engine stuttered audibly and took seconds to
-start a stream, and moving the path onto PipeWire is what fixed both.
+Under the hood the audio path is PipeWire's own realtime graph, driven by a
+small Rust daemon. Mixing and re-clocking several streams for several rooms is
+a realtime-scheduling problem: on a Raspberry Pi 4 a Python engine doing that
+job stuttered audibly and took seconds to start a stream, while PipeWire's
+graph is a C daemon built for precisely it. This sits *under* a music library
+rather than in place of one — see
+[How this fits with Music Assistant](#how-this-fits-with-music-assistant).
 
 ## Routing is one card
 
@@ -39,6 +41,36 @@ in the kitchen and the living room" is two taps and stays in sync.
   *offered*, including the neighbours' AirPlay speakers; nothing is routable,
   gets an entity, or is ever sent audio until you add it — each with a
   test-tone button so you can tell which speaker is which.
+
+## How this fits with Music Assistant
+
+[Music Assistant](https://music-assistant.io/) answers *what* to play. This
+answers *where* it goes, and when it has to be exact.
+
+MA is a library and a player: NAS files, playlists, web radio, provider
+accounts, queues, artwork. Its grouping works within one protocol, and it has
+no notion of routing a chosen input to a chosen set of outputs — a player
+doesn't need one. This project is the layer underneath: transports (AirPlay 2,
+ESPHome speakers, PC agents) on one clock, groups that span protocols, a matrix
+from any input to any set of outputs, and ducking as an operation on the audio
+graph rather than on a queue.
+
+So they compose. Point MA at this add-on's AirPlay input and it becomes one
+more AirPlay player in MA's list: MA keeps the library, the queue and the
+metadata, and the audio it sends is routed, grouped and ducked here like
+anything else that streams in.
+
+| | Music Assistant | this project |
+|---|---|---|
+| Knows about | libraries, playlists, web radio, providers, queues, artwork | PipeWire nodes, AirPlay/RTP/sendspin transports, clocks |
+| Groups | within one protocol | across protocols |
+| Routing | a queue to its player | any input to any set of outputs, live |
+| Latency | not a design driver | the design driver |
+
+Deliberately **not** built here: playlists, queues, gapless, library browsing.
+That is what MA is for, and two half-players would serve nobody. Setup and
+anything that needs troubleshooting:
+[docs/music_assistant_compatibility.md](docs/music_assistant_compatibility.md).
 
 ## Quick install
 
@@ -92,8 +124,7 @@ every measured gotcha in
 
 ## Status
 
-**Functionally complete for daily use; not yet cut over from Music
-Assistant.**
+**In daily use.**
 
 Last tested against **Home Assistant 2026.8.1**.
 The integration declares a **minimum of 2026.7.0** (`hacs.json`).
@@ -106,6 +137,9 @@ The integration declares a **minimum of 2026.7.0** (`hacs.json`).
   investigations with concrete findings (RAOP quirks, PipeWire's actual
   volume/module-loading capabilities, ESP32 hardware constraints, and more),
   not preferences.
+- [**docs/music_assistant_compatibility.md**](docs/music_assistant_compatibility.md)
+  — pointing Music Assistant at this add-on, who owns what, and what to do when
+  it does not connect.
 - [**docs/api-reference.md**](docs/api-reference.md) — the bridge daemon's
   REST/WebSocket API.
 - [**docs/addon_maintenance.md**](docs/addon_maintenance.md) — keeping up with
