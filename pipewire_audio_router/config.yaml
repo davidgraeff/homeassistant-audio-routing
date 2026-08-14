@@ -1,5 +1,5 @@
 name: PipeWire Audio Router
-version: "0.3.20260728212654"
+version: "0.4.20260814092836"
 slug: pipewire_audio_router
 description: >-
   PipeWire-based whole-home audio router (AirPlay-2 + sendspin outputs) with

@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-daemon"
-version = "0.3.20260728212654"
+version = "0.4.20260814092836"
 dependencies = [
  "airplay-client",
  "airplay-core",
