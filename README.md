@@ -261,3 +261,11 @@ docs/                                 architecture, decisions, API reference, br
 tests/                                verification scripts
 scripts/                              dev tooling (e.g. arm64 cross-build, branding render)
 ```
+
+## Related projects
+
+- [**trudenboy/sendspin-bt-bridge**](https://github.com/trudenboy/sendspin-bt-bridge)
+  — the mirror image of this repo's Bluetooth bridges: instead of making a
+  Bluetooth device a *source* for the house, it turns ordinary Bluetooth
+  *speakers* into sendspin players (Python, runs as an HA add-on, Docker or on a
+  Pi). Useful if the speaker you want to reach only speaks A2DP.
