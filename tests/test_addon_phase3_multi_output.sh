@@ -84,8 +84,10 @@ pw-cli create-node adapter \"{ factory.name=support.null-audio-sink node.name=$N
 " || fail "could not create the virtual sink $NAME"
   # Discovery is only an offer since the adoption gate (outputs_store.rs) — an
   # unadded device is not routable, so linking below would be refused.
-  ADOPT=$(curl -s -X POST "$BASE/api/outputs/$NAME/adopt")
-  echo "$ADOPT" | grep -q '"ok":true' || fail "could not add output $NAME: $ADOPT"
+  # 200-or-nothing: a write's verdict is its status, there is no `ok` field in the
+  # body (bridge-daemon/src/api/error/mod.rs; phase1_e2e explains the switch).
+  ADOPT=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/outputs/$NAME/adopt")
+  [ "$(tail -1 <<<"$ADOPT")" = "200" ] || fail "could not add output $NAME: $ADOPT"
 done
 
 echo "--- creating the AirPlay source via the API ---"
@@ -111,9 +113,9 @@ echo "OK: all three endpoints present"
 
 echo "--- fan-out: one source linked to BOTH outputs ---"
 for OUT in "$OUT_A" "$OUT_B"; do
-  LINK=$(curl -s -X POST "$BASE/api/routing/link" -H 'Content-Type: application/json' \
+  LINK=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/routing/link" -H 'Content-Type: application/json' \
     -d "{\"source\":\"$SOURCE_NAME\",\"output\":\"$OUT\"}")
-  echo "$LINK" | grep -q '"ok":true' || fail "link to $OUT did not report ok:true: $LINK"
+  [ "$(tail -1 <<<"$LINK")" = "200" ] || fail "link to $OUT was refused: $LINK"
 done
 # The point of the test: the *same* source port feeding two sinks at once. Assert
 # it in the real graph, not just in the API's answer.

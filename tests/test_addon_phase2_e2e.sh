@@ -93,8 +93,10 @@ echo "--- standing in for a sendspin device, then adding it ---"
 docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" bash -c "
 pw-cli create-node adapter \"{ factory.name=support.null-audio-sink node.name=$OUTPUT_NAME media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }\" >/dev/null
 " || fail "could not create the virtual sendspin sink"
-ADOPT=$(curl -s -X POST "$BASE/api/outputs/$OUTPUT_NAME/adopt")
-echo "$ADOPT" | grep -q '"ok":true' || fail "could not add output $OUTPUT_NAME: $ADOPT"
+# 200-or-nothing: a write's verdict is its status, there is no `ok` field in the
+# body (bridge-daemon/src/api/error/mod.rs; phase1_e2e explains the switch).
+ADOPT=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/outputs/$OUTPUT_NAME/adopt")
+[ "$(tail -1 <<<"$ADOPT")" = "200" ] || fail "could not add output $OUTPUT_NAME: $ADOPT"
 
 echo "--- creating the AirPlay source via the API ---"
 CODE=$(curl -s -o /tmp/phase2_src.json -w '%{http_code}' -X POST "$BASE/api/sources" \
@@ -119,9 +121,9 @@ done
 echo "OK: sendspin sink and AirPlay source both present"
 
 echo "--- routing the source to the output via POST /api/routing/link ---"
-LINK=$(curl -s -X POST "$BASE/api/routing/link" -H 'Content-Type: application/json' \
+LINK=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/routing/link" -H 'Content-Type: application/json' \
   -d "{\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\"}")
-echo "$LINK" | grep -q '"ok":true' || fail "link request did not report ok:true: $LINK"
+[ "$(tail -1 <<<"$LINK")" = "200" ] || fail "link request was refused: $LINK"
 REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
 echo "$REAL_LINKS" | grep -q "$OUTPUT_NAME" || { echo "$REAL_LINKS"; fail "no real pw-link into $OUTPUT_NAME after linking"; }
 echo "OK: real per-channel links in place before any audio is sent"

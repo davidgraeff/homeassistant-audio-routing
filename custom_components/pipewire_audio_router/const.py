@@ -19,7 +19,7 @@ DEFAULT_RTP_LATENCY_MSEC = 200
 
 # Poll interval for the daemon state that has no push channel (RTP source,
 # per-device volumes, output metadata, named groups). Routing is NOT polled:
-# it's pushed live over /api/routing/ws (see PipewireRouterCoordinator).
+# it's pushed live over /api/events (see PipewireRouterCoordinator).
 UPDATE_INTERVAL_SECONDS = 5
 
 # Delay before the routing WebSocket task reconnects after the socket drops.

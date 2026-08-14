@@ -102,8 +102,16 @@ echo "--- an unadopted output is offered, not routable ---"
 curl -s "$BASE/api/routing" | grep -q '"outputs":\[\]' || fail "expected no outputs in the matrix before adding one"
 
 echo "--- adopting an output puts it in the listing and the matrix ---"
-ADOPT=$(curl -s -X POST "$BASE/api/outputs/ap2-dev-test-placeholder/adopt")
-echo "$ADOPT" | grep -q '"ok":true' || fail "adopt did not report ok:true: $ADOPT"
+# The verdict on a write is the HTTP STATUS, not a field in the body: success is
+# `200 {message}`, a refusal is its own 4xx/5xx with `{kind, message}` — see
+# bridge-daemon/src/api/error/mod.rs, which says why there is no `ok` flag any
+# more ("the status already said so"). These assertions used to grep for
+# `"ok":true`, which silently became unprovable when that field went: the daemon
+# answered 200 and the test called it a failure. Same `\n%{http_code}` idiom the
+# source assertions above and hot_reload_e2e use, so the message still shows the
+# body — `$ADOPT` is body-then-status.
+ADOPT=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/outputs/ap2-dev-test-placeholder/adopt")
+[ "$(tail -1 <<<"$ADOPT")" = "200" ] || fail "adopt was refused: $ADOPT"
 OUTS=$(curl -s "$BASE/api/outputs")
 echo "$OUTS" | grep -q '"state":"adopted"' || fail "output not reported as adopted: $OUTS"
 MATRIX=$(curl -s "$BASE/api/routing")

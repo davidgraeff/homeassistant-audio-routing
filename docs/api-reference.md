@@ -900,7 +900,7 @@ Created natively via `Core::create_object` on the PipeWire thread
 (`pw/thread.rs`) — the port names are resolved to object ids against the
 live registry, then a create command is handed to that thread. Idempotent:
 a link already present between the same ports is reported as success
-(`ok: true`). Failure modes: either port name not found in the registry
+(a **200** with its `message`). Failure modes: either port name not found in the registry
 → 400; the PipeWire thread unreachable/dropped the request → 500.
 
 ### `GET /api/routing` / `POST /api/routing/link` / `POST /api/routing/unlink`
@@ -964,7 +964,7 @@ present, pairs every non-monitor output port on the source with the matching
 channel-suffix input on the output (`output_FL` ~ `send_FL` ~ `playback_FL`
 all match as `FL`) and creates those links natively; the intent is reapplied
 automatically if an endpoint (re)appears later. `unlink` removes the intent
-and any live links and returns `ok: true` even if there were none.
+and any live links and still answers **200** even if there were none.
 
 ### `DELETE /api/routing/entity/{node_name}`
 Forget an offline endpoint entirely — drops its saved routing intent so it

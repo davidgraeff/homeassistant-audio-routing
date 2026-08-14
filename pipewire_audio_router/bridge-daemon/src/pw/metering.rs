@@ -1,9 +1,11 @@
 //! On-demand peak-level metering for routing sources.
 //!
 //! A tiny PipeWire capture per metered node computes a peak (max |sample|) from
-//! the audio it produces. Taps exist **only while a web client is watching the
-//! routing matrix** (a `/api/routing/ws` connection is open) — when the last
-//! client disconnects, all taps are torn down, so idle installs pay nothing.
+//! the audio it produces. Taps exist **only while a client is subscribed to the
+//! `meters` topic** on `/api/events` (see `events/mod.rs`, which owns that
+//! accounting) — when the last subscriber goes away, all taps are torn down, so
+//! idle installs pay nothing. Note the unit is the *subscription*, not the
+//! socket: a page that holds the socket open for other topics pays nothing here.
 //! The matrix snapshot carries each source's current peak so the UI can draw a
 //! level meter (and you can see, e.g., whether AirPlay/RTP audio is actually
 //! arriving).

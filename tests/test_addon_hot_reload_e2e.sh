@@ -130,8 +130,10 @@ echo "--- adding an output is remembered too (adoption store) ---"
 # No device is behind this name — that is the point: an adopted output stays
 # listed while absent (grayed in the UI) so its routing survives the speaker
 # being off. Same RFC 5737 spirit as the placeholder IP this test used to use.
-ADOPT=$(curl -s -X POST "$BASE/api/outputs/ap2-dev-test-placeholder/adopt")
-echo "$ADOPT" | grep -q '"ok":true' || fail "adopt did not report ok:true: $ADOPT"
+# 200-or-nothing: a write's verdict is its status, there is no `ok` field in the
+# body (bridge-daemon/src/api/error/mod.rs; phase1_e2e explains the switch).
+ADOPT=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/outputs/ap2-dev-test-placeholder/adopt")
+[ "$(tail -1 <<<"$ADOPT")" = "200" ] || fail "adopt was refused: $ADOPT"
 OUTS=$(curl -s "$BASE/api/outputs")
 echo "$OUTS" | grep -q 'ap2-dev-test-placeholder' || fail "adopted output missing from /api/outputs: $OUTS"
 echo "$OUTS" | grep -q '"present":false' || fail "an output with no device behind it should not be present: $OUTS"

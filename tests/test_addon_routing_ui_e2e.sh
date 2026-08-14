@@ -12,8 +12,9 @@
 #    pw-link connections (confirmed via `pw-link -l`, not just the JSON
 #    response) and the matrix reflects it.
 # 5. POST /api/routing/unlink actually removes them.
-# 6. The /api/routing/ws WebSocket pushes a live snapshot (initial, then
-#    another one) the moment a real link change happens in PipeWire —
+# 6. The /api/events WebSocket, subscribed to the `matrix` topic, pushes a
+#    live snapshot (the subscribe answers with the current state, then
+#    another arrives) the moment a real link change happens in PipeWire —
 #    driven by pw_thread.rs's own registry listener, not polled.
 #
 # Needs a WebSocket client; the host's system python3 is broken in this
@@ -65,8 +66,10 @@ pw-cli create-node adapter \"{ factory.name=support.null-audio-sink node.name=se
   # Being in the graph is not enough: since the adoption gate (outputs_store.rs)
   # the matrix lists only *adopted* outputs, so a discovered-but-unadded device
   # is deliberately absent. Adding is what a user does on the Outputs page.
-  ADOPT=$(curl -s -X POST "http://localhost:$HOST_PORT/api/outputs/sendspin-out-$NAME/adopt")
-  echo "$ADOPT" | grep -q '"ok":true' || { echo "FAIL: could not add output sendspin-out-$NAME: $ADOPT"; exit 1; }
+  # 200-or-nothing: a write's verdict is its status, there is no `ok` field in the
+  # body (bridge-daemon/src/api/error/mod.rs; phase1_e2e explains the switch).
+  ADOPT=$(curl -s -w '\n%{http_code}' -X POST "http://localhost:$HOST_PORT/api/outputs/sendspin-out-$NAME/adopt")
+  [ "$(tail -1 <<<"$ADOPT")" = "200" ] || { echo "FAIL: could not add output sendspin-out-$NAME: $ADOPT"; exit 1; }
 done
 
 echo "--- waiting for both outputs ---"
@@ -115,9 +118,9 @@ fi
 echo "OK: source '$SOURCE_NAME' present, output '$OUTPUT_NAME' present"
 
 echo "--- POST /api/routing/link ---"
-LINK_RESPONSE=$(curl -s -X POST "http://localhost:$HOST_PORT/api/routing/link" -H 'Content-Type: application/json' \
+LINK_RESPONSE=$(curl -s -w '\n%{http_code}' -X POST "http://localhost:$HOST_PORT/api/routing/link" -H 'Content-Type: application/json' \
   -d "{\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\"}")
-echo "$LINK_RESPONSE" | grep -q '"ok":true' || { echo "FAIL: link request did not report ok:true: $LINK_RESPONSE"; exit 1; }
+[ "$(tail -1 <<<"$LINK_RESPONSE")" = "200" ] || { echo "FAIL: link request was refused: $LINK_RESPONSE"; exit 1; }
 sleep 0.5
 REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
 echo "$REAL_LINKS" | grep -q "test-music-src:capture_FL" || { echo "FAIL: real pw-link state missing the FL link after /api/routing/link"; echo "$REAL_LINKS"; exit 1; }
@@ -126,9 +129,9 @@ echo "$MATRIX" | grep -q "\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\
 echo "OK: link created and reflected both in real PipeWire state and the matrix"
 
 echo "--- POST /api/routing/unlink ---"
-UNLINK_RESPONSE=$(curl -s -X POST "http://localhost:$HOST_PORT/api/routing/unlink" -H 'Content-Type: application/json' \
+UNLINK_RESPONSE=$(curl -s -w '\n%{http_code}' -X POST "http://localhost:$HOST_PORT/api/routing/unlink" -H 'Content-Type: application/json' \
   -d "{\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\"}")
-echo "$UNLINK_RESPONSE" | grep -q '"ok":true' || { echo "FAIL: unlink request did not report ok:true: $UNLINK_RESPONSE"; exit 1; }
+[ "$(tail -1 <<<"$UNLINK_RESPONSE")" = "200" ] || { echo "FAIL: unlink request was refused: $UNLINK_RESPONSE"; exit 1; }
 sleep 0.5
 REAL_LINKS=$(docker exec -e XDG_RUNTIME_DIR=/run/pipewire "$CONTAINER_NAME" pw-link -l)
 echo "$REAL_LINKS" | grep -q "test-music-src:capture_FL" && { echo "FAIL: real pw-link state still shows the FL link after /api/routing/unlink"; echo "$REAL_LINKS"; exit 1; }
@@ -137,24 +140,37 @@ echo "$MATRIX" | grep -q "\"source\":\"$SOURCE_NAME\",\"output\":\"$OUTPUT_NAME\
 echo "OK: unlink removed the real PipeWire link and the matrix no longer shows it"
 
 echo "--- WebSocket: initial snapshot + live push on a real link change ---"
+# "|| true" on the assignment below, because of set -e: a failing assertion inside
+# the python exits the container non-zero, which makes the assignment fail, which
+# killed this script right there — before the echo could print the traceback saying
+# what the socket actually pushed. The grep two lines further down is the
+# assertion; the assignment only has to survive to reach it. (No backticks in
+# these comments: everything up to the closing quote is inside a double-quoted
+# string, where a backtick would start a command substitution.)
 WS_LOG=$(docker run --rm --network host python:3.13-slim bash -c "
 pip install --quiet --no-cache-dir websockets 2>&1 >/dev/null
 python3 - << PYEOF
 import asyncio, json, urllib.request
 import websockets
 
-# The socket multiplexes several frame kinds (routing.rs Frame: matrix, outputs,
-# discovered, agents, now_playing, meters), internally tagged. Only the matrix
-# frame carries links — reading 'links' off an outputs/meters frame would
-# KeyError, so every read below skips what it isn't looking for.
+# One socket for every push feed (events/mod.rs), internally tagged by 'type':
+# matrix, outputs, discovered, agents, now_playing, meters, align, … plus the
+# 'subscribed' acknowledgement. Only the matrix frame carries links — reading
+# 'links' off any other would KeyError, so every read below skips what it isn't
+# looking for.
 async def matrix(ws, timeout=10):
     while True:
         frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
-        if frame.get('type', 'matrix') == 'matrix':
+        if frame.get('type') == 'matrix':
             return frame
 
 async def main():
-    async with websockets.connect('ws://localhost:$HOST_PORT/api/routing/ws') as ws:
+    # Topics are SUBSCRIBED, not in the URL: this replaced the four status sockets
+    # (/api/routing/ws among them), because a browser gives one host six HTTP/1.1
+    # connections and the pages held four of them open. Subscribing sends that
+    # topic's current state at once, which is what the old connect-snapshot became.
+    async with websockets.connect('ws://localhost:$HOST_PORT/api/events') as ws:
+        await ws.send(json.dumps({'op': 'subscribe', 'topics': ['matrix']}))
         initial = await matrix(ws)
         assert initial['links'] == [], f'expected no links in initial snapshot, got {initial[\"links\"]}'
         req = urllib.request.Request(
@@ -179,8 +195,8 @@ async def main():
 
 asyncio.run(main())
 PYEOF
-" 2>&1)
-echo "$WS_LOG" | tail -5
+" 2>&1) || true
+echo "$WS_LOG" | tail -20
 echo "$WS_LOG" | grep -q "WS_OK" || { echo "FAIL: WebSocket did not push a live snapshot reflecting the real link change"; exit 1; }
 echo "OK: WebSocket pushed a live snapshot driven by the real PipeWire registry change"
 
