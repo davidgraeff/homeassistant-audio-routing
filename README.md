@@ -147,14 +147,33 @@ original-ESP32 board (not S2/S3/C3/C6 — that README explains why), or use
 [`firmware/pi-bridge/`](firmware/pi-bridge/README.md) on a Raspberry Pi Zero 2 W
 for higher-quality codecs.
 
-### 4. YouTube Music's Cast button — optional
+### 4. A Linux PC as an output — optional
+
+Turns any Linux machine running PipeWire — your desk PC, a media box, a Pi in
+the workshop — into an output the router can stream to. Its master volume and
+mute become Home Assistant's, and its *own* audio (a browser, a game) dips while
+an announcement plays. That takes a small helper [`pwrouter-agent`](pipewire_audio_router/pwrouter-agent/README.md).
+
+<a href="docs/images/pipewire_agent.webp"><img src="docs/images/pipewire_agent.webp" width="200" alt="Output music to any Linux PC running the agent"></a>
+
+Get the binary for that machine's architecture (`uname -m`) either **from the
+add-on** — *Outputs* → **Setup Linux/PipeWire host** or from this repository's
+[**Releases**](https://github.com/davidgraeff/homeassistant-audio-routing/releases)
+page. Then, on that machine:
+
+```sh
+chmod +x pwrouter-agent-*
+# copies it to ~/.local/bin, writes the systemd user unit
+./pwrouter-agent-* autostart enable    
+systemctl --user start pwrouter-agent
+```
+
+### 5. YouTube Music's Cast button — optional
 
 Puts the house in the Cast menu of the YouTube Music app. It is a second add-on
 in the same repository, so it is already in your store from step 1 — install it,
 start it, open its panel, and it walks you through the two things it needs: one
-button to create its audio route on the router, and an upload for the cookies
-that let it play as your own account (the page explains how to export those with
-yt-dlp).
+button to create its audio route on the router, and to setup your account.
 
 It plays from **your signed-in account** and leans on unofficial protocols and
 on `yt-dlp` keeping pace with YouTube, so treat it as the least stable thing
@@ -171,7 +190,7 @@ every measured gotcha in
 **In daily use.**
 
 Last tested against **Home Assistant 2026.8.1**.
-The integration declares a **minimum of 2026.7.0** (`hacs.json`).
+Requires a **minimum of 2026.7.0** (`hacs.json`).
 
 ## Documentation
 
@@ -199,7 +218,11 @@ The integration declares a **minimum of 2026.7.0** (`hacs.json`).
   (rustfmt/clippy/tests), the web UI (svelte-check/build), the HA integration
   (pytest), and the add-on end-to-end scripts — runs in CI on every push to
   `main` and every PR
-  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). A `v*` tag also
+  publishes the add-on images to GHCR
+  ([`build-addon.yml`](.github/workflows/build-addon.yml)) and a GitHub release
+  carrying the receiver-agent binaries for x86-64 and aarch64
+  ([`release.yml`](.github/workflows/release.yml)).
 
 ## How it works
 
