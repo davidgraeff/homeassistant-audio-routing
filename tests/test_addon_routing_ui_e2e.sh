@@ -39,8 +39,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "--- building add-on image ---"
-docker build -t "$IMAGE" "$ADDON_DIR"
+# SKIP_IMAGE_BUILD: CI builds the image once (buildx, with its layer cache and
+# the cargo mounts restored) and passes it in via IMAGE=; rebuilding it here on
+# the plain docker driver would miss that cache and recompile the daemon. Unset
+# — the normal local case — means build it.
+if [ -n "${SKIP_IMAGE_BUILD:-}" ]; then
+  docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || { echo "FAIL: SKIP_IMAGE_BUILD is set but image '$IMAGE' is not loaded"; exit 1; }
+  echo "--- using the prebuilt image $IMAGE ---"
+else
+  echo "--- building add-on image ---"
+  docker build -t "$IMAGE" "$ADDON_DIR"
+fi
 
 # No options.json seeding — two virtual test sinks are created below once the
 # daemon is up.

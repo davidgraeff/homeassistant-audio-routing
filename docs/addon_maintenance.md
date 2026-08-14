@@ -97,6 +97,24 @@ scripts/deploy-dev.sh integration              # rsync + restart HA core (second
 scripts/deploy-dev.sh addon                    # build, push to GHCR, force a pull
 ```
 
+Three knobs on the add-on image build, all used by
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) and worth knowing locally:
+
+- **`--target runtime`** builds everything except the two downloadable
+  `pwrouter-agent` binaries. Those are a second and third Rust cross-compile that
+  nothing in the e2e suite downloads, so the CI job skips them; a build with no
+  `--target` is still the complete add-on.
+- **`SKIP_IMAGE_BUILD=1`** makes each `tests/test_addon_*.sh` use the image in
+  `$IMAGE` as it finds it instead of running `docker build` first — for driving the
+  suite against an image you just built by hand, and how CI builds once for five
+  tests.
+- **`scripts/bump-base-images.sh`** refreshes the Dockerfile's digest pins. The
+  bases are pinned because a floating tag invalidates every layer under it:
+  `rust:1-slim-trixie` was republished between two CI runs and the daemon
+  recompiled from scratch for 7½ minutes on a warm cache. Never pass `--no-cache`
+  to a build you want to be fast, either — it *wipes* the `type=cache` mounts, so
+  the next build recompiles every dependency too.
+
 Things that need the real instance rather than a test:
 
 - **Voice ducking** — `tests/voice_duck_dev.sh` drives both halves without

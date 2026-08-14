@@ -158,11 +158,88 @@ jobs:
         # Replaces /usr/share/sounds/speech-dispatcher/pipe.wav (not present on
         # CI runners) — the announce tests loop this as the "music" bed.
         run: ffmpeg -y -loglevel error -f lavfi -i "sine=frequency=440:duration=2" -ar 44100 -ac 2 "$RUNNER_TEMP/music.wav"
+
+      # ---- why this job is not a plain `docker build` any more --------------
+      # It used to be, and the build was 8m01s of an 8m34s job — cold every time,
+      # because a runner is thrown away after the run and the local daemon's cache
+      # goes with it. Three things fix that, and they are independent:
+      #
+      #   1. `target: runtime` skips the `agent` stage, which cross-compiles
+      #      pwrouter-agent for BOTH arches (273 s, competing with the daemon's own
+      #      compile for the runner's cores) and produces two binaries no test here
+      #      ever downloads. See the Dockerfile's runtime stage.
+      #   2. `type=gha` layer cache, so an unchanged tree does not rebuild at all.
+      #      Caches written on main are readable from PR branches, which is what
+      #      makes this work for pull requests; the registry `:buildcache` tag is
+      #      deliberately left to build-addon.yml and deploy-dev.sh.
+      #   3. the cargo cache MOUNTS, restored below. BuildKit never exports a
+      #      `--mount=type=cache` into a layer/registry cache, so on a fresh builder
+      #      `target/` starts empty and *any* source change means recompiling every
+      #      dependency — which is why a layer-cache miss cost 7½ minutes rather
+      #      than one. This is the same thing that makes local rebuilds fast.
+      - uses: docker/setup-buildx-action@v3
+        id: buildx
+
+      # Keyed on the lockfile, NOT the commit: what makes a cold build expensive is
+      # compiling dependencies, and that set changes with Cargo.lock. An exact hit
+      # also means actions/cache saves nothing at the end of the job (no multi-GB
+      # upload per push), and the restore-keys still hand a stale-but-useful target/
+      # to the first build after a dependency bump. The GHA cache is 10 GB per repo
+      # and shared with the layer cache above, so churn here is not free.
+      - name: Restore the cargo cache mounts
+        uses: actions/cache@v4
+        id: cargo-mounts
+        with:
+          path: .buildkit-cache
+          key: e2e-cargo-mounts-${{ hashFiles('pipewire_audio_router/bridge-daemon/Cargo.lock') }}
+          restore-keys: |
+            e2e-cargo-mounts-
+      # Injects those directories into the builder's cache mounts before the build
+      # and extracts them again afterwards (its own post-step). The mounts are read
+      # out of the Dockerfile, so adding one there needs no change here.
+      #
+      # NEVER add `--no-cache`/`no-cache: true` to the build below: it does not just
+      # ignore the layer cache, it WIPES the cache mounts (verified locally — a
+      # marker file written into an id-addressed mount is gone after one --no-cache
+      # build, and stays gone for builds that do not pass the flag). That would
+      # silently turn all of this back into a cold compile.
+      - name: Inject them into the builder
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-dir: .buildkit-cache
+          dockerfile: pipewire_audio_router/Dockerfile
+          skip-extraction: ${{ steps.cargo-mounts.outputs.cache-hit }}
+      # A cache that quietly restores nothing looks exactly like a slow build, so
+      # say what came back. Empty here + a 7-minute compile below = the mount ids
+      # or the key stopped matching.
+      - name: What the cargo caches were worth
+        run: |
+          echo "cache hit: ${{ steps.cargo-mounts.outputs.cache-hit || 'false' }}"
+          du -sh .buildkit-cache/* 2>/dev/null || echo "(nothing restored — expect a cold compile)"
+
       - name: Build the add-on image
-        run: docker build -t pipewire_audio_router:dev pipewire_audio_router
+        uses: docker/build-push-action@v6
+        with:
+          context: pipewire_audio_router
+          # Everything except the two downloadable agent binaries (see above).
+          target: runtime
+          # Into the local daemon, because the tests `docker run` this tag.
+          load: true
+          tags: pipewire_audio_router:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # No image is published from here, and the local exporter would only
+          # write an attestation blob nobody reads.
+          provenance: false
+
       - name: Run the CI-feasible e2e suite
         env:
           IMAGE: pipewire_audio_router:dev
+          # The image is already built and loaded; without this each script would
+          # rebuild it on the plain docker driver, which shares none of the caches
+          # above and would compile the daemon a second time.
+          SKIP_IMAGE_BUILD: "1"
           MUSIC_WAV_HOST_PATH: ${{ runner.temp }}/music.wav
           WAV_HOST_PATH: ${{ runner.temp }}/music.wav
         # The whole add-on suite runs. phase2 / phase3 self-skip here: they need

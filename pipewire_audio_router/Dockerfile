@@ -7,12 +7,20 @@
 # spikes 1-4 — see ../PLAN.md Section 5.1 and ../spikes/ for why this exact
 # base, why these exact PipeWire/WirePlumber versions, and why no ALSA/Bluez
 # hardware monitors are enabled.
+#
+# EVERY BASE IS PINNED BY DIGEST, and that is a caching decision as much as a
+# reproducibility one: a floating tag silently invalidates every layer beneath
+# it. `rust:1-slim-trixie` was republished between two CI runs a day apart
+# (3b2879047d42 → 8e8cf8f7fd54) and the daemon recompiled from scratch for 7½
+# minutes on a *warm* registry cache, because the chain's root had moved. The
+# tag is kept next to the digest so it stays readable; refresh them on purpose
+# with `scripts/bump-base-images.sh` (which also says what changed).
 
 # Web UI (frontend/, Vite + Svelte). Built to static assets the daemon serves;
 # no Node in the runtime image. Pinned to the builder's native arch
 # (--platform=$BUILDPLATFORM): the output is just static JS/CSS, so there's no
 # reason to run npm under QEMU emulation for the target arch.
-FROM --platform=$BUILDPLATFORM node:22-slim AS frontend
+FROM --platform=$BUILDPLATFORM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS frontend
 WORKDIR /ui
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
@@ -54,7 +62,7 @@ RUN npm run build
 # Build-time only, like libasound2-dev. NOTE: `scripts/build-arm64.sh` cannot catch a
 # missing build dep here — it builds container/Dockerfile, which has no Rust build
 # stage at all; only `scripts/deploy-dev.sh addon` (or CI) exercises this stage.
-FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
+FROM --platform=$BUILDPLATFORM rust:1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS build
 ARG TARGETARCH
 ARG BUILDARCH
 # Resolve arch-specific names, install deps, and write /build-env.sh with the
@@ -168,7 +176,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # systems. Bookworm also ships PipeWire 0.3.65 headers, new enough for
 # pipewire-rs 0.10. Building on trixie instead would demand its much newer glibc
 # from every downloader for no benefit.
-FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS agent
+FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS agent
 # Both targets' libs side by side. Only the *foreign* architecture is added:
 # `dpkg --add-architecture` for the native one makes apt resolve unqualified
 # package names against the wrong architecture, which fails as
@@ -258,7 +266,15 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 FROM scratch AS agent-dist
 COPY --from=agent /agent-out/ /
 
-FROM ubuntu:26.04
+# The add-on, all but the agent downloads — and a stage name, because that split
+# is the difference between the e2e suite waiting for one Rust build or three.
+# The `agent` stage cross-compiles pwrouter-agent TWICE (x86_64 + aarch64) and
+# nothing in the end-to-end tests downloads either binary, yet a plain build of
+# this image needs them for the COPY below, so they were built on every CI run
+# and competed with the daemon's own compile for the runner's few cores
+# (measured: 273 s of agent alongside 451 s of daemon). `--target runtime` is
+# the whole image minus that, which is what .github/workflows/ci.yml builds.
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS runtime
 # systemd-standalone-sysusers: `pipewire`'s Depends is `systemd |
 # systemd-standalone-sysusers` (either satisfies its need to create system
 # users at install time) — apt defaults to the first alternative, the full
@@ -378,9 +394,6 @@ RUN set -eux; \
 COPY --from=build /bridge-daemon /usr/local/bin/bridge-daemon
 # Built web UI served by the daemon (default --static-dir /app/www).
 COPY --from=frontend /ui/dist /app/www
-# Downloadable receiver-agent binaries, served by the daemon's static file handler
-# (frontend/src/components/ReceiverAgentDocs.svelte links to them).
-COPY --from=agent /agent-out/ /app/www/agent/
 COPY rootfs/run.sh /run.sh
 # WirePlumber drop-in disabling unused hardware monitors (camera, bluetooth)
 # and the snap/logind integrations — silences their harmless "missing host
@@ -403,3 +416,13 @@ ARG ADDON_VERSION=dev
 ENV ADDON_VERSION=${ADDON_VERSION}
 
 ENTRYPOINT ["/run.sh"]
+
+# The shipped image = `runtime` plus the downloadable receiver-agent binaries,
+# served by the daemon's static file handler
+# (frontend/src/components/outputs/ReceiverAgentDocs.svelte links to them). This
+# is the LAST stage, so every build that names no target — Supervisor,
+# scripts/deploy-dev.sh, build-addon.yml — still gets the complete add-on;
+# only the e2e job asks for `runtime` and skips the two agent cross-compiles.
+# ENV/ENTRYPOINT are inherited from the base stage, so nothing is repeated here.
+FROM runtime
+COPY --from=agent /agent-out/ /app/www/agent/
