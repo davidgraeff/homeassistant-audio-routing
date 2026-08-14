@@ -248,6 +248,16 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
       esac; \
     done
 
+# Just the two agent binaries, nothing else — the stage
+# .github/workflows/release.yml targets to get them OUT of the build and onto a
+# GitHub release (`--target agent-dist --output type=local`). From `scratch`
+# because a local export writes the whole stage filesystem: exporting `agent`
+# itself would mean unpacking the ~1.5 GB Rust toolchain image to disk for two
+# files. Nothing in the add-on image depends on this stage, so a plain image
+# build never runs it.
+FROM scratch AS agent-dist
+COPY --from=agent /agent-out/ /
+
 FROM ubuntu:26.04
 # systemd-standalone-sysusers: `pipewire`'s Depends is `systemd |
 # systemd-standalone-sysusers` (either satisfies its need to create system

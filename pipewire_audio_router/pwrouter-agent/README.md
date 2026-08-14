@@ -26,10 +26,14 @@ Design and rationale: [`../docs/receiver-agent.md`](../docs/receiver-agent.md).
 
 ## Install
 
-The easy way: open the add-on's **Outputs** page → *Explain receiver hosts*, and
+The easy way: open the add-on's **Outputs** page → *Setup Linux/PipeWire host*, and
 download the binary for your architecture. The add-on serves the build that matches
-it, so there is nothing to compile and no third-party download. Those binaries need
-glibc 2.34+ (Ubuntu 22.04 LTS, Fedora 35, Debian 12 or newer) and PipeWire 0.3.
+it, so there is nothing to compile and no third-party download. The same two binaries
+are attached to every tagged [release] of this repository, for a machine that cannot
+reach the add-on's UI. Either way they need glibc 2.34+ (Ubuntu 22.04 LTS, Fedora 35,
+Debian 12 or newer) and PipeWire 0.3.
+
+[release]: https://github.com/davidgraeff/homeassistant-audio-routing/releases
 
 To build it yourself instead — older distro, or you are working on the agent —
 requires PipeWire (any 1.x) and a Rust toolchain plus `libpipewire-0.3` headers

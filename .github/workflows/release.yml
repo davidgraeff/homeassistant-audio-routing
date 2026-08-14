@@ -1,0 +1,157 @@
+name: Release
+
+# Publishes a GitHub release for a `v*` tag with the receiver-agent binaries
+# (docs/receiver-agent.md, pipewire_audio_router/pwrouter-agent/) attached, one
+# per architecture. The add-on serves those same two files from its Outputs page
+# — this is for the machine that cannot reach that page, and for a stable URL to
+# link people at.
+#
+# The add-on *images* are a different workflow (build-addon.yml, which also runs
+# on `v*`): images go to GHCR and Supervisor pulls them, they are not release
+# assets. Note that build-addon.yml carries a `paths:` filter, and on GitHub a
+# push event has to satisfy the ref filter AND the path filter — so tagging a
+# commit that changed nothing under pipewire_audio_router/ publishes this release
+# without rebuilding images. That is correct (the images for that commit already
+# exist from the push to main), just worth knowing when reading a tag's run list.
+#
+# Deliberately NOT gated on ci.yml: the tag is cut from a commit that already
+# went through CI on main, and a release job that waits for a second full CI pass
+# would only make tagging slower.
+
+on:
+  push:
+    tags: ["v*"]
+  # For re-attaching assets to an existing tag (a lost upload, a rebuilt binary)
+  # without moving the tag. The tag must already exist — see --verify-tag below.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v0.4)"
+        required: true
+
+permissions:
+  contents: write # create the release, upload its assets
+  packages: read # read the add-on's :buildcache to skip recompiling
+
+jobs:
+  agent:
+    name: Receiver agent (x86_64 + aarch64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A tag push checks out the tag anyway; the dispatch path needs to be
+          # told which one, or it would build the default branch and label it
+          # with a tag it does not contain.
+          ref: ${{ inputs.tag || github.ref }}
+          # No `submodules:` on purpose. The Dockerfile's `agent` stage copies
+          # only pwrouter-agent/ and pw-control/, and BuildKit builds nothing
+          # outside the target stage's graph — submodules/sendspin belongs to the
+          # bridge-daemon `build` stage, which is not in it.
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only to read the cache-from ref below; the release itself pushes nothing
+      # to the registry.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The binaries carry the ADD-ON's version as their build id, not the tag:
+      # `pwrouter-agent version` exists so a host can be compared with the add-on
+      # driving it, and that add-on reports the config.yaml version at runtime.
+      # Same value build-addon.yml bakes in, so a binary downloaded from here and
+      # one downloaded from the add-on's own page name the same build and are
+      # interchangeable — a tag would make them look like different things.
+      - name: Read add-on version from config.yaml
+        id: version
+        run: |
+          v=$(grep '^version:' pipewire_audio_router/config.yaml | sed -E 's/version: *"?([^"]+)"?/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # `agent-dist` is a `scratch` stage holding just the two binaries, so the
+      # local export writes two files instead of unpacking the Rust toolchain
+      # image. The stage cross-compiles both targets on this amd64 runner and
+      # asserts the GLIBC_2.34 floor itself — no QEMU, and a binary that would
+      # not run on the distros the docs promise fails the build here.
+      - name: Build the agent binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: pipewire_audio_router
+          target: agent-dist
+          platforms: linux/amd64
+          build-args: |
+            ADDON_VERSION=${{ steps.version.outputs.version }}
+          outputs: type=local,dest=dist
+          # There is no image to attest here, and the local exporter writes
+          # attestations as *files* into dest — which would put a provenance
+          # blob next to the two binaries.
+          provenance: false
+          # The add-on image's own cache contains this stage (mode=max exports
+          # intermediates), so when the tagged commit's agent sources and add-on
+          # version match the last main build, this is a cache hit rather than
+          # two full cross-compiles. Read-only: releases must not overwrite the
+          # cache the add-on builds share.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/amd64-addon-pipewire_audio_router:buildcache
+
+      # Names the release advertises, and what the install snippet's
+      # `chmod +x pwrouter-agent-*` expects to find.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -l
+          test -s pwrouter-agent-x86_64
+          test -s pwrouter-agent-aarch64
+          sha256sum pwrouter-agent-x86_64 pwrouter-agent-aarch64 | tee SHA256SUMS.txt
+
+      # `--verify-tag` so a dispatch with a typo'd or unpushed tag fails instead
+      # of gh creating that tag from the default branch. `--notes` is prepended to
+      # the generated changelog rather than replacing it.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          notes=$(cat <<EOF
+          ### Receiver agent
+
+          The helper that makes a Linux/PipeWire machine an output
+          ([setup](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/pipewire_audio_router/pwrouter-agent/README.md)).
+          Pick your architecture (\`uname -m\`), then:
+
+          \`\`\`sh
+          chmod +x pwrouter-agent-*
+          ./pwrouter-agent-* autostart enable
+          systemctl --user start pwrouter-agent
+          \`\`\`
+
+          Needs glibc 2.34+ (Ubuntu 22.04 LTS, Fedora 35, Debian 12 or newer) and
+          PipeWire 0.3. Reports itself as build \`${VERSION}\`, the add-on version
+          it was built from — the add-on serves these same binaries on its Outputs
+          page.
+
+          The add-on itself is not downloaded from here: its images are published to
+          GHCR and installed through the Home Assistant add-on store.
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-run (or a dispatch): replace the assets, leave the notes alone.
+            gh release upload "$TAG" \
+              "dist/pwrouter-agent-x86_64#pwrouter-agent x86-64 (Intel/AMD)" \
+              "dist/pwrouter-agent-aarch64#pwrouter-agent aarch64 (Raspberry Pi, ARM)" \
+              "dist/SHA256SUMS.txt" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --verify-tag \
+              --title "$TAG" \
+              --generate-notes \
+              --notes "$notes" \
+              "dist/pwrouter-agent-x86_64#pwrouter-agent x86-64 (Intel/AMD)" \
+              "dist/pwrouter-agent-aarch64#pwrouter-agent aarch64 (Raspberry Pi, ARM)" \
+              "dist/SHA256SUMS.txt"
+          fi

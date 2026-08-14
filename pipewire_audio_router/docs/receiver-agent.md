@@ -688,6 +688,17 @@ a test for exactly that.
   architecture.
 - Copied to `/app/www/agent/` and **served by the add-on itself**, so the download
   in the help dialog needs no third-party fetch and always matches the daemon.
+- **Also attached to every `v*` release** (`.github/workflows/release.yml`), which is
+  the same two files under the same names — the workflow bakes in the *add-on's*
+  `config.yaml` version, not the tag, so a binary fetched from a release and one
+  fetched from the add-on's page report the same build and are interchangeable. The
+  add-on's page stays the primary route (nothing to pick, nothing to verify); the
+  release exists for the host whose operator cannot reach that page, and to give a
+  stable URL to link at. Extracted through a `scratch` **`agent-dist`** stage that
+  holds only the two binaries: a `--output type=local` export writes the whole target
+  stage, so exporting `agent` itself would unpack the Rust toolchain image for two
+  files. Nothing in the runtime image depends on that stage, so an ordinary add-on
+  build never runs it.
 - **systemd user unit** (`~/.config/systemd/user/pwrouter-agent.service`), since it
   needs the user's session PipeWire. The unit is `include_str!`-ed into the binary
   and installed by `pwrouter-agent autostart enable` (or the tray switch) — which is
