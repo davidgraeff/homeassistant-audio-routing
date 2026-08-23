@@ -98,6 +98,29 @@ type SharedReady = Arc<Mutex<std::collections::HashSet<String>>>;
 /// the wait is bounded, and taking it is logged.
 const READY_GRACE: Duration = Duration::from_secs(3);
 
+/// How long after a device joins its group its `stream/start` is sent a second time.
+///
+/// **A firmware race, worked around here because it costs one control frame.** A
+/// `stream/start` that lands too soon after a fresh connection's handshake is sometimes
+/// silently dropped by `sendspin-cpp`: the device never processes the stream's codec
+/// header, so it builds no decoder and no ring buffer, and then **consumes the audio at
+/// full rate while rendering nothing** — reporting `PLAYING` throughout, with no warning
+/// and no error on either side. That is the "receives audio, renders nothing" fault
+/// (docs/sendspin-open-items.md item 4), and from the daemon it is invisible: the relay's
+/// own numbers are byte-identical in the silent and the playing state.
+///
+/// Re-sending the identical frame closes the window. Measured against a stock Voice PE
+/// (26.6.0) with a standalone two-connection harness: **15/15 renders with the re-issue,
+/// against roughly half without it**, and the re-issue never broke a connection that had
+/// already started correctly — the spec makes `stream/start` on a live stream a
+/// configuration update that does not clear buffers, and a device that already has the
+/// stream treats the repeat as a no-op.
+///
+/// One second is far enough past the race to be reliable while staying inside the
+/// send-ahead lead's own start-up slack, so a device that *did* need it starts about a
+/// second late rather than never.
+const STREAM_START_REISSUE: Duration = Duration::from_secs(1);
+
 /// Extra time an armed idle device keeps its stream after its announcement
 /// finishes, before `stream/end`. The device renders on a send-ahead lead, so
 /// ending the stream the instant the clip's last byte is queued would cut off audio
@@ -1196,12 +1219,37 @@ fn spawn_membership_task(
                     if spoke { "" } else { " (no client/state within the grace — streaming anyway)" }
                 );
                 let group = Group::with_timeline(Arc::clone(&timeline));
+                // Kept for the re-issue below: `add_member` takes the sender.
+                let reissue_sender = sender.clone();
                 if let Err(e) = group.add_member(client_id.clone(), sender).await {
                     tracing::warn!("sendspin '{node}': failed to start its stream: {e}");
                     continue;
                 }
                 finished_at.remove(&client_id);
-                groups.lock_recover().insert(client_id, group);
+                groups.lock_recover().insert(client_id.clone(), group);
+                // Send `stream/start` once more, a moment later — see
+                // [`STREAM_START_REISSUE`]. Detached rather than awaited: the poll loop
+                // must keep promoting other devices, and nothing here depends on the
+                // outcome. Skipped if the device left its group in the meantime, so a
+                // speaker that disconnected inside the window is not told to start a
+                // stream it is no longer part of.
+                {
+                    let groups = Arc::clone(&groups);
+                    let timeline = Arc::clone(&timeline);
+                    let client_id = client_id.clone();
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(STREAM_START_REISSUE).await;
+                        let still_a_member = groups.lock_recover().contains_key(&client_id);
+                        if !still_a_member {
+                            return;
+                        }
+                        let Some(config) = timeline.config() else { return };
+                        if let Err(e) = reissue_sender.queue_stream_start(config).written().await {
+                            tracing::debug!("sendspin '{node}': stream/start re-issue did not reach it: {e}");
+                        }
+                    });
+                }
             }
 
             // Demote (idle path only): the clip finished, so hand the device back after
