@@ -6,9 +6,10 @@ time during bring-up. Companion to [architecture.md](architecture.md)
 done vs. planned).
 
 **Open investigations** with their own plans (measurements, hypotheses,
-decision points): [sendspin-open-items.md](sendspin-open-items.md) (open work) and the archived
-[sendspin-group-churn-plan.md](old/sendspin-group-churn-plan.md) (the investigation)
-(adding a speaker silences the group for >10 s) and
+decision points): [sendspin-open-items.md](sendspin-open-items.md) (open work — its two
+headline faults, "adding a speaker silences the group" and "receives audio, renders
+nothing", are both closed; what is left is a workaround for the latter) and the archived
+[sendspin-group-churn-plan.md](old/sendspin-group-churn-plan.md) (the investigation) and
 [rtp-input-dropouts.md](rtp-input-dropouts.md) (Bluetooth/RTP input
 drops out every 5–10 min for up to 2 min).
 
@@ -60,6 +61,139 @@ A healthy (driver-anchored) cycle instead shows non-zero, advancing
   stalled, driverless cycle still reports its nodes as `R`; the tell is
   `QUANT 0 / RATE 0` and BUSY not advancing across samples.
 - `curl`/`python3` are absent in the add-on container (see above).
+
+## Device-side logs from the ESPHome speakers
+
+**The highest-value diagnostic for any sendspin fault, and it was written off as
+impossible for weeks** (the old item 8, "the device's API log subscription delivers
+nothing"). It delivers fine. The subscription was never the problem — the *output was
+being thrown away locally*, see the traps below.
+
+Why it matters: the daemon cannot tell "this device is being sent audio" from "this
+device is rendering audio" — that blind spot is what forced `tcpdump` and by-ear
+bisection through the whole group-churn investigation. The device answers it directly.
+
+### The recipe
+
+```bash
+DEV=192.168.178.82                  # the speaker
+HA=192.168.178.173                  # the HA host
+
+# 1. the device's API key, from HA's own config entry (the SSH add-on can read /config)
+PSK=$(ssh root@$HA "python3 - <<PY
+import json
+d=json.load(open('/config/.storage/core.config_entries'))
+print([e['data']['noise_psk'] for e in d['data']['entries']
+       if e.get('domain')=='esphome' and e['data'].get('host')=='$DEV'][0])
+PY")
+
+# 2. subscribe. BOTH env var and -s INT matter — see the traps.
+PYTHONUNBUFFERED=1 timeout -s INT 40 ~/.local/bin/aioesphomeapi-logs \
+  "$DEV" --noise-psk "$PSK" --strip-ansi-escapes > /tmp/dev.log 2>/dev/null || true
+
+# 3. the lines that matter
+grep -E "sendspin|speaker_mixer|ring_buffer|Media Player" /tmp/dev.log
+```
+
+To watch a *transition*, start it in the background, sleep ~12 s for the config dump to
+finish, then fire the API call — and only read the file after the tool has exited:
+
+```bash
+PYTHONUNBUFFERED=1 nohup timeout -s INT 55 ~/.local/bin/aioesphomeapi-logs \
+  "$DEV" --noise-psk "$PSK" --strip-ansi-escapes > /tmp/dev.log 2>/dev/null &
+sleep 12
+curl -s -XPUT http://$HA:8099/api/outputs/sendspin-dev-<slug>/delay \
+  -H 'Content-Type: application/json' -d '{"delay_ms":11}'
+sleep 40          # must outlast the timeout, or you read a half-flushed file
+```
+
+### Five traps — the first two are the whole of the old item 8
+
+1. **`timeout` sends SIGTERM, and Python dies without flushing stdout.** Redirected
+   stdout is block-buffered and flushed only at interpreter exit, so SIGTERM discards the
+   entire buffer. What survives is the three `logging` lines on *stderr* — "handshakes
+   fine and then produces zero lines" is exactly that, and it is an artifact of the
+   harness, not the device. Use **`timeout -s INT`** (SIGINT → `KeyboardInterrupt` → the
+   CLI's `contextlib.suppress` → clean exit → flush) and/or `PYTHONUNBUFFERED=1`.
+2. **`stdbuf` cannot fix it.** Python uses its own `io` layer rather than libc stdio, so
+   `stdbuf -oL` has no effect whatsoever. `PYTHONUNBUFFERED=1` (or `python -u`) is the
+   only knob.
+3. **`timeout -s INT` makes a *pipeline* exit 130**, which aborts the rest of a
+   `&&`-chain or a one-liner. Redirect to a file and grep it afterwards; don't pipe the
+   tool straight into `grep`.
+4. **Reading the file before the tool exits gets you nothing** (trap 1 again — the flush
+   is at exit). If you background it, sleep past the `timeout` before grepping.
+5. **~12 s of `[C]` config-dump comes first** on every connect, which buries whatever you
+   were trying to see. Sleep it out before triggering anything, or filter `[C]` away.
+
+Also: `--strip-ansi-escapes` exists only in the `~/.local/bin` install, not the venv's
+(it errors out there) — which accounted for part of an earlier "empty log".
+
+### The rendering oracle
+
+A device that is really rendering logs this on every stream start:
+
+```
+sendspin.client: Stream Started
+sendspin.sync_task: Processed new codec header: opus, 48000 Hz, 2 ch, 16-bit   <-- the decoder is built
+ring_buffer: Created ring buffer with size 19200
+speaker_mixer: Starting
+```
+
+A device that is **receiving audio and rendering nothing** logs `Stream Started`, then
+goes straight to `PLAYING` with **no** `Processed new codec header`, no `ring_buffer`, no
+`speaker_mixer: Starting` — and **no warning and no error**. That is the whole signature.
+
+- `Processed new codec header` (and `ring_buffer: Created`) is the reliable tell.
+- `speaker_mixer: Starting` only appears if the mixer had *stopped* first; it fires
+  `Stopped` 330–450 ms after `Stream ended` (n=10), so a handover faster than that
+  legitimately skips both the `Stopped` and the next `Starting` while still rendering —
+  measured at a 60 ms group→group switch.
+- **`media_player` state is NOT an oracle.** The firmware's own
+  `media_player.<name>_media_player` entity reports `playing` in both states, so neither
+  the HA entity nor its recorder history can tell you whether a speaker made a sound.
+
+### Reproducing a device-side fault without a deploy
+
+A 15-minute `deploy-dev.sh` per hypothesis makes protocol-level bisection impossible, so
+there is a harness that drives a speaker directly:
+[`bridge-daemon/examples/sendspin_handover.rs`](../bridge-daemon/examples/sendspin_handover.rs).
+
+```bash
+# take the speaker away from the daemon first, or the two compete for the connection
+curl -XDELETE http://<ha-ip>:8099/api/outputs/sendspin-dev-<slug>
+
+cd bridge-daemon
+cargo run --example sendspin_handover -- ws://<device-ip>:8928/sendspin plain     # the fault
+cargo run --example sendspin_handover -- ws://<device-ip>:8928/sendspin reissue   # the fix
+
+curl -XPOST http://<ha-ip>:8099/api/outputs/sendspin-dev-<slug>/adopt            # give it back
+```
+
+Why it is fast enough to iterate with: **no audio is needed.** The oracle above fires at
+`stream/start`, so a scenario is a dial plus one or two control frames — no encoder, no
+PipeWire, no anchor. Its module docs carry the scenario table and the three things that
+mislead (self-prime, or the first run after a quiet period passes and the next fails; scope
+the verdict to the phase under test, or the priming phase's header makes it report the
+opposite of the truth; and batch at least four runs per arm, because the base failure rate is
+roughly half and several n=2/n=3 results reversed here at n=4+).
+
+### Device inventory (dev setup)
+
+| output node | speaker | IP | firmware |
+|---|---|---|---|
+| `sendspin-dev-home_assistant_voice_093ca8` | Badezimmer | 192.168.178.52 | stock Nabu Casa Voice PE **26.6.0** |
+| `sendspin-dev-home_assistant_voice_096287` | Büro | 192.168.178.82 | stock Nabu Casa Voice PE **26.6.0** |
+| `sendspin-dev-home_assistant_voice_0966f3` | Dusche | 192.168.178.84 | stock Nabu Casa Voice PE **26.6.0** |
+| `sendspin-dev-satellite1_8f0c50` | satellite1 | 192.168.178.172 | own build, `v0.2.0` |
+| `sendspin-dev-satellite1_c4150c_c4150c` | satellite1 | 192.168.178.99 | own build, `dev` |
+
+**The three Voice PEs run stock Nabu Casa firmware (ESPHome 2026.6.0) with the
+*upstream* `sendspin.hub` / `sendspin-cpp` component — not the stale March
+`kahrendt/esphome` fork.** Only the satellite1 units run that fork. Confirmed from
+`app:151`/`app:153` in the device log and from each device's `update.*` entity's
+`installed_version`. Anything reasoning about "our pinned firmware" needs to say *which*
+device it means.
 
 ## AirPlay-2 diagnostics
 
@@ -337,6 +471,21 @@ printf '{"clients":[]}' | ssh root@host 'docker run --rm -i --entrypoint sh \
 ```
 
 ## Ruled out / key learnings (don't re-chase)
+
+- **An empty ESPHome device log is almost certainly your own buffering, not the device.**
+  This cost weeks as item 8 ("the subscription delivers nothing") and the devices were
+  talking the whole time — `timeout`'s SIGTERM discards Python's unflushed stdout. See
+  *Device-side logs* above. The corollary is bigger than the bug: the daemon has no way to
+  tell "sent" from "rendered", and the device does, so reach for its log **before** reaching
+  for `tcpdump` or your ears.
+- **"Receives audio but renders nothing" is a dropped `stream/start`, and it is a race.**
+  The device never processes the stream's codec header, so it builds no decoder and renders
+  nothing while draining the socket at full rate and reporting `PLAYING`. Fixed by
+  re-issuing the frame a second after the join (`STREAM_START_REISSUE`). `SharedTimeline`
+  age, the redial gap, overlapping sockets, `stream/clear` and the group lead are all ruled
+  out — see sendspin-open-items.md item 4 before re-deriving any of them. Note the *first*
+  pass blamed the idle-sender handover on 3/3-vs-9/9 field evidence and the harness did not
+  bear that out; the correlation is real, the causation is not established.
 
 - **"Dropout every ~2 min" was source churn, mostly self-inflicted
   testing.** Each add-on restart needs a manual Sources-tab **Save**

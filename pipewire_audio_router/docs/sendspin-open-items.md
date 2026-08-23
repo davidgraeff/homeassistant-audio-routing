@@ -5,6 +5,21 @@ and the wrong turns are archived in
 [old/sendspin-group-churn-plan.md](old/sendspin-group-churn-plan.md); this file carries
 only work that is still outstanding, so it should shrink over time rather than grow.
 
+> **2026-08-22 — "receives audio, renders nothing" is a dropped `stream/start`, and there
+> is a working fix.** The device sometimes never processes the stream's codec header, so it
+> builds no decoder and no ring buffer, and then consumes the Opus stream at full rate while
+> rendering **nothing** — reporting `PLAYING` the whole time, with no warning or error on
+> either side. Re-sending the identical `stream/start` one second after the join closes the
+> window: **15/15 renders with the re-issue, ~half without**, and it never disturbed a
+> connection that had already started correctly. Shipped in
+> `outputs/sendspin/server.rs` (`STREAM_START_REISSUE`).
+>
+> Two things made this findable, both worth keeping: the **device's own log** (the old item 8
+> claimed it was unavailable — it was a local buffering artifact) gives a real
+> rendering oracle, and a **standalone two-connection harness** against the vendored crate
+> reproduces the fault in ~15 s without a deploy. Item 4 has the evidence, the several
+> conclusions it overturns, and the honest limits of what is established.
+
 > **The headline is closed.** "Adding a device silences the whole group for tens of
 > seconds" was **our own server dropping the client's clock-sync requests** — a 50 ms
 > rate limit plus a single-slot reply channel, against a spec that puts the cadence in the
@@ -126,116 +141,106 @@ disconnected, so the RX path was unloaded (~150 B/s instead of ~26 kB/s). Buffer
 starvation is precisely what a *loaded* path causes, so #520 is **under-tested**, not
 disproven. Re-measure with the phone connected before drawing a conclusion either way.
 
-### 4. Intermittent: sendspin devices receive audio but render nothing (2026-08-03)
+### 4. Devices receive audio and render nothing — **fixed 2026-08-22 (workaround)** ✅
 
-Three of four sendspin devices went silent for both music and announcements, while
-satellite1 kept playing. **Cleared by an add-on restart; cause not established.**
+**The fault, from the device's side.** On a fresh connection the device accepts
+`stream/start` and then, sometimes, never processes the stream's codec header:
 
-**What was measured, and what it rules out.** Per-device bytes on the wire (tcpdump on
-port 8928, announce fired mid-capture) showed each "broken" device receiving a full-rate
-stream, correctly targeted:
+```
+sendspin.client: Stream Started
+                                       <-- no "sync_task: Processed new codec header"
+speaker_source_media_player: State changed to PLAYING
+                                       <-- no ring_buffer, no speaker_mixer: Starting
+```
 
-| target | its bytes/s during the clip | the other three |
-|---|---|---|
-| 093ca8 | 16,041 → 21,507 → 20,289 → 21,227 → 21,301 → 20,419 | ~880 (baseline) |
-| 0966f3 | 22,215 → 20,449 → 20,756 → 21,166 → 20,778 → 16,220 | ~880 |
-| 096287 | 13,939 → 21,623 → 20,359 → 21,041 → 21,702 → 21,099 | ~880 |
+No decoder, no ring buffer, no mixer — yet it drains the socket at the full Opus rate and
+reports `PLAYING`, and neither side logs a warning or an error. That is the entire
+signature, and it is why this took so long: from the daemon the silent and the playing state
+are **byte-identical** (500 blocks/10 s, `ts gap 20000..20000 µs`, `lead 173..194 ms`, real
+payloads, zero dropped writes).
 
-So routing, targeting, the overlay mixer, encoding and delivery were all healthy. The
-graph was minimal and correct (`bt-bridge-rtp → sync-grp-… → bridge-sendspin-capture`,
-all active), and identical during an announcement — correct, since the sendspin overlay
-is mixed in-process with no node involved. Clock sync was healthy too:
-`received == replied` with 341k+ exchanges per device.
+**The fix, and the number behind it.** Send the identical `stream/start` a second time about
+a second after the device joins its group — `STREAM_START_REISSUE` in
+[`outputs/sendspin/server.rs`](../bridge-daemon/src/outputs/sendspin/server.rs). Measured
+with a standalone harness against a stock Voice PE (26.6.0):
 
-**Not the group lead — but the first version of this reasoning was wrong, so here is the
-corrected form.** The hypothesis was that firmware reporting neither `min_buffer_ms` nor
-`required_lead_time_ms` (item 7, F8) gets assumed at the codec minimum, and that the old
-firmware needed more than the 320 ms it was given. Raising the effective lead 320 → 900 ms
-was confounded by a restart.
-
-It was then recorded here that "the lead was returned to an effective 320 ms with no
-restart and audio kept playing", and that this ruled the lead out. **That premise was
-false.** `GET /api/sync/settings` reported `effective 320 ms` while the running relay was
-still logging `lead 870..892 ms` — see item 6. Lowering the configured lead never
-re-armed anything, so the *running* lead never went back.
-
-The conclusion survives on better evidence: the running lead was **~880 ms in both the
-playing state and the silent state** (measured before and after the 2026-08-03 17:2x
-reproduction below), so it does not discriminate between them. F8 is still not implicated —
-but note that no test has yet run these devices at a genuinely low lead.
-
-**Reproduction (2026-08-03 17:2x) — the most useful fact so far.** Reconnecting the
-"Kitchen Zone" group from the *Music Now 2* input to *Bluetooth Bridge* and back, via the
-routing graph, reproduces it on demand. That is a **source switch**, which tears the sync
-group down and rebuilds it, so all members re-dial. Measured immediately afterwards, with
-music playing:
-
-- **every device receives real audio at an identical ~19 kB/s** on the wire (093ca8
-  19,194 · 096287 19,229 · 0966f3 19,128 · satellite1 19,112 B/s). Not silence — music.
-  So the daemon delivers to the silent devices exactly as it does to the working one.
-- the graph is correct: `airplay-in → sync-grp-… → bridge-sendspin-capture ×4`, one
-  anchor, fed by the current source.
-- the connections are ~5 min old with `replied == recv` and a healthy ~0.77/s cadence, i.e.
-  the re-dial and the clock sync both worked.
-
-**Confirmed workaround, and it sharpens the diagnosis considerably.** Nudging a device's
-static delay — a *per-device* re-dial (§4.10) — brings it back, verified on 093ca8 and then
-on all affected devices across a repeat of the reproduction. So:
-
-| operation | outcome |
+| phase-2 behaviour | renders |
 |---|---|
-| group rebuild (source switch) — every member re-dials into a **fresh** `SharedTimeline` | **silent** |
-| per-device re-dial — one member re-joins the **established** timeline | **plays** |
-| full add-on restart | plays |
+| plain `stream/start` (several connection shapes) | **~12/25** |
+| `stream/end` first, then `stream/start` | 1/4 |
+| a single `stream/start` delayed 100–1000 ms | 8/10, not reliable at any delay |
+| **`stream/start`, then the same frame again after 1 s** | **15/15** |
 
-Both middle rows re-dial the device, so the re-dial is not what matters. **The variable is
-the timeline**: devices that join a newly-created `SharedTimeline` fail to render, devices
-that join one already running are fine. That is where to look next, and it is also exactly
-what `stream/clear` (item 5) addresses — it re-anchors without re-dialling, so it isolates
-"needs re-anchoring" from "needs a new connection" in one test. It was not deployed when
-this was reproduced; deploy it before the next attempt.
+The re-issue also never disturbed a connection that had started correctly (controls
+included in that 15/15), which matches the spec: `stream/start` on a live stream is a
+configuration update that does not clear buffers. It costs one control frame per join.
 
-**So the cause is state that a restart clears but a reconnect does not.** Two candidates,
-neither confirmed:
+**Verified live, deployed in `0.4.20260821231829`.** On the exact field path that used to
+fail every time — unlink the speaker, let its idle sender take it, link it back — **6/6
+render**, and the device log shows precisely what the workaround buys:
 
-- **The phantom routed member** (item 1). The group had a *routed but permanently absent*
-  member, `sendspin-dev-satellite1_c4150c`. Worth checking whether an absent-but-routed
-  member can wedge the arming of its groupmates — it is the one anomaly that was present
-  throughout the fault and gone afterwards. Against it: satellite1 under its *new* name
-  played fine the whole time, and no mechanism is known that would spare one member and
-  starve three.
-- **Ordinary stale per-device state** in a connection 5.7 days old, cleared by the fresh
-  connect (fresh time filter, fresh `stream/start`).
+```
+01:25:41.913  sendspin.client: Stream Started          <-- the first frame, dropped as before
+01:25:42.938  sendspin.client: Stream Started          <-- the re-issue, 1.025 s later
+01:25:42.940  sync_task: Processed new codec header: opus, 48000 Hz, 2 ch, 16-bit
+01:25:42.981  ring_buffer: Created ring buffer with size 19200
+01:25:42.984  speaker_mixer: Starting
+```
 
-> **Ruled out: the "two `bridge-sendspin-capture` streams".** Flagged twice as a possible
-> leaked capture from an earlier generation, which would have matched the
-> restart-fixes-it/re-dial-does-not asymmetry perfectly. It is not a leak: all three
-> consumers of `sendspin_capture` (the sendspin relay, the AP2 sender, the pw-sink sender)
-> hard-coded the *same* node name, so a graph with AP2 receivers routed showed two
-> identically-named captures — one sendspin, one AP2. Fixed by naming each after its owner
-> (`bridge-sendspin-capture` / `bridge-ap2-capture` / `bridge-pwsink-capture`), so the
-> graph no longer invites this mistake.
+And on the path that already worked (a static-delay reconnect, 2/2): the *first* frame is
+processed normally and the re-issue re-reads the header **without** creating a second ring
+buffer or restarting the mixer — a benign no-op, no warnings on either side. So the device
+now starts about a second late on a route change instead of never, and nothing else
+changes.
 
-**What would catch it next time.** The gap is that "this device is being sent audio" and
-"this device is rendering audio" were indistinguishable from the daemon, which is why
-this needed `tcpdump` to investigate at all:
+**It is a race, and that corrects what this item said earlier today.** The first pass at
+this concluded the trigger was the **idle-sender handover** — a device moving from its idle
+sender (`connection_reason=discovery`) to a group server (`playback`) — on the strength of
+3/3 field failures on that path against 9/9 successes on playback→playback. The harness does
+not support that: once the fault is reproduced standalone, a plain playback→playback
+reconnect fails too, at roughly the same rate, and inserting or removing the discovery hop
+makes no difference. So:
 
-1. **A per-device rendered/receiving indicator in the UI.** Bytes/s per device, or
-   audio-vs-silence, is the single highest-value addition — it is exactly the measurement
-   above, and it should not require a packet capture.
-2. **Announce admission is now logged** (2026-08-03, deployed in
-   `0.3.20260803170132`): one `USER ACTION: announce -> N target(s) [...]` line per call
-   with admission, on-demand sessions and skipped targets. Previously an 8 h window
-   contained zero announce lines. The next occurrence is diagnosable from the log.
-3. **Surface `present=false` but routed** as a stale phantom with a "forget" action, so
-   candidate 1 above can be excluded in one glance rather than by reading the API.
-4. **Expose `stream/clear`** — see item 5 — so recovery does not need an add-on restart.
+- **Established:** the dropped `stream/start` exists, is timing-dependent, and the re-issue
+  fixes it.
+- **Correlation only:** in the field it showed up *every* time on the idle→group path and
+  *never* on a static-delay reconnect. Whether that is a real timing difference between the
+  two paths (the handover does dial within ~5 ms of closing the old socket) or 9 lucky
+  reconnects is **not established**. The fix does not depend on knowing.
+- The harness is not a perfect model: it sends `stream/start` sooner after the handshake than
+  the daemon does, and only its `*_daemonlike` scenarios wait for the initial `client/state`
+  the way the daemon's `ready` gate does. Those waited-for-state shapes still failed ~50%.
 
-A caution for whoever picks this up: `tone: true` is the *calibration* pattern, an
-alternating 8 ms click once per second, so roughly one block in fifty carries audio. It
-is easy to read as "nothing played" — I did, mid-investigation, and briefly concluded the
-daemon was delivering nothing. Use `test: true` (the committed speech clip) to ask whether
-a device makes sound at all.
+**Ruled out, with the evidence, so none of it gets re-chased:**
+
+- **"Devices that join a newly-created `SharedTimeline` fail to render."** False. A source
+  switch performed as link+unlink inside the 400 ms reconcile debounce goes group→group and
+  plays, brand-new anchor, server and timeline included.
+- **The redial gap and overlapping sockets.** Real and measurable — during a handover the
+  device can complete the new WebSocket ~2 ms *before* releasing the old one and hold both
+  for ~440 ms (`tcpdump` on 8928; `stop_client` only *signals* the old supervisor and
+  `shutdown()` never awaits it, so nothing enforces the ordering the reconciler's comment
+  claims). Neither necessary nor sufficient: handovers where the device processed the close
+  first fail identically, and a group→group redial with a 53 ms gap succeeds.
+- **`stream/clear` / the Resync button.** Does not recover it — see item 5.
+- **"A preceding `stream/end` primes it."** Killed twice: an announcement on the idle
+  connection gives a full start→render→end cycle and the next handover still fails; and
+  linking *while the announcement is still streaming*, so the old connection closes with a
+  live stream and logs `Stream ended - player:1` at the close, also fails.
+- **The shared `SendspinControl` unregister race.** Genuinely present — the idle server's
+  `Disconnected` and the group server's `Connected` run on two independent event loops and
+  both key `SendspinControl` by device node name, so a late `unregister` can drop the live
+  connection's sender. But it can only cost volume/mute/delay/`stream/clear`, never audio,
+  and it did not fire here: `USER ACTION: resync` logs only when the frame *reached* the
+  device, and it is in the log. **Still worth fixing on its own merits.**
+- **The group lead / the send-ahead.** See the byte-identical relay numbers above.
+
+**Left open.** The underlying firmware race is unfixed and belongs upstream in
+`sendspin-cpp` — worth filing with the harness sequence, which reproduces it in ~15 s. Also
+unexplained: why the re-issue is needed at all, i.e. what state the first `stream/start`
+lands in. And the daemon still cannot see the fault itself; the only rendering signal is the
+device log, so a per-device "is it actually rendering" indicator would still be worth having
+(item 4's old blind spot #1).
 
 ### 5. `stream/clear` — now exposed ✅
 
@@ -269,8 +274,15 @@ was the only option.
 > clear stores no desired state, which is pinned by
 > `outputs::sendspin::volume::tests::clearing_a_disconnected_device_is_reported_not_stored`.
 >
-> This is the first thing to try next time item 4 recurs — and it leaves the evidence
+> ~~This is the first thing to try next time item 4 recurs~~ — and it leaves the evidence
 > intact, which an add-on restart did not.
+>
+> **Correction, 2026-08-22: `stream/clear` does not recover item 4's fault.** Measured — the
+> frame reaches the device (`USER ACTION: resync` logs only on success) and is simply
+> ignored, because the device never built a decoder for that stream in the first place;
+> there is nothing buffered to discard and re-anchoring changes nothing. Resync remains the
+> right lever for a device that *is* rendering but drifted. For item 4 the lever is a
+> playback→playback reconnect.
 
 ### 6. `group_lead_effective_ms` did not report the lead actually in use ✅
 
@@ -382,6 +394,12 @@ which says anything about audio.
 
 ### 7. Four inert spec deviations
 
+> **Read the firmware correction in item 9 first.** "The pinned firmware" is not one thing:
+> the three Voice PEs run **stock Nabu Casa 26.6.0 / ESPHome 2026.6.0** with the *upstream*
+> `sendspin-cpp`, and only the satellite1 units run the March `kahrendt/esphome` fork. Each
+> claim below was checked against the fork, so anything asserted about "the pinned firmware"
+> needs re-checking against 26.6.0 before it is trusted for a Voice PE.
+
 From the 2026-07-29 audit against [Sendspin/spec](https://github.com/Sendspin/spec)
 (HEAD `aa752f6`). Each was checked against the *pinned firmware* rather than assumed, and
 all are currently inert — correctness debt, not live bugs. Full detail in the archive's
@@ -418,22 +436,40 @@ all are currently inert — correctness debt, not live bugs. Full detail in the 
 > config sets **480 µs** for its AIC3204 DAC. Neither is an ongoing buffer, so neither
 > substitutes for the group lead.
 
-### 8. The device's API log subscription delivers nothing
+### 8. The device's API log subscription delivers nothing — **wrong; it works** ✅
 
-`aioesphomeapi-logs` against satellite1 handshakes fine and then produces **zero** lines —
-across a full stream stop/start, across a reboot that should have printed a boot banner,
-and with no reply to a `dump_config` sent at `LOG_LEVEL_VERY_VERBOSE`. The device runs
-`logger: level: debug`, so a `ESP_LOGW` should pass.
+Solved 2026-08-22, and it was never the device. `aioesphomeapi-logs` delivers full DEBUG
+logs from both a Voice PE and satellite1; the output was being **discarded locally**:
 
-Two things known: `--strip-ansi-escapes` exists only in the `~/.local/bin` install, not
-the venv's (it errors out there), which accounted for part of an earlier "empty log"; and
-even with the flag removed the subscription still delivers nothing, for a reason not yet
-determined.
+- Python block-buffers redirected stdout and flushes only at interpreter exit, and
+  `timeout` sends **SIGTERM**, which kills it without flushing — so the whole log is
+  thrown away and only the three `logging` lines on *stderr* survive. That is exactly the
+  "handshakes fine and then produces zero lines" symptom.
+- **`stdbuf` cannot fix this** (Python uses its own `io` layer, not libc stdio).
 
-**Until this works, an empty ESPHome log is not evidence of anything.** Fixing it is the
-prerequisite for any future device-side debugging.
+Use `PYTHONUNBUFFERED=1` and `timeout -s INT`. Full recipe, the five traps, and the
+rendering oracle it unlocks are in
+[live-instance-debugging.md](live-instance-debugging.md) §"Device-side logs from the ESPHome
+speakers". This was the prerequisite for item 4, and it is what solved it.
 
-### 9. The firmware pin is four months stale — but the ladder is the cost
+### 9. The firmware pin is four months stale — **for satellite1 only**
+
+> **Correction, 2026-08-22 — this item was about the wrong devices.** Read from each
+> speaker's own log (`app:151`/`app:153`) and cross-checked against each `update.*` entity's
+> `installed_version`:
+>
+> | device | firmware |
+> |---|---|
+> | `home_assistant_voice_093ca8` / `_096287` / `_0966f3` | **stock Nabu Casa "Home Assistant Voice PE" 26.6.0, ESPHome 2026.6.0**, upstream `sendspin.hub` + `sendspin-cpp` |
+> | `satellite1_c4150c` | own build, `dev` |
+> | `satellite1_8f0c50` | own build, `v0.2.0` |
+>
+> So the stale `kahrendt/esphome` @ `7a6cf5c` pin and the whole version-ladder cost below
+> apply to **satellite1 only**. The Voice PEs are already on a recent upstream component —
+> which is also where item 4's bug lives, so "upgrade the firmware" is not the fix there.
+> The `client/state: "error"` reasoning in item 2 and the `min_buffer_ms` /
+> `required_lead_time_ms` findings in item 7 both need re-checking against 2026.6.0 for the
+> Voice PEs; they were only ever verified against the fork.
 
 `kahrendt/esphome` @ `7a6cf5c` (2026-03-23) from the **closed** WIP PR esphome#14933,
 predating `sendspin-cpp` v0.1.0. Upstream ESPHome now ships the component pinning
