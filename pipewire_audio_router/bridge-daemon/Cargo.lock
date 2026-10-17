@@ -600,6 +600,7 @@ dependencies = [
  "pw-control",
  "reqwest 0.13.4",
  "rtrb",
+ "rustls 0.23.42",
  "sendspin",
  "serde",
  "serde_json",

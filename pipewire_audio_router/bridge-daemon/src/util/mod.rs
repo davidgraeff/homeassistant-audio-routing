@@ -8,7 +8,8 @@
 //! conventions, not configuration: the daemon reads no config file, every source
 //! is created at runtime through the API and persisted in `store/`.
 //! [`host_assessment`] answers "is this machine strong enough for realtime
-//! multi-room audio?" once at boot.
+//! multi-room audio?" once at boot. [`tls`] picks the one rustls crypto provider
+//! the whole process uses.
 //!
 //! Nothing here may depend on another module of this crate. That is the entry
 //! condition: a helper that needs the registry or a store is not a util, it is a
@@ -17,3 +18,4 @@
 pub(crate) mod host_assessment;
 pub(crate) mod locks;
 pub(crate) mod node_names;
+pub(crate) mod tls;

@@ -806,6 +806,12 @@ credentials over the LAN. librespot implements it, is Rust, and decodes to f32 a
   that a daemon restart ends the session and the app has to pick the device again.
 - Spotify Premium is required by Spotify for every listener; a free account's login is
   refused at session start and shown as the source's `last_error`.
+- **The rustls crypto provider is installed explicitly** (`util/tls.rs`, first thing in
+  `main`). librespot's `hyper-rustls` brings `ring` next to reqwest's `aws-lc-rs`, and
+  with two backends rustls picks no default: the first Spotify login panicked inside
+  `Spirc::new`, which killed the device task without a word in the daemon's own log
+  while every app sat on "Connecting…". The device loop now also catches a panic,
+  restarts, and shows it as `last_error`.
 
 ## Sendspin: auto-discovery, grouping, per-device volume, and connection-driven liveness
 

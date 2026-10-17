@@ -109,6 +109,10 @@ librespot-connect = { version = "0.8.0", default-features = false, features = ["
 librespot-discovery = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "with-libmdns"] }
 librespot-metadata = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
 librespot-playback = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# Only to install the process-wide crypto provider (util/tls.rs): librespot
+# brings `ring` next to reqwest's `aws-lc-rs`, and with two backends rustls
+# picks no default. Same 0.23 line both already use.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 # The Spotify device id (sources/spotify.rs): a SHA-1 of the source id, the
 # same shape librespot's binary derives from its device name. Already in the
 # tree through librespot-discovery.

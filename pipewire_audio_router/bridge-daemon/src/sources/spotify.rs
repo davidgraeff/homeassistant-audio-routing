@@ -26,7 +26,7 @@ use crate::sources::now_playing::{MetadataUpdate, NowPlayingReporter, NowPlaying
 use crate::sources::pcm_producer::{samples_for_ms, spawn_producer, ProducerCmd, RingProducer, CHANNELS, RATE};
 use crate::sources::{SourceConfig, SourceEntry, SourceId, SpotifySourceConfig};
 use crate::util::locks::LockRecover;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::{DeviceType, SessionConfig};
@@ -44,6 +44,7 @@ use pipewire as pw;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -273,6 +274,10 @@ enum Exit {
     Shutdown,
     /// Something it depends on died; the caller restarts it after a delay.
     Failed,
+    /// It panicked. Restarted like `Failed`, but the reason stays visible as the
+    /// source's `last_error`: a crash that only reached stderr once left a device
+    /// that still looked healthy while every app hung on "Connecting…".
+    Crashed(String),
 }
 
 /// The state one device task owns.
@@ -294,11 +299,25 @@ impl Device {
     /// ends on its own (discovery could not bind yet at boot, a responder died).
     async fn run(self, mut shutdown: tokio::sync::oneshot::Receiver<()>) {
         loop {
-            match self.run_once(&mut shutdown).await {
+            // A panic anywhere in the librespot stack must not end the task: that
+            // leaves the node and the handle in place, so the device looks fine and
+            // is gone.
+            let exit = match AssertUnwindSafe(self.run_once(&mut shutdown)).catch_unwind().await {
+                Ok(exit) => exit,
+                Err(panic) => Exit::Crashed(panic_message(panic.as_ref())),
+            };
+            match exit {
                 Exit::Shutdown => break,
-                Exit::Failed => {
+                Exit::Failed | Exit::Crashed(_) => {
                     self.now_playing.clear();
-                    *self.status.lock_recover() = SpotifyStatus::default();
+                    let last_error = match exit {
+                        Exit::Crashed(msg) => {
+                            tracing::error!("Spotify '{}': the device crashed: {msg}", self.name);
+                            Some(format!("internal error: {msg}"))
+                        }
+                        _ => None,
+                    };
+                    *self.status.lock_recover() = SpotifyStatus { last_error, ..SpotifyStatus::default() };
                     tokio::select! {
                         _ = &mut shutdown => break,
                         _ = tokio::time::sleep(RESTART_DELAY) => {}
@@ -503,6 +522,15 @@ impl Device {
     }
 }
 
+/// The text of a caught panic, for the log and `last_error`.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 /// Title, artist(s), album, duration and the largest cover of a track (or the
 /// show of a podcast episode).
 fn track_metadata(item: &AudioItem) -> MetadataUpdate {
@@ -655,6 +683,14 @@ mod tests {
         let t = Instant::now();
         s.push_paced(&[0.0; 1000]);
         assert!(t.elapsed() < SINK_POLL * 4);
+    }
+
+    #[test]
+    fn a_panic_message_is_readable_whatever_its_payload() {
+        let caught = std::panic::catch_unwind(|| panic!("no provider {}", 1)).unwrap_err();
+        assert_eq!(panic_message(caught.as_ref()), "no provider 1");
+        let caught = std::panic::catch_unwind(|| panic!("static")).unwrap_err();
+        assert_eq!(panic_message(caught.as_ref()), "static");
     }
 
     #[test]

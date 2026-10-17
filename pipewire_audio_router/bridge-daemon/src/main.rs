@@ -56,6 +56,9 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before any TLS client exists: with two rustls backends in the tree there is
+    // no automatic default, and a client relying on it panics (util/tls.rs).
+    crate::util::tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
             |_| // `sendspin=info` matters more than it looks: the vendored server role logs its
