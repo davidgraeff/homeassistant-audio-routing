@@ -34,8 +34,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the long-lived daemon: connect to the already-running PipeWire
-    /// instance, bring up the stored AirPlay and RTP sources, and serve the REST
-    /// API — all of which can be reconfigured live (api/sources.rs's
+    /// instance, bring up the stored AirPlay, Spotify and RTP sources, and serve
+    /// the REST API — all of which can be reconfigured live (api/sources.rs's
     /// `/api/sources`). Sendspin devices and AirPlay-2
     /// receivers are discovered and grouped dynamically, so there's nothing
     /// stored for them.
