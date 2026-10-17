@@ -9,14 +9,15 @@ use super::*;
 // seeding) and is then authoritative. Same "runtime, no restart" model as
 // /api/outputs, but backed by an in-process receiver rather than a module.
 
-/// Reconcile BOTH source kinds after a `/api/sources` mutation: (un)load RTP
-/// modules (Phase 2) and start/stop AirPlay receivers (Phase 4) to match the
-/// persisted set. Idempotent, so it's safe to call after every add/update/
+/// Reconcile every source kind after a `/api/sources` mutation: (un)load RTP
+/// modules (Phase 2) and start/stop the AirPlay receivers (Phase 4) and
+/// Spotify devices to match the persisted set. Idempotent, so it's safe to call after every add/update/
 /// remove. `list()` returns an owned snapshot so no lock is held across await.
 pub(crate) async fn reconcile_sources(state: &AppState) {
     let entries = state.sources.lock_recover().list();
     crate::sources::rtp::reconcile(&entries, &state.pw_cmd, &state.pw).await;
     crate::sources::airplay::reconcile(&state.airplay, &entries, &state.airplay_clients, &state.now_playing).await;
+    crate::sources::spotify::reconcile(&state.spotify, &entries, &state.now_playing).await;
     // A source that no longer exists must not leave a track behind in the
     // listings for the TTL to eventually collect (sources/now_playing.rs).
     let live: Vec<String> = entries.iter().map(|e| e.node_name()).collect();

@@ -575,6 +575,7 @@ pub(crate) async fn build_snapshot(state: &AppState) -> RoutingMatrix {
             let ms = match &entry.config {
                 SourceConfig::Airplay(c) => c.latency_msec,
                 SourceConfig::Rtp(c) => c.latency_msec,
+                SourceConfig::Spotify(c) => c.latency_msec,
             };
             source_latencies.insert(node_name.clone(), ms);
             source_labels.insert(node_name, entry.label.clone());

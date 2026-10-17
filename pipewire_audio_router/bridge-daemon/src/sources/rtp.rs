@@ -154,7 +154,7 @@ pub async fn reconcile(sources: &[SourceEntry], pw_cmd: &PwCommandSender, pw: &S
         .iter()
         .filter_map(|e| match &e.config {
             SourceConfig::Rtp(cfg) => Some((e.node_name(), cfg.clone())),
-            SourceConfig::Airplay(_) => None,
+            SourceConfig::Airplay(_) | SourceConfig::Spotify(_) => None,
         })
         .collect();
 

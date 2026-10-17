@@ -11,16 +11,16 @@ use super::*;
 // ---- Multi-source collection CRUD (Phase 3) ------------------------------
 //
 // The generalized, keyed replacement for the two singular `/api/source/*` routes
-// this daemon used to expose: a collection of AirPlay + RTP input sources, each with its own
+// this daemon used to expose: a collection of AirPlay, Spotify and RTP input sources, each with its own
 // stable id / node name (sources/mod.rs). These handlers only mutate the
 // STORE — actually loading/unloading the PipeWire module (RTP) or starting/
-// stopping the embedded receiver (AirPlay) is done by the per-kind reconcilers
+// stopping the embedded receivers (AirPlay, Spotify) is done by the per-kind reconcilers
 // wired from main.rs (Phases 2 & 4). After each mutation we nudge the change
 // notifier so watchers refresh.
 
 /// Nested response shape for a single source. Distinct from the *flat* stored
 /// [`SourceEntry`] (`{id,label,kind,<config...>}`): here the kind-specific
-/// config is nested under `airplay`/`rtp` (exactly one non-null), plus the
+/// config is nested under `airplay`/`rtp`/`spotify` (exactly one non-null), plus the
 /// derived `node_name` and the live `present` flag. Matches the frontend's
 /// `SourceView` (Phase 5) exactly.
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -36,6 +36,11 @@ pub(crate) struct SourceView {
     pub(crate) airplay: Option<AirplaySourceConfig>,
     /// The RTP config when `kind == rtp`, else `null`.
     pub(crate) rtp: Option<RtpSourceConfig>,
+    /// The Spotify config when `kind == spotify`, else `null`.
+    pub(crate) spotify: Option<SpotifySourceConfig>,
+    /// Who is playing on a running Spotify device. `null` for the other kinds
+    /// and for a Spotify source whose device is not running.
+    pub(crate) spotify_status: Option<SpotifyStatus>,
     /// The discovered Bluetooth bridge that feeds this RTP source, when exactly
     /// one advertises this port (and group). `null` for AirPlay sources, when no
     /// bridge advertises, or when two do — see `sources::bt_bridge::match_bridge`.
@@ -92,9 +97,10 @@ impl BridgeView {
 /// `bridges` is the discovered-bridge set to match an RTP source against; pass an
 /// empty slice to skip (AirPlay sources never match).
 pub(crate) fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::sources::bt_bridge::BtBridge]) -> SourceView {
-    let (airplay, rtp) = match &entry.config {
-        SourceConfig::Airplay(a) => (Some(a.clone()), None),
-        SourceConfig::Rtp(r) => (None, Some(r.clone())),
+    let (airplay, rtp, spotify) = match &entry.config {
+        SourceConfig::Airplay(a) => (Some(a.clone()), None, None),
+        SourceConfig::Rtp(r) => (None, Some(r.clone()), None),
+        SourceConfig::Spotify(s) => (None, None, Some(s.clone())),
     };
     let bridge =
         rtp.as_ref().and_then(|r| crate::sources::bt_bridge::match_bridge(bridges.iter(), r.port, &r.source_addr)).map(BridgeView::of);
@@ -106,8 +112,22 @@ pub(crate) fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::
         node_name: entry.node_name(),
         airplay,
         rtp,
+        spotify,
+        spotify_status: None,
         bridge,
     }
+}
+
+/// Attach each running Spotify device's status to its view — runtime state the
+/// pure [`source_view`] cannot see.
+pub(crate) async fn with_spotify_status(state: &AppState, mut views: Vec<SourceView>) -> Vec<SourceView> {
+    if views.iter().any(|v| v.kind == SourceKind::Spotify) {
+        let statuses = crate::sources::spotify::statuses(&state.spotify).await;
+        for v in &mut views {
+            v.spotify_status = statuses.get(&v.id).cloned();
+        }
+    }
+    views
 }
 
 /// Whether a node with `node_name` is present in the live registry right now.
@@ -146,7 +166,7 @@ pub(crate) struct SourcesListResponse {
 }
 
 /// `POST /api/sources` body. `kind` selects which config object is honored; the
-/// matching `airplay`/`rtp` object carries partial fields (every field has a
+/// matching `airplay`/`rtp`/`spotify` object carries partial fields (every field has a
 /// serde default), and may be omitted entirely to accept all defaults.
 #[derive(Deserialize)]
 pub(crate) struct CreateSourceRequest {
@@ -156,10 +176,12 @@ pub(crate) struct CreateSourceRequest {
     pub(crate) airplay: Option<AirplaySourceConfig>,
     #[serde(default)]
     pub(crate) rtp: Option<RtpSourceConfig>,
+    #[serde(default)]
+    pub(crate) spotify: Option<SpotifySourceConfig>,
 }
 
 /// `PUT /api/sources/{id}` body. All fields optional: `label` renames, and an
-/// `airplay`/`rtp` object replaces the config (must match the source's
+/// `airplay`/`rtp`/`spotify` object replaces the config (must match the source's
 /// immutable kind — the store rejects a mismatch). Omitting both config objects
 /// is a label-only update.
 #[derive(Deserialize)]
@@ -170,6 +192,8 @@ pub(crate) struct UpdateSourceRequest {
     pub(crate) airplay: Option<AirplaySourceConfig>,
     #[serde(default)]
     pub(crate) rtp: Option<RtpSourceConfig>,
+    #[serde(default)]
+    pub(crate) spotify: Option<SpotifySourceConfig>,
 }
 
 /// A source-CRUD failure. The one convention: the status comes from the kind and the
@@ -199,6 +223,7 @@ pub(crate) async fn list_sources(State(state): State<AppState>) -> Json<SourcesL
     let present = present_node_names(&state.pw);
     let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
     let sources: Vec<SourceView> = entries.iter().map(|e| source_view(e, present.contains(&e.node_name()), &bridges)).collect();
+    let sources = with_spotify_status(&state, sources).await;
     let discovered_bridges = unmatched_bridges(&bridges, &sources);
     Json(SourcesListResponse { sources, discovered_bridges })
 }
@@ -220,6 +245,7 @@ pub(crate) async fn create_source(
     let config = match req.kind {
         SourceKind::Airplay => SourceConfig::Airplay(req.airplay.unwrap_or_default()),
         SourceKind::Rtp => SourceConfig::Rtp(req.rtp.unwrap_or_else(default_rtp_config)),
+        SourceKind::Spotify => SourceConfig::Spotify(req.spotify.unwrap_or_default()),
     };
     let entry = {
         let mut store = state.sources.lock_recover();
@@ -239,7 +265,8 @@ pub(crate) async fn get_source(State(state): State<AppState>, Path(id): Path<Str
         state.sources.lock_recover().get(&id).ok_or_else(|| source_err(StatusCode::NOT_FOUND, format!("no source with id '{id}'")))?;
     let present = node_present(&state.pw, &entry.node_name());
     let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
-    Ok(Json(source_view(&entry, present, &bridges)))
+    let view = source_view(&entry, present, &bridges);
+    Ok(Json(with_spotify_status(&state, vec![view]).await.remove(0)))
 }
 
 pub(crate) async fn update_source(
@@ -249,10 +276,11 @@ pub(crate) async fn update_source(
 ) -> Result<Json<SourceView>, SourceError> {
     // Kind is immutable, so it's derived from whichever config object is present
     // (the store rejects a config whose kind differs from the stored entry's).
-    let config = match (req.airplay, req.rtp) {
-        (Some(a), _) => Some(SourceConfig::Airplay(a)),
-        (None, Some(r)) => Some(SourceConfig::Rtp(r)),
-        (None, None) => None,
+    let config = match (req.airplay, req.rtp, req.spotify) {
+        (Some(a), _, _) => Some(SourceConfig::Airplay(a)),
+        (None, Some(r), _) => Some(SourceConfig::Rtp(r)),
+        (None, None, Some(s)) => Some(SourceConfig::Spotify(s)),
+        (None, None, None) => None,
     };
     let entry = {
         let mut store = state.sources.lock_recover();

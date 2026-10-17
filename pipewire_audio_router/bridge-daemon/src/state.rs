@@ -30,6 +30,10 @@ pub type SharedSources = Arc<Mutex<SourcesStore>>;
 /// Phase 4: multiple concurrent receivers, reconciled against the store.
 pub type SharedAirplay = crate::sources::airplay::SharedAirplayMap;
 
+/// The running Spotify Connect devices (sources/spotify.rs), keyed by source id —
+/// each an embedded librespot feeding its own PipeWire source node.
+pub type SharedSpotify = crate::sources::spotify::SharedSpotifyMap;
+
 /// Shared axum state: the live PipeWire registry snapshot, the routing UI's
 /// change-notification channel (routing/mod.rs), and the command sender for runtime
 /// module load/unload (pw/thread.rs). Existing handlers extract just the piece
@@ -41,6 +45,7 @@ pub struct AppState {
     pub pw_cmd: PwCommandSender,
     pub sources: SharedSources,
     pub airplay: SharedAirplay,
+    pub spotify: SharedSpotify,
     /// Remembered AirPlay senders (sources/airplay_clients.rs), per-receiver — the
     /// backing store for each source's connection list + ban/priority controls.
     /// Per-source views are taken via `.registry(id)`. Anti-takeover is now

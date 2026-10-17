@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// The UDP-`connect` trick sends no packets: it only makes the kernel choose the
 /// outbound interface for that destination, which — because Docker bridge routes
 /// are more specific and never the default — is the real LAN interface.
-fn primary_lan_ipv4() -> Option<Ipv4Addr> {
+pub(crate) fn primary_lan_ipv4() -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     sock.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;
     match sock.local_addr().ok()?.ip() {

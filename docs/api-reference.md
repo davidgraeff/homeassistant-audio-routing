@@ -403,11 +403,12 @@ seeding) and is managed live here with no restart (`sources/mod.rs`).
 > concurrent sources of each kind**, so every source has an `id` and its own config,
 > and there is one uniform collection API instead of two hard-coded singletons.
 
-Two kinds exist, both running **natively in-process** — no supervised subprocesses:
+Three kinds exist, all running **natively in-process** — no supervised subprocesses:
 
 | `kind` | Implementation |
 |---|---|
 | `airplay` | native embedded AirPlay/RAOP **receiver** (vendored+patched pure-Rust `shairplay`, `sources/airplay.rs`) — not a `shairport-sync` subprocess |
+| `spotify` | embedded **Spotify Connect** device (librespot, `sources/spotify.rs`); node `spotify-in-<id>` |
 | `rtp` | native `libpipewire-module-rtp-source` (`sources/rtp.rs`), e.g. the [Bluetooth bridge](../firmware/pi-bridge/README.md) |
 
 Creating or updating a source loads/starts it immediately; deleting one unloads it.
@@ -415,9 +416,10 @@ Sendspin, AirPlay-2 and pw-sink **outputs** are auto-discovered, not configured 
 [Outputs](#outputs-discovered-then-adopted).
 
 ### `GET /api/sources`
-Every configured source, with the kind-specific config **nested** under `airplay` or
-`rtp` (exactly one is non-null) plus the derived `node_name` and the live `present`
-flag.
+Every configured source, with the kind-specific config **nested** under `airplay`,
+`rtp` or `spotify` (exactly one is non-null) plus the derived `node_name` and the live
+`present` flag. A Spotify source also carries `spotify_status` — see
+[Spotify source config](#spotify-source-config-spotify).
 
 ```json
 { "sources": [
@@ -457,8 +459,8 @@ nudged. `id` is derived from `label` (slugified, with collision suffixing).
 One source, same `SourceView` shape as above. Unknown `id` → 404.
 
 ### `PUT /api/sources/{id}`
-Update a source. Every field is optional: `label` renames it, and an `airplay`/`rtp`
-object **replaces** that source's config. `kind` is immutable — sending the config
+Update a source. Every field is optional: `label` renames it, and an
+`airplay`/`rtp`/`spotify` object **replaces** that source's config. `kind` is immutable — sending the config
 object of the wrong kind is rejected. Omitting both config objects is a label-only
 update.
 
@@ -506,6 +508,30 @@ Everything else is fixed to match the bridge's wire format: native-endian **`S16
 | `prevent_takeover` | refuse a second sender while one is streaming |
 
 The receiver advertises unencrypted ALAC (`et=0`, `cn=1`).
+
+### Spotify source config (`spotify`)
+
+The `label` is the device name Spotify apps list. There is **no account field**: when
+someone picks the device in their app, the app hands it their own login over the LAN
+(Spotify Connect's zeroconf flow) and it plays from their account — Spotify Premium
+only. A second account picking it takes it over. Every config change restarts the
+device, which ends a running session.
+
+| Field | Meaning |
+|---|---|
+| `latency_msec` | ingest buffer, `20`–`2000` (default `250`). The sink applies backpressure, so this is how far playback runs ahead of the graph — what a pause or skip lags by, before the outputs' own delay |
+| `bitrate` | `96`, `160` or `320` kbit/s (default `320`) |
+| `initial_volume` | percent a fresh session starts at (default `50`); the app's slider controls the source from then on, in software |
+| `normalisation` | Spotify's track loudness normalisation (default `false`) |
+
+`spotify_status` (read-only, `null` while the device is not running):
+
+```json
+{ "user": "davidgraeff", "client": "David's iPhone", "volume": 62, "last_error": null }
+```
+
+`last_error` holds why the most recent login failed until the next one succeeds — a
+free account's refusal by Spotify lands here.
 
 ## Source clients (AirPlay senders)
 

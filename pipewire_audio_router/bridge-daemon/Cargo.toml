@@ -96,6 +96,23 @@ airplay-client = { path = "vendor/airplay2-sender/crates/airplay-client" }
 # Core types (Device/Features/StreamConfig/TimingProtocol/PtpMode) the sender's
 # Connection needs but airplay-client doesn't re-export. Same vendored workspace.
 airplay-core = { path = "vendor/airplay2-sender/crates/airplay-core" }
+# Spotify Connect receiver (sources/spotify.rs) — librespot, as libraries
+# rather than its binary, so the decoded PCM goes straight into a producer node
+# like the AirPlay receiver's. MIT. The individual crates instead of the
+# `librespot` umbrella, whose binary drags in env_logger/getopts/sysinfo. Every
+# crate's defaults are off: no audio backend (we are the sink), no native-tls
+# (rustls with bundled webpki roots, so the runtime image needs no CA store),
+# and libmdns — the pure-Rust responder — as the only zeroconf backend; the
+# others need avahi's D-Bus or its compat library on the host.
+librespot-core = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-connect = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-discovery = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "with-libmdns"] }
+librespot-metadata = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# The Spotify device id (sources/spotify.rs): a SHA-1 of the source id, the
+# same shape librespot's binary derives from its device name. Already in the
+# tree through librespot-discovery.
+sha1 = "0.10"
 opusic-sys = "0.7.4"
 flacenc = { version = "0.5.1", default-features = false, features = ["log"] }
 futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }

@@ -37,6 +37,7 @@ import type {
   SourceKind,
   SourcesResponse,
   SourceView,
+  SpotifySourceCfg,
   StatusInfo,
   SyncSettingsInfo,
 } from './types';
@@ -450,10 +451,16 @@ export const api = {
     kind: SourceKind;
     airplay?: Partial<AirplaySourceCfg>;
     rtp?: Partial<RtpSourceCfg>;
+    spotify?: Partial<SpotifySourceCfg>;
   }) => request<SourceView>('POST', 'api/sources', body),
   updateSource: (
     id: string,
-    body: { label?: string; airplay?: Partial<AirplaySourceCfg>; rtp?: Partial<RtpSourceCfg> },
+    body: {
+      label?: string;
+      airplay?: Partial<AirplaySourceCfg>;
+      rtp?: Partial<RtpSourceCfg>;
+      spotify?: Partial<SpotifySourceCfg>;
+    },
   ) => request<SourceView>('PUT', `api/sources/${enc(id)}`, body),
   deleteSource: (id: string) =>
     request<OpResponse>('DELETE', `api/sources/${enc(id)}`),

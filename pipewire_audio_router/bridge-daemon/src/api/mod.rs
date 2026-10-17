@@ -8,8 +8,9 @@ use crate::pw::thread::{ChangeNotifier, LinkSpec, PwCommand, PwCommandSender, Sh
 use crate::routing;
 use crate::sources::airplay_clients::AirplayClientStore;
 use crate::sources::rtp::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
-use crate::sources::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind};
-use crate::state::{AppState, SharedAirplay, SharedSources};
+use crate::sources::spotify::SpotifyStatus;
+use crate::sources::{AirplaySourceConfig, RtpSourceConfig, SourceConfig, SourceEntry, SourceKind, SpotifySourceConfig};
+use crate::state::{AppState, SharedAirplay, SharedSources, SharedSpotify};
 use crate::store::outputs::SharedOutputs;
 use crate::store::routing::SharedRouting;
 use crate::store::settings::SharedSettings;
@@ -39,6 +40,7 @@ pub fn router(
     pw_cmd: PwCommandSender,
     sources: SharedSources,
     airplay: SharedAirplay,
+    spotify: SharedSpotify,
     airplay_clients: AirplayClientStore,
     now_playing: crate::sources::now_playing::NowPlayingStore,
     meters: crate::pw::metering::SharedMeters,
@@ -68,6 +70,7 @@ pub fn router(
         pw_cmd,
         sources,
         airplay,
+        spotify,
         airplay_clients,
         now_playing,
         meters,

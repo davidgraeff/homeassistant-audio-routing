@@ -1380,11 +1380,12 @@ export interface AirplayClient {
 }
 
 // ---- Dynamic input sources (multi-source refactor) ---------------------
-// A source is either an AirPlay-receive endpoint or an RTP-receive endpoint.
+// A source is an AirPlay-receive endpoint, a Spotify Connect device or an
+// RTP-receive endpoint.
 // The daemon holds a keyed collection; the UI adds/edits/removes entries via
 // the /api/sources CRUD endpoints (docs/multi-source-inputs-plan.md).
 
-export type SourceKind = 'airplay' | 'rtp';
+export type SourceKind = 'airplay' | 'rtp' | 'spotify';
 
 /** AirPlay-receive per-instance config. `port` is the RTSP port, allocated by
  *  the daemon on add (0 = allocate on next load) and stable across restarts. */
@@ -1402,6 +1403,30 @@ export interface RtpSourceCfg {
   source_addr: string;
   ignore_ssrc: boolean;
   rate: number;
+}
+
+/** Spotify Connect per-instance config. No account: whoever picks the device in
+ *  their Spotify app hands it their own login over the LAN. */
+export interface SpotifySourceCfg {
+  /** Ingest buffer, ms — also how far a pause or skip lags (before the outputs' own delay). */
+  latency_msec: number;
+  /** Stream quality, kbit/s: 96, 160 or 320. */
+  bitrate: number;
+  /** Volume a fresh session starts at, percent; the app's slider takes over from there. */
+  initial_volume: number;
+  /** Spotify's loudness normalisation. */
+  normalisation: boolean;
+}
+
+/** Who is playing on a running Spotify device (runtime only). */
+export interface SpotifyStatus {
+  user?: string | null;
+  /** The controlling app instance, e.g. "David's iPhone". */
+  client?: string | null;
+  /** Spotify-side volume, percent. */
+  volume?: number | null;
+  /** Why the last login failed (a free account is refused by Spotify). */
+  last_error?: string | null;
 }
 
 /** A Bluetooth→RTP bridge discovered over mDNS (`_pwrouter-btbridge._tcp`,
@@ -1450,6 +1475,9 @@ export interface SourceView {
   node_name: string;
   airplay?: AirplaySourceCfg | null;
   rtp?: RtpSourceCfg | null;
+  spotify?: SpotifySourceCfg | null;
+  /** Null unless this is a Spotify source whose device is running. */
+  spotify_status?: SpotifyStatus | null;
   /** The discovered bridge feeding this RTP source, when exactly one advertises
    *  its port (and multicast group). Null for AirPlay, when none advertises, and
    *  deliberately when *two* do — an ambiguous match would link to the wrong Pi. */

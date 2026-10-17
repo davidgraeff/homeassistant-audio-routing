@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
             // dial loop (attempt, failure, retry backoff, goodbye reason) through the `log`
             // crate, and without its target enabled every one of those lines is dropped —
             // which left "why is this speaker not connected?" unanswerable from the log.
-            "bridge_daemon=info,sendspin=info,shairplay=info,airplay_client=info,airplay_audio=info,libairptp=info".into(),
+            "bridge_daemon=info,sendspin=info,shairplay=info,airplay_client=info,airplay_audio=info,libairptp=info,librespot=info".into(),
         ))
         .init();
 
@@ -118,7 +118,12 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         let list = sources.list();
         let airplay = list.iter().filter(|e| matches!(e.config, crate::sources::SourceConfig::Airplay(_))).count();
         let rtp = list.iter().filter(|e| matches!(e.config, crate::sources::SourceConfig::Rtp(_))).count();
-        tracing::info!("sources: {} configured ({airplay} AirPlay, {rtp} RTP) in {}", list.len(), sources_path.display());
+        let spotify = list.iter().filter(|e| matches!(e.config, crate::sources::SourceConfig::Spotify(_))).count();
+        tracing::info!(
+            "sources: {} configured ({airplay} AirPlay, {spotify} Spotify, {rtp} RTP) in {}",
+            list.len(),
+            sources_path.display()
+        );
     }
     // Anti-takeover is now per-receiver: each running AirplayHandle owns its own
     // flag (seeded from that source's stored config by crate::sources::airplay::reconcile),
@@ -198,6 +203,8 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
     // Running AirPlay receivers, keyed by source id (one per configured AirPlay
     // source), reconciled against the store below and via the API.
     let airplay: state::SharedAirplay = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    // Running Spotify Connect devices, likewise one per configured Spotify source.
+    let spotify: state::SharedSpotify = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     // Remembered AirPlay senders (Sources-tab connection list), per-receiver.
     // One backing file beside sources.json in /data holds a client list per
@@ -284,7 +291,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         // Start every stored source/adapter process (AirPlay source via
         // Supervisor) and the RTP source. A failed spawn is logged, not fatal
         // — the rest still start and it can be re-enabled live.
-        spawn_stored_sources(&sources, &airplay, &airplay_clients, &now_playing, &pw_state, pw_cmd.clone()).await;
+        spawn_stored_sources(&sources, &airplay, &spotify, &airplay_clients, &now_playing, &pw_state, pw_cmd.clone()).await;
 
         // NOTE: a multicast-IGMP self-heal watchdog used to run here
         // (`rtp_membership.rs`, removed 2026-07-28). `module-rtp-source` does this
@@ -514,6 +521,7 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
             pw_cmd,
             sources,
             airplay.clone(),
+            spotify.clone(),
             airplay_clients,
             now_playing,
             meters,
@@ -574,17 +582,24 @@ fn serve(sources_path: &Path, routing_path: &Path, static_dir: &Path, listen: &s
         for (_id, handle) in std::mem::take(&mut *airplay.lock().await) {
             handle.stop().await;
         }
+        // Spotify devices log out and unregister their advertisement, so a phone
+        // does not keep showing a device that is gone.
+        for (_id, handle) in std::mem::take(&mut *spotify.lock().await) {
+            handle.stop().await;
+        }
         Ok::<(), anyhow::Error>(())
     })
 }
 
-/// Starts the persisted sources: the native AirPlay receiver (sources/airplay.rs)
-/// and the RTP source (a PipeWire module). (Sendspin devices aren't started
+/// Starts the persisted sources: the native AirPlay receiver (sources/airplay.rs),
+/// the Spotify Connect devices (sources/spotify.rs) and the RTP source (a
+/// PipeWire module). (Sendspin devices aren't started
 /// here — they're auto-discovered and grouped from the routing intent; see
 /// routing/sync_group/mod.rs.)
 async fn spawn_stored_sources(
     sources: &state::SharedSources,
     airplay: &state::SharedAirplay,
+    spotify: &state::SharedSpotify,
     airplay_clients: &crate::sources::airplay_clients::AirplayClientStore,
     now_playing: &crate::sources::now_playing::NowPlayingStore,
     pw: &pw::thread::SharedState,
@@ -607,6 +622,9 @@ async fn spawn_stored_sources(
     // the reconciler starts each on its own node/port/mDNS name with its own
     // per-source client registry + anti-takeover flag.
     crate::sources::airplay::reconcile(airplay, &entries, airplay_clients, now_playing).await;
+
+    // Every configured Spotify device, each advertised under its own name.
+    crate::sources::spotify::reconcile(spotify, &entries, now_playing).await;
 }
 
 /// Completes on SIGTERM or SIGINT — the trigger for axum's graceful shutdown.

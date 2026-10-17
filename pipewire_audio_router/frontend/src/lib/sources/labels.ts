@@ -5,10 +5,23 @@
  * the API calls. A remembered AirPlay sender may have no name and no address yet — only
  * the key the daemon tracks it by — so the label falls back rather than rendering blank.
  */
-import type { AirplayClient, SourceKind } from '../types';
+import type { AirplayClient, SourceKind, SpotifyStatus } from '../types';
 
 export function kindLabel(kind: SourceKind): string {
-  return kind === 'airplay' ? 'AirPlay' : 'RTP';
+  switch (kind) {
+    case 'airplay':
+      return 'AirPlay';
+    case 'spotify':
+      return 'Spotify';
+    case 'rtp':
+      return 'RTP';
+  }
+}
+
+/** One line on who is playing on a Spotify device, or null when nobody is. */
+export function spotifyListener(st: SpotifyStatus | null | undefined): string | null {
+  if (!st?.user) return null;
+  return st.client ? `${st.user} · ${st.client}` : st.user;
 }
 
 export function clientLabel(c: AirplayClient): string {

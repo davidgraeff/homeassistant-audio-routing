@@ -100,12 +100,13 @@ subprocess stderr. See
 | Source | Node | How it gets into the graph |
 |---|---|---|
 | **AirPlay receive** | `airplay-in` | Native, in-process RAOP receiver — vendored+patched pure-Rust `shairplay` crate (`sources/airplay.rs`). Decoded f32 PCM is pushed through a jitter buffer into a PipeWire producer node. |
+| **Spotify Connect** | `spotify-in-<id>` | Embedded librespot (`sources/spotify.rs`): advertised over mDNS, logged in by whichever Spotify app picks it, decoding into the same producer node as AirPlay (`sources/pcm_producer.rs`) — with backpressure, since librespot is paced by its sink. |
 | **RTP** | `bt-bridge-rtp` (or similar) | PipeWire's `rtp-source` module, fed by the ESP32 / Pi Bluetooth bridge over RTP/UDP. Can bind a multicast group so several PipeWire hosts share one bridge stream. |
 
 Sources are a **keyed collection**, not one of each: `sources/mod.rs` holds a
-persisted list of sources of those two kinds (`sources.json`, presence in the
+persisted list of sources of those three kinds (`sources.json`, presence in the
 list = enabled) and reconciles the live receivers when it changes, so the user
-can add and remove several of either type at runtime, each independently
+can add and remove several of each type at runtime, each independently
 routable. Each AirPlay source carries its own registry of remembered senders,
 with bans and priorities (`sources/airplay_clients.rs`), and each source has a
 now-playing record fed by whichever producer can say (the receiver's DMAP

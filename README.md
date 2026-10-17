@@ -40,7 +40,8 @@ in the kitchen and the living room" is two taps and stays in sync.
 
 ## What you get
 
-- **Play in from** an iPhone, Mac or PC over AirPlay · any Bluetooth device, via
+- **Play in from** an iPhone, Mac or PC over AirPlay · anyone's Spotify app, as a
+  Spotify Connect device that plays from *their* account · any Bluetooth device, via
   a small ESP32 or Raspberry Pi bridge box · a Linux PC, via a receiver agent ·
   the YouTube Music app's own Cast button, via a second add-on in this
   repository.

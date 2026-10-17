@@ -124,6 +124,32 @@ fn rtp_entry() -> SourceEntry {
 }
 
 #[test]
+fn source_view_spotify_shape() {
+    let entry = SourceEntry {
+        id: "wohnzimmer".to_string(),
+        label: "Wohnzimmer".to_string(),
+        config: SourceConfig::Spotify(SpotifySourceConfig::default()),
+    };
+    let view = source_view(&entry, true, &[]);
+    assert_eq!(view.kind, SourceKind::Spotify);
+    assert_eq!(view.node_name, "spotify-in-wohnzimmer");
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["kind"], "spotify");
+    assert_eq!(json["airplay"], serde_json::Value::Null);
+    assert_eq!(json["rtp"], serde_json::Value::Null);
+    assert_eq!(json["spotify"]["bitrate"], 320);
+    assert_eq!(json["spotify"]["initial_volume"], 50);
+    assert_eq!(json["spotify"]["latency_msec"], 250);
+    assert_eq!(json["spotify"]["normalisation"], false);
+    // Runtime status is attached by the handlers, never by the pure view.
+    assert_eq!(json["spotify_status"], serde_json::Value::Null);
+
+    // A create request may carry the config partially, or not at all.
+    let req: CreateSourceRequest = serde_json::from_str(r#"{"label":"Küche","kind":"spotify","spotify":{"bitrate":160}}"#).unwrap();
+    assert_eq!(req.spotify.unwrap(), SpotifySourceConfig { bitrate: 160, ..SpotifySourceConfig::default() });
+}
+
+#[test]
 fn source_view_airplay_shape() {
     let view = source_view(&airplay_entry(), true, &[]);
     assert_eq!(view.id, "kitchen-airplay");

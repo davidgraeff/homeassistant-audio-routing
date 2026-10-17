@@ -12,8 +12,9 @@
     RtpSourceCfg,
     SourceKind,
     SourceView,
+    SpotifySourceCfg,
   } from '../../lib/types';
-  import { clientLabel, formatWhen, kindLabel, pct } from '../../lib/sources/labels';
+  import { clientLabel, formatWhen, kindLabel, pct, spotifyListener } from '../../lib/sources/labels';
   import { deriveRtpMode, RTP_MODES, type RtpMode, rtpModeToParams } from '../../lib/sources/rtp-mode';
 
   // The set of configured input sources (AirPlay-receive + RTP-receive). Loaded
@@ -101,10 +102,27 @@
   // page therefore does not touch the alignment session at all, and that is the point:
   // there is one session process-wide, and a page that neither starts nor shows it
   // cannot tear it down either.
+  // A Spotify device's listener lives on the source itself rather than in a client
+  // list, so the poll re-reads the list — quietly, without the loading state — but
+  // only while there is a Spotify source to keep current.
+  async function refreshSpotifyStatus() {
+    if (!sources.some((s) => s.kind === 'spotify')) return;
+    try {
+      const res = await api.listSources();
+      sources = res.sources;
+      discoveredBridges = res.discovered_bridges ?? [];
+    } catch {
+      /* keep last-known */
+    }
+  }
+
   onMount(() => {
     refresh();
     // Light poll so connect/disconnect/ban shows up without a manual reload.
-    const timer = setInterval(refreshAllClients, 5000);
+    const timer = setInterval(() => {
+      refreshAllClients();
+      refreshSpotifyStatus();
+    }, 5000);
     return () => clearInterval(timer);
   });
 
@@ -158,6 +176,11 @@
   let rtpRate = $state(48000);
   let rtpMode = $state<RtpMode>('all');
   let rtpMulticastAddr = $state('239.255.42.42');
+  // Spotify fields
+  let spLatency = $state(250);
+  let spBitrate = $state(320);
+  let spInitialVolume = $state(50);
+  let spNormalisation = $state(false);
 
   function resetAirplayFields(cfg?: AirplaySourceCfg | null) {
     apLatency = cfg?.latency_msec ?? 150;
@@ -176,11 +199,19 @@
     else rtpMulticastAddr = '239.255.42.42';
   }
 
+  function resetSpotifyFields(cfg?: SpotifySourceCfg | null) {
+    spLatency = cfg?.latency_msec ?? 250;
+    spBitrate = cfg?.bitrate ?? 320;
+    spInitialVolume = cfg?.initial_volume ?? 50;
+    spNormalisation = cfg?.normalisation ?? false;
+  }
+
   function openAdd(kind: SourceKind) {
     form = { type: 'add', kind };
     formLabel = '';
     rtpMenuOpen = false;
     if (kind === 'airplay') resetAirplayFields();
+    else if (kind === 'spotify') resetSpotifyFields();
     else resetRtpFields();
   }
   function openEdit(s: SourceView) {
@@ -188,6 +219,7 @@
     formLabel = s.label;
     rtpMenuOpen = false;
     if (s.kind === 'airplay') resetAirplayFields(s.airplay);
+    else if (s.kind === 'spotify') resetSpotifyFields(s.spotify);
     else resetRtpFields(s.rtp);
   }
   function closeForm() {
@@ -223,6 +255,21 @@
     };
   }
 
+  function spotifyBody(): SpotifySourceCfg {
+    return {
+      latency_msec: spLatency,
+      bitrate: spBitrate,
+      initial_volume: spInitialVolume,
+      normalisation: spNormalisation,
+    };
+  }
+  /** The kind-specific config object of a create/update body. */
+  function configBody(kind: SourceKind) {
+    if (kind === 'airplay') return { airplay: airplayBody() };
+    if (kind === 'spotify') return { spotify: spotifyBody() };
+    return { rtp: rtpBody() };
+  }
+
   async function save(e?: Event) {
     e?.preventDefault();
     const f = form;
@@ -232,13 +279,10 @@
     busy = true;
     let ok = false;
     if (f.type === 'add') {
-      const body =
-        f.kind === 'airplay'
-          ? { label, kind: f.kind, airplay: airplayBody() }
-          : { label, kind: f.kind, rtp: rtpBody() };
+      const body = { label, kind: f.kind, ...configBody(f.kind) };
       ok = await run(() => api.addSource(body), `Added ${kindLabel(f.kind)} source '${label}'`);
     } else {
-      const body = f.kind === 'airplay' ? { label, airplay: airplayBody() } : { label, rtp: rtpBody() };
+      const body = { label, ...configBody(f.kind) };
       ok = await run(() => api.updateSource(f.id, body), `Updated source '${label}'`);
     }
     busy = false;
@@ -356,9 +400,10 @@
     </div>
   </div>
   <p class="card-sub">
-    The audio this router can receive and route onward. Add as many as you like of two kinds:
-    an <strong>AirPlay-receive</strong> endpoint (a target phones and PCs cast into) or an
-    <strong>RTP-receive</strong> endpoint (an ESP32 / Raspberry Pi Bluetooth bridge, or any PipeWire
+    The audio this router can receive and route onward. Add as many as you like of three kinds:
+    an <strong>AirPlay-receive</strong> endpoint (a target phones and PCs cast into), a
+    <strong>Spotify Connect</strong> device (anyone on the network plays to it from their own Spotify
+    app and account), or an <strong>RTP-receive</strong> endpoint (an ESP32 / Raspberry Pi Bluetooth bridge, or any PipeWire
     machine running <code>module-rtp-sink</code>). Each source is independently routable in the matrix.
   </p>
   <p class="card-sub" style="margin-bottom:0">
@@ -410,6 +455,49 @@
     <input id="{idp}-ap-port" type="number" min="0" max="65535" bind:value={apPort} placeholder="auto" />
     <span class="hint">The AirPlay control port. Leave 0 to let the router allocate a free one (starting at 5000) and keep it stable across restarts.</span>
   </div>
+{/snippet}
+
+<!-- Spotify field group (references the sp* form state). There is no account
+     field on purpose: the device has none of its own. -->
+{#snippet spotifyFields(idp: string)}
+  <div class="row fields">
+    <div class="field grow">
+      <label for="{idp}-label">Name</label>
+      <input id="{idp}-label" type="text" bind:value={formLabel} placeholder="Living Room" />
+      <span class="hint">The device name Spotify apps on this network list under “Connect to a device”.</span>
+    </div>
+    <div class="field narrow">
+      <label for="{idp}-sp-bitrate">Quality</label>
+      <select id="{idp}-sp-bitrate" bind:value={spBitrate}>
+        <option value={320}>320 kbit/s (very high)</option>
+        <option value={160}>160 kbit/s (high)</option>
+        <option value={96}>96 kbit/s (normal)</option>
+      </select>
+    </div>
+  </div>
+  <div class="row fields">
+    <div class="field narrow">
+      <label for="{idp}-sp-volume">Starting volume (%)</label>
+      <input id="{idp}-sp-volume" type="number" min="0" max="100" step="5" bind:value={spInitialVolume} placeholder="50" />
+      <span class="hint">Where a new session starts. The app's volume slider controls this source from then on.</span>
+    </div>
+    <div class="field narrow">
+      <label for="{idp}-sp-latency">Buffer (ms)</label>
+      <input id="{idp}-sp-latency" type="number" min="20" max="2000" step="10" bind:value={spLatency} placeholder="250" />
+      <span class="hint">How far playback runs ahead of the speakers. Lower makes pause and skip snappier.</span>
+    </div>
+  </div>
+  <div class="field grow last">
+    <label class="check">
+      <input type="checkbox" bind:checked={spNormalisation} />
+      Normalise loudness
+    </label>
+    <span class="hint">Spotify's track-level volume normalisation, so a quiet track and a loud one play at a similar level.</span>
+  </div>
+  <p class="hint" style="margin:0">
+    Anyone on this network can pick this device in their Spotify app — it plays from <em>their</em> account
+    (Spotify Premium required). Picking it from a second account takes it over.
+  </p>
 {/snippet}
 
 <!-- RTP field group (references the rtp* form state). -->
@@ -487,7 +575,7 @@
 {:else}
   {#if sources.length === 0 && !(form && form.type === 'add')}
     <div class="card">
-      <p class="empty" style="padding:0">No input sources yet. Add an AirPlay or RTP receiver below.</p>
+      <p class="empty" style="padding:0">No input sources yet. Add an AirPlay, Spotify or RTP receiver below.</p>
     </div>
   {/if}
 
@@ -508,6 +596,14 @@
           <div class="src-badges">
             <span class="badge">{kindLabel(s.kind)}</span>
             <span class="badge {s.present ? 'on' : 'off'}">{s.present ? 'present' : 'offline'}</span>
+            {#if s.kind === 'spotify' && spotifyListener(s.spotify_status)}
+              <span class="badge on" title="Logged in on this device right now">
+                {spotifyListener(s.spotify_status)}
+              </span>
+            {/if}
+            {#if s.kind === 'spotify' && s.spotify_status?.last_error}
+              <span class="badge off" title={s.spotify_status.last_error}>login failed</span>
+            {/if}
             {#if s.kind === 'airplay' && connectedCount(s.id)}
               <span class="badge on" title="Senders streaming into this receiver right now">
                 {connectedCount(s.id)}&nbsp;connected
@@ -539,6 +635,8 @@
         <form class="src-form" onsubmit={save}>
           {#if s.kind === 'airplay'}
             {@render airplayFields('edit')}
+          {:else if s.kind === 'spotify'}
+            {@render spotifyFields('edit')}
           {:else}
             {@render rtpFields('edit')}
           {/if}
@@ -649,6 +747,8 @@
       <form class="src-form" onsubmit={save}>
         {#if form.kind === 'airplay'}
           {@render airplayFields('add')}
+        {:else if form.kind === 'spotify'}
+          {@render spotifyFields('add')}
         {:else}
           {@render rtpFields('add')}
         {/if}
@@ -663,6 +763,7 @@
     <div class="card add-bar">
       <span class="add-label">Add source:</span>
       <button class="ghost" type="button" onclick={() => openAdd('airplay')} disabled={busy}>+ AirPlay receiver</button>
+      <button class="ghost" type="button" onclick={() => openAdd('spotify')} disabled={busy}>+ Spotify Connect</button>
       <button class="ghost" type="button" onclick={() => openAdd('rtp')} disabled={busy}>+ RTP receiver</button>
     </div>
   {/if}

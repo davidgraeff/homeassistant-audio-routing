@@ -39,6 +39,11 @@ under `/data`, so it survives restarts.
   (see [Adding outputs](#adding-outputs) below).
 - **AirPlay-receive source** — the name phones/PCs cast *in* to. A single
   source, managed via `/api/source/airplay` (empty name = disabled).
+- **Spotify Connect source** — a device every Spotify app on the LAN lists
+  under "Connect to a device". There is no account to configure: whoever picks it
+  hands it their own login, and it plays from their account (Spotify Premium
+  required); a second person picking it takes it over. The app's volume slider
+  controls the source.
 - **Bluetooth bridge (RTP) source** — receives the RTP stream from the
   [ESP32 Bluetooth bridge firmware](../firmware/bt-bridge/README.md) and
   exposes it as a routable source (`bt-bridge-rtp`). A single source,
@@ -101,11 +106,16 @@ Full endpoint reference (status codes, failure modes):
   - **AirPlay-receive source**: an embedded pure-Rust RAOP server
     (`airplay_source.rs`, vendored `shairplay`) feeds decoded PCM into a
     PipeWire source node the daemon owns (node `airplay-in`).
+  - **Spotify Connect source**: librespot, embedded as libraries
+    (`sources/spotify.rs`), feeds decoded PCM into a PipeWire source node
+    (`spotify-in-<id>`) through the same producer as the AirPlay receiver.
   - **RTP (Bluetooth bridge) source**: a native PipeWire module, same as
     RAOP outputs.
 
   mDNS discovery and advertising (RAOP, AirPlay, sendspin) all use the
-  pure-Rust `mdns-sd` crate — no avahi or system D-Bus daemon involved.
+  pure-Rust `mdns-sd` crate — no avahi or system D-Bus daemon involved. The one
+  exception is the Spotify advertisement, which librespot makes with its own
+  pure-Rust responder (`libmdns`), pinned to the same LAN interface.
 
 Startup order (`rootfs/run.sh`): D-Bus session bus → `pipewire` →
 `wireplumber` → `bridge-daemon serve`. The daemon then loads a `raop-sink`

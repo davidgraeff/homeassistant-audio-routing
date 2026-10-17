@@ -2,7 +2,9 @@
 //!
 //! [`airplay`] is the in-process AirPlay-1/2 receiver (one per configured source,
 //! each with its own [`airplay_clients`] registry of remembered senders, bans and
-//! priorities), [`rtp`] the multicast/unicast RTP input a Bluetooth bridge feeds,
+//! priorities), [`spotify`] the in-process Spotify Connect receiver (librespot),
+//! both feeding a [`pcm_producer`] node; [`rtp`] the multicast/unicast RTP input a
+//! Bluetooth bridge feeds,
 //! [`bt_bridge`] the discovery of those bridges — which are *senders*, not
 //! outputs: they build no audio path, they annotate an RTP source with which
 //! bridge feeds it. [`now_playing`] holds what each input is currently playing,
@@ -15,8 +17,8 @@
 //!
 //! Historically this stored *exactly one* AirPlay-receive source (a name +
 //! three knobs) and *exactly one* Bluetooth-bridge RTP source. It is now a
-//! **keyed collection** of sources of two kinds (AirPlay + RTP), so the user can
-//! add/remove more than one of either type at runtime, each independently
+//! **keyed collection** of sources of three kinds (AirPlay, Spotify, RTP), so the
+//! user can add/remove more than one of each type at runtime, each independently
 //! routable. Mirrors store/outputs.rs: no `options.json` seeding — starts empty
 //! on a fresh install, then the `/data` file is authoritative and everything is
 //! managed live via the API (api/sources.rs).
@@ -29,7 +31,9 @@
 //!     "latency_msec": 100, "auth_setup": false, "prevent_takeover": true, "port": 5000 },
 //!   { "id": "bt-bridge-rtp", "label": "Bluetooth Bridge", "kind": "rtp",
 //!     "port": 46000, "latency_msec": 200, "source_addr": "0.0.0.0",
-//!     "ignore_ssrc": true, "rate": 48000 }
+//!     "ignore_ssrc": true, "rate": 48000 },
+//!   { "id": "wohnzimmer", "label": "Wohnzimmer", "kind": "spotify",
+//!     "latency_msec": 250, "bitrate": 320, "initial_volume": 50, "normalisation": false }
 //! ] }
 //! ```
 //!
@@ -50,10 +54,13 @@ pub(crate) mod airplay;
 pub(crate) mod airplay_clients;
 pub(crate) mod bt_bridge;
 pub(crate) mod now_playing;
+pub(crate) mod pcm_producer;
 pub(crate) mod rtp;
+pub(crate) mod spotify;
 
 use crate::sources::airplay::DEFAULT_AIRPLAY_LATENCY_MSEC;
 use crate::sources::rtp::{DEFAULT_RTP_IGNORE_SSRC, DEFAULT_RTP_LATENCY_MSEC, DEFAULT_RTP_PORT, DEFAULT_RTP_RATE, DEFAULT_RTP_SOURCE_ADDR};
+use crate::sources::spotify::{DEFAULT_SPOTIFY_BITRATE, DEFAULT_SPOTIFY_INITIAL_VOLUME, DEFAULT_SPOTIFY_LATENCY_MSEC};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -61,13 +68,14 @@ use std::path::{Path, PathBuf};
 /// key. Immutable once created.
 pub type SourceId = String;
 
-/// The two kinds of input source. Serialized `snake_case` (`"airplay"`/`"rtp"`)
-/// — it is the `kind` discriminator tag on the wire.
+/// The kinds of input source. Serialized `snake_case` (`"airplay"`/`"rtp"`/
+/// `"spotify"`) — it is the `kind` discriminator tag on the wire.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Airplay,
     Rtp,
+    Spotify,
 }
 
 /// AirPlay-receive source config: the four `airplay_*` knobs of one source, in one
@@ -136,6 +144,53 @@ pub struct RtpSourceConfig {
     pub rate: u32,
 }
 
+/// A Spotify Connect receiver (sources/spotify.rs). The label is the device
+/// name Spotify apps on the LAN show; there is no account here — whoever selects
+/// the device hands it their own login over the LAN (zeroconf), so the knobs
+/// are all about playback. Every field has a serde default so a hand-written or
+/// partial config loads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpotifySourceConfig {
+    /// Ingest ring target, ms. The sink applies backpressure, so this is also
+    /// how far playback runs ahead of the graph — what a pause or skip lags by
+    /// before the outputs' own latency.
+    #[serde(default = "default_spotify_latency_msec")]
+    pub latency_msec: u32,
+    /// Stream quality in kbit/s: 96, 160 or 320 (Ogg Vorbis).
+    #[serde(default = "default_spotify_bitrate")]
+    pub bitrate: u16,
+    /// Volume a fresh session starts at, percent. The Spotify app's slider
+    /// takes over from there (applied to the samples, in software).
+    #[serde(default = "default_spotify_initial_volume")]
+    pub initial_volume: u8,
+    /// Spotify's loudness normalisation (ReplayGain-style track gain).
+    #[serde(default)]
+    pub normalisation: bool,
+}
+
+impl Default for SpotifySourceConfig {
+    fn default() -> Self {
+        Self {
+            latency_msec: DEFAULT_SPOTIFY_LATENCY_MSEC,
+            bitrate: DEFAULT_SPOTIFY_BITRATE,
+            initial_volume: DEFAULT_SPOTIFY_INITIAL_VOLUME,
+            normalisation: false,
+        }
+    }
+}
+
+fn default_spotify_latency_msec() -> u32 {
+    DEFAULT_SPOTIFY_LATENCY_MSEC
+}
+
+fn default_spotify_bitrate() -> u16 {
+    DEFAULT_SPOTIFY_BITRATE
+}
+
+fn default_spotify_initial_volume() -> u8 {
+    DEFAULT_SPOTIFY_INITIAL_VOLUME
+}
+
 fn default_rtp_port() -> u16 {
     DEFAULT_RTP_PORT
 }
@@ -171,6 +226,7 @@ fn default_true() -> bool {
 pub enum SourceConfig {
     Airplay(AirplaySourceConfig),
     Rtp(RtpSourceConfig),
+    Spotify(SpotifySourceConfig),
 }
 
 impl SourceConfig {
@@ -179,6 +235,7 @@ impl SourceConfig {
         match self {
             SourceConfig::Airplay(_) => SourceKind::Airplay,
             SourceConfig::Rtp(_) => SourceKind::Rtp,
+            SourceConfig::Spotify(_) => SourceKind::Spotify,
         }
     }
 }
@@ -218,7 +275,8 @@ const AIRPLAY_PORT_BASE: u16 = 5000;
 
 /// Map a source `(kind, id)` to its PipeWire node name.
 ///
-/// AirPlay → `airplay-in-<id>`, RTP → `rtp-in-<id>`, EXCEPT the two legacy ids
+/// AirPlay → `airplay-in-<id>`, RTP → `rtp-in-<id>`, Spotify →
+/// `spotify-in-<id>`, EXCEPT the two legacy ids
 /// map to the bare legacy names (`airplay-in` / `bt-bridge-rtp`) so existing
 /// routing links resolve unchanged.
 pub fn source_node_name(kind: SourceKind, id: &str) -> String {
@@ -227,6 +285,7 @@ pub fn source_node_name(kind: SourceKind, id: &str) -> String {
         SourceKind::Rtp if id == LEGACY_RTP_ID => LEGACY_RTP_ID.to_string(),
         SourceKind::Airplay => format!("airplay-in-{id}"),
         SourceKind::Rtp => format!("rtp-in-{id}"),
+        SourceKind::Spotify => format!("spotify-in-{id}"),
     }
 }
 
@@ -277,6 +336,21 @@ fn slugify(label: &str) -> String {
         out.push_str("source");
     }
     out
+}
+
+/// Refuse a Spotify config librespot cannot honour, rather than storing it and
+/// silently playing at something else.
+fn validate_spotify(cfg: &SpotifySourceConfig) -> anyhow::Result<()> {
+    if !matches!(cfg.bitrate, 96 | 160 | 320) {
+        anyhow::bail!("Spotify bitrate must be 96, 160 or 320 (got {})", cfg.bitrate);
+    }
+    if cfg.initial_volume > 100 {
+        anyhow::bail!("Spotify initial volume is a percentage (got {})", cfg.initial_volume);
+    }
+    if !(20..=2000).contains(&cfg.latency_msec) {
+        anyhow::bail!("Spotify buffer must be 20-2000 ms (got {})", cfg.latency_msec);
+    }
+    Ok(())
 }
 
 /// Empty/whitespace AirPlay name means "disabled" everywhere — normalize to
@@ -370,6 +444,7 @@ impl SourcesStore {
                     anyhow::bail!("RTP port {} is already used by source '{other}'", r.port);
                 }
             }
+            SourceConfig::Spotify(sp) => validate_spotify(sp)?,
         }
         let entry = SourceEntry { id, label, config };
         self.config.sources.push(entry.clone());
@@ -394,6 +469,7 @@ impl SourcesStore {
                     }
                 }
                 SourceConfig::Airplay(_) => {}
+                SourceConfig::Spotify(sp) => validate_spotify(sp)?,
             }
         }
 
@@ -709,5 +785,32 @@ mod tests {
         assert_eq!(source_node_name(SourceKind::Rtp, LEGACY_RTP_ID), "bt-bridge-rtp");
         assert_eq!(source_node_name(SourceKind::Airplay, "kitchen"), "airplay-in-kitchen");
         assert_eq!(source_node_name(SourceKind::Rtp, "garage"), "rtp-in-garage");
+        assert_eq!(source_node_name(SourceKind::Spotify, "wohnzimmer"), "spotify-in-wohnzimmer");
+    }
+
+    #[test]
+    fn a_spotify_source_round_trips_with_defaults_and_is_validated() {
+        let path = temp_path("spotify");
+        let _ = std::fs::remove_file(&path);
+        let mut store = SourcesStore::load(&path).unwrap();
+        let sp = store.add("Wohnzimmer".to_string(), SourceConfig::Spotify(SpotifySourceConfig::default())).unwrap();
+        assert_eq!(sp.kind(), SourceKind::Spotify);
+        assert_eq!(sp.node_name(), "spotify-in-wohnzimmer");
+
+        // A bare `{"kind":"spotify"}` entry (hand-written, or from an older UI) gets
+        // every default rather than failing the whole file.
+        std::fs::write(&path, r#"{"sources":[{"id":"bad","label":"Bad","kind":"spotify"}]}"#).unwrap();
+        let reloaded = SourcesStore::load(&path).unwrap();
+        assert_eq!(reloaded.get("bad").unwrap().config, SourceConfig::Spotify(SpotifySourceConfig::default()));
+
+        let mut store = reloaded;
+        let bad_rate = SpotifySourceConfig { bitrate: 256, ..SpotifySourceConfig::default() };
+        assert!(store.add("Odd".to_string(), SourceConfig::Spotify(bad_rate.clone())).is_err());
+        assert!(store.update("bad", None, Some(SourceConfig::Spotify(bad_rate))).is_err());
+        let loud = SpotifySourceConfig { initial_volume: 101, ..SpotifySourceConfig::default() };
+        assert!(store.update("bad", None, Some(SourceConfig::Spotify(loud))).is_err());
+        // Kind stays immutable for the new kind too.
+        assert!(store.update("bad", None, Some(SourceConfig::Airplay(AirplaySourceConfig::default()))).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

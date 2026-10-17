@@ -768,6 +768,45 @@ PipeWire senders drive correctly on a trusted LAN. Tradeoff: real iOS senders
 A configurable producer **jitter buffer** (`/api/source/airplay` `latency_msec`,
 default 150 ms) rides out clock drift between the receiver and the graph.
 
+## Spotify Connect source: librespot in-process, not a sidecar or a second add-on
+
+The goal is "anyone on the LAN plays from their own Spotify app and account", which is
+exactly Spotify Connect's zeroconf login: the app hands the device the user's
+credentials over the LAN. librespot implements it, is Rust, and decodes to f32 at
+44.1 kHz — the AirPlay receiver's producer format — so it is embedded as libraries
+(`sources/spotify.rs`) and feeds the same producer node (`sources/pcm_producer.rs`).
+
+- **Not a sidecar librespot binary** with `--backend pipe`. Its one advantage, updating
+  librespot without touching the daemon, does not exist here: the add-on image is
+  rebuilt for every release either way. In-process gets metadata, cover art, position,
+  the logged-in user and login errors from typed events instead of an `--onevent`
+  script, and no process to supervise.
+- **Not a separate add-on** like the YouTube Music receiver. That one is separate
+  because it needs node, mpv and yt-dlp and sits on unofficial ground the main add-on
+  should not depend on; librespot needs nothing beyond crates, and a second install
+  plus an RTP hop would be strictly worse.
+- **The advertisement is librespot's own `libmdns` responder**, not the shared
+  `mdns-sd` daemon (see the mDNS entry below). `librespot-discovery` only accepts its
+  built-in backends — the hook takes a bare `fn` returning a handle with private
+  fields — and the other two need avahi on the host. It is pinned to the primary LAN
+  address (`zeroconf_ip`) for the same multicast-amplification reason.
+- **The sink applies backpressure.** librespot paces playback by its sink blocking, the
+  way an ALSA write does; a ring that drops on overflow (the AirPlay path) would play
+  at decode speed. So the ring's capacity *is* the standing latency (default 250 ms),
+  and the graph clock draining it keeps Spotify in real time. A node routed nowhere
+  is not scheduled by PipeWire at all, so after 500 ms without room the sink paces by
+  the wall clock instead (sleep each packet's duration, discard it) rather than
+  freezing the track until someone routes the source.
+- **Volume is librespot's soft mixer**, applied to the samples before the ring: the
+  app's slider scales this source ahead of every output it is routed to, which is what
+  a listener expects from "turn it down".
+- **No credentials are persisted.** The login a guest's app hands over is a reusable
+  token for their account; keeping it would let the device log back in as them after a
+  restart, which is not something they agreed to by playing one song. The price is
+  that a daemon restart ends the session and the app has to pick the device again.
+- Spotify Premium is required by Spotify for every listener; a free account's login is
+  refused at session start and shown as the source's `last_error`.
+
 ## Sendspin: auto-discovery, grouping, per-device volume, and connection-driven liveness
 
 Sendspin outputs were manually created one-per-output. They're now
