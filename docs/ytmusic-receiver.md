@@ -111,7 +111,7 @@ they coexist rather than one replacing the other:
 | JS runtime | private Node 22 tarball (Raspbian ships 20) | distro nodejs 22 |
 | cookie jar | `~/.local/state/pi-ytmusic-receiver/cookies.txt` | the add-on's `/data/cookies.txt` |
 | provision cookies | `push_cookies.py` | `push_cookies.py --addon` |
-| authenticated resolve | ~22 s local, ~7-10 s via remote cipher (both pre-daemon) | **2.6-3.5 s** measured live with the long-lived resolver and the resident worker; a *prefetched* track change reaches audio in **1.1-1.3 s** |
+| authenticated resolve | ~22 s local, ~7-10 s via remote cipher (both pre-daemon) | **0.1-0.3 s** through the VISIONOS request, audio **0.2-0.6 s** after the receiver starts a track (2026-10-17); yt-dlp, now only the fallback, ~1.3 s warm |
 
 The app directory stays canonical on the Pi side because that role is installed by copying
 it wholesale; `scripts/deploy-dev.sh ytmusic` stages a copy into `ytmusic_receiver/receiver/`
@@ -503,6 +503,24 @@ What it gives up, and why yt-dlp stays behind it:
 The yt-dlp attempts now also pass `player_skip=webpage,initial_data`: the two requests
 playback never reads. That took a spawned resolve from ~5.4 s to ~2.9 s, with the same itag
 and URLs that played no worse. `YTCR_PLAYER_SKIP=none` restores the full path.
+
+#### Measured live, before and after (2026-10-17)
+
+Tracks started the way Home Assistant's `play_media` starts them (`POST /api/play` with
+`ytmusic:track:<id>`), on the add-on, reading the receiver's own `audio flowing` line:
+
+| track | before (yt-dlp ladder) | after (VISIONOS first) |
+|---|---|---|
+| `fJ9rUzIMcZQ` | never played; ~32 s until the queue skipped to a track that did | **0.3 s** |
+| `9bZkp7q19f0` | 4.6 s | **0.2 s** |
+| `kJQP7kiw5Fk` | 23.7 s — every rung 403'd, then a resolver restart | **0.2 s** |
+| `5g91ypvpyI0` | — | **0.6 s** |
+| `dQw4w9WgXcQ` | — | **0.3 s** |
+
+All five resolved through VISIONOS at itag 251, and so did each mix's prefetched next track
+(0.1-0.4 s). Before these numbers comes the play request itself, 0.7-1.0 s — the catalogue
+fetching the track's mix before the receiver starts it — and after them the RTP hop and the
+router's buffering, ~0.6 s. The catalogue fetch is now the largest single term.
 
 #### Compared: VISIONOS, youtubei.js and yt-dlp (2026-10-17)
 
