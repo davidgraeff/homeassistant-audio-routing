@@ -45,6 +45,12 @@ ssh david@turnerstr-bluetooth.local \
 - `--cipher-url`: the yt-cipher server that solves YouTube's JS challenges off-box (~3×
   faster than this hardware manages locally; the local runtime stays as the automatic
   fallback). `none` solves only locally.
+- `--control-port`: serve the receiver's control API on this port, so Home Assistant can
+  play, pause, skip and start playlists on this Pi without a phone
+  (`media_player.<source label>`, see
+  [docs/ytmusic-receiver.md](../../docs/ytmusic-receiver.md#control-from-home-assistant)).
+  **Off by default**: here it has to listen on the LAN, unauthenticated. It writes no
+  credential, but turn it on only for a network you trust.
 - `--no-service`: set up the audio path only (no cast receiver).
 - `--test-tone`: play a 440 Hz tone into the sink. **Read the warning below first.**
 - `--disable`: remove this role (leaves the Bluetooth bridge alone).

@@ -176,6 +176,10 @@ in the same repository, so it is already in your store from step 1 — install i
 start it, open its panel, and it walks you through the two things it needs: one
 button to create its audio route on the router, and to setup your account.
 
+With the integration installed it is also an ordinary `media_player`
+(`media_player.youtube_music`): pause and skip from Home Assistant, see the queue,
+and start one of the recently played playlists without a phone.
+
 It plays from **your signed-in account** and leans on unofficial protocols and
 on `yt-dlp` keeping pace with YouTube, so treat it as the least stable thing
 here. Details in [`ytmusic_receiver/`](ytmusic_receiver/README.md), reasoning and

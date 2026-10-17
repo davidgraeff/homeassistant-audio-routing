@@ -3,6 +3,9 @@
 The **Cast button in the YouTube Music phone app** targets the house audio system: the
 phone's own transport controls (play/pause/skip/seek/volume) drive playback, and the audio
 arrives in the router as an ordinary RTP source that can be routed to any set of outputs.
+**Home Assistant can drive it too, without a phone** — pause, skip, show the queue and
+start one of the recently played playlists, through a plain `media_player`
+([*Control from Home Assistant*](#control-from-home-assistant)).
 
 **Personal install, deliberately not a published feature.** It depends on unofficial
 protocols and on `yt-dlp` keeping pace with YouTube's anti-bot measures, it plays from the
@@ -77,9 +80,9 @@ no incoming PCM to buffer.
 | Discovery + control | DIAL + Lounge via `yt-cast-receiver` (Node ≥ 18) — no Cast, no device certs |
 | Player | **`mpv --idle` over JSON IPC** — it already contains `yt-dlp`, the decoder, the buffer and seek |
 | Transport to the router | `module-rtp-sink` on its own port, S16LE/**48000**/2 |
-| Router side | An ordinary RTP source, `rate = 48000` — **zero daemon changes** |
-| Control surface | The phone app. No HA `media_player` for transport; the router's per-output volume still applies to the fan-out |
-| Reporting back | Now-playing only, over the daemon's generic `POST /api/now_playing/report` |
+| Router side | An ordinary RTP source, `rate = 48000`. The one daemon feature it uses beyond that, the control announcement, is producer-agnostic: the router stores a URL and never relays a command |
+| Control surface | The phone app, and Home Assistant's `media_player.youtube_music` through the receiver's own control API — both drive one player, and a connected phone sees every change. The router's per-output volume still applies to the fan-out |
+| Reporting back | Now-playing over the daemon's generic `POST /api/now_playing/report`; where the control API is, over the equally generic `POST /api/control/report` |
 
 **Why a dedicated RTP port rather than mixing into `bt-bridge-rtp`:** each RTP source
 carries its own `rate`
@@ -199,8 +202,8 @@ The container needs `host_network: true` for two independent reasons — DIAL di
 SSDP multicast on `239.255.255.250:1900`, so the phone can only find the receiver if it
 shares the host's LAN interface; and the RTP goes to the audio-router add-on, which is
 loopback on the same host. `SYS_NICE` lets PipeWire's realtime module raise its data loop to
-`SCHED_FIFO`. The ingress panel is a **setup** page, not a remote: the phone's app remains
-the control surface for playback.
+`SCHED_FIFO`. The ingress panel is a **setup** page, not a remote: playback is driven by the
+phone's app or by Home Assistant's `media_player` (below).
 
 [`rootfs/run.sh`](../ytmusic_receiver/rootfs/run.sh) generates the `ytm-out` RTP sink from
 the options (a static drop-in cannot know the configured host/port), starts a private D-Bus
@@ -950,13 +953,25 @@ step (`yt-cast-receiver` ships JS + typings, so plain Node runs it):
 | `jsc_worker.js` | That resident `node`: holds the ejs solver closures per player version (run via `node -e`, never imported) |
 | `priority.js` | The `nice`/`ionice` prefix shared by both resolve paths |
 | `metadata.js` | Now-playing reporting to the add-on's API |
+| `control.js` | The control API Home Assistant drives playback through, and its announcement to the router |
+| `catalogue.js` | Track names, queues and the library, cached, over the resolver daemon's catalogue ops |
+| `ytm_catalogue.py` | Those InnerTube requests' bodies and parsers (pure; imported by the daemon) |
+| `localqueue.js` | The receiver's own queue, for playback nobody cast |
+| `history.js` | The lists played here, newest first, in `recent-playlists.json` |
 | `singleton.js` | Single-instance lock, so a second mpv can never join `ytm-out` |
 
 Everything is configured by environment variable, so the systemd unit (or `run.sh`) is the
 single place that describes an install: `YTCR_DEVICE_NAME`, `YTCR_SCREEN_NAME`,
 `YTCR_DIAL_PORT`, `YTCR_BIND_ADDRESS`, `YTCR_AUDIO_DEVICE`, `YTCR_YTDL_PATH`,
 `YTCR_JS_RUNTIME`, `YTCR_COOKIES`, `YTCR_CIPHER_URL`, `YTCR_ADDON_HOST`/`_API_PORT`/
-`YTCR_RTP_PORT`, `YTCR_LOG_LEVEL`.
+`YTCR_RTP_PORT`, `YTCR_LOG_LEVEL`, and for the control API `YTCR_CONTROL_PORT` (off when
+unset), `YTCR_CONTROL_BIND` (default `127.0.0.1`), `YTCR_CONTROL_URL` (what is announced;
+derived from the bind) and `YTCR_STATE_DIR` (where `recent-playlists.json` lives; default
+the working directory, i.e. the state dir).
+
+Tests: `npm test` in `receiver/` (needs `npm install` first) — node's own runner for the
+JS, driving the real yt-cast-receiver `Player` base class over a fake mpv, and `unittest`
+for the catalogue parser against captured InnerTube responses.
 
 Pinned to `yt-cast-receiver` **^2.1.0**. A local git checkout of master says 2.1.1, which is
 *unpublished* — `npm install` fails with `ETARGET`. npm's latest, 2.1.0, carries everything
@@ -1043,14 +1058,156 @@ RTP sender that talks to nobody.
 
 **The metadata does not come from the phone.** The Lounge plane carries video ids and
 positions only (a `Video` is `{id, client, context}`, and the only `thumbnail` fields in the
-library are Google-account avatars). So the title comes from mpv's `media-title` (which
-`ytdl_hook` fills in from yt-dlp), and the artwork from the deterministic
-`https://i.ytimg.com/vi/<id>/hqdefault.jpg` — no extra request. `media-title` is one
-combined string, so artist/album stay empty: splitting them needs a second resolve per
-track, which is out of scope until it annoys.
+library are Google-account avatars). So the receiver asks YouTube Music itself — the
+[catalogue](#the-catalogue-what-youtube-music-calls-things) names the current track and
+the next 25 queued ids in one `music/get_queue` request per queue change — and reports
+title, **artist, album** and square album art. A track started from the receiver's own
+queue is named before it starts; a cast id a moment after. Until then (and whenever the
+catalogue cannot answer) the title falls back to mpv's `media-title` and the artwork to
+the deterministic `https://i.ytimg.com/vi/<id>/hqdefault.jpg`.
+
+That fallback is weaker than it looks, which is why it no longer overwrites a catalogue
+title: `media-title` is the *video* title only when `ytdl_hook` resolved the track. For a
+**prefetched direct URL** — the normal case — mpv knows only the URL and whatever tags the
+stream carries, and by its own rules falls back to the path's basename, `videoplayback`
+(inferred from mpv's behaviour, not observed on the add-on).
 
 Position is refreshed every 5 s; the daemon throttles publishing and HA extrapolates in
 between, so anything faster is pure radio traffic.
+
+---
+
+## Control from Home Assistant
+
+The phone app was the only control surface, which works for whoever holds the phone and
+not at all for a wall display. The receiver now has its own **control API**
+([`control.js`](../firmware/pi-ytmusic/receiver/control.js)), and the Home Assistant
+integration turns it into **`media_player.youtube_music`** with standard features —
+`PLAY`, `PAUSE`, `STOP`, `NEXT_TRACK`, `PREVIOUS_TRACK`, `SEEK`, `PLAY_MEDIA`,
+`BROWSE_MEDIA` — plus the queue as an attribute. The entity's contract (states,
+attributes, media ids, browse tree) is documented where it is implemented, in the
+[integration's README](../custom_components/pipewire_audio_router/README.md#controllable-sources-media_player).
+
+```
+media_player.youtube_music ──HTTP──▶ receiver control API (127.0.0.1:8094)
+        ▲                                │   Player.pause()/next()/play()…   ──Lounge──▶ phone (if connected)
+        │ GET /api/sources: control.url  │   catalogue → resolver daemon ──InnerTube──▶ YouTube Music
+   audio router ◀── POST /api/control/report (every 60 s, withdrawn on shutdown)
+```
+
+### How Home Assistant finds it
+
+The receiver announces the API's URL to the router — keyed by its RTP port, exactly like
+the now-playing report — every minute, and withdraws it on shutdown; the router lists it
+on the source as `control` with a 180 s TTL
+([api-reference](api-reference.md#post-apicontrolreport)). The router is a **rendezvous,
+not a relay**: it never forwards a command, so it still knows nothing about YouTube, and
+no request path through it can be aimed elsewhere. The announcement is its own table
+rather than part of the now-playing entry because that entry is *cleared when playback
+stops* — exactly when "start a playlist" needs the endpoint — and rather than part of
+the persisted source config because the web UI's edit form rewrites that whole.
+
+The API has no authentication, like the router's, so in the add-on it binds
+**`127.0.0.1:8094`** (`control_port`): Home Assistant core and the router share the host.
+On the Pi it is **off** unless `setup_pi_ytmusic.py --control-port` is given, because
+there it has to listen on the LAN. It writes no credential — the worst a caller can do is
+play, skip or read the history. An RTP source must exist on the router (the admin page's
+one button) before the announcement is accepted; until then the receiver logs one warning
+and keeps trying.
+
+### One player, two kinds of queue
+
+Every command goes through the same `Player` methods the Lounge messages call, which is
+what keeps a phone in sync: the base class emits a state change for each, and
+yt-cast-receiver sends it to the connected senders as `onStateChange`/`nowPlaying`. Pause
+in Home Assistant and the phone shows paused; skip and it shows the new track.
+
+- **A cast** keeps the phone's queue. next/previous walk it as before (the library asks
+  YouTube for the neighbours of the current entry in the phone's list); Home Assistant
+  shows it, named by the catalogue, but does not jump inside it — that list is the
+  phone's, and the Lounge protocol has no receiver-side way to edit it.
+- **Started from Home Assistant** there is no phone and no session, so the receiver plays
+  from **its own queue** ([`localqueue.js`](../firmware/pi-ytmusic/receiver/localqueue.js)):
+  the page YouTube Music's `next` answers for the list (~50 tracks, with names), refilled
+  from its continuation while a track plays so a radio never runs dry. Each track is
+  resolved through the same resolver and prefetch as a cast track, so the 1-2 s track
+  changes and the 403 ladder apply unchanged. A song is played the way YouTube Music
+  plays a tapped song: as the first track of its radio (`RDAMVM<id>`), seeded explicitly
+  because the server otherwise starts the mix one track later. Up to three unplayable
+  tracks in a row are skipped. `play_media` returns once the queue is known (~1 s); the
+  first resolve then shows as `buffering`.
+
+**The phone always wins.** Any change to its queue — it casts something, queues a song,
+picks another — ends the local queue; the cast queue is authoritative again. One
+deliberate divergence from the library: it *resets* the player when the last phone
+disconnects, which for a cast is right and for a local queue is not — a YouTube Music app
+that reconnected on its own and went away again must not stop what Home Assistant
+started — so for a local queue only the cast bookkeeping is reset. A phone that connects
+while the local queue plays is told the current track like any state change; what its app
+does with a track it did not queue is untested.
+
+### The catalogue: what YouTube Music calls things
+
+Names, queues and the library come from the requests the music.youtube.com web client
+makes ([`ytm_catalogue.py`](../firmware/pi-ytmusic/receiver/ytm_catalogue.py)), made by
+the long-lived resolver ([`ytdlp_daemon.py`](../firmware/pi-ytmusic/receiver/ytdlp_daemon.py)
+`queue`/`tracks`/`library` ops):
+
+| request | what for | measured (anonymous) |
+|---|---|---|
+| `next {playlistId[, videoId]}` | the queue of a playlist, album, mix or Liked Music | 50 entries in 0.7 s |
+| `next {continuation}` | its next page | 49 entries |
+| `music/get_queue {videoIds}` | names for ids a phone queued | 2 ids in 0.1 s |
+| `browse FEmusic_library_landing` | the library, YTM's "recent activity" order | signed-in only |
+| `browse FEmusic_history` | recently played songs | signed-in only |
+
+They run **in the resolver daemon** because they authenticate with the cookie jar, and the
+jar has exactly one writer (`SharedCookieJar`): a second process asking with the same
+session would rotate it against the first — the failure *[Cookies](#cookies)* warns about.
+yt-dlp supplies the request machinery (`_extract_response`: InnerTube context, the
+SAPISIDHASH header computed from the jar, retries), rotated cookies are saved like a
+resolve's, and requests name only ids and feed names validated by shape. None of this
+touches the JS challenge or the googlevideo URLs, so it cannot add to the 403 windows.
+Without the daemon (it failed to start, or `YTCR_YTDLP_DAEMON=0`) there is no catalogue:
+casting is unaffected, but nothing can be started from Home Assistant.
+
+Same terms as everything else here: a personal install, the owner's own account, read
+the way the owner's own browser reads it. These are unofficial endpoints, and their
+layouts move; the parser walks for the renderers it knows rather than indexing a fixed
+path, and a failure degrades to "unknown", never to a track that does not play.
+
+### Recently played: the receiver's own record first
+
+Two lists, on purpose:
+
+- **Zuletzt gespielt / Recently played** (`ytmusic:recent`) is the receiver's own record
+  ([`history.js`](../firmware/pi-ytmusic/receiver/history.js), `recent-playlists.json` in
+  the state dir): every list that started playing here, cast (the Lounge `setPlaylist`
+  names its list; a cast's untitled list is named with one `next` request) or started from
+  Home Assistant, newest first, 25 kept. This is the primary one because it is always
+  right *for this speaker*, works with no cookie jar, has real timestamps, and depends on
+  no private page layout. `RQ…` lists — a phone's ad-hoc queue of songs cast one by one —
+  exist only for that session and are not recorded.
+- **Mediathek / Library** and **Verlauf / History** come from the signed-in account
+  (`FEmusic_library_landing`, falling back to `FEmusic_liked_playlists`; and
+  `FEmusic_history`). They also cover what was played on other devices, but they need the
+  jar, and **their signed-in layout has not been seen live** from the workspace this was
+  written in — it is parsed from the documented shape, and anonymous requests are
+  recognised by their "Sign in" placeholder. If they come back empty for a signed-in jar,
+  that layout is the first suspect.
+
+### What the integration can and cannot do
+
+- Volume is not offered on this entity: mpv's volume is the phone's slider, and where and
+  how loud the source plays is the routing's business (a music group's `select_source`
+  and volume).
+- Jumping inside a phone's queue, or editing it, is not possible: the Lounge protocol has
+  no receiver-side queue edit, and a jump the phone did not ask for would leave its UI
+  showing a list the receiver no longer follows. Starting anything from Home Assistant
+  replaces the phone's queue instead, which the phone then shows.
+- Enqueueing (`MEDIA_ENQUEUE`) is not implemented; `play_media` always replaces.
+- Starting a cast session *on the phone* is impossible by design — the phone is a sender,
+  the receiver cannot call it.
 
 ---
 
@@ -1262,7 +1419,21 @@ add-on (anonymous, pre-cookies: 2035 in the same window); a 5 s test tone produc
 (`bt-bridge-capture → rtp-bridge:monitor_FL/FR`). Track changes cost **0.5 s** via prefetch
 instead of 22-30 s.
 
+**Control from Home Assistant, verified offline (2026-10-17):** the daemon's catalogue ops
+against YouTube Music anonymously (queues for a mix and a public playlist, names for ids,
+the signed-out library recognised); the control API over HTTP against that real daemon
+with a fake mpv — a playlist started, its queue with titles, next, a song started as its
+radio, the browse tree in both languages, refusals with sentences; the player's local
+queue through the real yt-cast-receiver `Player` base class (state events, phone
+takeover, reset, refill); the Home Assistant entity against a mocked receiver.
+
 **Not yet confirmed:**
+
+- **The control API on the real add-on**, with mpv, the RTP path and Home Assistant.
+- **The signed-in library and history layouts** — parsed from the documented shape only.
+- **A phone watching a local queue**: that pause/skip from Home Assistant render correctly
+  in the app, and what the app does with a track it did not queue (shown, offered for
+  next/previous, or replaced by its own `updatePlaylist`).
 
 - **The Pi Zero has not been redeployed** with the long-lived resolver or the resident worker.
   Every stage is measured there (6.3-7.3 s → 2.6-4.1 s for the process; 17.9 s → 4-48 ms for

@@ -68,14 +68,53 @@ disagree about what a valid jar is.
 | `dial_port` | `8098` | DIAL/SSDP HTTP port. Not 8099 — that is the audio router's |
 | `cipher_url` | *(empty)* | yt-cipher server that solves YouTube's JS challenges off-box. Empty (or `none`) solves locally, which is faster now: 15-58 ms in the resident worker against four WAN round trips. **Note:** an option with a default in `config.yaml` cannot be cleared from the UI — Supervisor re-applies the default when the key is absent — which is why this one has none |
 | `bind_address` | *(auto)* | Pin the DIAL server to one local IP; only needed on a multi-homed host, where answering SSDP on the wrong address makes senders silently drop the device |
-| `report_metadata` | `true` | Report now-playing (title/artwork/position) to the router's API |
+| `report_metadata` | `true` | Report now-playing (title/artist/album/artwork/position) to the router's API |
+| `control_port` | `8094` | The control API Home Assistant drives playback through — on `127.0.0.1` only, see below. Not 8096 (Jellyfin) or 8095 (Music Assistant) |
 | `log_level` | `info` | |
 
 `host_network: true` is required twice over: DIAL discovery is SSDP multicast, so the phone
 can only find the receiver if it shares the host's LAN interface, and the RTP target is the
 router add-on on the same host. `SYS_NICE` lets PipeWire raise its data loop to `SCHED_FIFO`
-so a resolve cannot starve playback. There is no ingress panel on purpose — the phone's app
-*is* the control surface.
+so a resolve cannot starve playback. The ingress panel is for setup, not playback — that is
+the phone's app, or Home Assistant (below).
+
+## Control from Home Assistant
+
+With the [PipeWire Audio Router integration](../custom_components/pipewire_audio_router/README.md)
+installed, this receiver appears as **`media_player.youtube_music`** (named after its RTP
+source on the router): play, pause, stop, next, previous, seek, the current song with
+artist, album and art, the next entries of the queue, and a media browser with the
+queue, the lists **recently played here**, and the account's library and history.
+`play_media` starts any of those **without a phone**:
+
+```yaml
+action: media_player.play_media
+target:
+  entity_id: media_player.youtube_music
+data:
+  media_content_id: ytmusic:playlist:LM      # Liked Music; or any id from the browser
+  media_content_type: playlist
+```
+
+Nothing to configure: the receiver serves its control API on `127.0.0.1:8094` and
+announces it to the router once a minute; the integration finds it there. The router
+needs this receiver's RTP source (the panel's first button) before it accepts the
+announcement. A phone that is casting stays in charge of its own queue and sees every
+pause or skip made from Home Assistant; starting something from Home Assistant takes over
+from it, the way a second phone casting would. Without a cookie jar, *recently played*
+still works and public playlists still start; the library and history need the jar.
+
+The entity's full contract — states, attributes, media ids, the browse tree — is in the
+[integration's README](../custom_components/pipewire_audio_router/README.md#controllable-sources-media_player);
+how it works and what it cannot do, in
+[docs/ytmusic-receiver.md](../docs/ytmusic-receiver.md#control-from-home-assistant).
+
+```bash
+# what Home Assistant sees, from the HA host
+curl -s 127.0.0.1:8094/api/state | python3 -m json.tool
+curl -s '127.0.0.1:8094/api/browse?id=ytmusic:recent&lang=de'
+curl -s 127.0.0.1:8099/api/sources | python3 -c 'import json,sys; [print(s["label"], s.get("control")) for s in json.load(sys.stdin)["sources"]]'
+```
 
 ## What runs inside
 

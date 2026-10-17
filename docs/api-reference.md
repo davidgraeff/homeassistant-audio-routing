@@ -443,7 +443,7 @@ it generalizes the old singular `loaded` (RTP) and `running` (AirPlay) flags.
 in practice only the YouTube Music receiver does:
 
 ```json
-"control": { "url": "http://127.0.0.1:8096", "features": ["pause", "next", "browse_media"], "protocol": 1 }
+"control": { "url": "http://127.0.0.1:8094", "features": ["pause", "next", "browse_media"], "protocol": 1 }
 ```
 
 ### `POST /api/sources`
@@ -682,7 +682,7 @@ producer refreshes by heartbeat; a daemon restart forgets it until the next beat
 
 ### `POST /api/control/report`
 ```json
-{ "rtp_port": 46002, "url": "http://127.0.0.1:8096", "features": ["pause", "next"], "protocol": 1 }
+{ "rtp_port": 46002, "url": "http://127.0.0.1:8094", "features": ["pause", "next"], "protocol": 1 }
 ```
 Self-identifying like the now-playing report: `rtp_port` is resolved against the source
 store. `url` must be an absolute `http(s)://` URL reachable from wherever the consumer
