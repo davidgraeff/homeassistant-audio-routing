@@ -43,6 +43,13 @@ const ESCALATED_RESPAWN_DELAY_MS = 250;
 const RESPAWN_WAIT_MS = 15000;
 /** Give up on a daemon that keeps dying, and let the caller spawn per track instead. */
 const MAX_RESPAWNS = 5;
+/**
+ * A daemon that served this long has earned a clean slate: its next crash starts a new
+ * count. Without it the count was per *receiver lifetime*, and a week of occasional exits
+ * added up to giving up for good — observed on the add-on, which then spent seven days
+ * spawning yt-dlp per track.
+ */
+const STABLE_UPTIME_MS = 10 * 60 * 1000;
 /** A catalogue read is one InnerTube request (measured 0.1-0.7 s); a minute is generous
  *  for a slow box and still short enough that Home Assistant gets an answer. */
 const CATALOGUE_TIMEOUT_MS = 60000;
@@ -61,6 +68,8 @@ export default class YtdlpDaemon extends EventEmitter {
   #pending = new Map();
   #shuttingDown = false;
   #respawns = 0;
+  /** When the current process answered its first ping; 0 until it has. */
+  #readyAt = 0;
   #giveUp = false;
   #started = false;
   /** Set while an exit we asked for is in flight, so the respawn is not delayed. */
@@ -80,9 +89,12 @@ export default class YtdlpDaemon extends EventEmitter {
   /** What the running daemon answers besides `resolve` — from its `ping`. */
   #ops = new Set();
 
+  #respawnDelayMs;
+
   constructor({ python, socketPath, modes, prewarm = true, jscResident = null,
-    jscPreprocessedCache = true, logger = console }) {
+    jscPreprocessedCache = true, respawnDelayMs = RESPAWN_DELAY_MS, logger = console }) {
     super();
+    this.#respawnDelayMs = respawnDelayMs;
     this.#python = python;
     this.#socketPath = socketPath;
     this.#modes = modes;
@@ -144,6 +156,7 @@ export default class YtdlpDaemon extends EventEmitter {
     const prefix = priorityPrefix();
     const [ cmd, ...cmdArgs ] = [ ...prefix, this.#python, ...args ];
     this.#logger.info(`[ytdlpd] spawning: ${this.#python} ${args.join(' ')}`);
+    this.#readyAt = 0;
     this.#proc = spawn(cmd, cmdArgs, { stdio: [ 'ignore', 'pipe', 'pipe' ] });
     if (!prefix.length) {
       try {
@@ -175,7 +188,17 @@ export default class YtdlpDaemon extends EventEmitter {
       if (this.#shuttingDown) {
         return;
       }
-      this.#respawns += 1;
+      // An exit we asked for (`invalidate(..., { escalate })`) is a restart, not a crash,
+      // and must not count: `resolver.js` requests one whenever a 403 window exhausts the
+      // client ladder, so counting them gave up on a perfectly healthy daemon.
+      const requested = this.#escalating;
+      this.#escalating = false;
+      if (!requested) {
+        if (this.#readyAt && Date.now() - this.#readyAt >= STABLE_UPTIME_MS) {
+          this.#respawns = 0;
+        }
+        this.#respawns += 1;
+      }
       if (this.#respawns > MAX_RESPAWNS) {
         this.#giveUp = true;
         this.#logger.error(
@@ -183,8 +206,7 @@ export default class YtdlpDaemon extends EventEmitter {
           + 'giving up on the daemon; resolves will spawn yt-dlp per track');
         return;
       }
-      const delay = this.#escalating ? ESCALATED_RESPAWN_DELAY_MS : RESPAWN_DELAY_MS;
-      this.#escalating = false;
+      const delay = requested ? ESCALATED_RESPAWN_DELAY_MS : this.#respawnDelayMs;
       this.#logger.warn(
         `[ytdlpd] exited (code=${code} signal=${signal}) — respawning in ${delay / 1000}s`);
       setTimeout(() => {
@@ -197,6 +219,7 @@ export default class YtdlpDaemon extends EventEmitter {
     await this.#connectWithRetry();
     const hello = await this.request({ op: 'ping' }, 10000);
     this.#ops = new Set(hello.ops ?? []);
+    this.#readyAt = Date.now();
     this.#restartPending = false;
     this.#logger.info(
       `[ytdlpd] ready — yt-dlp ${hello.version}, modes: ${(hello.modes ?? []).join(', ')}`);
