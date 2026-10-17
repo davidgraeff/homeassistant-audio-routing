@@ -17,7 +17,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DAEMON_DIR="$REPO_ROOT/pipewire_audio_router/bridge-daemon"
+# The whole add-on directory is mounted, not just bridge-daemon/: the daemon has
+# path dependencies on its siblings (../pw-control, ../submodules/sendspin).
+ADDON_DIR="$REPO_ROOT/pipewire_audio_router"
 
 # The sendspin server role is a git submodule (pipewire_audio_router/submodules/
 # sendspin), so a clone without --recursive leaves it empty. Fail here rather than
@@ -39,19 +41,20 @@ FROM rust:1-slim-trixie
 # `sendspin` git dependency. `g++` is required for the C++ crate `fdk-aac-sys`
 # (provides cc1plus) — the add-on Dockerfile's native path assumes the base
 # image ships it, but rust:1-slim-trixie does not, so install it explicitly.
+# cmake + make build the bundled libopus for `opusic-sys` (sendspin's codec).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config clang g++ git \
+        pkg-config clang cmake make g++ git \
         libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libevent-dev \
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 
 echo "=== cargo test (in container) ==="
 exec docker run --rm -t \
-    -v "$DAEMON_DIR":/build \
+    -v "$ADDON_DIR":/build \
     -v pw-router-cargo-registry:/usr/local/cargo/registry \
     -v pw-router-cargo-git:/usr/local/cargo/git \
     -v pw-router-rust-target:/target \
     -e CARGO_TARGET_DIR=/target \
-    -w /build \
+    -w /build/bridge-daemon \
     "$IMAGE" \
     cargo test "$@"
