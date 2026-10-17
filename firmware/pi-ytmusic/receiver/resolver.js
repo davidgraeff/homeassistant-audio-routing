@@ -26,6 +26,11 @@
  * across tracks, and this class asks it rather than spawning. The per-track spawn
  * survives as the fallback for when there is no usable daemon — see `#runOnce`.
  *
+ * And before yt-dlp is asked at all, one `/player` request as the VISIONOS client
+ * (`visionos.js`, NewPipe's approach) usually answers in ~0.1 s with a URL that needs no
+ * challenge solved. Everything yt-dlp does stays behind it as the fallback, because that
+ * request is anonymous and rests on a client YouTube may stop serving — see `#runFast`.
+ *
  * WHY NOT mpv's OWN PLAYLIST PREFETCH
  * -----------------------------------
  * Appending upcoming tracks to mpv's playlist would let mpv advance on its own,
@@ -82,9 +87,20 @@ const MAX_ENTRIES = 8;
  * lazily, so an unused rung costs nothing.
  */
 const DEFAULT_CLIENT_LADDER = [ 'web_embedded', 'web_safari', 'mweb' ];
+/**
+ * yt-dlp requests that playback never reads: the watch page (~1.3 s on the add-on host,
+ * whose embedded data yt-dlp then failed to parse and re-fetched anyway) and the `/next`
+ * "initial data" (~1.3 s, metadata only). Skipping both took a resolve from ~5.4 s to
+ * ~2.9 s, with the same itag and URLs that played no worse than the full path's.
+ */
+const DEFAULT_PLAYER_SKIP = 'webpage,initial_data';
+/** How long a video whose fast-path URL failed in mpv goes straight to yt-dlp. */
+const FAST_REFUSED_MS = 30 * 60 * 1000;
 
 export default class Resolver {
   #ytdlp;
+  /** One-request VISIONOS resolver (visionos.js), tried before yt-dlp; null to skip it. */
+  #fast;
   #cookies;
   #jsRuntime;
   #format;
@@ -92,19 +108,28 @@ export default class Resolver {
   #cipherTimeout;
   #potUrl;
   #clientLadder;
+  #playerSkip;
   #cacheDir;
   #logger;
   /** Long-lived yt-dlp (ytdlp.js), or null to spawn one per track. */
   #daemon = null;
-  /** videoId -> { url, headers, expiresAt } — headers are part of the answer, see #verify */
+  /** videoId -> { url, headers, expiresAt, fast } — headers are part of the answer, see #verify */
   #cache = new Map();
+  /**
+   * videoId -> when a fast-path URL for it was handed back by `invalidate`, i.e. passed
+   * `#verify` and still did not play in mpv. `player.js` retries such a track exactly once,
+   * so that retry has to reach yt-dlp — another VISIONOS URL would spend it.
+   */
+  #fastRefused = new Map();
   /** videoId -> Promise, so a play racing its own prefetch waits instead of duplicating. */
   #inflight = new Map();
 
-  constructor({ ytdlp, cookies = null, jsRuntime = null, format = 'bestaudio/best',
+  constructor({ ytdlp, fast = null, cookies = null, jsRuntime = null, format = 'bestaudio/best',
     cipherUrl = null, cipherTimeout = 8, potUrl = null, cacheDir = null,
-    clientLadder = DEFAULT_CLIENT_LADDER, logger = console }) {
+    clientLadder = DEFAULT_CLIENT_LADDER, playerSkip = DEFAULT_PLAYER_SKIP, logger = console }) {
     this.#ytdlp = ytdlp;
+    this.#fast = fast;
+    this.#playerSkip = playerSkip;
     this.#cookies = cookies;
     this.#jsRuntime = jsRuntime;
     this.#format = format;
@@ -119,6 +144,7 @@ export default class Resolver {
   /** Swap in the receiver's logger once it exists (same pattern as mpv.js). */
   setLogger(logger) {
     this.#logger = logger;
+    this.#fast?.setLogger?.(logger);
   }
 
   /**
@@ -140,9 +166,9 @@ export default class Resolver {
     return Object.fromEntries(this.#attempts().map((a) => [ a.mode, a.args ]));
   }
 
-  /** Whether prefetching is possible at all (a yt-dlp path is configured). */
+  /** Whether prefetching is possible at all (a yt-dlp path or the fast path is configured). */
   get enabled() {
-    return !!this.#ytdlp;
+    return !!this.#ytdlp || !!this.#fast;
   }
 
   /**
@@ -166,6 +192,12 @@ export default class Resolver {
 
   /** Drop a cached URL that turned out not to work. */
   invalidate(videoId) {
+    if (this.#cache.get(videoId)?.fast) {
+      this.#fastRefused.set(videoId, Date.now());
+      while (this.#fastRefused.size > MAX_ENTRIES) {
+        this.#fastRefused.delete(this.#fastRefused.keys().next().value);
+      }
+    }
     this.#cache.delete(videoId);
   }
 
@@ -268,6 +300,9 @@ export default class Resolver {
       // default, the installed plugin probes http://127.0.0.1:4416 and warns per resolve.
       youtubeArgs.push('fetch_pot=never');
     }
+    if (this.#playerSkip) {
+      youtubeArgs.push(`player_skip=${this.#playerSkip}`);
+    }
     const withYoutubeArgs = (extra = []) => {
       const merged = [ ...youtubeArgs, ...extra ];
       return merged.length ? [ '--extractor-args', `youtube:${merged.join(';')}` ] : [];
@@ -366,6 +401,10 @@ export default class Resolver {
   }
 
   async #run(videoId) {
+    const fast = await this.#runFast(videoId);
+    if (fast) {
+      return fast;
+    }
     let lastError = new Error('no resolution method configured');
     let ladderExhausted = false;
 
@@ -420,6 +459,42 @@ export default class Resolver {
     // has been guesswork.
     this.#daemon?.diagnose(videoId, lastError?.message ?? 'unknown');
     throw lastError;
+  }
+
+  /**
+   * The one-request VISIONOS attempt, gated by `#verify` like every yt-dlp rung. Returns
+   * null on any failure, so the yt-dlp ladder runs exactly as it would have without it.
+   *
+   * Deliberately outside the ladder's bookkeeping: a failure here says nothing about
+   * yt-dlp's session, so it must neither count towards the daemon restart nor trigger a
+   * diagnostic — those are for the ladder's own verdicts.
+   */
+  async #runFast(videoId) {
+    if (!this.#fast) {
+      return null;
+    }
+    const refusedAt = this.#fastRefused.get(videoId);
+    if (refusedAt && Date.now() - refusedAt < FAST_REFUSED_MS) {
+      this.#logger.info(`[resolver] visionos URL for ${videoId} did not play earlier — asking yt-dlp`);
+      return null;
+    }
+    this.#fastRefused.delete(videoId);
+    const started = Date.now();
+    let resolved;
+    try {
+      resolved = await this.#fast.resolve(videoId);
+      await this.#verify(resolved.url, resolved.headers);
+    }
+    catch (e) {
+      this.#logger.info(`[resolver] visionos did not resolve ${videoId} (${e.message}) — asking yt-dlp`);
+      return null;
+    }
+    this.#logger.info(
+      `[resolver] resolved ${videoId} in ${((Date.now() - started) / 1000).toFixed(1)}s `
+      + `via visionos (itag ${resolved.itag})`);
+    const answer = { url: resolved.url, headers: resolved.headers };
+    this.#store(videoId, answer, { fast: true });
+    return answer;
   }
 
   /**
@@ -515,11 +590,11 @@ export default class Resolver {
     });
   }
 
-  #store(videoId, { url, headers }) {
+  #store(videoId, { url, headers }, { fast = false } = {}) {
     // YouTube stamps its own lifetime into the URL; honour it rather than guessing.
     const m = /[?&]expire=(\d+)/.exec(url);
     const expiresAt = m ? (Number(m[1]) * 1000) - EXPIRY_MARGIN_MS : null;
-    this.#cache.set(videoId, { url, headers, expiresAt });
+    this.#cache.set(videoId, { url, headers, expiresAt, fast });
     while (this.#cache.size > MAX_ENTRIES) {
       this.#cache.delete(this.#cache.keys().next().value);
     }

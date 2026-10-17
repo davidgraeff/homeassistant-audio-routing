@@ -30,6 +30,7 @@ import MetadataReporter from './metadata.js';
 import MpvClient from './mpv.js';
 import MpvPlayer from './player.js';
 import Resolver from './resolver.js';
+import VisionOsResolver from './visionos.js';
 import YtdlpDaemon from './ytdlp.js';
 import { AlreadyRunningError } from './singleton.js';
 
@@ -271,6 +272,11 @@ async function main() {
   // resolved — it just happens while the previous track is still playing.
   const resolver = new Resolver({
     ytdlp: process.env.YTCR_YTDL_PATH,
+    // One anonymous VISIONOS `/player` request before yt-dlp (visionos.js): ~0.1 s
+    // instead of seconds when it works, a fall-through to yt-dlp when it does not.
+    // `YTCR_FAST_RESOLVE=0` sends every track straight to yt-dlp, which is the switch
+    // to reach for if YouTube stops serving that client.
+    fast: process.env.YTCR_FAST_RESOLVE !== '0' ? new VisionOsResolver({ logger: console }) : null,
     cookies: process.env.YTCR_COOKIES && existsSync(process.env.YTCR_COOKIES)
       ? process.env.YTCR_COOKIES : null,
     jsRuntime: process.env.YTCR_JS_RUNTIME || 'quickjs',
@@ -284,6 +290,11 @@ async function main() {
     ...(process.env.YTCR_CLIENT_LADDER
       ? { clientLadder: process.env.YTCR_CLIENT_LADDER === 'none'
         ? [] : process.env.YTCR_CLIENT_LADDER.split(',').map((c) => c.trim()).filter(Boolean) }
+      : {}),
+    // yt-dlp's `player_skip`: the default skips the watch page and `/next`, which
+    // playback never reads. `none` restores the full path; any other value replaces it.
+    ...(process.env.YTCR_PLAYER_SKIP
+      ? { playerSkip: process.env.YTCR_PLAYER_SKIP === 'none' ? null : process.env.YTCR_PLAYER_SKIP }
       : {}),
     cacheDir: process.env.YTCR_YTDLP_CACHE_DIR || null,
   });

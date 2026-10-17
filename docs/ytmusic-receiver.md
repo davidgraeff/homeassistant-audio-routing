@@ -442,6 +442,68 @@ probing `http://127.0.0.1:4416` and emits a `WARNING: … Error reaching GET
 http://127.0.0.1:4416/ping` on **every resolve**. Verified both ways on the add-on: without
 the switch, that warning plus `251`; with it, just `251`.
 
+### The one-request fast path: what NewPipe does (`visionos.js`)
+
+NewPipe starts a song about a second after it is tapped, while this receiver took 5-60 s.
+The difference is not the player or the hardware; it is how many requests it takes to get
+a stream URL. Measured on the add-on host (x86_64) on 2026-10-17, one resolve through
+yt-dlp's default authenticated clients:
+
+| step | cost |
+|---|---|
+| Python start, plugin registration | 0.5 s |
+| watch page (whose embedded data yt-dlp then failed to parse) | 1.3 s |
+| `/next` "initial data", re-fetched because of that — metadata only | 1.3 s |
+| embed config + `/player` for `web_embedded` and `tv_downgraded` | 0.9 s |
+| `n` challenge: node re-parsing the player | 1.1 s |
+
+And most of the URLs this produced on that day answered **403 or 503** to a two-byte
+fetch, so a track walked the whole client ladder (~5.5 s per rung) before mpv's own
+resolution was tried — which is where "up to a minute" came from.
+
+NewPipeExtractor (`dev`, 2026-10) makes **one** `/player` request as the `VISIONOS` client
+(YouTube's Apple Vision Pro app), after a `visitor_id` request for the visitorData it must
+present. That client answers with plain `url` fields — no `signatureCipher`, no `n`, no PO
+token — so NewPipe never downloads the player JS at all. The same request from the add-on
+host:
+
+| | yt-dlp, default clients | VISIONOS request |
+|---|---|---|
+| to a URL | 5.4 s per attempt, often several | **~0.1 s** (`/player`), ~0.3 s including the two-byte check |
+| URLs that played | most answered 403/503 | **8 of 8**, opus itag 251 |
+
+`visionos.js` reproduces that request field for field, and `resolver.js` tries it **before**
+yt-dlp, gated by the same `#verify`. Every failure — a non-`OK` playability status, no plain
+audio-only format, a URL that does not verify, a timeout — falls through to the yt-dlp
+ladder unchanged, and does not count towards that ladder's restart or diagnostic. The
+visitorData is reused for up to six hours and dropped on any failure. The format is itag 251
+where offered, else the highest-bitrate audio-only format, skipping dynamic-range-compressed
+variants and dubbed audio tracks; the URL is fetched with the app's User-Agent, which the
+answer carries as its headers, exactly like a yt-dlp resolve.
+
+Through a real mpv (null audio output, same User-Agent), 4 of 5 such URLs opened and decoded
+within ~0.2 s, including one from a 90 s offset; the fifth failed at the open after passing
+the two-byte check. That case has its own rule: when `player.js` hands a fast-path URL back
+through `invalidate()` (it verified, yet mpv could not play it), the one retry it is allowed
+goes to yt-dlp, and that video skips the fast path for 30 minutes — another VISIONOS URL
+would only spend the retry.
+
+What it gives up, and why yt-dlp stays behind it:
+
+- **It is anonymous.** No cookie jar, so no Premium-only formats, and videos made for kids
+  or age-restricted ones come back unplayable (yt-dlp then resolves them with the jar). Ads
+  do not matter: a direct stream URL has none.
+- **It rests on one client YouTube may stop serving.** NewPipe dropped `ANDROID`, `IOS` and
+  `WEB_EMBEDDED` during 2026 for exactly that reason. `YTCR_FAST_RESOLVE=0` sends every track
+  straight to yt-dlp.
+- **yt-dlp's own `visionos` client is not a substitute.** With its older version string and
+  a desktop Safari User-Agent it was answered "Sign in to confirm you're not a bot" for the
+  same videos this request played seconds later.
+
+The yt-dlp attempts now also pass `player_skip=webpage,initial_data`: the two requests
+playback never reads. That took a spawned resolve from ~5.4 s to ~2.9 s, with the same itag
+and URLs that played no worse. `YTCR_PLAYER_SKIP=none` restores the full path.
+
 ### Prefetch — why track changes are fast and the first track is not
 
 [`resolver.js`](../firmware/pi-ytmusic/receiver/resolver.js) resolves the *next* track to a
@@ -621,6 +683,10 @@ This immediately settled one question: in a 13.1 s start, mpv accounted for **1.
 resolve for 11.2 s, of which two thirds was a rejected URL and a second resolve. mpv, the
 `--audio-buffer=1`, and the mid-stream seek were never the problem. A prefetched track change
 reads `resolve 0.0s`, `mpv 1.1s`, audio at 1.2 s.
+
+The VISIONOS fast path logs as `[resolver] resolved <id> in 0.3s via visionos (itag 251)`;
+when it does not answer, `[resolver] visionos did not resolve <id> (<why>) — asking yt-dlp`
+precedes the usual yt-dlp lines.
 
 #### The 403 at the verify step: unexplained, mitigated (2026-08-10)
 
@@ -802,6 +868,14 @@ logs whether it was served warm:
 #### Resolver traps already handled
 
 Small things that cost real time to find, so that none of them is "tidied up" later:
+
+- **Restarts we ask for are not crashes.** `ytdlp.js` gives up on the daemon after
+  `MAX_RESPAWNS` exits, and used to count every exit for the life of the receiver, the
+  escalation restarts `resolver.js` requests after a 403 window included. On the add-on that
+  added up within a day of bad windows, and the receiver then spent **seven days** spawning
+  yt-dlp per track with no resident worker — visible only as `ps` showing no
+  `ytdlp_daemon.py`. Requested exits no longer count, and a daemon that served for 10 minutes
+  starts a fresh count; a daemon that dies before it listens is still given up on.
 
 - **Closing a listening socket does not wake a blocked `accept()`** on Linux. The daemon's
   escalation path logged "exiting" and then sat there until the next connection arrived —
@@ -1399,6 +1473,9 @@ handler declining to act. Verified by re-running that probe against the fixed pl
 
 1. **`yt-dlp` vs YouTube** — cookies expire, extractors break, token requirements change.
    Frequent, usually fixed by updating `yt-dlp` (which the weekly timer does by itself).
+   The VISIONOS request in front of it fails the same way when YouTube stops serving that
+   client; it then only costs ~0.1 s per track before yt-dlp, and `YTCR_FAST_RESOLVE=0`
+   removes it.
 2. **Lounge API drift** — mitigated by `yt-cast-receiver` being maintained for exactly this;
    our exposure is a dependency bump.
 3. **Google drops DIAL from the YTM picker** — terminal for this approach, no mitigation.
