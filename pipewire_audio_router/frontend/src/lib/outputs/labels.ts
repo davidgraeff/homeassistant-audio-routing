@@ -59,10 +59,18 @@ export function statusBadge(o: OutputInfo): { cls: string; text: string; title: 
   return { cls: 'badge on', text: 'online', title: 'On the network and carrying audio routed to it.' };
 }
 
-// PTP-lock badge for an AirPlay-2 output — tri-state, because a lock is not
-// needed for single-room realtime playback (the receiver free-runs off our
-// PT=87 anchors); it only prevents drift in a multi-room group. So we only
-// *alarm* (red) when the receiver is both unlocked AND in a ≥2-member group.
+// PTP badge for an AirPlay-2 output. Four states, because "not locked" means two
+// completely different things depending on the receiver, and conflating them is
+// what made this badge cry wolf:
+//
+//   * Receivers whose PTP answers back (`ptp_responsive`, e.g. Pioneer VSX-934 —
+//     measured ~8 Delay_Req/s while streaming) — for those a lock is observable,
+//     and losing it is a real drift risk worth flagging in a multi-room group.
+//   * Receivers that never answer (e.g. Yamaha WX-021 — measured zero gPTP packets
+//     in 90 s while playing perfectly). They slave to our Sync/Follow_Up one-way and
+//     render off the PT=87 anchors; there is no lock to observe and nothing wrong.
+//     This one gets a plain, non-alarming badge even in a group.
+//
 // Returns null when no badge should show (non-AP2 or offline).
 export function ptpBadge(o: OutputInfo): { cls: string; text: string; title: string } | null {
   if (o.kind !== 'airplay2' || !o.present) return null;
@@ -77,17 +85,26 @@ export function ptpBadge(o: OutputInfo): { cls: string; text: string; title: str
       title: "This receiver doesn't advertise PTP support (features bit 41); our sender streams realtime without it.",
     };
   }
+  // Never answered us, and that is this receiver's normal, working state.
+  if (o.ptp_responsive === false) {
+    return {
+      cls: 'badge',
+      text: 'PTP one-way',
+      title:
+        'This receiver listens to our clock but never answers it — normal for some AirPlay-2 stacks (Yamaha among them). It follows our Sync messages and the timestamps in the audio stream, stays in sync, and needs nothing from you.',
+    };
+  }
   if (o.ptp_relevant) {
     return {
       cls: 'badge warn',
       text: 'no PTP lock',
-      title: `Not exchanging PTP with us${age}. This receiver is in a multi-room AirPlay-2 group, so without a shared clock the rooms can drift out of sync. Re-route it (disconnect then reconnect) to re-establish PTP.`,
+      title: `This receiver was exchanging PTP with us and has stopped${age}. It is in a multi-room AirPlay-2 group, so without a shared clock the rooms can drift apart. Its session is rebuilt automatically; Resync forces that now.`,
     };
   }
   return {
     cls: 'badge',
     text: 'PTP —',
-    title: `Not exchanging PTP with us${age} — fine for single-room realtime playback; a live PTP lock only matters for keeping multiple rooms in sync.`,
+    title: `Not exchanging PTP with us right now${age} — fine for single-room realtime playback; a live PTP lock only matters for keeping multiple rooms in sync.`,
   };
 }
 

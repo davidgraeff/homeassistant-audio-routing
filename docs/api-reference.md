@@ -208,10 +208,11 @@ adds its own:
   { "node_name": "ap2-dev-pioneer_vsx_934_f11b89", "name": "Pioneer VSX-934 F11B89",
     "kind": "airplay2", "present": true, "configured": false, "state": "adopted",
     "ip": "192.168.178.35", "port": 7000, "encryption": "HomeKit", "latency_ms": 200,
-    "ptp_locked": true, "ptp_lock_age_s": 0, "ptp_supported": true, "ptp_relevant": true,
+    "ptp_locked": true, "ptp_lock_age_s": 0, "ptp_responsive": true,
+    "ptp_supported": true, "ptp_relevant": true,
     "ap2_features": { "raw": "0x445F8A00,0x1C340", "ptp": true,
                       "buffered_audio": true, "transient_pairing": true },
-    "ap2_rate_mode": "auto", "ap2_rate": 44100, "ap2_volume": 0.44, "ap2_muted": false },
+    "ap2_rate_mode": "44100", "ap2_rate": 44100, "ap2_volume": 0.44, "ap2_muted": false },
 
   { "node_name": "pwsink-dev-david_local", "name": "david-local", "kind": "pwsink",
     "present": true, "configured": false, "state": "adopted",
@@ -222,7 +223,13 @@ adds its own:
 ```
 
 `ptp_locked` is **runtime** state, not a capability — a receiver can advertise PTP and
-sit unlocked without anything being wrong outside a multi-room group.
+sit unlocked without anything being wrong outside a multi-room group. Read it together
+with **`ptp_responsive`**, which says whether the receiver's PTP stack answers ours at
+all: receivers come in two classes, wire-measured over 90 s with both streaming in one
+group — a Pioneer VSX-934 (`PTPInfo: SUE PTP 1.0`) sent 717 `Delay_Req`, a Yamaha WX-021
+(`PTPInfo: AirPlay;2.0.4`) sent **zero** and played perfectly throughout. For that
+one-way class `ptp_locked` is permanently `false` and that is its healthy state; only a
+`ptp_responsive: true` receiver going quiet is a fault.
 
 `sendspin_out_of_sync` / `sendspin_sync_errors` are the *speaker's own* verdict on whether
 it is rendering what it was sent: `client/state: "error"`, which `sendspin-cpp` ≥ 0.7.0
@@ -357,8 +364,9 @@ watchdog also handles by itself — this endpoint is for the cases it cannot see
 not waiting.
 
 ### `PUT /api/outputs/{node_name}/ap2-rate`
-AirPlay-2 rate mode for one receiver — `auto` or a fixed rate (e.g. `fixed_44100`),
-mirroring the `ap2_rate_mode` / `ap2_rate` fields above.
+AirPlay-2 rate mode for one receiver — `44100` (the default) or `try_48000`, mirroring the
+`ap2_rate_mode` / `ap2_rate` fields above. The older `fixed_44100` / `auto` spellings are
+still accepted.
 
 ### `PUT /api/outputs/{node_name}/sendspin-codec`
 Pick a sendspin device's codec from its `sendspin_codec_options` (`auto`, `opus`,
@@ -715,14 +723,18 @@ Two AP2-specific things are worth knowing about those shared endpoints:
 > Pioneer VSX-934 does this repeatedly, and until this existed the only fixes were
 > restarting the add-on or power-cycling the AVR — both of which work only because both
 > build a new session. The daemon also does it **by itself**: the AP2 liveness task
-> rebuilds the session of a receiver that had a lock, is still being streamed to, and has
-> gone quiet for 30 s (at most one attempt every two minutes, and never for a receiver
-> that has *never* locked — a Yamaha WX-021 never sends a `Delay_Req` and plays
-> perfectly). The endpoint is for the cases it cannot see, and for not waiting.
+> rebuilds the session of a receiver whose gPTP is **two-way**, is still being streamed
+> to, and has gone quiet for 30 s (at most one attempt every two minutes). A one-way
+> receiver — `ptp_responsive: false`, e.g. a Yamaha WX-021, which never sends a
+> `Delay_Req` and plays perfectly — is never touched. The endpoint is for the cases it
+> cannot see, and for not waiting.
 
 ### `PUT /api/outputs/{node_name}/ap2-rate`
-The one knob that *is* AP2-only: the wire sample-rate mode, `auto` (negotiate 48 kHz, fall
-back to 44.1 kHz) or `fixed_44100`. Restarts that receiver's group at the new rate.
+The one knob that *is* AP2-only: the wire sample-rate mode, `44100` (the default) or
+`try_48000`. Restarts that receiver's group at the new rate. 48 kHz is opt-in per device
+because receivers do not advertise whether they support it — the WX-021 accepts the SETUP
+and then stops rendering — so a receiver that goes quiet after switching wants switching
+back. Choosing `try_48000` clears any cached refusal, so it really does re-probe.
 
 ## PipeWire receiver hosts (agents)
 

@@ -91,11 +91,20 @@ Two patches to the vendored `libairptp` are load-bearing and must be kept
   [architecture.md](architecture.md#7-real-time-thread-ladder).
 - **The staleness send-gate is removed** (`ptp_msg_handle.c`
   `peers_msg_send()`). It skipped sending Sync to a peer not heard from in
-  15 s, but a third-party receiver only replies (Delay_Req) once it is
-  *already* locking onto our Sync — a chicken-and-egg that stopped Sync
-  15 s after peer-add so the receiver could never lock. We manage peers
-  explicitly (add on discovery, remove when gone), so we keep offering the
-  clock unconditionally. Wire-confirmed: 0 → ~177 gPTP pkts/6 s.
+  15 s, which stopped Sync 15 s after peer-add so the receiver could never
+  lock. We manage peers explicitly (add on discovery, remove when gone), so we
+  keep offering the clock unconditionally. Wire-confirmed: 0 → ~177 gPTP
+  pkts/6 s outbound.
+
+  The original reasoning here was that "a receiver only replies once it is
+  already locking onto our Sync" — a chicken-and-egg. **That was too kind to
+  the gate:** measured 2026-08-21, a Yamaha WX-021 replies *never*, not late.
+  It sent zero packets in 90 s while rendering perfectly, in a group whose
+  Pioneer VSX-934 sent 717. So for the one-way class the gate would have
+  silenced the clock permanently rather than merely delaying a lock, and
+  removing it is load-bearing for a stronger reason than we thought. The
+  consequences for what "PTP lock" can mean are in
+  [airplay2-output.md](airplay2-output.md#5-per-brand-interop-and-quirks).
 
 ## Near-real-time principle: small buffers + real-time feeders, not bigger buffers
 

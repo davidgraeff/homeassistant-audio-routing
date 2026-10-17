@@ -16,13 +16,15 @@
   let loading = $state(true);
   let poll: ReturnType<typeof setInterval>;
 
-  // Live PTP-lock label for the capability table. A lock isn't needed for
-  // single-room realtime playback (the receiver free-runs off our PT=87
-  // anchors), so an unlocked lone receiver is neutral, not an error.
+  // Live PTP label for the capability table. A lock isn't needed for single-room
+  // realtime playback (the receiver renders off our PT=87 anchors), and some
+  // receivers never answer gPTP at all while playing perfectly — so "unlocked" is
+  // only a warning for a receiver that DOES answer and has stopped.
   function lockLabel(o: OutputInfo): { cls: string; text: string } {
     if (!o.present) return { cls: 'badge off', text: 'offline' };
     if (o.ptp_locked) return { cls: 'badge on', text: 'locked' };
-    if (o.ptp_relevant) return { cls: 'badge warn', text: 'unlocked (drift risk)' };
+    if (o.ptp_responsive === false) return { cls: 'badge', text: 'one-way (normal)' };
+    if (o.ptp_relevant) return { cls: 'badge warn', text: 'lock lost (drift risk)' };
     return { cls: 'badge', text: 'unlocked (single-room ok)' };
   }
 

@@ -15,9 +15,12 @@ drops out every 5–10 min for up to 2 min).
 
 ## Environment / who's who (dev setup)
 
-- **HA host (daemon)** = `192.168.178.22` (`homeassistant.local`), daemon REST API
-  on `:8099`. SSH: `ssh root@homeassistant.local` (add-on container;
-  `export XDG_RUNTIME_DIR=/run/user/0` for `pw-*` tools).
+- **HA host (daemon)** = `192.168.178.173` (an x86 box since 2026-08-21; it was a
+  Raspberry Pi 4 at `192.168.178.22` before that, and older recipes here still say
+  `homeassistant.local`). Daemon REST API on `:8099`. SSH: `ssh root@192.168.178.173`
+  (the SSH add-on container — it has `tcpdump`, `curl` and `python3`, which the
+  *daemon's* container does not; `export XDG_RUNTIME_DIR=/run/user/0` for `pw-*`
+  tools).
 - **The daemon's container name is `app_local_pipewire_audio_router`.** The
   Supervisor used to name add-on containers `addon_*` and now uses `app_*`, so every
   older recipe fails with a bare `No such container` — which reads like the add-on is
@@ -215,23 +218,43 @@ path.
 curl -s :8099/api/outputs      # each ap2-dev-* shows ptp_locked + ptp_lock_age_s
 ```
 
-`ptp_locked` / `ptp_lock_age_s` derive from libairptp
-`airptp_peer_last_seen()` → `Ap2PtpService::peer_lock_age()` and surface as
-a UI badge in `OutputsTab.svelte` (red "no PTP lock" / green "PTP ✓").
-`last_seen` is bumped on every gPTP packet a locked receiver sends, so it's
-a true lock-liveness signal.
+`ptp_locked` / `ptp_lock_age_s` / `ptp_responsive` derive from libairptp
+`airptp_peer_last_seen()` → `Ap2PtpService::peer_ptp()` and surface as a UI
+badge in `OutputsTab.svelte`.
 
-> **Caveat learned the hard way:** single-device AP2 rendering was observed
-> to work **while gPTP was effectively silent** on the wire, so `ptp_locked`
-> can read `false` while audio plays — it is a *sync-quality / multi-room*
-> signal, not a "will it render" signal. gPTP health can only be judged
-> **while actively streaming** to a receiver: receivers only send Delay_Req
-> (which refreshes `last_seen`) during an active RTSP session; at idle
-> `tcpdump` on 319/320 shows ~0 packets and that is **expected**.
+> **Two traps here, both cost a day (2026-08-21).**
+>
+> **1. `last_seen` is seeded at peer-add.** libairptp writes
+> `peer->last_seen = time(NULL)` inside `daemon_peer_add`, so a raw read cannot
+> tell "the receiver is answering" from "we just registered it". Our
+> `ptp::heard_age()` discounts anything not newer than the add — but a `tcpdump`
+> is still the only *proof*, and any future code reading the FFI directly will
+> re-acquire the bug. What it caused: a receiver that has never sent one gPTP
+> packet read as "locked 0 s ago" right after connect, then "lock lost" 30 s
+> later, and the watchdog's own reconnect re-seeded the timestamp — a 2-minute
+> reconnect loop, ~1.4 s of silence each time, on a receiver that was fine.
+>
+> **2. Receivers come in two classes, and only one has an observable lock.**
+> Measured over 90 s with both streaming in one group:
+>
+> | receiver | `PTPInfo` | `Delay_Req` → us | Sync ← us |
+> |---|---|---|---|
+> | Pioneer VSX-934 | `SUE PTP 1.0` | **717** (~8/s) | 1434 |
+> | Yamaha WX-021 "Dusche" | `AirPlay;2.0.4` | **0** | 1434 |
+>
+> Both render perfectly. The Yamaha listens one-way and never talks back, so for
+> it `ptp_locked: false` is the permanent healthy state and there is nothing to
+> recover; the watchdog is gated on `ptp_responsive` for exactly this reason.
+> Judge gPTP health **only while actively streaming** — at idle even the Pioneer
+> stops, and `tcpdump` on 319/320 showing ~0 packets is expected.
 
 ```
-# while streaming, expect continuous Sync (~8/s) out + Delay_Req back:
-ssh root@homeassistant.local 'timeout 6 tcpdump -ni any "udp and (port 319 or port 320)"'
+# while streaming, expect continuous Sync (~8/s) out; Delay_Req back only from
+# a two-way receiver. src of every packet is what matters — decode the message
+# type from the first payload byte's low nibble (0=SYNC, 1=DELAY_REQ, 8=FOLLOW_UP,
+# 9=DELAY_RESP, 0xb=ANNOUNCE, 0xc=SIGNALING):
+ssh root@<ha-ip> 'timeout 90 tcpdump -i any -nn -s 64 -w /tmp/ptp.pcap "udp portrange 319-320"'
+# NB: `-i any` gives linktype 276 (LINUX_SLL2) = a 20-byte link header, not 16.
 ```
 
 ### First: "needs several attempts" is usually **our** leaked session, not the receiver

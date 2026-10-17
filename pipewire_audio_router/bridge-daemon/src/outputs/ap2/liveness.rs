@@ -33,12 +33,23 @@
 //! a Pioneer VSX-934, where the only recoveries were restarting the add-on or
 //! power-cycling the AVR: both work because both build a new session.
 //!
+//! `PTP_LOCK_FRESH` / `PTP_LOCK_LOST_AFTER` / `ptp_recovery_due` all speak of a
+//! "lock" as shorthand for *we are hearing gPTP from it*. That is what the grandmaster
+//! can actually observe, and for a two-way receiver it tracks the lock closely; for a
+//! one-way receiver there is no observable at all, which is why the class gate below
+//! comes first.
+//!
 //! Two rules keep it from firing on a healthy system:
 //!
-//! * **Only receivers that have demonstrated a lock.** A Yamaha WX-021 in this house
-//!   never sends a `Delay_Req` at all and plays perfectly — its lock age is hours.
-//!   "Advertises PTP" is a capability; "is locked" is a runtime fact, and only a
-//!   receiver that *was* locked and stopped can have lost it.
+//! * **Only receivers whose gPTP is two-way.** Third-party receivers come in two
+//!   classes, measured on the wire (2026-08-21, both streaming in one group, 90 s):
+//!   a Pioneer VSX-934 (`PTPInfo: SUE PTP 1.0`) sent **717** `Delay_Req` — ~8/s,
+//!   matching our Sync rate — while a Yamaha WX-021 (`PTPInfo: AirPlay;2.0.4`) sent
+//!   **zero** and rendered perfectly throughout. For the Yamaha class, silence is not
+//!   a fault, it is the protocol it speaks: it slaves to our Sync/Follow_Up and never
+//!   answers. So the gate is [`crate::outputs::ap2::ptp::PeerPtp::two_way`] — "we have
+//!   genuinely heard gPTP from this device" — not "it advertises PTP" and not a raw
+//!   lock-age read, which libairptp seeds at peer-add (see that module's `heard_age`).
 //! * **Only while it is supposed to be streaming**, with a cooldown between attempts.
 //!   A reconnect costs that one receiver a few seconds of audio, so it must never
 //!   become a loop against a receiver that simply will not lock.
@@ -50,7 +61,7 @@ use crate::outputs::ap2::ptp::SharedAp2Ptp;
 use crate::outputs::ap2::volume::SharedAp2Control;
 use crate::pw::thread::ChangeNotifier;
 use crate::util::locks::LockRecover;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -72,9 +83,9 @@ const REMOVE_AFTER: Duration = Duration::from_secs(300);
 /// A gPTP message this recently from a receiver counts as **locked**: it is slaving to
 /// our grandmaster right now. Matches the badge `/api/outputs` shows
 /// (`outputs/listing.rs`), so the UI and the watchdog cannot disagree about what
-/// "locked" means. A locked receiver exchanges `Delay_Req`/`Delay_Resp` continuously,
-/// so this is generous rather than tight.
-const PTP_LOCK_FRESH: Duration = Duration::from_secs(5);
+/// "locked" means. A two-way receiver exchanges `Delay_Req`/`Delay_Resp` continuously
+/// (~8/s measured), so this is generous rather than tight.
+pub(crate) const PTP_LOCK_FRESH: Duration = Duration::from_secs(5);
 
 /// Silence this long from a receiver that **was** locked is treated as lock lost. Six
 /// times [`PTP_LOCK_FRESH`] on purpose: the badge may flicker on one slow exchange,
@@ -90,13 +101,15 @@ const PTP_RECOVER_COOLDOWN: Duration = Duration::from_secs(120);
 /// Should the watchdog rebuild this receiver's session? Pure, because every condition
 /// here exists to stop it firing on a working system and each one is worth pinning:
 ///
-/// * `age` — how long since libairptp heard gPTP from it (`None` = never).
-/// * `ever_locked` — it has been seen locked since the daemon started. A receiver that
-///   never locks (and plays fine, like the Yamaha here) can't have *lost* a lock.
+/// * `age` — how long since we genuinely heard gPTP from it (`None` = never; the
+///   peer-add seed is already discounted by `ptp::heard_age`).
+/// * `two_way` — this receiver *does* answer our grandmaster, so its silence means
+///   something. A one-way receiver (Yamaha WX-021: 0 packets in 90 s while playing
+///   perfectly) has no lock to lose and must never be touched.
 /// * `streaming` — it has a live sender. With no session there is nothing to rebuild.
 /// * `since_last_recover` — `None` when we have not tried before.
-fn ptp_recovery_due(age: Option<Duration>, ever_locked: bool, streaming: bool, since_last_recover: Option<Duration>) -> bool {
-    ever_locked
+fn ptp_recovery_due(age: Option<Duration>, two_way: bool, streaming: bool, since_last_recover: Option<Duration>) -> bool {
+    two_way
         && streaming
         && age.is_none_or(|a| a >= PTP_LOCK_LOST_AFTER)
         && since_last_recover.is_none_or(|since| since >= PTP_RECOVER_COOLDOWN)
@@ -106,9 +119,6 @@ pub fn spawn(devices: SharedAp2Devices, ptp: SharedAp2Ptp, ap2_control: SharedAp
     tokio::spawn(async move {
         let mut fails: HashMap<String, u32> = HashMap::new();
         let mut offline_since: HashMap<String, Instant> = HashMap::new();
-        // Receivers seen PTP-locked at least once since the daemon started — the set the
-        // watchdog is allowed to act on (see the module docs).
-        let mut ever_locked: HashSet<String> = HashSet::new();
         // When each receiver was last reconnected by the watchdog, for the cooldown.
         let mut last_recover: HashMap<String, Instant> = HashMap::new();
         loop {
@@ -154,22 +164,24 @@ pub fn spawn(devices: SharedAp2Devices, ptp: SharedAp2Ptp, ap2_control: SharedAp
                     // leaving the UI green for a receiver that is playing nothing.
                     let mut ptp_fault: Option<String> = None;
                     if let Some(ip) = addr.map(|a| a.ip().to_string()) {
-                        let age = ptp.peer_lock_age(&ip);
+                        // One poll for both facts, so the class latch and the age can
+                        // never disagree about the same receiver.
+                        let crate::outputs::ap2::ptp::PeerPtp { age, two_way } = ptp.peer_ptp(&ip);
                         if age.is_some_and(|a| a <= PTP_LOCK_FRESH) {
-                            // Locked now: remember it, and forget any past attempt so a
+                            // Answering us right now: forget any past attempt so a
                             // receiver that flaps twice a day isn't rate-limited by
                             // yesterday's recovery.
-                            if ever_locked.insert(node_name.clone()) {
-                                tracing::debug!("AP2 PTP: '{node_name}' ({ip}) is locked to the grandmaster");
-                            }
                             last_recover.remove(&node_name);
-                        } else if ever_locked.contains(&node_name) && streaming.contains(&node_name) {
+                        } else if two_way && streaming.contains(&node_name) {
                             // A lock it had, gone, while we are still streaming to it. The
                             // note stands for as long as that is true; the *action* is rate
                             // limited, so the two are decided separately.
+                            // `None` here means it answered us earlier in this session but
+                            // has said nothing since its peer registration was last
+                            // renewed — gPTP stopped entirely rather than merely slowed.
                             let age_note = match age {
                                 Some(a) => format!("last heard {}s ago", a.as_secs()),
-                                None => "never heard from since it was added as a peer".to_string(),
+                                None => "silent since its clock peering was renewed".to_string(),
                             };
                             ptp_fault = Some(format!("Lost its PTP clock lock ({age_note}) — rebuilding its session"));
                             if ptp_recovery_due(age, true, true, last_recover.get(&node_name).map(Instant::elapsed)) {
@@ -231,9 +243,9 @@ pub fn spawn(devices: SharedAp2Devices, ptp: SharedAp2Ptp, ap2_control: SharedAp
                         devs.remove(name);
                         fails.remove(name);
                         offline_since.remove(name);
-                        // A receiver that left takes its lock history with it: if it comes
-                        // back it must prove a lock again before the watchdog acts on it.
-                        ever_locked.remove(name);
+                        // A receiver that left takes its recovery history with it; its
+                        // gPTP class goes with the PTP peer below (`forget_peer`), so a
+                        // device that comes back has to prove itself again.
                         last_recover.remove(name);
                         // The entry is gone, so its fault message has nothing left to
                         // annotate.
@@ -245,7 +257,10 @@ pub fn spawn(devices: SharedAp2Devices, ptp: SharedAp2Ptp, ap2_control: SharedAp
                 // devices lock; add_peer/remove_peer take the PTP service's own lock).
                 for (_, peer_ip) in &to_remove {
                     if let Some(ip) = peer_ip {
-                        ptp.remove_peer(ip);
+                        // `forget_peer`, not `remove_peer`: this device is gone, so drop
+                        // what we learned about its gPTP too. (A reconnect uses
+                        // `remove_peer` precisely so it does NOT do that.)
+                        ptp.forget_peer(ip);
                     }
                 }
                 notify = true;
@@ -268,31 +283,34 @@ fn set_present(devices: &SharedAp2Devices, node_name: &str, present: bool) {
 mod tests {
     use super::*;
 
-    /// The receiver this exists for: a Pioneer VSX-934 that was locked, is still being
-    /// streamed to, and has gone quiet on gPTP. That combination renders silence and
-    /// nothing else in the daemon notices it.
+    /// The receiver this exists for: a Pioneer VSX-934 that answers gPTP (~8 `Delay_Req`
+    /// per second, wire-measured), is still being streamed to, and has gone quiet. That
+    /// combination renders silence and nothing else in the daemon notices it.
     #[test]
-    fn a_streaming_receiver_that_lost_a_lock_it_had_is_recovered() {
+    fn a_streaming_two_way_receiver_that_went_quiet_is_recovered() {
         assert!(ptp_recovery_due(Some(Duration::from_secs(45)), true, true, None));
-        // "Never heard from" counts as lost too, once it *had* been locked — that is a
-        // peer whose gPTP stopped entirely rather than merely slowed.
+        // "Nothing since its peering was renewed" counts as lost too, for a receiver that
+        // *does* answer: that is gPTP stopping entirely rather than merely slowing.
         assert!(ptp_recovery_due(None, true, true, None));
         // And again after the cooldown, because a receiver can fail to re-lock.
         assert!(ptp_recovery_due(None, true, true, Some(PTP_RECOVER_COOLDOWN)));
     }
 
-    /// The three guards, each of which would otherwise reconnect a healthy receiver.
-    /// The first is the important one: a Yamaha WX-021 in this house never sends a
-    /// `Delay_Req` at all and plays perfectly, so "no recent gPTP" on its own is not a
-    /// fault — it is that model's normal state (docs/sendspin-open-items.md, and the
-    /// reason the badge is a runtime fact rather than a capability).
+    /// The guard that matters most, and the one whose absence caused the 2026-08-21
+    /// incident: a **one-way** receiver. A Yamaha WX-021 sent zero gPTP packets in 90 s
+    /// while playing perfectly in a group whose other member sent 717 — so for that class
+    /// "no recent gPTP" is not a fault, it is the whole of its normal behaviour. Before
+    /// the class was measured rather than inferred, this receiver was reconnected every
+    /// two minutes for a lock it had never held: libairptp seeds `last_seen` at peer-add,
+    /// so each recovery attempt manufactured the "it was locked!" evidence that armed the
+    /// next one (see `ptp::heard_age`).
     #[test]
-    fn a_receiver_that_never_locked_is_left_alone() {
-        assert!(!ptp_recovery_due(None, false, true, None), "a receiver that never locks has nothing to lose");
+    fn a_one_way_receiver_is_left_alone() {
+        assert!(!ptp_recovery_due(None, false, true, None), "a receiver that never answers has nothing to lose");
         assert!(!ptp_recovery_due(Some(Duration::from_secs(3600)), false, true, None));
-        // Not streaming ⇒ no session to rebuild; the reconciler owns that case.
+        // Not streaming => no session to rebuild; the reconciler owns that case.
         assert!(!ptp_recovery_due(None, true, false, None));
-        // Still locked ⇒ nothing wrong. (The caller only reaches here when the age is
+        // Still answering => nothing wrong. (The caller only reaches here when the age is
         // past PTP_LOCK_FRESH, but the rule must hold on its own.)
         assert!(!ptp_recovery_due(Some(Duration::from_secs(1)), true, true, None));
     }

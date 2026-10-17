@@ -654,13 +654,10 @@ pub(crate) async fn set_pwsink_jitter(state: AppState, node_name: String, reques
 
 #[derive(serde::Deserialize)]
 pub(crate) struct SetAp2RateModeRequest {
-    /// `"auto"` (negotiate 48 kHz, fall back to 44.1 kHz) or `"fixed_44100"`.
+    /// `"44100"` (the default) or `"try_48000"`. The older `"fixed_44100"` / `"auto"`
+    /// spellings are still accepted so a saved automation or dashboard keeps working.
     pub(crate) mode: String,
 }
-
-/// Set an AP2 output's wire-rate mode (persisted in routing/sync_settings.rs) and nudge the
-/// reconciler so the group re-negotiates + restarts at the new rate. Choosing `auto`
-/// also clears any learned 44.1k cap so 48 kHz is re-probed.
 /// Per-sendspin-output wire codec (`{"codec": "auto"|"pcm"|"opus"|"flac"}`).
 ///
 /// Rejects a codec that isn't currently selectable — the daemon can't encode it, or
@@ -704,6 +701,9 @@ pub(crate) async fn set_sendspin_codec(
     ok(format!("codec for '{node_name}' set to {}", codec.as_str()))
 }
 
+/// Set an AP2 output's wire-rate mode (persisted in routing/sync_settings.rs) and nudge
+/// the reconciler so the group restarts at the new rate. Choosing `try_48000` also clears
+/// any learned 44.1k cap, so the opt-in really re-probes.
 pub(crate) async fn set_ap2_rate_mode(
     State(state): State<AppState>,
     Path(node_name): Path<String>,
@@ -713,10 +713,10 @@ pub(crate) async fn set_ap2_rate_mode(
         return Err(ApiError::bad_request(format!("'{node_name}' is not an AirPlay-2 output")));
     }
     let mode = match req.mode.as_str() {
-        "auto" => crate::routing::sync_settings::Ap2RateMode::Auto,
-        "fixed_44100" | "fixed44100" | "44100" => crate::routing::sync_settings::Ap2RateMode::Fixed44100,
+        "44100" | "fixed_44100" | "fixed44100" => crate::routing::sync_settings::Ap2RateMode::Hz44100,
+        "try_48000" | "48000" | "auto" => crate::routing::sync_settings::Ap2RateMode::Try48000,
         other => {
-            return Err(ApiError::bad_request(format!("unknown rate mode '{other}' (use 'auto' or 'fixed_44100')")));
+            return Err(ApiError::bad_request(format!("unknown rate mode '{other}' (use '44100' or 'try_48000')")));
         }
     };
     if let Err(e) = state.sync_settings.lock_recover().set_ap2_rate_mode(&node_name, mode) {
@@ -725,8 +725,8 @@ pub(crate) async fn set_ap2_rate_mode(
     // Rate is part of the AP2 restart identity → the group re-negotiates + restarts.
     let _ = state.changes.send(());
     let label = match mode {
-        crate::routing::sync_settings::Ap2RateMode::Auto => "auto (negotiate 48 kHz)",
-        crate::routing::sync_settings::Ap2RateMode::Fixed44100 => "fixed 44.1 kHz",
+        crate::routing::sync_settings::Ap2RateMode::Hz44100 => "44.1 kHz (the AirPlay default)",
+        crate::routing::sync_settings::Ap2RateMode::Try48000 => "48 kHz if the receiver takes it",
     };
     ok(format!("set '{node_name}' sample rate to {label} (applies shortly)"))
 }

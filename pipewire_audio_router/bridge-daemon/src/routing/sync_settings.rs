@@ -142,7 +142,7 @@ struct SyncConfig {
     #[serde(default)]
     pwsink_jitter: BTreeMap<String, u16>,
     /// Per-AP2-output wire sample-rate MODE (user choice), keyed by AP2 node name.
-    /// Absent ⇒ `Auto`. `Auto` negotiates 48 kHz and falls back to 44.1 kHz;
+    /// Absent ⇒ [`Ap2RateMode::Hz44100`], the default. `Try48000` is the opt-in;
     /// `Fixed44100` forces the AirPlay-standard 44.1 kHz (for receivers that
     /// misbehave at 48 kHz).
     #[serde(default)]
@@ -158,8 +158,8 @@ struct SyncConfig {
     align_band_split: BTreeMap<String, BandSplit>,
     /// Per-AP2-device LEARNED capability cache (Hz), keyed by AP2 node name: the
     /// last successfully-negotiated rate, or 44100 if a 48 kHz SETUP was rejected.
-    /// Absent ⇒ untested (Auto optimistically tries 48 kHz). Persisted so we don't
-    /// re-probe a known-44.1k-only receiver on every connect.
+    /// Absent ⇒ untested. Only consulted in [`Ap2RateMode::Try48000`], and persisted so
+    /// an opt-in that was already refused isn't re-probed on every connect.
     #[serde(default)]
     ap2_rate_cap: BTreeMap<String, u32>,
 }
@@ -203,19 +203,37 @@ pub struct BandSplit {
 }
 
 /// Per-AP2-output sample-rate mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// **44.1 kHz is the default, and 48 kHz is opt-in per device.** That is the opposite of
+/// how this started, and the reason is that 48 kHz cannot be *negotiated*: an AirPlay-2
+/// receiver's `GET /info` carries an `audioFormats` capability list only on newer SDKs —
+/// neither test receiver publishes one (Yamaha WX-021 / `AirPlay;2.0.4`, Pioneer VSX-934 /
+/// `AirPlay;2.0.2`) — and the mDNS `features` bitmask says nothing about rates. So the
+/// only way to find out is to try, and a receiver that gets it wrong does not say so:
+/// the WX-021 **accepted** every 48 kHz SETUP (log-confirmed, 2026-08-21) and then stopped
+/// rendering after a few seconds. Guessing 48 kHz therefore risks silence, while 44.1 kHz
+/// is what Apple's own senders use for realtime ALAC and what every receiver is built for.
+/// The upside of 48 kHz is one skipped resample in our graph, which is not worth paying
+/// for with a silent speaker the user has to diagnose.
+///
+/// The aliases keep older stores loading. **`fixed44100` with no underscore is the one
+/// that matters**: this enum used to carry `#[serde(rename_all = "snake_case")]`, which
+/// does not insert a separator before digits, so `Fixed44100` went to disk as
+/// `"fixed44100"` — confirmed by reading the live instance's `/data/sync-settings.json`.
+/// Aliasing only the underscored spelling (which is what the *API* accepted) would make
+/// `SyncSettings::load` fail outright on any store that had the knob set, taking the
+/// group lead and render delays down with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Ap2RateMode {
-    /// Negotiate 48 kHz, fall back to 44.1 kHz on rejection (default).
-    Auto,
-    /// Force 44.1 kHz (AirPlay standard).
-    Fixed44100,
-}
-
-impl Default for Ap2RateMode {
-    fn default() -> Self {
-        Self::Auto
-    }
+    /// AirPlay's native realtime rate. The default, and the safe answer.
+    #[default]
+    #[serde(rename = "44100", alias = "fixed44100", alias = "fixed_44100")]
+    Hz44100,
+    /// Opt-in: try 48 kHz, and fall back to 44.1 kHz if the receiver *rejects* the SETUP.
+    /// A receiver that accepts it and then misbehaves has to be switched back by hand —
+    /// see the type docs for why that case can't be detected up front.
+    #[serde(rename = "try_48000", alias = "auto")]
+    Try48000,
 }
 
 /// Per-sendspin-output wire codec choice.
@@ -466,7 +484,7 @@ impl SyncSettings {
         self.persist()
     }
 
-    /// The user-chosen rate mode for an AP2 output (default [`Ap2RateMode::Auto`]).
+    /// The user-chosen rate mode for an AP2 output (default [`Ap2RateMode::Hz44100`]).
     pub fn ap2_rate_mode(&self, node_name: &str) -> Ap2RateMode {
         self.config.ap2_rate_mode.get(node_name).copied().unwrap_or_default()
     }
@@ -476,11 +494,12 @@ impl SyncSettings {
         self.config.ap2_rate_mode.clone()
     }
 
-    /// Set an AP2 output's rate mode and persist. Setting `Auto` also clears any
-    /// learned cap so the next connect re-probes 48 kHz.
+    /// Set an AP2 output's rate mode and persist. Choosing `Try48000` also clears any
+    /// learned cap, so asking for 48 kHz again really does re-probe rather than being
+    /// silently overruled by an old rejection.
     pub fn set_ap2_rate_mode(&mut self, node_name: &str, mode: Ap2RateMode) -> anyhow::Result<()> {
         self.config.ap2_rate_mode.insert(node_name.to_string(), mode);
-        if mode == Ap2RateMode::Auto {
+        if mode == Ap2RateMode::Try48000 {
             self.config.ap2_rate_cap.remove(node_name);
         }
         self.persist()
@@ -496,13 +515,12 @@ impl SyncSettings {
         self.persist()
     }
 
-    /// The effective wire rate for one AP2 output: `Fixed44100` ⇒ 44100; `Auto` ⇒
-    /// the learned cap (44100 if a prior 48 kHz SETUP was rejected), else 48000
-    /// (optimistic — untested Auto devices try 48 kHz first).
+    /// The effective wire rate for one AP2 output: `Hz44100` (the default) ⇒ 44100;
+    /// `Try48000` ⇒ 48000 unless a previous SETUP rejection capped it at 44100.
     pub fn ap2_effective_rate(&self, node_name: &str) -> u32 {
         match self.ap2_rate_mode(node_name) {
-            Ap2RateMode::Fixed44100 => 44_100,
-            Ap2RateMode::Auto => self.config.ap2_rate_cap.get(node_name).copied().unwrap_or(48_000),
+            Ap2RateMode::Hz44100 => 44_100,
+            Ap2RateMode::Try48000 => self.config.ap2_rate_cap.get(node_name).copied().unwrap_or(48_000),
         }
     }
 
@@ -564,6 +582,51 @@ mod tests {
         assert_eq!(reloaded.sendspin_delays().get("sendspin-dev-kitchen").copied(), Some(40));
         assert_eq!(reloaded.ap2_latency("ap2-dev-dusche"), Some(800));
         assert_eq!(reloaded.pwsink_jitter("pwsink-dev-shop_david"), Some(40));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The rate default and its history. An untouched AP2 output must run at 44.1 kHz —
+    /// the rate AirPlay realtime audio actually is — because 48 kHz cannot be negotiated
+    /// (no test receiver publishes `audioFormats`) and a receiver that mishandles it
+    /// **accepts the SETUP anyway** and goes quiet seconds later. And a store written
+    /// before the flip has to keep loading: `auto`/`fixed_44100` are the old spellings.
+    #[test]
+    fn the_rate_default_is_44_1_and_old_stores_still_load() {
+        let path = temp_path("ap2-rate");
+        let _ = std::fs::remove_file(&path);
+        let s = SyncSettings::load(&path).unwrap();
+        assert_eq!(s.ap2_rate_mode("ap2-dev-dusche"), Ap2RateMode::Hz44100, "the default must be the safe rate");
+        assert_eq!(s.ap2_effective_rate("ap2-dev-dusche"), 44_100);
+
+        // A store from before the flip. `fixed44100` — no underscore — is the spelling the
+        // live instance actually had on disk (`rename_all = "snake_case"` doesn't separate
+        // digits); the underscored form is what the API took. BOTH have to load, or a real
+        // store fails to parse and takes the group lead and render delays with it.
+        std::fs::write(
+            &path,
+            r#"{"group_lead_ms":180,"ap2_rate_mode":{"ap2-dev-old-auto":"auto","ap2-dev-old-fixed":"fixed44100","ap2-dev-old-api":"fixed_44100"}}"#,
+        )
+        .unwrap();
+        let mut s = SyncSettings::load(&path).unwrap();
+        assert_eq!(s.ap2_rate_mode("ap2-dev-old-api"), Ap2RateMode::Hz44100);
+        assert_eq!(s.ap2_rate_mode("ap2-dev-old-auto"), Ap2RateMode::Try48000);
+        assert_eq!(s.ap2_rate_mode("ap2-dev-old-fixed"), Ap2RateMode::Hz44100);
+        assert_eq!(s.ap2_effective_rate("ap2-dev-old-auto"), 48_000);
+
+        // A refused 48 kHz sticks, so we don't re-probe a receiver that said no...
+        s.set_ap2_rate_cap("ap2-dev-old-auto", 44_100).unwrap();
+        assert_eq!(s.ap2_effective_rate("ap2-dev-old-auto"), 44_100);
+        // ...but asking for 48 kHz again is a real request to retry, not a no-op.
+        s.set_ap2_rate_mode("ap2-dev-old-auto", Ap2RateMode::Try48000).unwrap();
+        assert_eq!(s.ap2_effective_rate("ap2-dev-old-auto"), 48_000);
+
+        // One capture serves a whole group, so a single 44.1 kHz member decides for all.
+        assert_eq!(s.ap2_group_rate(["ap2-dev-old-auto"]), 48_000);
+        assert_eq!(s.ap2_group_rate(["ap2-dev-old-auto", "ap2-dev-old-fixed"]), 44_100);
+
+        // And the new names round-trip through the file.
+        let reloaded = SyncSettings::load(&path).unwrap();
+        assert_eq!(reloaded.ap2_rate_mode("ap2-dev-old-auto"), Ap2RateMode::Try48000);
         let _ = std::fs::remove_file(&path);
     }
 

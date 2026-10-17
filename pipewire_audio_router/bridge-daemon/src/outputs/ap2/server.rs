@@ -14,6 +14,7 @@
 //! (48 kHz / S16 / stereo); `LiveAudioDecoder` resamples 48k→44.1k internally.
 #![allow(dead_code)] // wired into routing/sync_group/mod.rs in the same phase
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -136,6 +137,24 @@ const AP2_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// the group task's life where the device is already registered for commands but its
 /// command channel is not yet being drained.
 const AP2_VOLUME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often each connected receiver gets a `POST /feedback` on its RTSP session — the
+/// keepalive every real AirPlay-2 sender sends, at the ~2 s cadence the vendored client
+/// documents. Both test receivers ask for it in their `GET /info` (`keepAliveLowPower`
+/// and `keepAliveSendStatsAsBody` are both true), and we sent none at all until now.
+///
+/// It earns its place twice. It is the keepalive, and it is the **only** thing that
+/// notices a session dying under us: the RTSP socket is otherwise write-only after
+/// RECORD, so a receiver that tore the session down left the output green in the UI and
+/// silent in the room. The liveness probe can't see it either — that opens its own
+/// connection, so a receiver whose AirTunes is perfectly healthy but has dropped *our*
+/// session answers it happily.
+const AP2_FEEDBACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Consecutive failed feedback round-trips before we treat a member's session as dead.
+/// Two, not one: a single failure is a lost packet or a busy receiver, and the cost of
+/// being wrong is an audible reconnect.
+const AP2_FEEDBACK_FAILS: u32 = 2;
 
 /// A running group's AP2 senders. Dropping it signals the task to stop + TEARDOWN
 /// every receiver session (mirrors `SendspinServerHandle`: drop = tear down), and
@@ -412,6 +431,39 @@ async fn apply_command(conns: &mut [(String, Connection)], cmd: Ap2Command) -> O
         Ap2Command::Reconnect { node_name, reason } => return Some((node_name, reason)),
     }
     None
+}
+
+/// Send one keepalive round — a `POST /feedback` per connected receiver — and return the
+/// members whose session has now failed [`AP2_FEEDBACK_FAILS`] round-trips in a row.
+///
+/// Sequential, like every other RTSP write in this task, because the task owns the
+/// `Connection`s. Each call is bounded inside the vendored client (2 s), and a *timeout*
+/// there is deliberately reported as success by `send_feedback` — only a transport
+/// failure counts here, which is the case that means "this session is gone".
+///
+/// A round is therefore worst-case 2 s per member, during which the task is not draining
+/// `cmd_rx` — the same trade the connect loop and the inline reconnect already make, and
+/// what `Ap2Control::try_queue` is lossy-not-fatal for. A responsive receiver answers in
+/// milliseconds, so the window only opens when something is already wrong.
+async fn feedback_round(conns: &mut [(String, Connection)], fails: &mut HashMap<String, u32>) -> Vec<String> {
+    let mut dead = Vec::new();
+    for (name, conn) in conns.iter_mut() {
+        match conn.send_feedback().await {
+            Ok(()) => {
+                fails.remove(name);
+            }
+            Err(e) => {
+                let n = fails.entry(name.clone()).or_insert(0);
+                *n += 1;
+                tracing::debug!("AP2: keepalive to '{name}' failed ({n}/{AP2_FEEDBACK_FAILS}): {e}");
+                if *n >= AP2_FEEDBACK_FAILS {
+                    fails.remove(name);
+                    dead.push(name.clone());
+                }
+            }
+        }
+    }
+    dead
 }
 
 /// What a running group task needs in order to (re)build one member's session on its
@@ -866,9 +918,60 @@ pub fn start(
         // sender threads. The relay thread is stopped separately by the handle dropping
         // `_capture` (closes the capture channel → relay's blocking_recv returns None).
         if !shutting_down {
+            // Keepalives start only once every member is connected: the connect loop above
+            // is bounded (AP2_CONNECT_TIMEOUT × attempts per member) and well inside any
+            // receiver's session timeout, and it is the proven path — not somewhere to add
+            // another RTSP write. The first tick fires immediately, so a group that just
+            // came up is greeted right away.
+            let mut feedback_tick = tokio::time::interval(AP2_FEEDBACK_INTERVAL);
+            feedback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut feedback_fails: HashMap<String, u32> = HashMap::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = feedback_tick.tick() => {
+                        for name in feedback_round(&mut conns, &mut feedback_fails).await {
+                            // The session is gone while we were still feeding it PCM: this
+                            // is the "green in the UI, silent in the room" case.
+                            //
+                            // If this group is on 48 kHz *because this member opted in*,
+                            // that is the first suspect: a receiver can accept a 48 kHz
+                            // SETUP and only then fail to sustain it (log-confirmed on a
+                            // Yamaha WX-021), which is precisely the failure the
+                            // SETUP-rejection fallback cannot see. Cap it at 44.1 kHz and
+                            // let the reconciler restart the group there — a reconnect at
+                            // the same rate would just fail the same way.
+                            let opted_into_48k = rate >= 48_000
+                                && sync_settings.lock_recover().ap2_rate_mode(&name)
+                                    == crate::routing::sync_settings::Ap2RateMode::Try48000;
+                            if opted_into_48k {
+                                tracing::warn!(
+                                    "AP2: '{name}''s session stopped answering at {rate} Hz — it accepted the rate and \
+                                     then dropped the session. Capping it at 44.1 kHz and restarting the group there."
+                                );
+                                crate::outputs::ap2::health::Ap2Health::global().set(
+                                    &name,
+                                    format!(
+                                        "Stopped playing at {} kHz — the receiver took the stream and then dropped it. \
+                                         Back to 44.1 kHz; switch the rate back only if you want to retry.",
+                                        rate / 1000
+                                    ),
+                                );
+                                if let Err(e) = sync_settings.lock_recover().set_ap2_rate_cap(&name, 44_100) {
+                                    tracing::warn!("AP2: failed to persist 44.1k cap for '{name}': {e}");
+                                }
+                                control_task.lock().await.notify_reconcile();
+                            } else {
+                                tracing::warn!(
+                                    "AP2: '{name}''s session stopped answering keepalives — rebuilding it. \
+                                     Its groupmates keep streaming."
+                                );
+                                crate::outputs::ap2::health::Ap2Health::global()
+                                    .set(&name, "Its AirPlay session stopped responding — rebuilding it".to_string());
+                                reconnect_member(&ctx, &name, "its session stopped responding", &mut conns, &mut fwd_tasks).await;
+                            }
+                        }
+                    }
                     Some(cmd) = cmd_rx.recv() => {
                         // A reconnect is served inline: it is the one command that has to
                         // happen *here*, since only this task owns the connections. It

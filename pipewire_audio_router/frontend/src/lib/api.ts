@@ -191,9 +191,10 @@ export const api = {
    *  nothing. */
   resyncOutput: (nodeName: string) => request<OpResponse>('POST', `api/outputs/${enc(nodeName)}/resync`),
 
-  // AirPlay-2 wire sample-rate mode: 'auto' (negotiate 48 kHz, fall back to
-  // 44.1 kHz) or 'fixed_44100'. Restarts that receiver's group at the new rate.
-  setAp2RateMode: (nodeName: string, mode: 'auto' | 'fixed_44100') =>
+  // AirPlay-2 wire sample-rate mode: '44100' (the default — what AirPlay realtime
+  // audio actually is) or 'try_48000' (opt in; receivers don't advertise 48 kHz
+  // support, so this is a try-and-listen). Restarts that receiver's group.
+  setAp2RateMode: (nodeName: string, mode: '44100' | 'try_48000') =>
     request<OpResponse>('PUT', `api/outputs/${enc(nodeName)}/ap2-rate`, { mode }),
 
   /** Per-sendspin-output wire codec. Rejected (with a reason) if that codec isn't

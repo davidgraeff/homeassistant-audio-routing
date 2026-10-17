@@ -23,10 +23,11 @@ design.
 ## 1. What shipped, and what it proved
 
 Everything in phases 0–6: discovery over `_airplay._tcp`, the host-global PTP
-grandmaster, transient pairing (PIN 3939), realtime ALAC (type 96, 48 kHz),
-ChaCha20, PT=87 anchors, synchronized multi-room playback, and the full control
-plane — per-device volume/mute, live render delay, per-group 48 kHz / 44.1 kHz
-negotiation, announcement-group duck+announce, HA `media_player` adoption.
+grandmaster, transient pairing (PIN 3939), realtime ALAC (type 96), ChaCha20,
+PT=87 anchors, synchronized multi-room playback, and the full control
+plane — per-device volume/mute, live render delay, the per-group wire rate
+(44.1 kHz, with 48 kHz opt-in per device — §5), announcement-group duck+announce,
+HA `media_player` adoption.
 Reliability came with it: liveness/demotion, reconcile debounce, pairing retry,
 and an awaited-TEARDOWN graceful shutdown. RAOP was then **hard-removed**, with a
 one-shot node-name migration so existing routing and groups survived.
@@ -39,9 +40,10 @@ Two findings from that work outlived it and are recorded in
 [decisions.md](decisions.md): the **render delay must be retuned live**, not by
 reconnect (a reconnect "succeeded" on the wire while a flaky receiver silently
 stopped rendering, taking the play-tone and announce paths down with it), and
-**gPTP lock is required for rendering** — PT=87 anchors alone are not enough,
-which is what made libairptp's `SCHED_FIFO` 55 and its removed staleness send-gate
-load-bearing patches rather than tuning.
+**a live gPTP clock is required for rendering** — PT=87 anchors alone are not
+enough, which is what made libairptp's `SCHED_FIFO` 55 and its removed staleness
+send-gate load-bearing patches rather than tuning. "Lock" there means *our Sync is
+reaching the receiver*, not *the receiver is answering*: some never do (§5).
 
 ---
 
@@ -54,9 +56,11 @@ hardware:
 - Initial-session reliability (no manual reconnect), no dropouts, multi-room sync.
 - A receiver going offline and back demotes and recovers cleanly (the liveness
   task).
-- **Rate negotiation**: an `Auto` device runs at 48 kHz; switching one to **Fixed
-  44.1 kHz** (or a receiver that rejects 48 kHz) restarts its group at 44.1 kHz
-  with no audible break.
+- **Rate**: a device runs at 44.1 kHz by default; opting one into **48 kHz** (and back)
+  restarts its group at the new rate with no audible break, and any 44.1 kHz member
+  holds the whole group at 44.1 kHz. A receiver that *rejects* 48 kHz at SETUP is capped
+  automatically; one that accepts it and then goes quiet is caught by the keepalive
+  (§5) — confirm both by ear on the WX-021, which is the device that does the latter.
 - **Announcements** play and duck — including on a receiver with **no input routed
   to it**, which opens an on-demand session for the clip and hands it back after a
   30 s lease
@@ -86,9 +90,38 @@ Small, all still open, all verified present in the tree as of 2026-08-12:
   `main.rs`, which were raised for debugging.
 - Excise the dead Rust-PTP code in the vendored `airplay2-sender` crate — PTP is
   driven by libairptp, so that code cannot run.
-- Add tests / CI for the AP2 path, and keep a per-brand quirk table (§5).
+- Add tests / CI for the AP2 path. (The per-brand quirk table is now in §5 — keep it fed.)
 - Fold the vendored `with_daemon` mDNS patches and the libairptp patches into the
   `pull_request_docs/` upstream mirrors, per the vendoring convention.
+
+### The PTP-lock signal was measuring the wrong thing ✅ (2026-08-21)
+
+The lock watchdog below shipped on a signal that could not carry the meaning it was
+given, and on an x86 host it turned into a **two-minute reconnect loop** against a
+receiver that was playing fine — ~1.4 s of silence each time (1 s teardown budget +
+~0.35 s reconnect), nine times before it was caught.
+
+Two facts, both measured on the wire rather than inferred:
+
+- **libairptp seeds `peer->last_seen` with `time(NULL)` in `daemon_peer_add`.** So
+  `peer_lock_age` answered *"how long since we registered this peer"*, not *"how long
+  since the receiver spoke to us"*. A receiver that has never sent one gPTP packet read
+  as "locked 0 s ago" immediately after connect and "lock lost" 30 s later — and the
+  watchdog's own `remove_peer` + `add_peer` re-seeded the timestamp, so every recovery
+  attempt manufactured the evidence that armed the next one. `ptp::heard_age` now
+  discounts anything not newer than the add, with the trap written down in
+  [live-instance-debugging.md](live-instance-debugging.md#ptp-lock-health).
+- **Receivers come in two gPTP classes** (90 s, both streaming in one group): a Pioneer
+  VSX-934 (`PTPInfo: SUE PTP 1.0`) sent **717** `Delay_Req`, ~8/s, matching our Sync
+  rate; a Yamaha WX-021 (`PTPInfo: AirPlay;2.0.4`) sent **zero** and rendered perfectly
+  throughout. One-way receivers slave to Sync/Follow_Up and never answer, so they have
+  no observable lock and nothing to recover.
+
+So the watchdog is now gated on `PeerPtp::two_way` — *we have genuinely heard gPTP from
+this device* — which the recovery path cannot fabricate (`remove_peer` keeps the class,
+`forget_peer` drops it only when the device leaves). The Pioneer keeps its watchdog; the
+Yamaha is left alone. `/api/outputs` gained `ptp_responsive` so the badge can say "PTP
+one-way" plainly instead of alarming, and the Diagnostics table with it.
 
 ### Lost PTP lock is recoverable per receiver ✅ (2026-08-12)
 
@@ -99,6 +132,9 @@ applied volume — so the only recoveries were restarting the add-on or power-cy
 receiver. Both work for the same reason: they build a new session. Observed repeatedly on
 the Pioneer VSX-934; the Yamaha WX-021 never locks at all and plays fine, which is the
 whole reason the check has to be about runtime state rather than advertised capability.
+
+(The paragraph above says the Yamaha "never locks at all" — read that as *never answers*,
+per the 2026-08-21 section; it was the right instinct on a signal that could not carry it.)
 
 Three pieces, all per receiver — its groupmates keep streaming throughout:
 
@@ -176,11 +212,48 @@ are not re-litigated as oversights:
 
 ---
 
-## 5. Open design and interop questions
+## 5. Per-brand interop and quirks
 
-- **Per-brand interop is won device by device.** Proven on Yamaha + Pioneer only.
-  Validate each brand before trusting the "all AP2-capable" premise, and record
-  quirks as they appear.
+**Interop is won device by device.** Proven on Yamaha + Pioneer only. Validate each
+brand before trusting the "all AP2-capable" premise, and add to this table as you go.
+
+Both units are `AirTunes/366.0`, both advertise the identical
+`features=0x445F8A00,0x1C340`, and both set `keepAliveLowPower` +
+`keepAliveSendStatsAsBody` — so **nothing they advertise separates them.** Everything
+below had to be measured.
+
+| | Yamaha WX-021 "Dusche" | Pioneer VSX-934 |
+|---|---|---|
+| `PTPInfo` / `sdk` | `AirPlay;2.0.4` | `SUE PTP 1.0` / `AirPlay;2.0.2` |
+| gPTP direction | **one-way** — 0 `Delay_Req` in 90 s while playing | **two-way** — 717 in 90 s (~8/s) |
+| `ptp_locked` when healthy | permanently `false` (nothing to observe) | `true`, age ~0 |
+| PTP watchdog | never armed (`ptp_responsive: false`) | armed — a real lost lock is recoverable |
+| `audioFormats` in `/info` | **absent** | **absent** |
+| 48 kHz realtime ALAC | **accepts the SETUP, then stops rendering after seconds** | ran at 48 kHz without complaint |
+| TEARDOWN on reconnect | routinely misses the 1 s budget | answers promptly |
+| Firmware measured | 2.06 (`Dec 4 2023`), Linux 3.10.100 | `1.08/21609ALP` |
+| Other | — | AirTunes can wedge until a **mains** power cycle ([probe.rs](../bridge-daemon/src/outputs/ap2/probe.rs)) |
+
+Two consequences are now baked into the code:
+
+- **Sample rate is 44.1 kHz by default and 48 kHz is opt-in per device**
+  (`Ap2RateMode::Hz44100` / `Try48000`). It cannot be negotiated: neither receiver
+  publishes an `audioFormats` capability list, and the mDNS `features` bitmask says
+  nothing about rates — so the only way to learn is to try, and the failure is silent.
+  The old `Auto` mode guessed 48 kHz and only fell back on a *SETUP rejection*, which
+  the WX-021 never issues: it accepted every 48 kHz SETUP (log-confirmed) and then went
+  quiet. Guessing costs a silent speaker the user has to diagnose; the upside was one
+  skipped resample in our graph.
+- **A `POST /feedback` keepalive every 2 s per session**, which both receivers ask for
+  and we sent none of. It doubles as the only detector of a session dying under us — the
+  RTSP socket is write-only after RECORD, and the liveness probe opens its *own*
+  connection, so it happily reports a receiver that has dropped our session as fine.
+  Two consecutive failures rebuild that member's session; if the group was on 48 kHz by
+  opt-in, it caps the receiver at 44.1 kHz instead, since a reconnect at the same rate
+  would fail the same way. **Limit worth knowing:** this catches the session *dying*.
+  A receiver that keeps the session and merely stops rendering is still invisible —
+  with `keepAliveSendStatsAsBody: true` the receiver's feedback *body* is the place that
+  would show it, and the vendored client discards it today.
 - **Mixed sendspin + AP2 group coincidence.** The two backends reference different
   clocks (sendspin's `CLOCK_MONOTONIC_RAW` send-ahead vs AP2's libairptp
   `CLOCK_MONOTONIC` + PT=87 anchors). Pure-AP2 and pure-sendspin groups are fine;

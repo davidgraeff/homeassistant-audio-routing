@@ -219,12 +219,20 @@ export interface OutputInfo {
   latency_effective_ms?: number | null;
   /** AirPlay 2 only: PTP-lock health. true = receiver is exchanging gPTP with our
    * grandmaster; false = present but not exchanging gPTP; undefined = not an AP2
-   * output / PTP not started. NB: realtime playback does NOT require a lock (a lone
-   * receiver free-runs) — false is only alarming when `ptp_relevant` is true. */
+   * output / PTP not started. NB: false is the PERMANENT, HEALTHY reading for a
+   * one-way receiver (see `ptp_responsive`) — check that before reading anything
+   * into it, and even for a two-way receiver a lost lock is a drift risk rather
+   * than silence, so `ptp_relevant` gates the alarm. */
   ptp_locked?: boolean;
   /** AirPlay 2 only: seconds since the last gPTP packet from the receiver (lock
    * age); undefined if never seen / not AP2. Small = healthy. */
   ptp_lock_age_s?: number;
+  /** AirPlay 2 only: does this receiver's PTP stack ANSWER our grandmaster? true =
+   * we have genuinely heard gPTP from it, so `ptp_locked` means what it says.
+   * false = it has never answered — the one-way class (e.g. Yamaha WX-021), which
+   * slaves to our Sync/Follow_Up and plays perfectly with `ptp_locked: false`
+   * forever. Never alarm on an unlocked one-way receiver. */
+  ptp_responsive?: boolean;
   /** AirPlay 2 only: receiver advertises PTP support (features bit 41). undefined
    * if not AP2 / features unseen. A device that doesn't advertise PTP never locks. */
   ptp_supported?: boolean;
@@ -244,9 +252,9 @@ export interface OutputInfo {
     /** bit 48 — HomeKit transient pairing (how we connect). */
     transient_pairing: boolean;
   };
-  /** AirPlay 2 only: wire sample-rate mode — 'auto' (negotiate 48 kHz, fall back
-   * to 44.1 kHz) or 'fixed_44100'. undefined for non-AP2 outputs. */
-  ap2_rate_mode?: 'auto' | 'fixed_44100';
+  /** AirPlay 2 only: wire sample-rate mode — '44100' (the default) or 'try_48000'
+   * (opt in to 48 kHz). undefined for non-AP2 outputs. */
+  ap2_rate_mode?: '44100' | 'try_48000';
   /** AirPlay 2 only: the effective wire rate (Hz) the output will use (48000 or
    * 44100), reflecting the mode + learned capability. undefined for non-AP2. */
   ap2_rate?: number;

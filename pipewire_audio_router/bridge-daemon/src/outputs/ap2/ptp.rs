@@ -16,7 +16,7 @@
 //! not yet wired to discovery/streaming (that's Phase 2+), hence `allow(dead_code)`.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -174,7 +174,61 @@ struct Inner {
     master: Option<AirptpMaster>,
     /// receiver addr → libairptp peer id, for dedup + targeted removal.
     peers: HashMap<String, u32>,
+    /// receiver addr → unix seconds when we (re)registered it as a peer. Load-bearing:
+    /// libairptp *seeds* `peer->last_seen` with `time(NULL)` inside `daemon_peer_add`
+    /// (`vendor/libairptp/src/daemon.c`), so a raw `last_seen` read cannot tell "the
+    /// receiver is answering us" from "we just added it". Everything downstream —
+    /// the UI badge, and the PTP watchdog that rebuilds sessions — needs the
+    /// difference, so we keep the add time and discount anything not newer than it.
+    /// See [`heard_age`].
+    added_at: HashMap<String, u64>,
+    /// Receivers we have genuinely heard gPTP *from* since the daemon started: the
+    /// two-way class (see [`Ap2PtpService::peer_ptp`]). Latched, and deliberately
+    /// **not** cleared by [`Ap2PtpService::remove_peer`] — a reconnect must not erase
+    /// what we know about the device, or the watchdog would re-learn its class from
+    /// its own recovery attempt. Cleared only by [`Ap2PtpService::forget_peer`].
+    two_way: HashSet<String>,
     clock_id: Option<u64>,
+}
+
+/// What we currently know about one receiver's gPTP behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerPtp {
+    /// Time since a gPTP message genuinely arrived *from* this receiver, or `None` if
+    /// none ever has (see [`heard_age`]). Small = it is slaving to us and talking back.
+    pub age: Option<std::time::Duration>,
+    /// Has this receiver ever answered our grandmaster? Two classes exist on real
+    /// hardware, and they need opposite treatment:
+    ///
+    /// * **Two-way** (e.g. Pioneer VSX-934, `PTPInfo: SUE PTP 1.0`): sends `Delay_Req`
+    ///   continuously while streaming — measured at ~8/s, matching our Sync rate. For
+    ///   these, a silent stretch is a real fault and worth rebuilding the session for.
+    /// * **One-way** (e.g. Yamaha WX-021, `PTPInfo: AirPlay;2.0.4`): answers *nothing*,
+    ///   ever — measured 0 packets in 90 s while streaming in a group whose other member
+    ///   sent 717 — and renders perfectly anyway off our Sync/Follow_Up + PT=87 anchors.
+    ///   For these, silence is the normal state and must never trigger anything.
+    pub two_way: bool,
+}
+
+/// Time since a receiver genuinely spoke to us, given libairptp's `last_seen`, the
+/// moment we registered it as a peer, and now — all in unix seconds.
+///
+/// `last_seen == 0` is libairptp's "never"; `last_seen <= added_at` is the seed written
+/// by `daemon_peer_add` and carries no information about the receiver, so both are
+/// `None`. The one-second granularity of `time(NULL)` means a receiver that answers
+/// within the same second as the add is reported as unheard until the clock ticks over —
+/// harmless, since a two-way receiver sends ~8 packets a second.
+fn heard_age(last_seen: u64, added_at: u64, now: u64) -> Option<std::time::Duration> {
+    if last_seen == 0 || last_seen <= added_at {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(now.saturating_sub(last_seen)))
+}
+
+impl Inner {
+    fn empty() -> Self {
+        Inner { master: None, peers: HashMap::new(), added_at: HashMap::new(), two_way: HashSet::new(), clock_id: None }
+    }
 }
 
 /// The daemon's single host-global AirPlay-2 PTP grandmaster. Cheaply cloneable
@@ -187,7 +241,7 @@ pub struct Ap2PtpService {
 
 impl Ap2PtpService {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { inner: Mutex::new(Inner { master: None, peers: HashMap::new(), clock_id: None }), port_override: None })
+        Arc::new(Self { inner: Mutex::new(Inner::empty()), port_override: None })
     }
 
     /// Lazily bind 319/320 and start the grandmaster. Idempotent — returns the
@@ -213,24 +267,36 @@ impl Ap2PtpService {
         self.inner.lock().unwrap().clock_id
     }
 
-    /// How long since libairptp last heard a gPTP message from the receiver at `addr`
-    /// — its PTP liveness/lock age. A locked receiver sends `Delay_Req` continuously,
-    /// so a small age = healthy; a large age or `None` (never seen / not a peer / not
-    /// started) means the receiver is NOT PTP-locked, so the AP2 stream's PT=87 anchors
-    /// are meaningless to it and it renders silence. Used for degraded-connection UI.
-    pub fn peer_lock_age(&self, addr: &str) -> Option<std::time::Duration> {
-        let g = self.inner.lock().unwrap();
-        let master = g.master.as_ref()?;
-        let peer_id = *g.peers.get(addr)?;
-        let last_seen = master.peer_last_seen(peer_id);
-        if last_seen == 0 {
-            return None;
+    /// What we know about the receiver at `addr`'s gPTP behaviour right now: how long
+    /// since it genuinely spoke to us, and whether it ever has (its class).
+    ///
+    /// **Not a plain getter** — it latches the two-way class the first time it sees real
+    /// traffic, because that is the only moment the evidence exists (libairptp keeps a
+    /// timestamp, not a history). Both callers poll on a timer, so the latch is reliable:
+    /// the liveness tick (every 12 s) and `/api/outputs`.
+    pub fn peer_ptp(&self, addr: &str) -> PeerPtp {
+        let mut g = self.inner.lock().unwrap();
+        let age = (|| {
+            let master = g.master.as_ref()?;
+            let peer_id = *g.peers.get(addr)?;
+            let added_at = g.added_at.get(addr).copied().unwrap_or(0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            heard_age(master.peer_last_seen(peer_id), added_at, now)
+        })();
+        if age.is_some() && g.two_way.insert(addr.to_string()) {
+            tracing::info!("AP2 PTP: {addr} answers our grandmaster (two-way gPTP) — its clock lock is observable");
         }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        Some(std::time::Duration::from_secs(now.saturating_sub(last_seen)))
+        PeerPtp { age, two_way: g.two_way.contains(addr) }
     }
 
-    /// Whether the receiver at `addr` looks PTP-locked (heard from within `max_age`).
+    /// How long since the receiver at `addr` genuinely spoke to us; `None` if it never
+    /// has. See [`PeerPtp`] — for a one-way receiver this is `None` forever *and that is
+    /// normal*, so never treat it on its own as "not locked, so it renders silence".
+    pub fn peer_lock_age(&self, addr: &str) -> Option<std::time::Duration> {
+        self.peer_ptp(addr).age
+    }
+
+    /// Whether the receiver at `addr` is answering us right now (heard within `max_age`).
     pub fn peer_locked(&self, addr: &str, max_age: std::time::Duration) -> bool {
         self.peer_lock_age(addr).is_some_and(|age| age <= max_age)
     }
@@ -248,19 +314,34 @@ impl Ap2PtpService {
             m.add_peer(addr)?
         };
         g.peers.insert(addr.to_string(), id);
+        // Remember when, so libairptp's seeded `last_seen` can be discounted.
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            g.added_at.insert(addr.to_string(), now.as_secs());
+        }
         tracing::info!("AP2 PTP: added peer {} (id={})", addr, id);
         Ok(())
     }
 
-    /// Remove a previously added receiver (no-op if unknown / not started).
+    /// Remove a previously added receiver (no-op if unknown / not started), keeping what
+    /// we learned about its gPTP class — this is the reconnect path, and the device is
+    /// the same device afterwards. Use [`Self::forget_peer`] when it actually leaves.
     pub fn remove_peer(&self, addr: &str) {
         let mut g = self.inner.lock().unwrap();
+        g.added_at.remove(addr);
         if let Some(id) = g.peers.remove(addr) {
             if let Some(m) = g.master.as_ref() {
                 m.remove_peer(id);
                 tracing::info!("AP2 PTP: removed peer {} (id={})", addr, id);
             }
         }
+    }
+
+    /// Remove a receiver **and** forget its gPTP class — for a device that has left the
+    /// registry. If it comes back it has to demonstrate two-way gPTP again, which is
+    /// what keeps a replaced-but-same-IP device from inheriting the old one's verdict.
+    pub fn forget_peer(&self, addr: &str) {
+        self.remove_peer(addr);
+        self.inner.lock().unwrap().two_way.remove(addr);
     }
 
     /// Currently registered peer addresses (for diagnostics/API).
@@ -287,10 +368,7 @@ mod tests {
     fn grandmaster_starts_and_reports_clock_id() {
         // Use high, unprivileged ports so the test needs no capability and can't
         // collide with a real grandmaster on 319/320.
-        let svc = Arc::new(Ap2PtpService {
-            inner: Mutex::new(Inner { master: None, peers: HashMap::new(), clock_id: None }),
-            port_override: Some((19319, 19320)),
-        });
+        let svc = Arc::new(Ap2PtpService { inner: Mutex::new(Inner::empty()), port_override: Some((19319, 19320)) });
         let cid = svc.ensure_started().expect("grandmaster should start");
         // libairptp forces a non-EUI-64 id: top 16 bits = 0xFFFF.
         assert_eq!(cid >> 48, 0xFFFF, "clock id should carry the 0xFFFF prefix");
@@ -304,5 +382,54 @@ mod tests {
         assert_eq!(svc.peers().len(), 1);
         svc.remove_peer("127.0.0.1");
         assert!(svc.peers().is_empty());
+    }
+
+    /// The bug this module was fixed for, and the one worth pinning hardest: adding a
+    /// peer must not look like the receiver answered us. libairptp seeds
+    /// `peer->last_seen` with `time(NULL)` in `daemon_peer_add`, so before this check a
+    /// freshly-added receiver read back as "locked 0 s ago" — which is how a receiver
+    /// that has never sent a single gPTP packet ended up in a two-minute
+    /// lose-lock → reconnect → "locked!" → lose-lock loop, the reconnect being the only
+    /// thing that ever refreshed the timestamp.
+    #[test]
+    fn a_peer_add_is_not_evidence_that_the_receiver_answered() {
+        let now = 1_000_000u64;
+        // Exactly the seed `daemon_peer_add` writes.
+        assert_eq!(heard_age(now, now, now), None, "the add's own timestamp is not traffic");
+        // And still not, later: the seed never becomes evidence just because time passed.
+        assert_eq!(heard_age(now, now, now + 300), None);
+        // libairptp's explicit "never".
+        assert_eq!(heard_age(0, now, now), None);
+        // A packet that arrived after the add IS evidence, and its age is real.
+        assert_eq!(heard_age(now + 5, now, now + 8), Some(std::time::Duration::from_secs(3)));
+        // A re-add (reconnect) invalidates the older reading rather than preserving it:
+        // otherwise a recovery attempt would credit itself with the lock it went looking for.
+        assert_eq!(heard_age(now + 5, now + 10, now + 12), None);
+        // Clock going backwards must not panic or read as a huge age.
+        assert_eq!(heard_age(now + 5, now, now), Some(std::time::Duration::ZERO));
+    }
+
+    /// A receiver's *class* — does it answer gPTP at all — has to survive a reconnect,
+    /// because the reconnect path removes and re-adds the peer. Losing it there would
+    /// disarm the watchdog for exactly the two-way receivers it exists to protect.
+    #[test]
+    fn the_gptp_class_survives_a_reconnect_but_not_a_departure() {
+        let svc = Arc::new(Ap2PtpService { inner: Mutex::new(Inner::empty()), port_override: Some((19419, 19420)) });
+        svc.ensure_started().expect("grandmaster should start");
+        svc.add_peer("127.0.0.2").expect("add_peer");
+        // Nothing heard yet: a loopback "peer" never answers, which is exactly the
+        // one-way receiver's steady state.
+        assert_eq!(svc.peer_ptp("127.0.0.2"), PeerPtp { age: None, two_way: false });
+
+        // Stand in for "we heard from it" by latching the class directly — the FFI's
+        // timestamp is not ours to fake.
+        svc.inner.lock().unwrap().two_way.insert("127.0.0.2".to_string());
+        svc.remove_peer("127.0.0.2");
+        svc.add_peer("127.0.0.2").expect("re-add");
+        assert!(svc.peer_ptp("127.0.0.2").two_way, "a reconnect must not erase what we learned");
+
+        svc.forget_peer("127.0.0.2");
+        svc.add_peer("127.0.0.2").expect("re-add after departure");
+        assert!(!svc.peer_ptp("127.0.0.2").two_way, "a device that left has to prove itself again");
     }
 }

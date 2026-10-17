@@ -91,16 +91,24 @@ pub(crate) struct OutputInfo {
     /// AirPlay-2 only: PTP-lock health. `Some(true)` = the receiver is currently
     /// returning gPTP to our grandmaster (heard recently); `Some(false)` = registered
     /// but not exchanging gPTP; `None` = not an AP2 output (or PTP not started). NOTE:
-    /// since we stream realtime ALAC (type 96), a single receiver renders fine WITHOUT
-    /// an active lock (it free-runs off the PT=87 anchors) — a lock only matters for
-    /// multi-room drift. So `false` is only alarming when `ptp_relevant` is true; the
-    /// UI badge keys off both.
+    /// `false` is the *permanent, healthy* reading for a one-way receiver, which never
+    /// answers and renders perfectly regardless — check `ptp_responsive` before reading
+    /// anything into it. Even for a two-way receiver, a lost lock is about multi-room
+    /// drift rather than the receiver going mute, so `ptp_relevant` gates the alarm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ptp_locked: Option<bool>,
     /// AirPlay-2 only: seconds since the last gPTP packet from the receiver (lock age);
     /// `None` if never seen / not AP2. Small = healthy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ptp_lock_age_s: Option<u64>,
+    /// AirPlay-2 only: does this receiver's PTP stack **answer** our grandmaster?
+    /// `Some(true)` = we have genuinely heard gPTP from it, so `ptp_locked` means what it
+    /// says and going quiet is a real fault. `Some(false)` = it has never answered — the
+    /// one-way class (Yamaha WX-021 and friends), which slaves to our Sync/Follow_Up and
+    /// renders perfectly with `ptp_locked: false` forever. The UI must not alarm on an
+    /// unlocked one-way receiver; there is nothing to fix and nothing to see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ptp_responsive: Option<bool>,
     /// AirPlay-2 only: does the receiver *advertise* PTP support (features bit 41)?
     /// `None` if not AP2 or features weren't seen. A device that doesn't advertise PTP
     /// will never lock, so the UI shouldn't alarm about it.
@@ -117,8 +125,8 @@ pub(crate) struct OutputInfo {
     /// Diagnostics card. `None` if not AP2 or features weren't seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ap2_features: Option<Ap2FeaturesInfo>,
-    /// AirPlay-2 only: wire sample-rate mode — `"auto"` (negotiate 48 kHz, fall back
-    /// to 44.1 kHz) or `"fixed_44100"`. `None` for non-AP2 outputs.
+    /// AirPlay-2 only: wire sample-rate mode — `"44100"` (the default) or `"try_48000"`
+    /// (opt in to 48 kHz). `None` for non-AP2 outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ap2_rate_mode: Option<&'static str>,
     /// AirPlay-2 only: the effective wire rate in Hz the output will use (48000 or
@@ -339,6 +347,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             latency_effective_ms: None,
             ptp_locked: None, // sendspin has no PTP
             ptp_lock_age_s: None,
+            ptp_responsive: None,
             ptp_supported: None,
             ptp_relevant: None,
             ap2_features: None,
@@ -398,12 +407,16 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             .map(|d| d.display_name.clone())
             .unwrap_or_else(|| node_name.strip_prefix(AP2_DEV_PREFIX).unwrap_or(&node_name).replace(['_', '-'], " "));
         let addr = dev.and_then(|d| d.addr);
-        // PTP-lock health: has libairptp heard gPTP from this receiver recently? A
-        // locked receiver sends Delay_Req at a ~130ms cadence, so 5s is a generous
-        // "still locked" window. If a present, routed receiver isn't locked, its stream
-        // renders silence — surface that as degraded in the UI.
-        let ptp_age = addr.and_then(|a| state.ap2_ptp.peer_lock_age(&a.ip().to_string()));
-        let ptp_locked = if present { Some(ptp_age.is_some_and(|age| age <= std::time::Duration::from_secs(5))) } else { None };
+        // PTP health: has libairptp heard gPTP from this receiver recently, and does this
+        // receiver answer at all? A two-way receiver sends Delay_Req at a ~125ms cadence,
+        // so 5s is a generous "still locked" window — but a one-way receiver never sends
+        // one and plays fine, so `ptp_responsive` is what decides whether an unlocked
+        // reading is worth a word to the user. Both come from one poll (which also
+        // latches the class), so they cannot contradict each other.
+        let ptp = addr.map(|a| state.ap2_ptp.peer_ptp(&a.ip().to_string()));
+        let ptp_age = ptp.and_then(|p| p.age);
+        let ptp_locked = if present { Some(ptp_age.is_some_and(|age| age <= crate::outputs::ap2::liveness::PTP_LOCK_FRESH)) } else { None };
+        let ptp_responsive = if present { ptp.map(|p| p.two_way) } else { None };
         // Decoded capabilities (features TXT bit 41 = PTP, 40 = buffered, 48 = transient).
         let features = dev.and_then(|d| d.features).map(Features::from_raw);
         let ptp_supported = features.map(|f| f.supports_ptp());
@@ -426,8 +439,8 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
         let (rate_mode, rate) = {
             let ss = state.sync_settings.lock_recover();
             let mode = match ss.ap2_rate_mode(&node_name) {
-                crate::routing::sync_settings::Ap2RateMode::Auto => "auto",
-                crate::routing::sync_settings::Ap2RateMode::Fixed44100 => "fixed_44100",
+                crate::routing::sync_settings::Ap2RateMode::Hz44100 => "44100",
+                crate::routing::sync_settings::Ap2RateMode::Try48000 => "try_48000",
             };
             (mode, ss.ap2_effective_rate(&node_name))
         };
@@ -449,6 +462,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             ),
             ptp_locked,
             ptp_lock_age_s: ptp_age.map(|a| a.as_secs()),
+            ptp_responsive,
             ptp_supported,
             ptp_relevant,
             ap2_features,
@@ -523,6 +537,7 @@ pub(crate) async fn collect_outputs(state: &AppState) -> Vec<OutputInfo> {
             ),
             ptp_locked: None,
             ptp_lock_age_s: None,
+            ptp_responsive: None,
             ptp_supported: None,
             ptp_relevant: None,
             ap2_features: None,

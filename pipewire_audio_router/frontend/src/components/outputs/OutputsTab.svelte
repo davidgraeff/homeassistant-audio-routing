@@ -463,11 +463,12 @@
     await refresh();
   }
 
-  // AirPlay-2 wire sample-rate mode (auto vs forced 44.1 kHz). Restarts the group.
+  // AirPlay-2 wire sample-rate mode (44.1 kHz vs an opt-in 48 kHz attempt).
+  // Restarts the group — the rate is part of its identity.
   async function setRateMode(o: OutputInfo, e: Event) {
-    const mode = (e.currentTarget as HTMLSelectElement).value as 'auto' | 'fixed_44100';
+    const mode = (e.currentTarget as HTMLSelectElement).value as '44100' | 'try_48000';
     await run(() => api.setAp2RateMode(o.node_name, mode),
-      `Set '${o.name}' sample rate to ${mode === 'auto' ? 'auto' : '44.1 kHz'}`);
+      `Set '${o.name}' sample rate to ${mode === 'try_48000' ? '48 kHz if it takes it' : '44.1 kHz'}`);
     await refresh();
   }
 
@@ -787,12 +788,12 @@
                 <div class="sync-cell">
                   <select
                     id="rate-{o.node_name}"
-                    value={o.ap2_rate_mode ?? 'auto'}
+                    value={o.ap2_rate_mode ?? '44100'}
                     onchange={(e) => setRateMode(o, e)}
-                    title="Auto negotiates 48 kHz and falls back to 44.1 kHz; fix 44.1 kHz for receivers that misbehave at 48 kHz"
+                    title="44.1 kHz is what AirPlay senders use for realtime audio and what every receiver is built for. 48 kHz saves one resample in our graph, but receivers don't advertise whether they support it — some accept the stream and then stop playing after a few seconds, so it is opt-in per device. If a receiver goes quiet shortly after you switch it, switch it back."
                   >
-                    <option value="auto">Auto (negotiate 48 kHz)</option>
-                    <option value="fixed_44100">AirPlay default (44.1 kHz)</option>
+                    <option value="44100">44.1 kHz (AirPlay default)</option>
+                    <option value="try_48000">Try 48 kHz (opt-in)</option>
                   </select>
                   <span class="muted" style="white-space:nowrap">
                     {o.ap2_rate ? `${(o.ap2_rate / 1000).toFixed(1)} kHz` : ''}
