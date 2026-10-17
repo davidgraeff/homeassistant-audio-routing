@@ -47,9 +47,10 @@ esac
 POT_URL="$(opt pot_provider_url)"
 BIND_ADDRESS="$(opt bind_address)"
 REPORT_METADATA="$(opt report_metadata true)"
+CONTROL_PORT="$(opt control_port 8094)"
 LOG_LEVEL="$(opt log_level info)"
 
-echo "[run] YouTube Music receiver ${ADDON_VERSION:-dev}: DIAL '${DEVICE_NAME}' on :${DIAL_PORT}, audio -> ${RTP_HOST}:${RTP_PORT}, admin page on :8097"
+echo "[run] YouTube Music receiver ${ADDON_VERSION:-dev}: DIAL '${DEVICE_NAME}' on :${DIAL_PORT}, audio -> ${RTP_HOST}:${RTP_PORT}, admin page on :8097, control API on 127.0.0.1:${CONTROL_PORT}"
 
 # --- PipeWire ---------------------------------------------------------------
 export XDG_RUNTIME_DIR=/run/pipewire
@@ -144,6 +145,13 @@ export YTCR_ADDON_HOST="$RTP_HOST"
 export YTCR_ADDON_API_PORT=8099
 export YTCR_RTP_PORT="$RTP_PORT"
 export YTCR_REPORT_METADATA="$REPORT_METADATA"
+
+# The control API (receiver/control.js): Home Assistant's play/pause/skip, playlists and
+# browsing. Loopback, because everything that calls it — Home Assistant core and the
+# router it announces itself to — runs on this host, and it has no authentication. The
+# announced URL follows from the bind, so nothing else needs configuring.
+export YTCR_CONTROL_PORT="$CONTROL_PORT"
+export YTCR_CONTROL_BIND=127.0.0.1
 
 # The admin page (receiver/admin.js). This port MUST equal `ingress_port` in
 # config.yaml — with host networking Supervisor proxies ingress straight to it, and a

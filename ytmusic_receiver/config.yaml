@@ -38,10 +38,10 @@ host_network: true
 # No IPC_LOCK: unlike the router, nothing here mlocks the audio path.
 privileged:
   - SYS_NICE
-# Ingress, for the setup page — NOT a remote control. The phone's YouTube Music app
-# stays the control surface for playback; duplicating its transport here would be
-# pointless. What the page does is the two things outside that app which decide
-# whether a cast is audible at all: the RTP source on the router, and the cookie jar.
+# Ingress, for the setup page — NOT a remote control. Playback is driven by the phone's
+# YouTube Music app, or by Home Assistant's media_player through the control API below
+# (`control_port`); the page does the two things outside both which decide whether
+# anything is audible at all: the RTP source on the router, and the cookie jar.
 # Both used to be workstation errands (the router's own UI, push_cookies.py over ssh
 # + docker exec), which is exactly what kept this add-on from being installable in
 # one click.
@@ -70,6 +70,7 @@ options:
   #    (one per challenge), takes 3.4-4.6 s, and has been observed returning a wrong
   #    `n` and an nginx 504. Set it only if the local path is unavailable.
   report_metadata: true
+  control_port: 8094
   log_level: info
 schema:
   # Name shown in the YouTube Music app's Cast menu.
@@ -100,4 +101,9 @@ schema:
   bind_address: str?
   # Report now-playing (title/artwork/position) to the audio router's API.
   report_metadata: bool
+  # The control API Home Assistant drives playback through (play/pause/skip, start a
+  # playlist, browse) — announced to the audio router, which is how the integration finds
+  # it. Loopback only: Home Assistant and the router are on this host, and the API has no
+  # authentication. Not 8096 (Jellyfin's default) nor 8095 (Music Assistant's).
+  control_port: int(1024,65535)
   log_level: list(debug|info|warn|error)
