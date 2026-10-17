@@ -16,9 +16,31 @@
  *   - End of track has to be reported back, or the queue never advances. mpv's
  *     `end-file` event does that, but it fires for *stop* too, so the reason has
  *     to be checked (`eof` = track finished, `stop`/`quit` = we did it).
+ *
+ * TWO KINDS OF QUEUE
+ * ------------------
+ * A cast session's queue is the phone's: yt-cast-receiver's `Playlist` mirrors it and
+ * the base class's next/previous walk it. Playback started from Home Assistant has no
+ * phone, so it runs from the receiver's own queue (`LocalQueue`, filled from YouTube
+ * Music's `next` via `catalogue.js`) — "local" below. Both drive this one player and
+ * both go through the base class's play/pause/stop, which is what reports every state
+ * change to a connected phone, so a phone that is watching stays in sync either way.
+ *
+ * The phone always wins: the moment its queue changes (it cast something, queued a
+ * song, picked another), local playback ends and the cast queue is authoritative again.
  */
 
-import { Player } from 'yt-cast-receiver';
+import { Constants, Player } from 'yt-cast-receiver';
+import LocalQueue from './localqueue.js';
+
+const { PLAYER_STATUSES, CLIENTS } = Constants;
+/** The cast queue's events, i.e. "a phone changed what is queued". */
+const CAST_QUEUE_EVENTS = [ 'playlistSet', 'playlistAdded', 'playlistUpdated', 'playlistCleared',
+  'videoSelected', 'videoAdded', 'videoRemoved' ];
+/** Skip at most this many unplayable tracks in a row before giving up on a local queue. */
+const MAX_LOCAL_SKIPS = 3;
+/** How many upcoming cast-queue ids to name for the control API's queue. */
+const CAST_HYDRATE_AHEAD = 25;
 
 /**
  * How long to allow for resolve + first audio before calling a play attempt failed.
@@ -41,12 +63,31 @@ export default class MpvPlayer extends Player {
   #volume = { level: 100, muted: false };
   /** Video id whose direct URL already got one retry, so retries cannot recurse. */
   #retriedFor = null;
+  /** Track metadata and queues (catalogue.js); absent means ids only, as before. */
+  #catalogue = null;
+  /** Recently played lists (history.js); absent means nothing is recorded. */
+  #history = null;
+  /** The receiver's own queue while playing something nobody cast, else null. */
+  #local = null;
+  /** Set while *we* rewrite the cast queue, so our own change is not read as a phone's. */
+  #selfQueueUpdate = false;
+  /** The last thing that went wrong on a local request, for the control API to show. */
+  #lastError = null;
+  /** Bumped by every local start, so a superseded start's late failure says nothing. */
+  #localGeneration = 0;
 
-  constructor(mpv, metadata = null, resolver = null) {
+  constructor(mpv, metadata = null, resolver = null, { catalogue = null, history = null } = {}) {
     super();
     this.#mpv = mpv;
     this.#metadata = metadata;
     this.#resolver = resolver;
+    this.#catalogue = catalogue;
+    this.#history = history;
+
+    const onCastQueue = (event) => this.#onCastQueue(event);
+    for (const type of CAST_QUEUE_EVENTS) {
+      this.queue.on(type, onCastQueue);
+    }
 
     this.#mpv.on('end-file', (msg) => {
       const reason = msg.reason ?? 'unknown';
@@ -132,8 +173,10 @@ export default class MpvPlayer extends Player {
     await this.#mpv.setProperty('user-agent', direct?.headers?.['User-Agent'] ?? '');
     // Tell the reporter which video this is *before* loading: the artwork URL is
     // derivable from the id alone, so it can be reported while yt-dlp is still
-    // resolving the title (metadata.js).
-    this.#metadata?.trackStarted(video.id);
+    // resolving the title (metadata.js). A local queue already knows title, artist and
+    // album; a cast id is named by the catalogue as soon as it answers.
+    this.#metadata?.trackStarted(video.id, this.#catalogue?.track(video.id) ?? null);
+    this.#nameUpcoming(video.id);
     // Wait for mpv to report the file open (or fail) rather than trusting the
     // command's own acknowledgement, which only means "queued".
     const started = new Promise((resolve) => {
@@ -219,11 +262,18 @@ export default class MpvPlayer extends Player {
    * — including its autoplay suggestion when the user queued nothing further.
    */
   #prefetchUpcoming() {
+    if (this.#local) {
+      // Fetch the queue's next page while this track plays, so a radio never runs dry
+      // at a track change.
+      void this.#refillLocal();
+    }
     if (!this.#resolver?.enabled) {
       return;
     }
     try {
-      const next = this.queue?.next ?? this.queue?.autoplay ?? null;
+      const next = this.#local
+        ? (this.#local.upcoming ? { id: this.#local.upcoming.video_id } : null)
+        : (this.queue?.next ?? this.queue?.autoplay ?? null);
       if (next?.id) {
         this.#resolver.prefetch(next.id);
       }
@@ -231,6 +281,297 @@ export default class MpvPlayer extends Player {
     catch (e) {
       this.logger.debug(`[MpvPlayer] could not look up the next track: ${e.message}`);
     }
+  }
+
+  /**
+   * Name the current track and what follows it, for the now-playing report and the
+   * control API's queue. One batched catalogue request; nothing waits on it.
+   */
+  #nameUpcoming(currentId) {
+    if (!this.#catalogue?.available || this.#local) {
+      return;
+    }
+    const ids = this.queue?.videoIds ?? [];
+    const at = Math.max(0, ids.indexOf(currentId));
+    const wanted = [ currentId, ...ids.slice(at, at + CAST_HYDRATE_AHEAD) ];
+    void this.#catalogue.hydrate(wanted).then((learned) => {
+      if (learned.includes(currentId)) {
+        this.#metadata?.describe(currentId, this.#catalogue.track(currentId));
+      }
+    }).catch((e) => this.logger.debug(`[MpvPlayer] naming ${currentId} failed: ${e.message}`));
+  }
+
+  // --- the receiver's own queue -------------------------------------------------------
+
+  /**
+   * Play `playlistId` from the receiver's own queue — no phone involved.
+   *
+   * Resolves once the queue is known (one catalogue request) and playback has been
+   * *started*; the first track's resolve then runs in the background, visible as the
+   * `loading` state, so Home Assistant's service call returns in about a second rather
+   * than after a cold resolve. Throws with a sentence when the list cannot be queued.
+   */
+  async playLocal({ playlistId, videoId = null }) {
+    if (!this.#catalogue) {
+      throw new Error('this receiver has no catalogue to build a queue from');
+    }
+    const page = await this.#catalogue.queue(playlistId, videoId);
+    if (!page.items?.length) {
+      throw new Error(`YouTube Music returned an empty queue for ${playlistId}`);
+    }
+    const start = videoId ? Math.max(0, page.items.findIndex((t) => t.video_id === videoId)) : 0;
+    const queue = new LocalQueue({
+      playlistId: page.playlist_id || playlistId,
+      title: page.title ?? null,
+      items: page.items,
+      continuation: page.continuation ?? null,
+      startIndex: start,
+    });
+    await this.#enterLocal(queue);
+    this.#history?.record({ playlist_id: playlistId, title: queue.title,
+      thumbnail: page.items[0]?.thumbnail ?? null, origin: 'local' });
+    this.logger.info(
+      `[MpvPlayer] playing ${playlistId}${queue.title ? ` ("${queue.title}")` : ''} from the receiver's own queue `
+      + `(${queue.length} track(s) from #${start + 1})`);
+    void this.#playLocalCurrent();
+    return { playlist_id: queue.playlistId, title: queue.title, length: queue.length, index: queue.index };
+  }
+
+  /** Jump to an entry of the local queue. False when there is no local queue or no such entry. */
+  async jumpTo(index) {
+    if (!this.#local?.jump(index)) {
+      return false;
+    }
+    void this.#playLocalCurrent();
+    return true;
+  }
+
+  async #enterLocal(queue) {
+    this.#local = queue;
+    this.#lastError = null;
+    this.#localGeneration += 1;
+    // Empty the cast queue, so a stale phone list cannot supply next/previous — and do
+    // it through the same message the phone would send, so the library's bookkeeping
+    // stays consistent. Our own change must not end the local queue it is making room for.
+    this.#selfQueueUpdate = true;
+    try {
+      await this.queue.updateByMessage({ name: 'setPlaylist', payload: {} }, null);
+    }
+    catch (e) {
+      this.logger.debug(`[MpvPlayer] could not clear the cast queue: ${e.message}`);
+    }
+    finally {
+      this.#selfQueueUpdate = false;
+    }
+  }
+
+  /**
+   * Play the local queue's current entry, skipping forward past unplayable ones (at
+   * most MAX_LOCAL_SKIPS in a row, so a dead jar cannot spin through a whole radio).
+   */
+  async #playLocalCurrent() {
+    // Started without being awaited (the control API answers before the resolve), so it
+    // must never reject: an unhandled rejection ends the process, and the cast session
+    // with it.
+    try {
+      return await this.#playLocalCurrentOrThrow();
+    }
+    catch (e) {
+      this.#lastError = e.message;
+      this.logger.error(`[MpvPlayer] local playback failed: ${e.message}`);
+      return false;
+    }
+  }
+
+  async #playLocalCurrentOrThrow() {
+    const generation = this.#localGeneration;
+    for (let skips = 0; this.#local && skips <= MAX_LOCAL_SKIPS; skips++) {
+      const track = this.#local.current;
+      if (!track) {
+        return false;
+      }
+      const ok = await this.play({ id: track.video_id, client: CLIENTS.YTMUSIC }, 0);
+      if (ok || generation !== this.#localGeneration || !this.#local) {
+        if (ok) {
+          this.#lastError = null;
+        }
+        return ok;
+      }
+      this.#lastError = `could not play "${track.title ?? track.video_id}"`;
+      await this.#refillLocal();
+      if (!this.#local?.advance()) {
+        break;
+      }
+      this.logger.warn(`[MpvPlayer] ${this.#lastError} — skipping to the next track`);
+    }
+    return false;
+  }
+
+  async #refillLocal() {
+    const queue = this.#local;
+    if (!queue?.needsMore || !this.#catalogue?.available) {
+      return;
+    }
+    const token = queue.continuation;
+    queue.continuation = null; // one fetch at a time; restored by `append`
+    try {
+      const page = await this.#catalogue.continueQueue(queue.playlistId, token);
+      queue.append(page.items, page.continuation);
+      this.logger.debug(`[MpvPlayer] local queue now ${queue.length} track(s)`);
+    }
+    catch (e) {
+      this.logger.warn(`[MpvPlayer] could not fetch more of ${queue.playlistId}: ${e.message}`);
+    }
+  }
+
+  /** A phone changed its queue: it is in charge again, and its list is worth remembering. */
+  #onCastQueue(event) {
+    if (this.#selfQueueUpdate) {
+      return;
+    }
+    if (this.#local) {
+      this.logger.info(`[MpvPlayer] a phone changed the queue (${event?.type}) — leaving the receiver's own queue`);
+      this.#local = null;
+      this.#localGeneration += 1;
+    }
+    const listId = this.queue.id;
+    if (listId && (event?.type === 'playlistSet' || event?.type === 'playlistAdded')
+      && this.#history?.record({ playlist_id: listId, origin: 'cast' })) {
+      void this.#describeCast(listId);
+    }
+  }
+
+  /** A cast names its list but not its title; ask once, so "recently played" can show it. */
+  async #describeCast(listId) {
+    const known = this.#history?.list().find((e) => e.playlist_id === listId);
+    if (!this.#catalogue?.available || known?.title) {
+      return;
+    }
+    try {
+      const page = await this.#catalogue.queue(listId);
+      this.#history.describe(listId, { title: page.title, thumbnail: page.items?.[0]?.thumbnail ?? null });
+    }
+    catch (e) {
+      this.logger.debug(`[MpvPlayer] could not name cast list ${listId}: ${e.message}`);
+    }
+  }
+
+  // --- transport, aware of the local queue --------------------------------------------
+
+  async next(AID) {
+    if (!this.#local) {
+      return super.next(AID);
+    }
+    await this.#refillLocal();
+    if (!this.#local?.advance()) {
+      this.logger.info('[MpvPlayer] end of the receiver\'s own queue');
+      await this.stop(AID);
+      return false;
+    }
+    return this.#playLocalCurrent();
+  }
+
+  async previous(AID) {
+    if (!this.#local) {
+      return super.previous(AID);
+    }
+    if (!this.#local.back()) {
+      // At the first entry "previous" restarts it, as every music app does.
+      return this.seek(0, AID);
+    }
+    return this.#playLocalCurrent();
+  }
+
+  async resume(AID) {
+    // After a stop (or a cast session reset) the base class has no current video to
+    // restart; the local queue still knows where it was.
+    if (this.#local && this.status !== PLAYER_STATUSES.PLAYING && this.status !== PLAYER_STATUSES.PAUSED) {
+      return this.#playLocalCurrent();
+    }
+    return super.resume(AID);
+  }
+
+  /**
+   * yt-cast-receiver resets the player when the last phone disconnects. For a cast that
+   * is right — the phone's session is over. For the receiver's own queue it is not: a
+   * phone whose app reconnected on its own and then went away must not stop what Home
+   * Assistant started. So only the cast bookkeeping is reset then.
+   */
+  async reset(AID) {
+    if (!this.#local) {
+      return super.reset(AID);
+    }
+    this.logger.info('[MpvPlayer] cast session reset — the receiver\'s own queue keeps playing');
+    this.#selfQueueUpdate = true;
+    try {
+      this.queue.reset();
+    }
+    finally {
+      this.#selfQueueUpdate = false;
+    }
+    return undefined;
+  }
+
+  /** End local playback for good (the control API's stop keeps the queue; this does not). */
+  async clearLocal() {
+    this.#local = null;
+    this.#localGeneration += 1;
+    return this.stop();
+  }
+
+  /**
+   * Everything the control API reports, in one read: transport state, the current
+   * track, and the queue around it — the local one, or the phone's.
+   */
+  async describe({ queueAfter = 50, queueBefore = 5 } = {}) {
+    const status = this.status;
+    const active = status === PLAYER_STATUSES.PLAYING || status === PLAYER_STATUSES.PAUSED;
+    const current = this.queue.current;
+    const videoId = active || status === PLAYER_STATUSES.LOADING ? current?.id ?? null : null;
+    const name = (id) => this.#catalogue?.track(id) ?? null;
+    let queue;
+    if (this.#local) {
+      queue = {
+        origin: 'local',
+        playlist_id: this.#local.playlistId,
+        title: this.#local.title,
+        index: this.#local.index,
+        length: this.#local.length,
+        more: !!this.#local.continuation,
+        can_next: this.#local.hasNext,
+        can_previous: this.#local.hasPrevious,
+        items: this.#local.window({ before: queueBefore, after: queueAfter }),
+      };
+    }
+    else {
+      const ids = this.queue.videoIds ?? [];
+      const at = current?.id ? ids.indexOf(current.id) : -1;
+      const start = Math.max(0, at - queueBefore);
+      const window = ids.slice(start, at >= 0 ? at + queueAfter + 1 : queueAfter);
+      void this.#catalogue?.hydrate(window);
+      const nav = this.getNavInfo();
+      queue = {
+        origin: ids.length || current ? 'cast' : null,
+        playlist_id: this.queue.id ?? null,
+        title: this.queue.id ? this.#history?.list().find((e) => e.playlist_id === this.queue.id)?.title ?? null : null,
+        index: at >= 0 ? at : null,
+        length: ids.length,
+        more: false,
+        can_next: nav.hasNext || !!this.queue.autoplay,
+        can_previous: nav.hasPrevious,
+        items: window.map((id, i) => ({ ...(name(id) ?? { video_id: id }), video_id: id, index: start + i,
+          current: start + i === at })),
+      };
+    }
+    return {
+      status: statusName(status),
+      video_id: videoId,
+      track: videoId ? { ...(name(videoId) ?? {}), video_id: videoId } : null,
+      position: active ? await this.getPosition() : null,
+      duration: active ? await this.getDuration() : null,
+      queue,
+      error: this.#lastError,
+    };
   }
 
   async doPause() {
@@ -293,5 +634,21 @@ export default class MpvPlayer extends Player {
 
   async doGetDuration() {
     return (await this.#mpv.getProperty('duration', 0)) ?? 0;
+  }
+}
+
+/** The base class's numeric status, as the word the control API speaks. */
+export function statusName(status) {
+  switch (status) {
+    case PLAYER_STATUSES.PLAYING:
+      return 'playing';
+    case PLAYER_STATUSES.PAUSED:
+      return 'paused';
+    case PLAYER_STATUSES.LOADING:
+      return 'loading';
+    case PLAYER_STATUSES.STOPPED:
+      return 'stopped';
+    default:
+      return 'idle';
   }
 }

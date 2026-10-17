@@ -14,9 +14,13 @@
  * yt-dlp), and the artwork from the deterministic thumbnail URL for the video id —
  * no extra HTTP request, no API call.
  *
- * `media-title` is one combined string, so artist/album stay empty: splitting them
- * needs a second resolve per track (`yt-dlp --dump-single-json` or an innertube
- * library) and that is deliberately out of scope.
+ * Title, artist, album and square album art come from the **catalogue** when it can
+ * name the track (`catalogue.js` — YouTube Music's own queue/`get_queue` answers, one
+ * batched request per queue change, no extra resolve). A local queue knows them before
+ * the track starts; a cast id is named a moment later via `describe()`. Until then, and
+ * whenever the catalogue cannot answer, mpv's `media-title` is the fallback — which is
+ * the *video* title for `ytdl_hook`'s own resolution, and merely the URL's basename for
+ * a prefetched direct URL, so it is never allowed to overwrite a catalogue title.
  */
 
 const DEFAULT_API_PORT = 8099;
@@ -33,6 +37,11 @@ export function artworkUrl(videoId) {
   return videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : null;
 }
 
+function emptyTrack() {
+  return { videoId: null, title: null, artist: null, album: null, artworkUrl: null, durationMs: null,
+    state: 'stopped', named: false };
+}
+
 export default class MetadataReporter {
   #url;
   #rtpPort;
@@ -41,7 +50,7 @@ export default class MetadataReporter {
   /** Last body sent, so an unchanged report is not sent again. */
   #lastSent = null;
   /** Current track, accumulated from several sources (see the class comment). */
-  #track = { videoId: null, title: null, durationMs: null, state: 'stopped' };
+  #track = emptyTrack();
   #mpv = null;
 
   constructor({ host, apiPort = DEFAULT_API_PORT, rtpPort, logger = console }) {
@@ -60,7 +69,7 @@ export default class MetadataReporter {
   attach(mpv) {
     this.#mpv = mpv;
     mpv.observeProperty('media-title', (value) => {
-      if (typeof value === 'string' && value.trim()) {
+      if (typeof value === 'string' && value.trim() && !this.#track.named) {
         this.#track.title = value.trim();
         this.#report();
       }
@@ -80,21 +89,46 @@ export default class MetadataReporter {
     });
   }
 
-  /** A new track started (called from the player, which is told the video id). */
-  trackStarted(videoId) {
+  /**
+   * A new track started (called from the player, which is told the video id, and the
+   * catalogue's metadata for it when that is already known).
+   */
+  trackStarted(videoId, info = null) {
     // Reset rather than merge: a new video id means everything the previous track
     // contributed is stale, and the add-on treats a changed title the same way.
-    this.#track = { videoId, title: null, durationMs: null, state: 'playing' };
+    this.#track = { ...emptyTrack(), videoId, state: 'playing' };
+    this.#apply(info);
     this.#startPositionTimer();
-    // Nothing to say yet — no title until mpv resolves — but the artwork is
-    // already known from the id, so send that much now.
+    // The artwork is known from the id alone, so there is always something to send
+    // now; with catalogue metadata it is the whole description.
     this.#report();
+  }
+
+  /** The catalogue named the current track after it started (a cast id). */
+  describe(videoId, info) {
+    if (!videoId || videoId !== this.#track.videoId || !info) {
+      return;
+    }
+    this.#apply(info);
+    this.#report();
+  }
+
+  #apply(info) {
+    if (!info?.title) {
+      return;
+    }
+    this.#track.title = info.title;
+    this.#track.artist = info.artist ?? null;
+    this.#track.album = info.album ?? null;
+    this.#track.artworkUrl = info.thumbnail ?? null;
+    this.#track.durationMs ??= info.duration ? info.duration * 1000 : null;
+    this.#track.named = true;
   }
 
   /** Playback stopped for good: clear the add-on's entry. */
   stopped() {
     this.#stopPositionTimer();
-    this.#track = { videoId: null, title: null, durationMs: null, state: 'stopped' };
+    this.#track = emptyTrack();
     this.#lastSent = null;
     this.#post({});
   }
@@ -137,10 +171,16 @@ export default class MetadataReporter {
     if (this.#track.title) {
       body.title = this.#track.title;
     }
+    if (this.#track.artist) {
+      body.artist = this.#track.artist;
+    }
+    if (this.#track.album) {
+      body.album = this.#track.album;
+    }
     if (this.#track.durationMs) {
       body.duration_ms = this.#track.durationMs;
     }
-    const art = artworkUrl(this.#track.videoId);
+    const art = this.#track.artworkUrl ?? artworkUrl(this.#track.videoId);
     if (art) {
       body.artwork_url = art;
     }

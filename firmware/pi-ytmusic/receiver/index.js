@@ -9,6 +9,9 @@
  *   - `MpvPlayer` (player.js) over `MpvClient` (mpv.js) — the actual playback,
  *     into the `ytm-out` PipeWire sink (`module-rtp-sink`), which transmits to
  *     the audio-router add-on over RTP.
+ *   - The control API (control.js) — play/pause/skip, start a playlist and browse
+ *     without a phone, for Home Assistant — over the catalogue (catalogue.js), which
+ *     asks YouTube Music what a list plays and what an id is called.
  *
  * Everything is configured by environment variable so the systemd unit (on the
  * Pi) or the add-on's run.sh is the single place that describes an install.
@@ -20,6 +23,9 @@ import { existsSync } from 'fs';
 import YouTubeCastReceiver, { Constants } from 'yt-cast-receiver';
 import path from 'path';
 import startAdmin from './admin.js';
+import Catalogue from './catalogue.js';
+import startControl, { Controller } from './control.js';
+import PlayHistory from './history.js';
 import MetadataReporter from './metadata.js';
 import MpvClient from './mpv.js';
 import MpvPlayer from './player.js';
@@ -301,7 +307,13 @@ async function main() {
     });
   }
 
-  const player = new MpvPlayer(mpv, metadata, resolver);
+  // What YouTube Music calls things, and the lists this receiver played. Both work
+  // without a phone, which is the point: they are what the control API is made of.
+  // The catalogue only answers once the resolver daemon runs (it owns the cookie jar).
+  const catalogue = new Catalogue({ logger: console });
+  const history = new PlayHistory({ dir: process.env.YTCR_STATE_DIR || process.cwd(), logger: console });
+
+  const player = new MpvPlayer(mpv, metadata, resolver, { catalogue, history });
 
   const receiver = new YouTubeCastReceiver(player, {
     dial: {
@@ -314,6 +326,8 @@ async function main() {
   mpv.setLogger(receiver.logger);
   resolver.setLogger?.(receiver.logger);
   ytdlpDaemon?.setLogger(receiver.logger);
+  catalogue.setLogger(receiver.logger);
+  history.setLogger(receiver.logger);
   metadata?.attach(mpv);
 
   /** The phone currently driving us, for the admin page to show. Kept from the
@@ -355,11 +369,12 @@ async function main() {
     try {
       await ytdlpDaemon.start();
       resolver.setDaemon(ytdlpDaemon);
+      catalogue.setDaemon(ytdlpDaemon);
     }
     catch (e) {
       receiver.logger.warn(
         `[ytcr] resolver daemon did not start (${e.message}) — resolving with one `
-        + 'yt-dlp per track');
+        + 'yt-dlp per track, and without the catalogue (no playlists without a phone)');
       ytdlpDaemon = null;
     }
   }
@@ -404,11 +419,39 @@ async function main() {
     logger: receiver.logger,
   });
 
+  // The control API (control.js): Home Assistant's way to play, pause, skip and start a
+  // playlist without a phone. Off unless a port is set. Loopback by default — in the
+  // add-on, Home Assistant and the router are on this host, and the API has no
+  // authentication. The URL announced to the router is what Home Assistant will call,
+  // so a LAN bind announces the LAN address the DIAL server uses.
+  const controlPort = Number(process.env.YTCR_CONTROL_PORT) || null;
+  const controlBind = process.env.YTCR_CONTROL_BIND || '127.0.0.1';
+  const controlHost = [ '0.0.0.0', '::' ].includes(controlBind) ? (bindAddress ?? '127.0.0.1') : controlBind;
+  const control = startControl({
+    port: controlPort,
+    bind: controlBind,
+    advertisedUrl: process.env.YTCR_CONTROL_URL || `http://${controlHost}:${controlPort}`,
+    controller: new Controller({
+      player,
+      catalogue,
+      history,
+      sender: () => connectedSender,
+      info: { name: deviceName, rtpPort: Number(process.env.YTCR_RTP_PORT || 46001) },
+    }),
+    // Announced where the now-playing reports go; without a router there is no one to tell.
+    router: addonHost
+      ? { host: addonHost, apiPort: Number(process.env.YTCR_ADDON_API_PORT || 8099),
+        rtpPort: Number(process.env.YTCR_RTP_PORT || 46001) }
+      : null,
+    logger: receiver.logger,
+  });
+
   receiver.logger.info(
     `[ytcr] ready — DIAL name "${deviceName}" on ${bindAddress ?? 'all interfaces'}:${dialPort}, ` +
     `audio -> ${audioDevice}` +
     (metadata ? `, metadata -> ${addonHost}` : ', metadata reporting off') +
-    (ytdlpDaemon ? ', resolver: long-lived yt-dlp' : ', resolver: yt-dlp per track'));
+    (ytdlpDaemon ? ', resolver: long-lived yt-dlp' : ', resolver: yt-dlp per track') +
+    (control ? `, control API on :${controlPort}` : ', control API off'));
 
   let stopping = false;
   const shutdown = async (signal) => {
@@ -419,6 +462,9 @@ async function main() {
     receiver.logger.info(`[ytcr] ${signal} — shutting down`);
     // First, so a page mid-refresh cannot hold the process open past its answer.
     admin?.close();
+    // Withdraws the announcement, so Home Assistant marks the source unavailable now
+    // rather than when the router's TTL runs out.
+    await control?.close().catch(() => {});
     try {
       await receiver.stop();
     }

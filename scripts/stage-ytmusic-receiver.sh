@@ -32,10 +32,11 @@ cp "$src"/*.js "$src"/*.py "$src"/*.html "$src"/package.json "$dst/"
 #     yt-dlp and a 15 s challenge.
 #   ytm_catalogue.py                   the daemon imports it, so its absence is a daemon
 #     that never starts: per-track resolves again, and no playlists without a phone.
+#   control.js                         the control API Home Assistant drives playback with.
 #   cookie_jar.py                      the jar rules; without it the admin page cannot
 #     judge an upload, so cookies cannot be provisioned at all.
 #   admin.js / admin.html              the admin page itself, which is what ingress
 #     proxies to — its absence is a blank panel.
-for required in ytdlp_daemon.py jsc_resident.py jsc_worker.js ytm_catalogue.py cookie_jar.py admin.js admin.html; do
+for required in ytdlp_daemon.py jsc_resident.py jsc_worker.js ytm_catalogue.py cookie_jar.py admin.js admin.html control.js; do
   [ -f "$dst/$required" ] || { echo "ERROR: $src/$required missing" >&2; exit 1; }
 done
