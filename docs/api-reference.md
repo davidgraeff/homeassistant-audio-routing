@@ -82,6 +82,7 @@ handler name, which is the authoritative place to check the exact body shape.
 | `GET`/`PUT`/`DELETE` | `/api/now_playing/{node_name}` | read / update / clear one source's metadata |
 | `GET` | `/api/now_playing/{node_name}/artwork` | embedded cover-art bytes |
 | `POST` | `/api/now_playing/report` | self-identifying report from a remote producer |
+| `POST` | `/api/control/report` | a producer announces (or withdraws) where it can be driven from |
 | `GET` | `/api/sendspin/volumes` | all sendspin volumes |
 | `GET` | `/api/sendspin/delays` | per-device sendspin delays |
 | `GET` | `/api/agents` | paired and pending receiver hosts (diagnostics) |
@@ -437,6 +438,14 @@ Every configured source, with the kind-specific config **nested** under `airplay
 `present` means a node called `node_name` is in the live PipeWire registry right now —
 it generalizes the old singular `loaded` (RTP) and `running` (AirPlay) flags.
 
+`control` is `null` unless the source's producer announced a control API
+([`POST /api/control/report`](#post-apicontrolreport)) within the last three minutes —
+in practice only the YouTube Music receiver does:
+
+```json
+"control": { "url": "http://127.0.0.1:8096", "features": ["pause", "next", "browse_media"], "protocol": 1 }
+```
+
 ### `POST /api/sources`
 Create a source. `label` and `kind` are required; the matching config object carries
 partial fields (each has a serde default) and may be **omitted entirely** to accept all
@@ -654,6 +663,34 @@ A body with **no metadata fields** means "nothing is playing any more" and clear
 entry — so a reporter needs no second endpoint for that. `404` when no RTP source is
 configured on that port, which is not worth retrying: the bridge may simply have been set
 up before its source was added here.
+
+## Source control (a producer that can be driven)
+
+Now-playing says what a source is playing; this says **who to ask to pause it**. A
+remote producer with its own control surface — the
+[YouTube Music receiver](ytmusic-receiver.md#control-from-home-assistant) — announces
+the URL of that surface here, and Home Assistant reads it back off
+[`GET /api/sources`](#get-apisources) (`control`) and talks to the producer directly.
+
+The daemon is a **rendezvous, not a relay** (`sources/control.rs`): it stores the URL
+and the producer's feature list and never forwards a command, so the router still knows
+nothing about what the producer is, and no request path through it can be aimed
+elsewhere. It is not part of the now-playing entry (that is cleared when playback stops,
+which is exactly when "start something" needs the endpoint) nor of the persisted source
+config (the web UI's edit form rewrites that whole). In-memory, with a 180 s TTL a
+producer refreshes by heartbeat; a daemon restart forgets it until the next beat.
+
+### `POST /api/control/report`
+```json
+{ "rtp_port": 46002, "url": "http://127.0.0.1:8096", "features": ["pause", "next"], "protocol": 1 }
+```
+Self-identifying like the now-playing report: `rtp_port` is resolved against the source
+store. `url` must be an absolute `http(s)://` URL reachable from wherever the consumer
+runs (≤ 256 characters) — the producer knows its own address, the daemon does not guess
+one; `features` are at most 32 short `snake_case` words, opaque to the daemon.
+`"url": null` (or no `url`) **withdraws** the announcement, which a producer sends on
+shutdown so the consumer marks it unavailable at once. `404` when no RTP source listens
+on that port yet — keep heartbeating — and `400` for a malformed URL or feature list.
 
 ## Sendspin devices
 

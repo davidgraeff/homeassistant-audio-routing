@@ -57,6 +57,10 @@ pub struct AppState {
     /// DMAP callbacks locally, a Pi reporter over `/api/sources/{id}/now_playing`
     /// remotely. Read into the routing socket's `now_playing` frame.
     pub now_playing: crate::sources::now_playing::NowPlayingStore,
+    /// Where each source's producer accepts transport commands, if it announced one
+    /// (sources/control.rs). In-memory, heartbeat-refreshed; surfaced on the source
+    /// listing so Home Assistant can drive the producer directly.
+    pub controls: crate::sources::control::ControlRegistry,
     /// On-demand source peak meters (pw/metering.rs); taps live only while a
     /// routing-matrix WS client is connected.
     pub meters: crate::pw::metering::SharedMeters,

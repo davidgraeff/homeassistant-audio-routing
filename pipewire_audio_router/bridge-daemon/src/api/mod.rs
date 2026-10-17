@@ -73,6 +73,9 @@ pub fn router(
         spotify,
         airplay_clients,
         now_playing,
+        // Nothing outside the API reads or writes it, so it is created here rather than
+        // threaded through main.rs: an announcement lives only as long as its heartbeat.
+        controls: crate::sources::control::ControlRegistry::default(),
         meters,
         xruns,
         profiler_watchers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -146,6 +149,10 @@ pub fn router(
         .route("/api/now_playing/report", post(report_now_playing))
         .route("/api/now_playing/{node_name}", get(get_now_playing).put(put_now_playing).delete(clear_now_playing))
         .route("/api/now_playing/{node_name}/artwork", get(get_now_playing_artwork))
+        // Where a source's producer can be driven from (sources/control.rs). Same
+        // self-identifying shape as the now-playing report: the producer names its RTP
+        // port, not an id it would have to learn.
+        .route("/api/control/report", post(report_control))
         // Multi-source collection CRUD — the sole source-management API.
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/{id}", get(get_source).put(update_source).delete(delete_source))
@@ -253,6 +260,7 @@ pub(crate) mod agents;
 pub(crate) mod align;
 pub(crate) mod announce;
 pub(crate) mod clients;
+pub(crate) mod control;
 pub(crate) mod duck;
 /// The one way to fail (and to say a write worked) — see its module docs.
 pub(crate) mod error;
@@ -276,6 +284,7 @@ pub(crate) use agents::*;
 pub(crate) use align::*;
 pub(crate) use announce::*;
 pub(crate) use clients::*;
+pub(crate) use control::*;
 pub(crate) use duck::*;
 pub(crate) use error::*;
 pub(crate) use groups::*;

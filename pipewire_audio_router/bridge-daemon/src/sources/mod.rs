@@ -9,7 +9,8 @@
 //! outputs: they build no audio path, they annotate an RTP source with which
 //! bridge feeds it. [`now_playing`] holds what each input is currently playing,
 //! from whichever producer can say (the receiver's DMAP callbacks locally, a Pi
-//! reporter over the API remotely).
+//! reporter over the API remotely), and [`control`] where a producer that can be
+//! *driven* (the YouTube Music receiver) accepts transport commands.
 //!
 //! This module itself is the persisted source collection *and* its reconciler: it
 //! is what starts and stops the receivers when the stored list changes, which is
@@ -53,6 +54,7 @@
 pub(crate) mod airplay;
 pub(crate) mod airplay_clients;
 pub(crate) mod bt_bridge;
+pub(crate) mod control;
 pub(crate) mod now_playing;
 pub(crate) mod pcm_producer;
 pub(crate) mod rtp;

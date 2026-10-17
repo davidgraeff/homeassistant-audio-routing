@@ -45,6 +45,10 @@ pub(crate) struct SourceView {
     /// one advertises this port (and group). `null` for AirPlay sources, when no
     /// bridge advertises, or when two do — see `sources::bt_bridge::match_bridge`.
     pub(crate) bridge: Option<BridgeView>,
+    /// Where this source's producer accepts transport commands, when it announced one
+    /// (`POST /api/control/report`, sources/control.rs). `null` for every source whose
+    /// producer cannot be driven — which is all of them except a controllable receiver.
+    pub(crate) control: Option<crate::sources::control::SourceControl>,
 }
 
 /// A discovered Bluetooth→RTP bridge, as the UI sees it. Used both nested on an
@@ -115,6 +119,7 @@ pub(crate) fn source_view(entry: &SourceEntry, present: bool, bridges: &[crate::
         spotify,
         spotify_status: None,
         bridge,
+        control: None,
     }
 }
 
@@ -223,7 +228,7 @@ pub(crate) async fn list_sources(State(state): State<AppState>) -> Json<SourcesL
     let present = present_node_names(&state.pw);
     let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
     let sources: Vec<SourceView> = entries.iter().map(|e| source_view(e, present.contains(&e.node_name()), &bridges)).collect();
-    let sources = with_spotify_status(&state, sources).await;
+    let sources = with_controls(&state, with_spotify_status(&state, sources).await);
     let discovered_bridges = unmatched_bridges(&bridges, &sources);
     Json(SourcesListResponse { sources, discovered_bridges })
 }
@@ -266,7 +271,7 @@ pub(crate) async fn get_source(State(state): State<AppState>, Path(id): Path<Str
     let present = node_present(&state.pw, &entry.node_name());
     let bridges: Vec<_> = state.bt_bridges.lock_recover().values().cloned().collect();
     let view = source_view(&entry, present, &bridges);
-    Ok(Json(with_spotify_status(&state, vec![view]).await.remove(0)))
+    Ok(Json(with_controls(&state, with_spotify_status(&state, vec![view]).await).remove(0)))
 }
 
 pub(crate) async fn update_source(

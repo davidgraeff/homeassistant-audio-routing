@@ -193,6 +193,8 @@ fn source_view_rtp_shape() {
     assert_eq!(json["rtp"]["rate"], 48000);
     // No discovered bridges passed in → no diagnostics offer.
     assert_eq!(json["bridge"], serde_json::Value::Null);
+    // A control endpoint is runtime state, attached by the handlers like Spotify's status.
+    assert_eq!(json["control"], serde_json::Value::Null);
 }
 
 /// A discovered bridge for `rtp_entry()`'s port (47000, unicast `0.0.0.0`).
@@ -354,4 +356,31 @@ fn a_per_output_write_refuses_by_kind_and_says_which() {
     for name in ["sendspin-dev-kitchen", "ap2-dev-dusche", "pwsink-dev-desk"] {
         assert!(level::kind_of(name).is_ok(), "{name}");
     }
+}
+
+/// The control announcement is the now-playing report's sibling: the producer names its
+/// RTP port, and `url: null` (or no url at all) is the withdrawal it sends on shutdown.
+#[test]
+fn a_control_report_is_a_port_plus_an_optional_url() {
+    let req: ControlReportRequest =
+        serde_json::from_str(r#"{"rtp_port":46002,"url":"http://127.0.0.1:8096","features":["pause","next"]}"#).expect("parses");
+    assert_eq!(req.rtp_port, 46002);
+    assert_eq!(req.url.as_deref(), Some("http://127.0.0.1:8096"));
+    assert_eq!(req.features, vec!["pause".to_string(), "next".to_string()]);
+    assert_eq!(req.protocol, 1);
+
+    let withdraw: ControlReportRequest = serde_json::from_str(r#"{"rtp_port":46002,"url":null}"#).expect("parses");
+    assert!(withdraw.url.is_none());
+    let bare: ControlReportRequest = serde_json::from_str(r#"{"rtp_port":46002}"#).expect("parses");
+    assert!(bare.url.is_none() && bare.features.is_empty());
+}
+
+/// `/api/control/report` must not collide with anything the router already serves.
+#[test]
+fn the_control_report_route_builds_beside_now_playing() {
+    let app: Router = Router::new()
+        .route("/api/now_playing/report", post(|| async { "reported" }))
+        .route("/api/now_playing/{node_name}", get(|| async { "one" }))
+        .route("/api/control/report", post(|| async { "announced" }));
+    drop(app);
 }
