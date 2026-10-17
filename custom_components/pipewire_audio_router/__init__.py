@@ -36,6 +36,7 @@ from .api import (
     PwsinkAgent,
     RoutingMatrix,
     RtpSourceState,
+    SourceControl,
 )
 from .const import (
     ATTR_PRESET,
@@ -52,6 +53,7 @@ from .const import (
 from .frontend import async_register_card
 from .pwsink_hosts import async_reconcile_pwsink_host_devices
 from .service_device import async_register_service_device
+from .source_control import CONTROL_PROTOCOL, ControlState, SourceControlClient, SourceControlError, steady_position
 from .voice_duck import VoiceDucker
 
 _LOGGER = logging.getLogger(__name__)
@@ -137,6 +139,13 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
         # pw-sink host runs (shown as its device's version) and the sink it plays to
         # (a diagnostic sensor). Empty for a daemon without `/api/agents`.
         self.agents: dict[str, PwsinkAgent] = {}
+        # Sources whose producer can be driven (play/pause/skip/browse), by source node
+        # name — the control API each announced to the daemon — and the last state read
+        # from each. A source whose last read failed has no entry in `control_states`,
+        # which is what makes its media_player unavailable.
+        self.source_controls: dict[str, SourceControl] = {}
+        self.control_states: dict[str, ControlState] = {}
+        self._control_clients: dict[str, SourceControlClient] = {}
         # Voice-assistant ducking (voice_duck.py). Set in `async_setup_entry`
         # right after the coordinator exists, because the ducker reads the polled
         # routing/groups/outputs state this object holds. Its enabled/level/scope
@@ -193,6 +202,9 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
             self.active_preset = presets.active
         except PipewireRouterApiError as err:
             _LOGGER.debug("groups/settings unavailable: %s", err)
+        # Controllable sources, secondary like the rest: their entities go unavailable,
+        # nothing else does.
+        await self._async_update_controls()
         # The running build, for the service device. Secondary, and re-registering
         # the device only when the version actually changes — an add-on update is
         # the one thing that moves it, not every poll.
@@ -205,6 +217,69 @@ class PipewireRouterCoordinator(DataUpdateCoordinator[None]):
             self.status = status
             if changed and self.config_entry is not None:
                 async_register_service_device(self.hass, self.config_entry, self)
+
+    async def _async_update_controls(self) -> None:
+        """Refresh which sources can be driven, then read each one's state.
+
+        The announcement list keeps its last value when the daemon cannot be asked (the
+        health check above already decides availability of everything else); a producer
+        that does not answer loses only its own state."""
+        try:
+            announced = await self.client.async_get_source_controls()
+        except PipewireRouterApiError as err:
+            _LOGGER.debug("source controls unavailable: %s", err)
+        else:
+            usable = {}
+            for control in announced:
+                if control.protocol != CONTROL_PROTOCOL:
+                    _LOGGER.warning(
+                        "%s announces control protocol %s, this integration speaks %s — not driving it",
+                        control.node_name,
+                        control.protocol,
+                        CONTROL_PROTOCOL,
+                    )
+                    continue
+                usable[control.node_name] = control
+            self.source_controls = usable
+        if not self.source_controls:
+            self.control_states = {}
+            return
+        results = await asyncio.gather(
+            *(self.control_client(n).async_state() for n in self.source_controls), return_exceptions=True
+        )
+        states: dict[str, ControlState] = {}
+        for node_name, result in zip(self.source_controls, results, strict=True):
+            if isinstance(result, ControlState):
+                states[node_name] = steady_position(self.control_states.get(node_name), result)
+            elif isinstance(result, SourceControlError):
+                _LOGGER.debug("control state of %s unavailable: %s", node_name, result)
+            else:
+                _LOGGER.warning("unexpected error reading the control state of %s: %r", node_name, result)
+        self.control_states = states
+
+    @callback
+    def control_client(self, node_name: str) -> SourceControlClient:
+        """The client for a controllable source, reused while its URL stays the same."""
+        url = self.source_controls[node_name].url
+        client = self._control_clients.get(node_name)
+        if client is None or client.url != url.rstrip("/"):
+            client = SourceControlClient(async_get_clientsession(self.hass), url)
+            self._control_clients[node_name] = client
+        return client
+
+    async def async_refresh_control(self, node_name: str) -> None:
+        """Re-read one producer's state right after commanding it, and re-render — so a
+        pause shows as paused now, not at the next poll."""
+        if node_name not in self.source_controls:
+            return
+        try:
+            state = await self.control_client(node_name).async_state()
+        except SourceControlError as err:
+            _LOGGER.debug("control state of %s unavailable: %s", node_name, err)
+            self.control_states.pop(node_name, None)
+        else:
+            self.control_states[node_name] = state
+        self.async_update_listeners()
 
     async def async_activate_preset(self, preset: str) -> None:
         """Put a preset in force, addressed by **id or name** (case-insensitively).
@@ -359,6 +434,7 @@ def _async_register_cleanup_service(hass: HomeAssistant) -> None:
             # f"{entry_id}_{node_name}" per-output ids) is stale → removed.
             valid = {f"{entry_id}_mg_{g.id}" for g in coordinator.music_groups}
             valid |= {f"{entry_id}_ag_{g.id}" for g in coordinator.announcement_groups}
+            valid |= {f"{entry_id}_src_{n}" for n in coordinator.source_controls}
             if coordinator.expose_outputs:
                 valid |= {f"{entry_id}_out_{o.node_name}" for o in coordinator.routing.outputs}
             for entity in er.async_entries_for_config_entry(registry, entry_id):

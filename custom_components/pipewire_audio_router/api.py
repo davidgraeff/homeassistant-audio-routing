@@ -174,6 +174,24 @@ class NowPlayingFrame:
 
 
 @dataclass
+class SourceControl:
+    """A source whose producer can be *driven*: the control API it announced to the daemon
+    (`control` on `GET /api/sources`, the daemon's sources/control.rs).
+
+    The daemon only stores this — it never relays a command — so `url` is where this
+    integration talks to the producer directly (`source_control.py`). `features` are the
+    producer's own words (`pause`, `next`, `browse_media`, …), and `protocol` is the
+    version of its wire format, so one this integration does not speak can be skipped
+    rather than misread."""
+
+    node_name: str
+    label: str
+    url: str
+    features: list[str]
+    protocol: int = 1
+
+
+@dataclass
 class RoutingNode:
     """One source or output in the bridge daemon's routing matrix
     (`RoutingNode` in routing.rs). `node_name` is the stable identity callers
@@ -439,6 +457,26 @@ class PipewireRouterApiClient:
             latency_msec=int(rtp.get("latency_msec", self._RTP_DEFAULT_LATENCY_MSEC)),
             loaded=bool(src.get("present", False)),
         )
+
+    async def async_get_source_controls(self) -> list[SourceControl]:
+        """Every source whose producer announced a control API (`GET /api/sources`,
+        `control`). Empty for a daemon that predates announcements — the field is simply
+        absent there."""
+        controls = []
+        for src in await self._async_list_sources():
+            control = src.get("control")
+            if not isinstance(control, dict) or not control.get("url"):
+                continue
+            controls.append(
+                SourceControl(
+                    node_name=str(src.get("node_name") or src.get("id")),
+                    label=str(src.get("label") or src.get("node_name") or ""),
+                    url=str(control["url"]).rstrip("/"),
+                    features=[str(f) for f in control.get("features") or []],
+                    protocol=int(control.get("protocol") or 1),
+                )
+            )
+        return controls
 
     async def async_set_rtp_source(self, port: int, latency_msec: int) -> None:
         """Enable (or re-point) the RTP source. If it already exists, its stored

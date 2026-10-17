@@ -169,6 +169,93 @@ add-on's `/api/routing/ws` WebSocket, so re-wiring shows up immediately.
   add-on's own web UI, another automation — reflect here without waiting
   for a poll.
 
+### Controllable sources (`media_player`)
+
+A source whose producer can be **driven** gets a `media_player` of its own — today
+that is the [YouTube Music receiver](../../ytmusic_receiver/README.md), as
+**`media_player.youtube_music`** (the entity is named after the source's label, so a
+renamed source gives a different id). It plays, pauses, skips and starts playlists
+**without a phone**, with ordinary Home Assistant services, and anything that renders a
+`media_player` (a media card, a wall display) gets the current song, the queue and a
+browsable list of what was played recently.
+
+How it is found: the receiver announces its own control API to the add-on
+(`POST /api/control/report`), the add-on lists it on the source as `control`, and this
+integration talks to that API **directly** every 5 s (`source_control.py`) — the add-on
+never relays a command. The entity goes `unavailable` while the receiver does not
+answer and comes back by itself; it is created the first time an announcement is seen
+and stays as long as the source exists.
+
+**Supported features**: `PLAY`, `PAUSE`, `STOP`, `NEXT_TRACK`, `PREVIOUS_TRACK`, `SEEK`,
+`PLAY_MEDIA`, `BROWSE_MEDIA` — exactly what the receiver announces. No volume: where
+and how loud the source plays is the routing's business (route it with a music group's
+or an output's `select_source`, set the level there).
+
+**State**: `playing`, `paused`, `buffering` (a track is being resolved — the first one
+after a `play_media` takes a second or two), `idle` (stopped, or nothing loaded).
+
+**Attributes** — the standard ones from the receiver itself: `media_title`,
+`media_artist`, `media_album_name` (songs only; music videos have none),
+`media_duration`, `media_position` + `media_position_updated_at`,
+`media_content_id` (`ytmusic:track:<videoId>`), `media_playlist` (the list's title),
+`entity_picture` (album art, proxied by Home Assistant). And:
+
+| Attribute | |
+|---|---|
+| `queue` | the **next** up to 10 entries: `{media_content_id, title, artist, album, duration, image, playable}` — browse *Queue* for more |
+| `queue_position` | index of the current entry in the queue (0-based), `null` if unknown |
+| `queue_size` | entries in the queue (a radio grows as it plays) |
+| `playback_origin` | `local` — started from Home Assistant, the receiver's own queue; `cast` — a phone is in charge; `null` when idle |
+| `playlist_id` / `playlist_media_id` | the list playing (`PL…`, `OLAK5uy_…`, `RD…`, `LM`) and the id `play_media` takes to start it again |
+| `cast_connected` / `cast_sender` | whether a phone is connected, and its name |
+| `last_error` | why the last `play_media` / track failed, else `null` |
+
+**Services** — all standard: `media_player.media_play`, `media_pause`, `media_play_pause`,
+`media_stop`, `media_next_track`, `media_previous_track`, `media_seek`, `play_media`,
+and the media browser (`media_player/browse_media` over the websocket).
+
+```yaml
+action: media_player.play_media
+target:
+  entity_id: media_player.youtube_music
+data:
+  media_content_id: ytmusic:playlist:LM        # Liked Music
+  media_content_type: playlist
+```
+
+`media_content_id` is one of the receiver's own ids — whatever browse or the `queue`
+attribute handed out — or a link:
+
+| `media_content_id` | plays |
+|---|---|
+| `ytmusic:playlist:<listId>` | a playlist, album, mix or Liked Music (`LM`) from its first track |
+| `ytmusic:playlist:<listId>:<videoId>` | the same list, starting at that track |
+| `ytmusic:track:<videoId>` | that song, then its radio — what YouTube Music does with a tapped song |
+| `ytmusic:queue:<index>` | jump to that entry of the receiver's own queue (only when `playback_origin` is `local`) |
+| `https://music.youtube.com/playlist?list=…`, `…/watch?v=…&list=…`, `https://youtu.be/<id>` | parsed into the above |
+
+A media-source item (TTS, local files) is refused: this source plays from its own
+service. Starting something takes over from a phone the same way casting from a second
+phone would; pause/next/stop while a phone is in charge are shown on the phone at once.
+
+**Browse tree** (`BROWSE_MEDIA`), labels in Home Assistant's language (German or English):
+
+```
+YouTube Music                          ytmusic:root
+├─ Warteschlange / Queue               ytmusic:queue     (only while something is queued)
+│    tracks: ytmusic:queue:<n> (playable only for the receiver's own queue)
+├─ Zuletzt gespielt / Recently played  ytmusic:recent    lists played on this receiver, newest first
+├─ Mediathek / Library                 ytmusic:library   the account's library ("recent activity")
+└─ Verlauf / History                   ytmusic:history   the account's recently played songs
+     ytmusic:playlist:<listId>   (playable, expandable → its tracks as ytmusic:playlist:<listId>:<videoId>)
+     ytmusic:track:<videoId>     (playable)
+```
+
+*Recently played* is the receiver's own record — every list a phone cast or Home
+Assistant started here, with real timestamps, and it needs no cookie jar. *Library* and
+*History* come from the signed-in account and are empty without one; why both exist is
+in [docs/ytmusic-receiver.md](../../docs/ytmusic-receiver.md#control-from-home-assistant).
+
 ## Dashboard card
 
 The integration ships a Lovelace card that shows the whole house's routing at a
@@ -297,7 +384,8 @@ See `tests/README.md` for what each test actually covers.
 ```
 __init__.py       setup/teardown, coordinator (5s poll: players + RTP source; routing pushed via /api/routing/ws), platform forwarding
 config_flow.py     single-step host/port form, validates by calling the add-on
-media_player.py    the MediaPlayerEntity subclass described above (incl. select_source + link/unlink services)
+media_player.py    the MediaPlayerEntity subclasses described above (incl. select_source + link/unlink services)
+source_control.py  client for a controllable source's own control API (state, transport, play_media, browse)
 ws_api.py          WebSocket API behind the dashboard card: routing subscription + link/unlink/route_group
 frontend.py        serves www/pipewire-router-card.js and loads it into the frontend
 www/               the built dashboard card (committed; built from ../../pipewire_audio_router/frontend)

@@ -1,4 +1,8 @@
-"""One MediaPlayerEntity per PipeWire output node the bridge daemon reports.
+"""The router's media_player entities: one per music group, per announcement group,
+optionally per output — and one per *controllable source* (`ControlledSourceMediaPlayer`),
+a source whose producer can be driven (the YouTube Music receiver), at the bottom.
+
+What follows was the original scope of the output entities:
 
 Deliberately scoped for Phase 3 (PLAN.md): state (playing/idle, derived
 from whether anything is currently linked into this output — Section 6),
@@ -19,6 +23,9 @@ from datetime import datetime
 import voluptuous as vol
 from homeassistant.components import media_source
 from homeassistant.components.media_player import (
+    BrowseError,
+    BrowseMedia,
+    MediaClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
@@ -42,6 +49,7 @@ from . import PipewireRouterCoordinator
 from .api import AnnouncementGroup, MusicGroup, NowPlaying, RoutingMatrix, RoutingNode
 from .const import ATTR_SOURCE, DOMAIN, SERVICE_LINK, SERVICE_UNLINK, SOURCE_NONE
 from .pwsink_hosts import async_find_pwsink_host_device
+from .source_control import ControlState, ControlTrack, SourceControlError
 
 # Must match the bridge-daemon's node-name prefixes exactly — no shared source
 # of truth across the Rust/Python boundary, just this comment. The
@@ -325,6 +333,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 key = f"out:{name}"
                 if key not in entities:
                     desired[key] = PipewireRouterMediaPlayer(hass, coordinator, entry, name)
+        for name in coordinator.source_controls:
+            key = f"src:{name}"
+            if key not in entities:
+                desired[key] = ControlledSourceMediaPlayer(coordinator, entry, name)
 
         new = list(desired.values())
         for key, ent in desired.items():
@@ -333,10 +345,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             async_add_entities(new)
 
         # Anything no longer backed by a group/output (or per-output turned off).
+        # A controllable source's entity outlives a lapsed announcement (its producer
+        # restarting, say) as long as the source itself exists — it shows unavailable
+        # instead of vanishing from every dashboard that uses it.
+        configured_sources = {s.node_name for s in coordinator.routing.sources}
         live_keys = (
             {f"mg:{g.id}" for g in coordinator.music_groups}
             | {f"ag:{g.id}" for g in coordinator.announcement_groups}
             | ({f"out:{n}" for n in _output_node_names(coordinator)} if coordinator.expose_outputs else set())
+            | {f"src:{n}" for n in coordinator.source_controls}
+            | {key for key in entities if key.startswith("src:") and key[4:] in configured_sources}
         )
         gone = [key for key in entities if key not in live_keys]
         if gone:
@@ -942,3 +960,245 @@ class AnnouncementGroupMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator],
         except Exception as err:
             _LOGGER.error("announce to group %s failed: %s", self.entity_id, err)
             raise
+
+
+# --- Controllable sources ---------------------------------------------------------------
+
+#: Producer feature word -> Home Assistant feature. Anything else a producer announces is
+#: ignored here (e.g. `queue`, which is an attribute rather than a feature).
+_CONTROL_FEATURES = {
+    "play": MediaPlayerEntityFeature.PLAY,
+    "pause": MediaPlayerEntityFeature.PAUSE,
+    "stop": MediaPlayerEntityFeature.STOP,
+    "next": MediaPlayerEntityFeature.NEXT_TRACK,
+    "previous": MediaPlayerEntityFeature.PREVIOUS_TRACK,
+    "seek": MediaPlayerEntityFeature.SEEK,
+    "play_media": MediaPlayerEntityFeature.PLAY_MEDIA,
+    "browse_media": MediaPlayerEntityFeature.BROWSE_MEDIA,
+}
+
+_CONTROL_STATES = {
+    "playing": MediaPlayerState.PLAYING,
+    "paused": MediaPlayerState.PAUSED,
+    "loading": MediaPlayerState.BUFFERING,
+    "stopped": MediaPlayerState.IDLE,
+    "idle": MediaPlayerState.IDLE,
+}
+
+#: Producer browse kind -> (media class, media content type).
+_BROWSE_KINDS = {
+    "directory": (MediaClass.DIRECTORY, "directory"),
+    "playlist": (MediaClass.PLAYLIST, MediaType.PLAYLIST),
+    "mix": (MediaClass.PLAYLIST, MediaType.PLAYLIST),
+    "album": (MediaClass.ALBUM, MediaType.ALBUM),
+    "artist": (MediaClass.ARTIST, MediaType.ARTIST),
+    "track": (MediaClass.TRACK, MediaType.TRACK),
+}
+
+
+def _browse_node(data: dict, *, with_children: bool = True) -> BrowseMedia:
+    """A producer browse node -> `BrowseMedia`. Children one level deep, as HA expects."""
+    media_class, content_type = _BROWSE_KINDS.get(str(data.get("kind")), _BROWSE_KINDS["directory"])
+    children = None
+    child_class = None
+    if with_children and isinstance(data.get("children"), list):
+        children = [_browse_node(c, with_children=False) for c in data["children"] if isinstance(c, dict)]
+        classes = {c.media_class for c in children}
+        child_class = classes.pop() if len(classes) == 1 else None
+    return BrowseMedia(
+        media_class=media_class,
+        media_content_id=str(data.get("id") or ""),
+        media_content_type=content_type,
+        title=str(data.get("title") or data.get("id") or ""),
+        can_play=bool(data.get("playable")),
+        can_expand=bool(data.get("expandable")),
+        thumbnail=data.get("thumbnail"),
+        children=children,
+        children_media_class=child_class,
+    )
+
+
+class ControlledSourceMediaPlayer(CoordinatorEntity[PipewireRouterCoordinator], MediaPlayerEntity):
+    """A source whose producer can be driven, as a media_player: play/pause/stop/next/
+    previous/seek, `play_media` of a playlist or a track, and `browse_media` of the
+    producer's own tree (its queue, what it played recently, the account's library).
+
+    Everything comes from the producer's control API (`source_control.py`), which the
+    producer announced to the daemon — this entity never goes through the daemon to
+    command it. Where the source's audio *plays* stays the routing's business: the
+    music-group and output entities show this source's metadata when it is routed to
+    them, and their `select_source` is how it gets there.
+
+    One entity per controllable source, named after the source (`YouTube Music` →
+    `media_player.youtube_music`). Unavailable while its producer does not answer.
+    """
+
+    _attr_has_entity_name = False
+    _attr_media_image_remotely_accessible = False
+
+    def __init__(self, coordinator: PipewireRouterCoordinator, entry: ConfigEntry, node_name: str) -> None:
+        super().__init__(coordinator)
+        self.node_name = node_name
+        self._attr_unique_id = f"{entry.entry_id}_src_{node_name}"
+
+    def _control_state(self) -> ControlState | None:
+        return self.coordinator.control_states.get(self.node_name)
+
+    def _track(self) -> ControlTrack | None:
+        cs = self._control_state()
+        return cs.track if cs else None
+
+    @property
+    def name(self) -> str | None:
+        source = next((s for s in self.coordinator.routing.sources if s.node_name == self.node_name), None)
+        if source is not None:
+            return source.display_name
+        control = self.coordinator.source_controls.get(self.node_name)
+        return control.label if control and control.label else self.node_name
+
+    @property
+    def available(self) -> bool:
+        # The coordinator's own health too: its poll is what refreshes the producer's
+        # state, so with the router unreachable the last state read would be stale.
+        return (
+            super().available
+            and self.node_name in self.coordinator.source_controls
+            and self._control_state() is not None
+        )
+
+    @property
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        cs = self._control_state()
+        control = self.coordinator.source_controls.get(self.node_name)
+        words = (cs.features if cs and cs.features else None) or (control.features if control else [])
+        features = MediaPlayerEntityFeature(0)
+        for word in words:
+            features |= _CONTROL_FEATURES.get(word, MediaPlayerEntityFeature(0))
+        return features
+
+    @property
+    def state(self) -> MediaPlayerState | None:
+        cs = self._control_state()
+        return _CONTROL_STATES.get(cs.state, MediaPlayerState.IDLE) if cs else None
+
+    @property
+    def media_content_id(self) -> str | None:
+        t = self._track()
+        return t.media_id if t else None
+
+    @property
+    def media_content_type(self) -> MediaType | str | None:
+        return MediaType.MUSIC if self._track() else None
+
+    @property
+    def media_title(self) -> str | None:
+        t = self._track()
+        return t.title if t else None
+
+    @property
+    def media_artist(self) -> str | None:
+        t = self._track()
+        return t.artist if t else None
+
+    @property
+    def media_album_name(self) -> str | None:
+        t = self._track()
+        return t.album if t else None
+
+    @property
+    def media_image_url(self) -> str | None:
+        t = self._track()
+        return t.image_url if t else None
+
+    @property
+    def media_duration(self) -> int | None:
+        t = self._track()
+        return round(t.duration) if t and t.duration else None
+
+    @property
+    def media_position(self) -> int | None:
+        t = self._track()
+        return round(t.position) if t and t.position is not None else None
+
+    @property
+    def media_position_updated_at(self) -> datetime | None:
+        t = self._track()
+        if not t or t.position_at is None:
+            return None
+        return dt_util.utc_from_timestamp(t.position_at / 1000)
+
+    @property
+    def media_playlist(self) -> str | None:
+        cs = self._control_state()
+        return cs.playlist_title if cs else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object] | None:
+        """The queue and where playback comes from — what no standard attribute carries.
+
+        `queue` lists the next entries (at most ten; browse `Queue` for the rest), each
+        with the `media_content_id` that `play_media` takes — playable only for the
+        receiver's own queue, since a phone's queue is the phone's."""
+        cs = self._control_state()
+        if cs is None:
+            return None
+        return {
+            "queue": [t.as_attribute() for t in cs.queue],
+            "queue_position": cs.queue_index,
+            "queue_size": cs.queue_length,
+            "playback_origin": cs.origin,
+            "playlist_id": cs.playlist_id,
+            "playlist_media_id": cs.playlist_media_id,
+            "cast_connected": cs.cast_connected,
+            "cast_sender": cs.cast_sender,
+            "last_error": cs.error,
+        }
+
+    async def _command(self, command: str, **extra) -> None:
+        try:
+            await self.coordinator.control_client(self.node_name).async_command(command, **extra)
+        except (SourceControlError, KeyError) as err:
+            raise HomeAssistantError(f"{self.entity_id}: {command} failed: {err}") from err
+        await self.coordinator.async_refresh_control(self.node_name)
+
+    async def async_media_play(self) -> None:
+        await self._command("play")
+
+    async def async_media_pause(self) -> None:
+        await self._command("pause")
+
+    async def async_media_stop(self) -> None:
+        await self._command("stop")
+
+    async def async_media_next_track(self) -> None:
+        await self._command("next")
+
+    async def async_media_previous_track(self) -> None:
+        await self._command("previous")
+
+    async def async_media_seek(self, position: float) -> None:
+        await self._command("seek", position=position)
+
+    async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs) -> None:
+        """Start what the producer's browse tree (or queue attribute) handed out — a
+        playlist, a track (as its radio), a queue entry — or a YouTube / YouTube Music
+        link. A media-source item cannot be played here: this source plays from its own
+        service, not from a URL Home Assistant serves."""
+        if media_source.is_media_source_id(media_id):
+            raise HomeAssistantError(f"{self.entity_id} plays from its own service, not from Home Assistant media")
+        try:
+            await self.coordinator.control_client(self.node_name).async_play(media_id, str(media_type) if media_type else None)
+        except (SourceControlError, KeyError) as err:
+            raise HomeAssistantError(f"{self.entity_id}: could not play {media_id}: {err}") from err
+        await self.coordinator.async_refresh_control(self.node_name)
+
+    async def async_browse_media(
+        self, media_content_type: MediaType | str | None = None, media_content_id: str | None = None
+    ) -> BrowseMedia:
+        try:
+            node = await self.coordinator.control_client(self.node_name).async_browse(
+                media_content_id or None, self.hass.config.language
+            )
+        except (SourceControlError, KeyError) as err:
+            raise BrowseError(f"{self.entity_id}: {err}") from err
+        return _browse_node(node)

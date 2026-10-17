@@ -39,6 +39,11 @@ installs the version this HA pins, and is the easier way to run all of this.
   pushes on change (and *no* push when a poll changed nothing), the four routing
   commands, daemon errors surfaced to the card, and the one-vs-several-routers
   `entry_id` rules.
+- `test_source_control.py` — a controllable source (the YouTube Music receiver) as a
+  `media_player`: created from the daemon's `control` announcement, its track/queue
+  attributes and features from the receiver's state, the transport services and
+  `play_media` reaching the receiver, the browse tree, unavailability while the receiver
+  does not answer, an unknown protocol left alone, and the wire format itself.
 - `test_rtp_source.py` — the Bluetooth-bridge RTP `switch`/`number`: entities
   reflect daemon state, enable/disable, live vs. remembered port changes, and
   the API client's `/api/sources` calls (parsing + `ok`-flag errors).
