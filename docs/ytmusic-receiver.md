@@ -504,6 +504,43 @@ The yt-dlp attempts now also pass `player_skip=webpage,initial_data`: the two re
 playback never reads. That took a spawned resolve from ~5.4 s to ~2.9 s, with the same itag
 and URLs that played no worse. `YTCR_PLAYER_SKIP=none` restores the full path.
 
+#### Compared: VISIONOS, youtubei.js and yt-dlp (2026-10-17)
+
+Measured on the add-on host with the deployed cookie jar: 11 videos (two of them YouTube
+Music art tracks), the configurations interleaved per video so that every one met the same
+rejection windows, 2.5 s apart. "Played" means 206 on a two-byte GET at offset 0, then 206
+(or 416, past the end) at 1 MiB and 3 MiB, with the headers the resolver specified.
+
+| resolver | first call | warm median | played |
+|---|---|---|---|
+| **VISIONOS request, anonymous (`visionos.js`'s request)** | 0.2 s | **0.12 s** | **11/11** |
+| youtubei.js 18.1 `VISIONOS`, anonymous | 0.3 s | 0.13 s | 10/11 |
+| youtubei.js 18.1 `YTMUSIC` + cookie | 0.5-0.7 s | 0.37 s | 11/11 |
+| youtubei.js `music.getInfo` + cookie | 0.4-0.5 s | 0.38 s | 10/11 |
+| youtubei.js `TV` / `WEB_EMBEDDED` + cookie, `ANDROID_VR` anonymous | — | — | 0/3 each, dropped |
+| yt-dlp daemon + `player_skip` (resident worker) | 1.5 s | 1.3 s | 5/12 |
+| yt-dlp daemon, previous args | 4.4 s | 3.5 s | 5/12 |
+| yt-dlp spawn + `player_skip` | — | 2.7 s | 1/12 |
+| yt-dlp spawn, previous args | 5.0 s | 4.4 s | 1/4 |
+
+Every failed yt-dlp URL answered 403 (sometimes 503) at all offsets — in the same windows in
+which cookie-authenticated `YTMUSIC` played 11 of 11. So yt-dlp's failures here are not
+YouTube rejecting this host. They follow from the formats yt-dlp picks, most plausibly
+from the client it takes them from (it fetched `web_embedded`, `tv_downgraded` and `web`
+player responses; the mechanism is inferred, not proven).
+
+No configuration was offered the Premium-only opus itag 774, cookie `YTMUSIC` included; every
+one topped out at itag 251 (~124-137 kbps). Being anonymous therefore costs the fast path no
+audio quality today.
+
+youtubei.js was not adopted. Its `VISIONOS` path is the same request with older constants (1.02, a
+Safari User-Agent) behind ~0.6 s of import and `Innertube.create`, and it played one fewer.
+Its real advantage is the cookie-authenticated `YTMUSIC` client — ~0.4 s and reliable — which
+would be the natural second attempt if the anonymous one stops working. It brings
+its own fragility: a parser that lagged YouTube (`PlayerErrorCommand not found`), a random
+desktop User-Agent that one URL rejected while another was accepted, and in 18.1 the eval shim
+must `return process(n, sp, sig)` and `chooseFormat` needs `format: 'any'` to ever pick opus.
+
 ### Prefetch — why track changes are fast and the first track is not
 
 [`resolver.js`](../firmware/pi-ytmusic/receiver/resolver.js) resolves the *next* track to a
