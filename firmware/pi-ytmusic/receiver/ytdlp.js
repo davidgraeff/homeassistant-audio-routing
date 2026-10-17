@@ -43,6 +43,9 @@ const ESCALATED_RESPAWN_DELAY_MS = 250;
 const RESPAWN_WAIT_MS = 15000;
 /** Give up on a daemon that keeps dying, and let the caller spawn per track instead. */
 const MAX_RESPAWNS = 5;
+/** A catalogue read is one InnerTube request (measured 0.1-0.7 s); a minute is generous
+ *  for a slow box and still short enough that Home Assistant gets an answer. */
+const CATALOGUE_TIMEOUT_MS = 60000;
 
 export default class YtdlpDaemon extends EventEmitter {
   #python;
@@ -74,6 +77,8 @@ export default class YtdlpDaemon extends EventEmitter {
 
   #jscResident;
   #jscPreprocessedCache;
+  /** What the running daemon answers besides `resolve` — from its `ping`. */
+  #ops = new Set();
 
   constructor({ python, socketPath, modes, prewarm = true, jscResident = null,
     jscPreprocessedCache = true, logger = console }) {
@@ -191,6 +196,7 @@ export default class YtdlpDaemon extends EventEmitter {
 
     await this.#connectWithRetry();
     const hello = await this.request({ op: 'ping' }, 10000);
+    this.#ops = new Set(hello.ops ?? []);
     this.#restartPending = false;
     this.#logger.info(
       `[ytdlpd] ready — yt-dlp ${hello.version}, modes: ${(hello.modes ?? []).join(', ')}`);
@@ -315,6 +321,36 @@ export default class YtdlpDaemon extends EventEmitter {
    */
   resolve(videoId, mode, timeoutMs) {
     return this.request({ op: 'resolve', video_id: videoId, mode }, timeoutMs);
+  }
+
+  /**
+   * Whether the YouTube Music catalogue reads (`ytm_catalogue.py`) are available: the
+   * queue a list plays, metadata for ids, the signed-in library. They ride on this
+   * process because they authenticate with the cookie jar, and the jar has one writer.
+   */
+  get hasCatalogue() {
+    return this.running && this.#ops.has('queue');
+  }
+
+  /**
+   * The queue YouTube Music would play for `playlistId` (optionally starting at
+   * `videoId`), or the next page of it when `continuation` is given.
+   *
+   * @returns {Promise<{playlist_id: string, title: ?string, items: object[], continuation: ?string, infinite?: boolean}>}
+   */
+  queue(playlistId, { videoId = null, continuation = null } = {}) {
+    return this.request({ op: 'queue', playlist_id: playlistId, video_id: videoId, continuation },
+      CATALOGUE_TIMEOUT_MS);
+  }
+
+  /** Title/artist/album/duration/thumbnail for up to 50 video ids, in one request. */
+  tracks(videoIds) {
+    return this.request({ op: 'tracks', video_ids: videoIds }, CATALOGUE_TIMEOUT_MS);
+  }
+
+  /** A signed-in library feed: `library` (recent activity), `playlists`, `history`. */
+  library(feed) {
+    return this.request({ op: 'library', feed }, CATALOGUE_TIMEOUT_MS);
   }
 
   /**

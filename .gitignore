@@ -5,6 +5,12 @@ pipewire_audio_router/pw-control/target/
 # Container-extracted binary from scripts/build-daemon.sh
 pipewire_audio_router/bridge-daemon/dist/
 
+# The receiver's dependencies, from `npm install` for a dev run or its tests — npm's job
+# inside the image and on the Pi, never committed.
+firmware/pi-ytmusic/receiver/node_modules
+# Scratch history files of a test run that died before cleaning up.
+firmware/pi-ytmusic/receiver/tests/.history-*/
+
 # Python
 __pycache__/
 *.pyc

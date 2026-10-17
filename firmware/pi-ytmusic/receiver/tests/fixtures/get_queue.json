@@ -1,0 +1,223 @@
+{
+ "queueDatas": [
+  {
+   "content": {
+    "playlistPanelVideoRenderer": {
+     "title": {
+      "runs": [
+       {
+        "text": "Never Gonna Give You Up"
+       }
+      ]
+     },
+     "longBylineText": {
+      "runs": [
+       {
+        "text": "Rick Astley",
+        "navigationEndpoint": {
+         "browseEndpoint": {
+          "browseId": "UCwZEU0wAwIyZb4x5G_KJp2w",
+          "browseEndpointContextSupportedConfigs": {
+           "browseEndpointContextMusicConfig": {
+            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+           }
+          }
+         }
+        }
+       },
+       {
+        "text": " • "
+       },
+       {
+        "text": "Whenever You Need Somebody",
+        "navigationEndpoint": {
+         "browseEndpoint": {
+          "browseId": "MPREb_dcYZhAh5urI",
+          "browseEndpointContextSupportedConfigs": {
+           "browseEndpointContextMusicConfig": {
+            "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+           }
+          }
+         }
+        }
+       },
+       {
+        "text": " • "
+       },
+       {
+        "text": "1987"
+       }
+      ]
+     },
+     "thumbnail": {
+      "thumbnails": [
+       {
+        "url": "https://yt3.googleusercontent.com/eC9DfRcYSk4FE-fvDCJSu_4xsKdVMKxwmFTYFZwP8OqB7R4TKxAjKoR-Kp1lXeRi2WddPFYulSte4eW-=w60-h60-l90-rj",
+        "width": 60,
+        "height": 60
+       },
+       {
+        "url": "https://yt3.googleusercontent.com/eC9DfRcYSk4FE-fvDCJSu_4xsKdVMKxwmFTYFZwP8OqB7R4TKxAjKoR-Kp1lXeRi2WddPFYulSte4eW-=w120-h120-l90-rj",
+        "width": 120,
+        "height": 120
+       },
+       {
+        "url": "https://yt3.googleusercontent.com/eC9DfRcYSk4FE-fvDCJSu_4xsKdVMKxwmFTYFZwP8OqB7R4TKxAjKoR-Kp1lXeRi2WddPFYulSte4eW-=w180-h180-l90-rj",
+        "width": 180,
+        "height": 180
+       },
+       {
+        "url": "https://yt3.googleusercontent.com/eC9DfRcYSk4FE-fvDCJSu_4xsKdVMKxwmFTYFZwP8OqB7R4TKxAjKoR-Kp1lXeRi2WddPFYulSte4eW-=w226-h226-l90-rj",
+        "width": 226,
+        "height": 226
+       },
+       {
+        "url": "https://yt3.googleusercontent.com/eC9DfRcYSk4FE-fvDCJSu_4xsKdVMKxwmFTYFZwP8OqB7R4TKxAjKoR-Kp1lXeRi2WddPFYulSte4eW-=w302-h302-l90-rj",
+        "width": 302,
+        "height": 302
+       },
+       {
+        "url": "https://yt3.googleusercontent.com/eC9DfRcYSk4FE-fvDCJSu_4xsKdVMKxwmFTYFZwP8OqB7R4TKxAjKoR-Kp1lXeRi2WddPFYulSte4eW-=w544-h544-l90-rj",
+        "width": 544,
+        "height": 544
+       }
+      ]
+     },
+     "lengthText": {
+      "runs": [
+       {
+        "text": "3:34"
+       }
+      ]
+     },
+     "selected": false,
+     "navigationEndpoint": {
+      "watchEndpoint": {
+       "videoId": "lYBUbBu4W08",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "hasPersistentPlaylistPanel": true,
+         "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+        }
+       }
+      }
+     },
+     "videoId": "lYBUbBu4W08",
+     "shortBylineText": {
+      "runs": [
+       {
+        "text": "Rick Astley"
+       }
+      ]
+     },
+     "canReorder": true,
+     "queueNavigationEndpoint": {
+      "queueAddEndpoint": {
+       "queueTarget": {
+        "videoId": "lYBUbBu4W08"
+       },
+       "queueInsertPosition": "INSERT_AT_END"
+      }
+     }
+    }
+   }
+  },
+  {
+   "content": {
+    "playlistPanelVideoRenderer": {
+     "title": {
+      "runs": [
+       {
+        "text": "Take On Me"
+       }
+      ]
+     },
+     "longBylineText": {
+      "runs": [
+       {
+        "text": "a-ha",
+        "navigationEndpoint": {
+         "browseEndpoint": {
+          "browseId": "UCx00XxqRCfPS6zaTzRm3H2A",
+          "browseEndpointContextSupportedConfigs": {
+           "browseEndpointContextMusicConfig": {
+            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+           }
+          }
+         }
+        }
+       },
+       {
+        "text": " • "
+       },
+       {
+        "text": "2.5B views"
+       },
+       {
+        "text": " • "
+       },
+       {
+        "text": "13M likes"
+       }
+      ]
+     },
+     "thumbnail": {
+      "thumbnails": [
+       {
+        "url": "https://i.ytimg.com/vi/djV11Xbc914/hqdefault.jpg?sqp=-oaymwEWCJADEOEBIAQqCggAEOADGC0guwJIWg&rs=AMzJL3lnYP0tGrb4rgHWpUKN6xzNJ9uXaw",
+        "width": 400,
+        "height": 225
+       },
+       {
+        "url": "https://i.ytimg.com/vi/djV11Xbc914/hq720.jpg?sqp=-oaymwEKCKAGEMIDIABIWg&rs=AMzJL3mmPTGnPcmzRTeFgWnQ1g36bfXJCw",
+        "width": 800,
+        "height": 450
+       },
+       {
+        "url": "https://i.ytimg.com/vi/djV11Xbc914/hq720.jpg?sqp=-oaymwEKCNUGEN8DIABIWg&rs=AMzJL3n4j5h_GiQe61vVk1O8psgc4w2wVw",
+        "width": 853,
+        "height": 479
+       }
+      ]
+     },
+     "lengthText": {
+      "runs": [
+       {
+        "text": "4:04"
+       }
+      ]
+     },
+     "selected": false,
+     "navigationEndpoint": {
+      "watchEndpoint": {
+       "videoId": "djV11Xbc914",
+       "watchEndpointMusicSupportedConfigs": {
+        "watchEndpointMusicConfig": {
+         "hasPersistentPlaylistPanel": true,
+         "musicVideoType": "MUSIC_VIDEO_TYPE_OMV"
+        }
+       }
+      }
+     },
+     "videoId": "djV11Xbc914",
+     "shortBylineText": {
+      "runs": [
+       {
+        "text": "a-ha"
+       }
+      ]
+     },
+     "canReorder": true,
+     "queueNavigationEndpoint": {
+      "queueAddEndpoint": {
+       "queueTarget": {
+        "videoId": "djV11Xbc914"
+       },
+       "queueInsertPosition": "INSERT_AT_END"
+      }
+     }
+    }
+   }
+  }
+ ]
+}

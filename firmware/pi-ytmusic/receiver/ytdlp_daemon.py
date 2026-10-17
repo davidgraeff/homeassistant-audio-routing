@@ -55,10 +55,21 @@ exactly like mpv's own IPC (`mpv.js`) so the client side is the same shape:
     -> {"id": 3, "op": "invalidate", "mode": "local", "reason": "HTTP 403"}
     <- {"id": 3, "ok": true}
 
+The catalogue ops (see `ytm_catalogue.py`) read YouTube Music itself — what a list
+plays, what an id is called, the signed-in library — with the same jar:
+
+    -> {"id": 4, "op": "queue", "playlist_id": "RDAMVM...", "video_id": null}
+    <- {"id": 4, "playlist_id": "...", "title": "...", "items": [...], "continuation": "..."}
+    -> {"id": 5, "op": "queue", "playlist_id": "...", "continuation": "..."}
+    -> {"id": 6, "op": "tracks", "video_ids": ["...", "..."]}
+    <- {"id": 6, "items": [{"video_id", "title", "artist", "album", "duration", "thumbnail"}]}
+    -> {"id": 7, "op": "library", "feed": "library" | "playlists" | "history"}
+    <- {"id": 7, "signed_in": true, "items": [...]}
+
 The socket is trusted: it is mode 0600 in a private runtime directory and the only
 client is the receiver that spawned this process. No request can name a URL — only
-a video id, which is substituted into a fixed template, so this cannot be turned
-into a general-purpose fetcher.
+a video id, a playlist id or a feed name, each validated by shape and substituted into
+a fixed request, so this cannot be turned into a general-purpose fetcher.
 
 CONFIGURATION
 -------------
@@ -87,6 +98,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import jsc_resident  # noqa: E402
+import ytm_catalogue  # noqa: E402
 
 #: Written to a cookie jar at most this often. `--cookies FILE` makes the jar a
 #: live, rotating credential that yt-dlp normally dumps back when the process
@@ -318,6 +330,136 @@ class SharedCookieJar:
             self._hash = self._digest()
 
 
+def strip_print_options(argv: list[str]) -> list[str]:
+    """Drop `-g`/`--print X` from a mode's argv.
+
+    Printing options are for the fallback *spawn* path, which has only stdout to answer
+    on. In-process the URL and its headers come out of the info dict, so they are
+    dropped rather than left to write into this daemon's log.
+    """
+    out = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ('-g', '--get-url'):
+            continue
+        if arg == '--print':
+            skip_next = True
+            continue
+        out.append(arg)
+    return out
+
+
+class Catalogue:
+    """YouTube Music's own reads — queues, track metadata, the library — over InnerTube.
+
+    WHY IN THIS PROCESS
+    -------------------
+    These requests authenticate with the cookie jar, and the jar is a live, rotating
+    credential with exactly one writer: this daemon (`SharedCookieJar`). A second
+    process asking with the same session would rotate it against this one, which is
+    the failure `push_cookies.py` warns about at length — so the catalogue rides on the
+    jar object the resolver already holds, and its cookie rotations are saved the same
+    way. yt-dlp contributes the request machinery (InnerTube context, the SAPISIDHASH
+    header computed from the jar, retries); `ytm_catalogue.py` builds the bodies and
+    parses the answers.
+
+    One `YoutubeDL`, built lazily from the resolver's primary mode (same jar, cache dir
+    and extractor args) and rebuilt on the same age and failure rules, behind a lock
+    because an instance is not thread-safe. None of this touches the JS challenge or
+    the googlevideo URLs, so it cannot add to the 403 windows the resolver fights.
+    """
+
+    #: What `ytdlp.js` may ask for, advertised on `ping`.
+    OPS = ('queue', 'tracks', 'library')
+    #: `music/get_queue` answers for a whole batch; more than a screenful is pointless.
+    MAX_TRACKS = 50
+
+    def __init__(self, argv: list[str], cookies: SharedCookieJar | None) -> None:
+        self.argv = strip_print_options(argv)
+        self.cookies = cookies
+        self.lock = threading.Lock()
+        self._ydl = None
+        self._ie = None
+        self._built_at = 0.0
+        self._failures = 0
+
+    def _build(self) -> None:
+        from yt_dlp import YoutubeDL, parse_options
+
+        opts = parse_options(self.argv).ydl_opts
+        opts.update({'logger': YtdlpLogger(), 'noprogress': True, 'skip_download': True})
+        self._ydl = YoutubeDL(opts, auto_init=True)
+        if self.cookies:
+            self.cookies.attach(self._ydl)
+        self._ie = self._ydl.get_info_extractor('YoutubeTab')
+        self._ie.initialize()
+        self._built_at = time.monotonic()
+
+    def _close(self) -> None:
+        if self._ydl:
+            try:
+                self._ydl.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._ydl = self._ie = None
+
+    def call(self, ep: str, query: dict, item_id: str) -> dict:
+        """One InnerTube request as the music.youtube.com web client. Raises on failure."""
+        with self.lock:
+            if self.cookies:
+                self.cookies.refresh_if_pushed()
+            if self._ydl is not None and time.monotonic() - self._built_at > MAX_WARM_AGE_S:
+                self._close()
+            if self._ydl is None:
+                self._build()
+            try:
+                response = self._ie._extract_response(  # noqa: SLF001 — yt-dlp's own InnerTube call
+                    item_id=item_id, query=query, ep=ep, default_client='web_music', fatal=True)
+            except Exception:
+                self._failures += 1
+                if self._failures >= RECYCLE_AFTER_FAILURES:
+                    self._close()
+                    self._failures = 0
+                raise
+            self._failures = 0
+            if self.cookies:
+                self.cookies.maybe_save()
+            if not isinstance(response, dict):
+                raise RuntimeError(f'{ep} answered with nothing for {item_id}')
+            return response
+
+    def queue(self, playlist_id: str, video_id: str | None, continuation: str | None) -> dict:
+        if not ytm_catalogue.is_playlist_id(playlist_id):
+            raise ValueError(f'bad playlist id {playlist_id!r}')
+        if video_id is not None and not ytm_catalogue.is_video_id(video_id):
+            raise ValueError(f'bad video id {video_id!r}')
+        if continuation:
+            if not isinstance(continuation, str) or len(continuation) > 2048:
+                raise ValueError('bad continuation token')
+            r = self.call('next', ytm_catalogue.continuation_query(playlist_id, continuation), playlist_id)
+            return {'playlist_id': playlist_id, **ytm_catalogue.parse_queue_continuation(r)}
+        r = self.call('next', ytm_catalogue.watch_query(playlist_id, video_id), playlist_id)
+        return ytm_catalogue.parse_watch_queue(r, playlist_id)
+
+    def tracks(self, video_ids: list) -> dict:
+        ids = [v for v in (video_ids or []) if ytm_catalogue.is_video_id(v)][:self.MAX_TRACKS]
+        if not ids:
+            return {'items': []}
+        r = self.call('music/get_queue', {'videoIds': ids}, ids[0])
+        return {'items': ytm_catalogue.parse_get_queue(r)}
+
+    def library(self, feed: str) -> dict:
+        browse_id = ytm_catalogue.LIBRARY_FEEDS.get(feed)
+        if not browse_id:
+            raise ValueError(f'unknown library feed {feed!r}')
+        r = self.call('browse', {'browseId': browse_id}, browse_id)
+        parsed = ytm_catalogue.parse_history(r) if feed == 'history' else ytm_catalogue.parse_library(r)
+        return {'feed': feed, 'signed_in_jar': bool(self.cookies), **parsed}
+
+
 class Mode:
     """One resolve strategy — a label plus the yt-dlp options it implies.
 
@@ -339,21 +481,7 @@ class Mode:
     def _build(self):
         from yt_dlp import YoutubeDL, parse_options
 
-        # Printing options are for the fallback *spawn* path, which has only stdout to
-        # answer on. Here the URL and its headers come out of the info dict, so they are
-        # dropped rather than left to write into this daemon's log.
-        argv = []
-        skip_next = False
-        for arg in self.argv:
-            if skip_next:
-                skip_next = False
-                continue
-            if arg in ('-g', '--get-url'):
-                continue
-            if arg == '--print':
-                skip_next = True
-                continue
-            argv.append(arg)
+        argv = strip_print_options(self.argv)
         opts = parse_options(argv).ydl_opts
         opts.update({
             'logger': YtdlpLogger(),
@@ -469,6 +597,8 @@ class Server:
         self._last_diagnose = 0.0
         #: The shared cookie jar, so a diagnostic resolves with the same credentials.
         self.cookies = None
+        #: YouTube Music catalogue reads (queues, metadata, library), same jar.
+        self.catalogue: Catalogue | None = None
 
     # --- socket lifecycle ---------------------------------------------------
 
@@ -533,7 +663,30 @@ class Server:
         if op == 'ping':
             from yt_dlp.version import __version__ as ytdlp_version
             self._reply(conn, write_lock, {
-                'id': rid, 'version': ytdlp_version, 'modes': list(self.modes)})
+                'id': rid, 'version': ytdlp_version, 'modes': list(self.modes),
+                'ops': ['resolve', 'invalidate', 'diagnose',
+                        *(Catalogue.OPS if self.catalogue else ())]})
+            return
+        if op in Catalogue.OPS:
+            if not self.catalogue:
+                self._reply(conn, write_lock, {'id': rid, 'error': 'no catalogue in this daemon'})
+                return
+            started = time.monotonic()
+            try:
+                if op == 'queue':
+                    result = self.catalogue.queue(request.get('playlist_id') or '', request.get('video_id'),
+                                                  request.get('continuation'))
+                elif op == 'tracks':
+                    result = self.catalogue.tracks(request.get('video_ids') or [])
+                else:
+                    result = self.catalogue.library(request.get('feed') or '')
+            except Exception as e:  # noqa: BLE001 — the client decides what a failure means
+                log(f'{op} failed: {type(e).__name__}: {flatten(str(e))}')
+                self._reply(conn, write_lock, {'id': rid, 'error': f'{type(e).__name__}: {e}'})
+                return
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log(f'{op} answered {len(result.get("items") or [])} item(s) in {elapsed_ms / 1000:.1f}s')
+            self._reply(conn, write_lock, {'id': rid, 'elapsed_ms': elapsed_ms, **result})
             return
         if op == 'diagnose':
             video_id = request.get('video_id') or ''
@@ -879,6 +1032,10 @@ def main() -> int:
     modes = {label: Mode(label, argv, cookies) for label, argv in parsed.items()}
     server = Server(args.socket, modes)
     server.cookies = cookies
+    # The catalogue asks with the local mode's options when there is one: it needs the
+    # jar and the cache dir, and none of the remote-cipher plumbing.
+    catalogue_argv = parsed.get('local') or next(iter(parsed.values()))
+    server.catalogue = Catalogue(catalogue_argv, cookies)
     signal.signal(signal.SIGTERM, server.stop)
     signal.signal(signal.SIGINT, server.stop)
     server.claim_socket()
@@ -894,6 +1051,8 @@ def main() -> int:
             cookies.maybe_save(force=True)
         for mode in modes.values():
             mode._close()  # noqa: SLF001 — same module, shutdown path
+        if server.catalogue:
+            server.catalogue._close()  # noqa: SLF001 — same module, shutdown path
         jsc_resident.stop()
         try:
             os.unlink(args.socket)

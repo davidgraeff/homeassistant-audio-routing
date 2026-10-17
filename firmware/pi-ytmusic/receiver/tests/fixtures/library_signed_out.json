@@ -1,0 +1,66 @@
+{
+ "contents": {
+  "singleColumnBrowseResultsRenderer": {
+   "tabs": [
+    {
+     "tabRenderer": {
+      "selected": true,
+      "content": {
+       "sectionListRenderer": {
+        "contents": [
+         {
+          "itemSectionRenderer": {
+           "contents": [
+            {
+             "messageRenderer": {
+              "text": {
+               "runs": [
+                {
+                 "text": "Explore your favorites"
+                }
+               ]
+              },
+              "button": {
+               "buttonRenderer": {
+                "style": "STYLE_DEFAULT",
+                "isDisabled": false,
+                "text": {
+                 "runs": [
+                  {
+                   "text": "Sign in"
+                  }
+                 ]
+                },
+                "navigationEndpoint": {
+                 "signInEndpoint": {}
+                }
+               }
+              },
+              "subtext": {
+               "messageSubtextRenderer": {
+                "text": {
+                 "runs": [
+                  {
+                   "text": "Sign in to access tracks that you liked or saved"
+                  }
+                 ]
+                }
+               }
+              },
+              "style": {
+               "value": "RENDER_STYLE_VERTICAL_CENTERED"
+              }
+             }
+            }
+           ]
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   ]
+  }
+ }
+}
