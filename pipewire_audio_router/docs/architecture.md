@@ -74,9 +74,9 @@ each child's role — the reason the tree exists at all. Two placements are
 deliberate and look wrong at first glance: `sources/mod.rs` *is* the source
 store (it reconciles live receivers, so it is not a pure `store/` module),
 and `align/relay_delay.rs` lives with alignment even though it is *called*
-from the three output relays. The refactor that produced this, and the
-lessons from doing it, are in
-[module-layout-plan.md](module-layout-plan.md).
+from the three output relays. Why it is shaped this way, and the lessons
+from the refactor that produced it, are in
+[decisions.md](decisions.md#module-layout-directories-that-state-the-layering).
 
 ## 2. The PipeWire graph
 

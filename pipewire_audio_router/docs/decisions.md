@@ -347,8 +347,8 @@ module cycles inside a crate — what constrains it is call-site fan-in and
 concurrent edits), and the reviewable invariant is **"baseline unchanged", not
 "clean"** — state the test/clippy/fmt numbers in the commit message and prove
 them identical, since a wave that silences a pre-existing finding is as suspect
-as one that adds one. Details, including where tests live and the still-pending
-`align/measure/mod.rs` decomposition: [module-layout-plan.md](module-layout-plan.md).
+as one that adds one. The wave-by-wave plan was retired once the move completed;
+it is in git history as `docs/module-layout-plan.md` (last at `d00bd52`).
 
 ---
 

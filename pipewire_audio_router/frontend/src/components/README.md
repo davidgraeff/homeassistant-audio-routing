@@ -3,7 +3,7 @@
 One directory per feature, plus `ui/` for the pieces every feature uses. The
 daemon's `src/` is organised the same way and for the same reason — the directory
 should say what a file is for before you open it (see
-`docs/module-layout-plan.md`).
+`docs/architecture.md` §1.1).
 
 | directory | what lives there |
 |---|---|
