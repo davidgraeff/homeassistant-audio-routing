@@ -27,6 +27,12 @@
 import fs from 'fs';
 import path from 'path';
 
+/**
+ * The largest single file kept — ~65 min of opus at 130 kbps, i.e. any song. An hour-long
+ * DJ mix arrived as 248 MiB: a quarter of a 1 GiB cache, ~60 songs evicted for it, and 11 s
+ * during which the next song's download waited behind it. Those stream instead.
+ */
+const MAX_FILE_BYTES = 64 * 1024 * 1024;
 /** Range size per request; above this googlevideo starts throttling. */
 const CHUNK_BYTES = 10 * 1024 * 1024;
 /** Per range request. A whole 10 MiB range took well under a second when measured. */
@@ -45,6 +51,8 @@ const VIDEO_ID = /^[\w-]{11}$/;
 export default class AudioCache {
   #dir;
   #maxBytes;
+  /** MAX_FILE_BYTES, or the whole cache when that is smaller. */
+  #maxFile;
   #logger;
   /** videoId -> { file, size, used } for complete files. */
   #entries = new Map();
@@ -59,6 +67,7 @@ export default class AudioCache {
   constructor({ dir, maxBytes, logger = console }) {
     this.#dir = dir;
     this.#maxBytes = maxBytes;
+    this.#maxFile = Math.min(MAX_FILE_BYTES, maxBytes);
     this.#logger = logger;
   }
 
@@ -81,6 +90,10 @@ export default class AudioCache {
       }
       try {
         const st = await fs.promises.stat(file);
+        if (st.size > this.#maxFile) {
+          await fs.promises.rm(file, { force: true });
+          continue;
+        }
         this.#add(id, file, st.size, st.mtimeMs);
       }
       catch {
@@ -177,7 +190,8 @@ export default class AudioCache {
   async #download(videoId, url, headers) {
     const params = new URL(url).searchParams;
     const length = Number(params.get('clen')) || null;
-    if (length && length > this.#maxBytes) {
+    if (length && length > this.#maxFile) {
+      this.#logger.debug(`[audiocache] ${videoId} is ${mib(length)} — streamed, not cached`);
       return;
     }
     const file = path.join(this.#dir, `${videoId}.${extensionFor(params.get('mime'))}`);
@@ -198,6 +212,9 @@ export default class AudioCache {
         const { body } = res;
         await out.write(body);
         written += body.length;
+        if (written > this.#maxFile) {
+          throw new Error(`larger than ${mib(this.#maxFile)} — streamed, not cached`);
+        }
         const total = Number(/\/(\d+)$/.exec(res.contentRange ?? '')?.[1]) || length;
         if (res.status === 200 || body.length === 0 || (total && written >= total)) {
           if (total && written !== total) {

@@ -120,3 +120,14 @@ test('a range answered 503 is tried again, and a waiting caller gets the file', 
     flaky.close();
   }
 });
+
+test('a file longer than any song (a DJ mix) is streamed, not cached, and not kept from before', async () => {
+  const big = path.join(dir, 'vid00000008.webm');
+  fs.writeFileSync(big, Buffer.alloc((64 << 20) + 1));
+  const cache = new AudioCache({ dir, maxBytes: 1024 << 20, logger: quietLogger });
+  await cache.init();
+  assert.equal(fs.existsSync(big), false, 'an oversized file from before is dropped at start');
+  cache.fetch('vid00000001', `${base}/mix?mime=audio%2Fwebm&clen=${(64 << 20) + 1}`);
+  await cache.idle();
+  assert.equal(requests.length, 0);
+});

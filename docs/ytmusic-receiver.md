@@ -535,6 +535,19 @@ cannot be fetched no longer fails the request: the song plays as a queue of one.
 playlist started without a song still waits for its list, because until then nothing is
 known to play.
 
+Measured on the add-on (2026-10-18), from Home Assistant's play request to the song
+`playing` in the control API's state, polled every 25 ms from inside the container:
+
+| start | before | after |
+|---|---|---|
+| a song never played here | 0.82-1.20 s | **0.27-0.56 s**; 1.0-1.4 s while googlevideo answered every other request 503 |
+| a song played before (audio cache) | — | **0.03-0.07 s** |
+| `next` within a radio (prefetched and cached) | — | **0.04-0.06 s** |
+
+The request itself still answers after the list, 0.8-1.4 s; the music no longer waits for
+it. Since the next song is always cached while the current one plays, only the first song
+of a session can be a network start at all.
+
 ### The audio cache (`audiocache.js`, 2026-10-18)
 
 Played songs are kept on disk — on the add-on in `/data/audio-cache`, up to
@@ -554,6 +567,10 @@ with 1 MiB. So the cache fetches in 10 MiB ranges (yt-dlp's `http_chunk_size` fo
 same reason), and therefore can do something mpv cannot: fetch the *next* song whole
 while the current one plays, so it starts from a file. A song not yet cached streams as
 before and is downloaded alongside.
+
+No single file larger than 64 MiB is kept (~65 min of opus, i.e. any song): an hour-long
+DJ mix arrived as 248 MiB, a quarter of the cache, and held up the next song's download
+for 11 s. Those stream; an oversized file left from before is deleted at start.
 
 Files are `<videoId>.webm` (opus) or `.m4a` (AAC), written as `.part` and renamed only
 once complete — their length checked against the URL's `clen` — so a reader never sees
