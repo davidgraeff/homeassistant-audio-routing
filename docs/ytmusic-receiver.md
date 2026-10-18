@@ -1524,6 +1524,31 @@ inside the add-on container settled it — the first proved mpv does emit
 handler declining to act. Verified by re-running that probe against the fixed player:
 `track ended — advancing queue` → `Player.next()`.
 
+### The cast-playlist-stops-after-one-song bug (fixed 2026-10-18)
+
+**Symptom:** a playlist cast from the phone plays its first song, then stops. The log
+reads `track ended — advancing queue` → `Player.next()` → `No next video in queue.` →
+`No autoplay video - autoplay is disabled.` → `Player.stop()`, and no `prefetching` line
+ever appeared during the song — the queue never knew a next track.
+
+**Cause, the library's:** yt-cast-receiver's `Playlist` takes next and previous only from
+its request handler, and the default `DefaultPlaylistRequestHandler` asks YouTube's
+`/next` for the autoplay set of the current video *in the cast playlist* — anonymously,
+as a 2023 `TVHTML5` client. An anonymous request cannot see a private playlist or Liked
+Music. Reproduced with the library's own handler: `next: null` for `LM`, while a public
+mix (`RDAMVM…`) answered with a next track — which is why it went unnoticed. The phone had
+in fact sent the list: the Lounge `setPlaylist` carries the queue's video ids, and the
+receiver had just named six of them through the catalogue.
+
+**Fix:** `castqueue.js`, installed as the receiver's `playlistRequestHandler`. Previous and
+next come from the list the phone sent — no request at all, which also drops a 1-2 s
+anonymous `/player` + `/next` per track that the default handler spent trying (and
+failing, `No playback tracking URL found`) to mark the song watched. Past the end of that
+list the library's handler is still asked, because what plays then is YouTube's autoplay
+call; and a song missing from the list is looked up in the signed-in catalogue, which sees
+private lists. A song listed twice is placed by its own `context.index`, not its first
+appearance.
+
 ### Failure modes, in expected order
 
 1. **`yt-dlp` vs YouTube** — cookies expire, extractors break, token requirements change.

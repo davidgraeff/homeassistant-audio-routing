@@ -29,6 +29,7 @@ import PlayHistory from './history.js';
 import MetadataReporter from './metadata.js';
 import MpvClient from './mpv.js';
 import MpvPlayer from './player.js';
+import CastQueueHandler from './castqueue.js';
 import Resolver from './resolver.js';
 import VisionOsResolver from './visionos.js';
 import YtdlpDaemon from './ytdlp.js';
@@ -332,6 +333,10 @@ async function main() {
       ...(bindAddress ? { bindToAddresses: [ bindAddress ] } : {}),
     },
     device: { name: deviceName, screenName },
+    // Next/previous from the list the phone sent (castqueue.js). The library's own
+    // handler asks YouTube anonymously, cannot see private lists or Liked Music, and so
+    // ended those casts after their first song.
+    app: { playlistRequestHandler: new CastQueueHandler({ catalogue }) },
     logLevel: process.env.YTCR_LOG_LEVEL || 'info',
   });
   mpv.setLogger(receiver.logger);
