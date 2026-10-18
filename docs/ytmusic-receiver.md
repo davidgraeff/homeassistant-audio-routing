@@ -535,6 +535,34 @@ cannot be fetched no longer fails the request: the song plays as a queue of one.
 playlist started without a song still waits for its list, because until then nothing is
 known to play.
 
+### The audio cache (`audiocache.js`, 2026-10-18)
+
+Played songs are kept on disk — on the add-on in `/data/audio-cache`, up to
+`audio_cache_mb` (default 1024; `0` turns it off) — and a song found there plays from its
+file: no resolve, no `/player` request, nothing for a 403 window to reject. The least
+recently *played* go first past the limit; a hit touches the file's mtime, which is the
+whole of the bookkeeping, so it survives restarts with nothing else stored. The directory
+is in the add-on's `backup_exclude`, so backups do not carry gigabytes of re-downloadable
+songs. On the Pi it is off unless `YTCR_AUDIO_CACHE_DIR` is set (`YTCR_AUDIO_CACHE_MB`
+sizes it), because there it is an SD card.
+
+**It downloads in ranges, which matters more than the caching.** googlevideo throttles a
+single open-ended GET — how mpv streams — to ~33 KB/s: measured, 0.98 of 4.6 MB in 30 s,
+about twice real time for opus at 130 kbps. Ranged requests of up to 10 MiB are served at
+full speed: the same 4.6 MB in **71 ms** with 10 MiB ranges, 269 ms with 4 MiB, 488 ms
+with 1 MiB. So the cache fetches in 10 MiB ranges (yt-dlp's `http_chunk_size` for the
+same reason), and therefore can do something mpv cannot: fetch the *next* song whole
+while the current one plays, so it starts from a file. A song not yet cached streams as
+before and is downloaded alongside.
+
+Files are `<videoId>.webm` (opus) or `.m4a` (AAC), written as `.part` and renamed only
+once complete — their length checked against the URL's `clen` — so a reader never sees
+half a song; leftovers of an interrupted download are deleted at start. Downloads run one
+at a time, in the background, and every failure is logged and dropped: the network path
+works without the cache. A cached file that does not play is deleted and the retry
+streams. The log says which it was: `play <id> from 0s (cached)` and
+`[audiocache] cached <id> (4.4 MiB in 0.1s)`.
+
 #### Compared: VISIONOS, youtubei.js and yt-dlp (2026-10-17)
 
 Measured on the add-on host with the deployed cookie jar: 11 videos (two of them YouTube

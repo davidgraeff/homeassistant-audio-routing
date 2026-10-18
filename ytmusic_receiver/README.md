@@ -70,6 +70,7 @@ disagree about what a valid jar is.
 | `bind_address` | *(auto)* | Pin the DIAL server to one local IP; only needed on a multi-homed host, where answering SSDP on the wrong address makes senders silently drop the device |
 | `report_metadata` | `true` | Report now-playing (title/artist/album/artwork/position) to the router's API |
 | `control_port` | `8094` | The control API Home Assistant drives playback through — on `127.0.0.1` only, see below. Not 8096 (Jellyfin) or 8095 (Music Assistant) |
+| `audio_cache_mb` | `1024` | Played songs kept on disk (`/data/audio-cache`), so a song heard before starts from a file; least recently played go first. `0` turns it off. Not included in backups |
 | `log_level` | `info` | |
 
 `host_network: true` is required twice over: DIAL discovery is SSDP multicast, so the phone

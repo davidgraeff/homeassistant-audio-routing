@@ -75,14 +75,17 @@ export default class MpvPlayer extends Player {
   #lastError = null;
   /** Bumped by every local start, so a superseded start's late failure says nothing. */
   #localGeneration = 0;
+  /** Songs on disk (audiocache.js); absent means every play streams. */
+  #cache = null;
 
-  constructor(mpv, metadata = null, resolver = null, { catalogue = null, history = null } = {}) {
+  constructor(mpv, metadata = null, resolver = null, { catalogue = null, history = null, cache = null } = {}) {
     super();
     this.#mpv = mpv;
     this.#metadata = metadata;
     this.#resolver = resolver;
     this.#catalogue = catalogue;
     this.#history = history;
+    this.#cache = cache;
 
     const onCastQueue = (event) => this.#onCastQueue(event);
     for (const type of CAST_QUEUE_EVENTS) {
@@ -149,16 +152,22 @@ export default class MpvPlayer extends Player {
     // starting a second one in parallel, which on a 4-core 1 GHz box would slow
     // both. The watch URL stays the fallback, so a resolver failure just degrades to
     // mpv's own behaviour.
-    const wasCached = !!this.#resolver?.peek(video.id);
+    // A song on disk needs no resolve at all (audiocache.js).
+    const file = this.#cache?.lookup(video.id) ?? null;
+    const wasPrefetched = !file && !!this.#resolver?.peek(video.id);
     this.logger.info(
-      `[MpvPlayer] play ${video.id} from ${position}s${wasCached ? ' (prefetched)' : ''}`);
-    const direct = await this.#resolver?.urlFor(video.id) ?? null;
-    if (!direct && this.#resolver?.enabled) {
+      `[MpvPlayer] play ${video.id} from ${position}s${file ? ' (cached)' : wasPrefetched ? ' (prefetched)' : ''}`);
+    const direct = file ? null : await this.#resolver?.urlFor(video.id) ?? null;
+    if (!file && !direct && this.#resolver?.enabled) {
       this.logger.warn(`[MpvPlayer] falling back to mpv's own resolution for ${video.id}`);
     }
     const prefetched = !!direct;
     const resolvedAt = Date.now();
-    const url = direct?.url ?? watchUrl;
+    const url = file ?? direct?.url ?? watchUrl;
+    if (direct) {
+      // Fetched alongside mpv's own stream, in fast ranges, so the next time is a file.
+      this.#cache?.fetch(video.id, direct.url, direct.headers);
+    }
     // Hand mpv the User-Agent yt-dlp used, because the URL is issued against it: some
     // googlevideo URLs answer **403** to a request without a matching UA and 206 with
     // one (measured on the add-on, same URL, three fetchers). `ytdl_hook` passes these
@@ -235,17 +244,23 @@ export default class MpvPlayer extends Player {
     if (!ok) {
       this.#mpv.off('playback-restart', onRestart);
     }
-    if (!ok && prefetched && this.#retriedFor !== video.id) {
+    if (!ok && (prefetched || file) && this.#retriedFor !== video.id) {
       // The direct URL was accepted by `loadfile` but did not play — most likely
       // expired or rejected. Drop it and try once more via mpv's own resolution,
-      // rather than reporting a dead track to the phone.
+      // rather than reporting a dead track to the phone. A cached file that does not
+      // play is dropped the same way, and the retry streams.
       //
       // The `#retriedFor` guard is load-bearing: without it, a fresh resolve is
       // also a "direct" URL, so a URL that consistently fails to play would
       // recurse forever.
-      this.logger.warn(`[MpvPlayer] direct URL for ${video.id} did not play — retrying once`);
+      this.logger.warn(`[MpvPlayer] ${file ? 'cached file' : 'direct URL'} for ${video.id} did not play — retrying once`);
       this.#retriedFor = video.id;
-      this.#resolver?.invalidate(video.id);
+      if (file) {
+        await this.#cache.remove(video.id);
+      }
+      else {
+        this.#resolver?.invalidate(video.id);
+      }
       return this.doPlay(video, position);
     }
     this.#retriedFor = null;
@@ -274,9 +289,21 @@ export default class MpvPlayer extends Player {
       const next = this.#local
         ? (this.#local.upcoming ? { id: this.#local.upcoming.video_id } : null)
         : (this.queue?.next ?? this.queue?.autoplay ?? null);
-      if (next?.id) {
-        this.#resolver.prefetch(next.id);
+      if (!next?.id || this.#cache?.has(next.id)) {
+        return;
       }
+      if (!this.#cache) {
+        this.#resolver.prefetch(next.id);
+        return;
+      }
+      // With a cache the next song is downloaded whole while this one plays, so it
+      // starts from a file — a ~5 MB song takes well under a second in ranges.
+      this.logger.info(`[MpvPlayer] prefetching and caching ${next.id}`);
+      void this.#resolver.urlFor(next.id).then((d) => {
+        if (d) {
+          this.#cache.fetch(next.id, d.url, d.headers);
+        }
+      });
     }
     catch (e) {
       this.logger.debug(`[MpvPlayer] could not look up the next track: ${e.message}`);

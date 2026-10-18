@@ -48,6 +48,7 @@ POT_URL="$(opt pot_provider_url)"
 BIND_ADDRESS="$(opt bind_address)"
 REPORT_METADATA="$(opt report_metadata true)"
 CONTROL_PORT="$(opt control_port 8094)"
+AUDIO_CACHE_MB="$(opt audio_cache_mb 1024)"
 LOG_LEVEL="$(opt log_level info)"
 
 echo "[run] YouTube Music receiver ${ADDON_VERSION:-dev}: DIAL '${DEVICE_NAME}' on :${DIAL_PORT}, audio -> ${RTP_HOST}:${RTP_PORT}, admin page on :8097, control API on 127.0.0.1:${CONTROL_PORT}"
@@ -151,6 +152,11 @@ export YTCR_REPORT_METADATA="$REPORT_METADATA"
 # router it announces itself to — runs on this host, and it has no authentication. The
 # announced URL follows from the bind, so nothing else needs configuring.
 export YTCR_CONTROL_PORT="$CONTROL_PORT"
+
+# Played songs on disk (receiver/audiocache.js), in /data so they survive restarts and
+# image updates; config.yaml's backup_exclude keeps them out of backups.
+export YTCR_AUDIO_CACHE_DIR=/data/audio-cache
+export YTCR_AUDIO_CACHE_MB="$AUDIO_CACHE_MB"
 export YTCR_CONTROL_BIND=127.0.0.1
 
 # The admin page (receiver/admin.js). This port MUST equal `ingress_port` in

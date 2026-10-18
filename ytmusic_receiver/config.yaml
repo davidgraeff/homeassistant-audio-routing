@@ -71,6 +71,7 @@ options:
   #    `n` and an nginx 504. Set it only if the local path is unavailable.
   report_metadata: true
   control_port: 8094
+  audio_cache_mb: 1024
   log_level: info
 schema:
   # Name shown in the YouTube Music app's Cast menu.
@@ -106,4 +107,12 @@ schema:
   # it. Loopback only: Home Assistant and the router are on this host, and the API has no
   # authentication. Not 8096 (Jellyfin's default) nor 8095 (Music Assistant's).
   control_port: int(1024,65535)
+  # Played songs kept on disk in /data/audio-cache, so a song heard before starts from a
+  # file instead of YouTube; the least recently played go first past this size. 0 turns
+  # it off. Excluded from backups (below): it is a cache, refilled by playing.
+  audio_cache_mb: int(0,100000)
   log_level: list(debug|info|warn|error)
+# The audio cache is gigabytes of re-downloadable songs; a backup of it would only be big.
+backup_exclude:
+  - "audio-cache"
+  - "audio-cache/*"

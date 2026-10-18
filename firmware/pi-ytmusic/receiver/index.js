@@ -29,6 +29,7 @@ import PlayHistory from './history.js';
 import MetadataReporter from './metadata.js';
 import MpvClient from './mpv.js';
 import MpvPlayer from './player.js';
+import AudioCache from './audiocache.js';
 import CastQueueHandler from './castqueue.js';
 import Resolver from './resolver.js';
 import VisionOsResolver from './visionos.js';
@@ -325,7 +326,23 @@ async function main() {
   const catalogue = new Catalogue({ logger: console });
   const history = new PlayHistory({ dir: process.env.YTCR_STATE_DIR || process.cwd(), logger: console });
 
-  const player = new MpvPlayer(mpv, metadata, resolver, { catalogue, history });
+  // Played songs on disk (audiocache.js), so a song heard before starts from a file. Off
+  // unless a directory is configured — the add-on sets one in /data; on the Pi's SD card
+  // it is an explicit choice. `YTCR_AUDIO_CACHE_MB=0` turns it off there too.
+  const cacheMb = Number(process.env.YTCR_AUDIO_CACHE_MB ?? 1024);
+  let cache = null;
+  if (process.env.YTCR_AUDIO_CACHE_DIR && cacheMb > 0) {
+    cache = new AudioCache({ dir: process.env.YTCR_AUDIO_CACHE_DIR, maxBytes: cacheMb * 1024 * 1024, logger: console });
+    try {
+      await cache.init();
+    }
+    catch (e) {
+      console.warn(`[audiocache] ${process.env.YTCR_AUDIO_CACHE_DIR} is unusable (${e.message}) — every song streams`);
+      cache = null;
+    }
+  }
+
+  const player = new MpvPlayer(mpv, metadata, resolver, { catalogue, history, cache });
 
   const receiver = new YouTubeCastReceiver(player, {
     dial: {
@@ -343,6 +360,7 @@ async function main() {
   resolver.setLogger?.(receiver.logger);
   ytdlpDaemon?.setLogger(receiver.logger);
   catalogue.setLogger(receiver.logger);
+  cache?.setLogger(receiver.logger);
   history.setLogger(receiver.logger);
   metadata?.attach(mpv);
 

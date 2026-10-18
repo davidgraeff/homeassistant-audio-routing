@@ -168,3 +168,32 @@ test('a song whose radio cannot be fetched still plays, as a queue of one', asyn
   assert.match(mpv.loaded[0], /vid00000005/);
   assert.equal((await player.describe()).status, 'playing');
 });
+
+test('a cached song plays from its file, and a streamed one is handed to the cache', async () => {
+  const fetched = [];
+  const cache = {
+    files: { vid00000001: '/cache/vid00000001.webm' },
+    has(id) { return !!this.files[id]; },
+    lookup(id) { return this.files[id] ?? null; },
+    fetch(id, url) { fetched.push([ id, url ]); },
+    async remove(id) { delete this.files[id]; },
+  };
+  const resolved = [];
+  const resolver = { enabled: true, peek: () => null, prefetch() {}, invalidate() {},
+    async urlFor(id) { resolved.push(id); return { url: `https://rr.example/${id}`, headers: { 'User-Agent': 'UA' } }; } };
+  player = new MpvPlayer(mpv, null, resolver, { catalogue, cache });
+  player.setLogger(quietLogger);
+  player.queue.setLogger(quietLogger);
+  player.queue.setRequestHandler({ async getPreviousNextVideosAbortable() { return { previous: null, next: null }; },
+    reset() {}, setLogger() {} });
+  await player.playLocal({ playlistId: 'PLroad' });
+  await settle();
+  assert.equal(mpv.loaded[0], '/cache/vid00000001.webm');
+  assert.equal(mpv.props['user-agent'], '', 'a file needs no User-Agent');
+  // The next song was resolved while the first played, and handed to the cache whole.
+  assert.deepEqual(fetched, [ [ 'vid00000002', 'https://rr.example/vid00000002' ] ]);
+  await player.next();
+  await settle();
+  assert.equal(mpv.loaded.at(-1), 'https://rr.example/vid00000002', 'not cached yet, so it streams');
+  assert.deepEqual(resolved.filter((id) => id === 'vid00000001'), [], 'the cached song was never resolved');
+});
