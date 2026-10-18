@@ -853,7 +853,7 @@ somewhere cheap to act:
 **Mitigation, which is what actually ships.** Cheapest first, and each rung gated by
 `#verify` so a URL that will not play never reaches mpv:
 
-1. **`#verify` retries once after 1.5 s** — a transient rejection costs 1.5 s, not a resolve.
+1. **`#verify` retries once after 0.4 s** — a transient rejection costs 0.4 s, not a resolve (1.5 s until 2026-10-18, when intermittent 503s on VISIONOS URLs made that the largest term of a start).
 2. **A client ladder.** The primary attempt keeps the default clients (itag 251: opus,
    audio-only, 48 kHz — the resample-free format). If its URL will not play, the same video
    is resolved through `web_embedded`, then `web_safari`, then `mweb` (`YTCR_CLIENT_LADDER`,

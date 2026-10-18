@@ -53,9 +53,11 @@ const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 const RESOLVE_TIMEOUT_MS = 150000;
 /** Budget for the two-byte URL verification (see #verify). */
 const VERIFY_TIMEOUT_MS = 8000;
-/** Pause before verify's single retry. Long enough for a transient rejection to pass,
- * short enough to stay inside a track change. */
-const VERIFY_RETRY_DELAY_MS = 1500;
+/** Pause before verify's single retry (5xx, timeouts, resets — a 4xx is not retried).
+ * googlevideo's 503s are intermittent rather than a window — up to 1 request in 3 at
+ * times, the next one usually fine — and the resolve is on the play path: at 1.5 s, one
+ * such 503 made a 0.1 s VISIONOS resolve take 1.8 s. */
+const VERIFY_RETRY_DELAY_MS = 400;
 /** Cache bound. The queue only ever needs the next one or two. */
 const MAX_ENTRIES = 8;
 /**
