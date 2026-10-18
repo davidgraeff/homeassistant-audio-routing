@@ -98,3 +98,21 @@ test('kinds follow the id prefix', () => {
   assert.equal(kindOf('PLx'), 'playlist');
   assert.equal(kindOf('LM'), 'playlist');
 });
+
+test('a queue started from one song adopts its list around that song', () => {
+  // The song was found in its list: it keeps playing at its place there, with its full entry.
+  const q = new LocalQueue({ playlistId: 'RDAMVMvid00000003', items: [ { video_id: 'vid00000003' } ] });
+  q.adopt(items(5), 'C1');
+  assert.equal(q.index, 2);
+  assert.equal(q.current.title, 'Song 3');
+  assert.equal(q.length, 5);
+  assert.equal(q.continuation, 'C1');
+  // Not in the list: it stays in front of it, and the list follows.
+  const r = new LocalQueue({ playlistId: 'PLx', items: [ track(9) ] });
+  r.adopt(items(3), null);
+  assert.deepEqual(r.window({ after: 9 }).map((t) => t.title), [ 'Song 9', 'Song 1', 'Song 2', 'Song 3' ]);
+  assert.equal(r.index, 0);
+  // An empty page changes nothing.
+  r.adopt([], null);
+  assert.equal(r.length, 4);
+});

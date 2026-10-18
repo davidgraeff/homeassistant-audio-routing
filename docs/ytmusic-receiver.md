@@ -522,6 +522,19 @@ All five resolved through VISIONOS at itag 251, and so did each mix's prefetched
 fetching the track's mix before the receiver starts it — and after them the RTP hop and the
 router's buffering, ~0.6 s. The catalogue fetch is now the largest single term.
 
+#### A requested song does not wait for its radio (2026-10-18)
+
+That catalogue request is now off the critical path when the song is known — a track
+from Home Assistant (`ytmusic:track:<id>`, played as the first song of its radio) or a
+playlist entry (`ytmusic:playlist:<id>:<videoId>`). `player.js` starts the song from a
+one-entry queue at once and fetches the list in parallel; when it arrives, the queue
+adopts it around the song that is already playing (`LocalQueue.adopt`: at its place in
+the list, or in front of it), and the next track is prefetched from there. The control
+API still answers once the list is known, with the same answer as before. A list that
+cannot be fetched no longer fails the request: the song plays as a queue of one. A
+playlist started without a song still waits for its list, because until then nothing is
+known to play.
+
 #### Compared: VISIONOS, youtubei.js and yt-dlp (2026-10-17)
 
 Measured on the add-on host with the deployed cookie jar: 11 videos (two of them YouTube

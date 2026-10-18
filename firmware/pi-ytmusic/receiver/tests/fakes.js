@@ -84,8 +84,12 @@ export class FakeCatalogue {
     return [];
   }
 
+  /** Set to a promise to hold `queue()` answers until it settles — a slow catalogue. */
+  hold = null;
+
   async queue(playlistId, videoId = null) {
     this.asked.push({ playlistId, videoId });
+    await this.hold;
     const page = this.pages[playlistId];
     if (!page) {
       throw new Error(`no such list ${playlistId}`);

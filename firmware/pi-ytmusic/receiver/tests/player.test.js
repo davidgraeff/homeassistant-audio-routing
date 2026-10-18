@@ -140,3 +140,31 @@ test('a list YouTube Music cannot queue is refused with a sentence and nothing p
   await assert.rejects(player.playLocal({ playlistId: 'PLempty' }), /empty queue/);
   assert.equal(mpv.loaded.length, 0);
 });
+
+test('a requested song plays before its radio has been fetched, and the radio follows it', async () => {
+  let release;
+  catalogue.hold = new Promise((r) => {
+    release = r;
+  });
+  const started = player.playLocal({ playlistId: 'RDAMVMvid00000002', videoId: 'vid00000002' });
+  await settle();
+  assert.equal(mpv.loaded.length, 1, 'playing while the catalogue is still answering');
+  assert.match(mpv.loaded[0], /vid00000002/);
+  release();
+  const answer = await started;
+  // At its own place in the radio (second, in this fixture), not restarted at the top.
+  assert.deepEqual(answer, { playlist_id: 'RDAMVMvid00000002', title: 'Song 2 Mix', length: 2, index: 1 });
+  await settle();
+  assert.equal(mpv.loaded.length, 1, 'adopting the list does not restart the song');
+  mpv.finishTrack();
+  await settle();
+  assert.match(mpv.loaded.at(-1), /vid00000007/, 'and the radio plays on, into its next page');
+});
+
+test('a song whose radio cannot be fetched still plays, as a queue of one', async () => {
+  const answer = await player.playLocal({ playlistId: 'RDAMVMnope', videoId: 'vid00000005' });
+  await settle();
+  assert.equal(answer.length, 1);
+  assert.match(mpv.loaded[0], /vid00000005/);
+  assert.equal((await player.describe()).status, 'playing');
+});

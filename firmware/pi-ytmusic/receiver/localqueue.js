@@ -101,6 +101,32 @@ export default class LocalQueue {
     this.continuation = this.#items.length < MAX_ITEMS ? (continuation ?? null) : null;
   }
 
+  /**
+   * Replace the list with a fetched page while keeping what plays.
+   *
+   * For a queue started before its list was known — `player.js` plays a requested song at
+   * once and fetches its radio in parallel. The current track stays current: at its place
+   * in the page when the page has it (its richer catalogue entry replacing a bare id), in
+   * front of it otherwise.
+   */
+  adopt(items, continuation) {
+    const page = (items ?? []).filter((t) => t?.video_id).slice(0, MAX_ITEMS);
+    if (!page.length) {
+      return;
+    }
+    const current = this.current;
+    const at = current ? page.findIndex((t) => t.video_id === current.video_id) : -1;
+    if (current && at < 0) {
+      this.#items = [ current, ...page ].slice(0, MAX_ITEMS);
+      this.#index = 0;
+    }
+    else {
+      this.#items = page;
+      this.#index = Math.max(0, at);
+    }
+    this.continuation = this.#items.length < MAX_ITEMS ? (continuation ?? null) : null;
+  }
+
   /** Items around the current one: `before` behind it, `after` ahead, with their index. */
   window({ before = 0, after = 50 } = {}) {
     const start = Math.max(0, this.#index - before);

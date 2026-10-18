@@ -310,10 +310,17 @@ export default class MpvPlayer extends Player {
    * *started*; the first track's resolve then runs in the background, visible as the
    * `loading` state, so Home Assistant's service call returns in about a second rather
    * than after a cold resolve. Throws with a sentence when the list cannot be queued.
+   *
+   * With a `videoId` the song is known before its list is, so it does not wait for it:
+   * the catalogue request (0.7-1.0 s on the add-on, the largest term of a start once
+   * resolving took ~0.2 s) runs while the song already plays — see `#playLocalEarly`.
    */
   async playLocal({ playlistId, videoId = null }) {
     if (!this.#catalogue) {
       throw new Error('this receiver has no catalogue to build a queue from');
+    }
+    if (videoId) {
+      return this.#playLocalEarly({ playlistId, videoId });
     }
     const page = await this.#catalogue.queue(playlistId, videoId);
     if (!page.items?.length) {
@@ -334,6 +341,60 @@ export default class MpvPlayer extends Player {
       `[MpvPlayer] playing ${playlistId}${queue.title ? ` ("${queue.title}")` : ''} from the receiver's own queue `
       + `(${queue.length} track(s) from #${start + 1})`);
     void this.#playLocalCurrent();
+    return { playlist_id: queue.playlistId, title: queue.title, length: queue.length, index: queue.index };
+  }
+
+  /**
+   * Play `videoId` now from a one-entry queue, and turn that into the list once the
+   * catalogue answers. The answer is the same as `playLocal`'s, and arrives at the same
+   * time; only the music no longer waits for it.
+   *
+   * If the catalogue fails, the song keeps playing as a queue of one — better than the old
+   * behaviour of failing the request with nothing audible. If the song itself could not be
+   * played by then, the list's next entry is started, as a failed local track always is.
+   */
+  async #playLocalEarly({ playlistId, videoId }) {
+    const queue = new LocalQueue({ playlistId,
+      items: [ { ...(this.#catalogue.track(videoId) ?? {}), video_id: videoId } ] });
+    await this.#enterLocal(queue);
+    const generation = this.#localGeneration;
+    // Whether the first track is settled, and how. One that fails *after* the list arrived
+    // needs nothing from here: #playLocalCurrentOrThrow skips forward through the adopted
+    // list itself. Only a failure that came first, with a one-entry queue to skip in,
+    // leaves the list unplayed.
+    let firstOk = null;
+    void this.#playLocalCurrent().then((ok) => {
+      firstOk = ok;
+    });
+    let page = null;
+    try {
+      page = await this.#catalogue.queue(playlistId, videoId);
+    }
+    catch (e) {
+      this.logger.warn(`[MpvPlayer] could not fetch ${playlistId} (${e.message}) — playing ${videoId} on its own`);
+    }
+    const current = () => this.#local === queue && this.#localGeneration === generation;
+    if (page?.items?.length && current()) {
+      queue.adopt(page.items, page.continuation ?? null);
+      queue.title = page.title ?? null;
+      if (page.playlist_id) {
+        queue.playlistId = page.playlist_id;
+      }
+      if (firstOk === false) {
+        if (queue.advance()) {
+          void this.#playLocalCurrent();
+        }
+      }
+      else {
+        // The list did not exist when the first track started, so nothing was prefetched.
+        this.#prefetchUpcoming();
+      }
+    }
+    this.#history?.record({ playlist_id: playlistId, title: queue.title,
+      thumbnail: page?.items?.[0]?.thumbnail ?? queue.current?.thumbnail ?? null, origin: 'local' });
+    this.logger.info(
+      `[MpvPlayer] playing ${playlistId}${queue.title ? ` ("${queue.title}")` : ''} from the receiver's own queue `
+      + `(${queue.length} track(s) from #${queue.index + 1}, started before the list arrived)`);
     return { playlist_id: queue.playlistId, title: queue.title, length: queue.length, index: queue.index };
   }
 
