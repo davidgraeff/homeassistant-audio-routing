@@ -197,3 +197,31 @@ test('a cached song plays from its file, and a streamed one is handed to the cac
   assert.equal(mpv.loaded.at(-1), 'https://rr.example/vid00000002', 'not cached yet, so it streams');
   assert.deepEqual(resolved.filter((id) => id === 'vid00000001'), [], 'the cached song was never resolved');
 });
+
+test('a stream mpv cannot open is retried from the cached copy, and the queue does not skip it', async () => {
+  const cache = {
+    files: {},
+    has(id) { return !!this.files[id]; },
+    lookup(id) { return this.files[id] ?? null; },
+    fetch() {},
+    // The ranged download alongside the stream finished: what audiocache.js answers then.
+    async ready(id) { this.files[id] = `/cache/${id}.webm`; return this.files[id]; },
+    async remove(id) { delete this.files[id]; },
+  };
+  const invalidated = [];
+  const resolver = { enabled: true, peek: () => null, prefetch() {}, invalidate(id) { invalidated.push(id); },
+    async urlFor(id) { return { url: `https://rr.example/${id}`, headers: {} }; } };
+  player = new MpvPlayer(mpv, null, resolver, { catalogue, cache });
+  player.setLogger(quietLogger);
+  player.queue.setLogger(quietLogger);
+  player.queue.setRequestHandler({ async getPreviousNextVideosAbortable() { return { previous: null, next: null }; },
+    reset() {}, setLogger() {} });
+  mpv.failOpens = 1;
+  await player.playLocal({ playlistId: 'PLroad' });
+  await settle();
+  assert.deepEqual(mpv.loaded, [ 'https://rr.example/vid00000001', '/cache/vid00000001.webm' ]);
+  assert.deepEqual(invalidated, [], 'no second resolve: the file was there');
+  const d = await player.describe();
+  assert.equal(d.status, 'playing');
+  assert.equal(d.queue.index, 0, 'the failed open did not also skip to the next song');
+});

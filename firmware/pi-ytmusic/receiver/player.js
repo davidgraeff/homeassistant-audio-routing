@@ -52,6 +52,12 @@ const CAST_HYDRATE_AHEAD = 25;
  * as failed while yt-dlp was still working.
  */
 const PLAY_START_TIMEOUT_MS = 150000;
+/**
+ * How long a stream mpv could not open may wait for the audio cache's copy of it before the
+ * retry asks yt-dlp instead. The copy is fetched in ranges alongside the stream and is
+ * normally on disk within half a second; a yt-dlp resolve costs several.
+ */
+const CACHE_RESCUE_MS = 3000;
 
 export default class MpvPlayer extends Player {
   #mpv;
@@ -77,6 +83,13 @@ export default class MpvPlayer extends Player {
   #localGeneration = 0;
   /** Songs on disk (audiocache.js); absent means every play streams. */
   #cache = null;
+  /**
+   * Loads in flight in `doPlay`. A file that fails to *open* emits `end-file reason=error`
+   * too, and that failure is `doPlay`'s to handle — it retries. Left to the end-file
+   * handler as well, the same failure also skipped to the next track: observed, a requested
+   * song replaced by its successor while its own retry was starting.
+   */
+  #loading = 0;
 
   constructor(mpv, metadata = null, resolver = null, { catalogue = null, history = null, cache = null } = {}) {
     super();
@@ -106,6 +119,9 @@ export default class MpvPlayer extends Player {
       // `playlist_entry_id`, if this ever needs to correlate precisely.)
       if (reason === 'stop' || reason === 'quit' || reason === 'redirect') {
         return;
+      }
+      if (reason === 'error' && this.#loading > 0) {
+        return; // a file that would not open: doPlay's to retry, see #loading
       }
       if (reason === 'error') {
         // A single unplayable track must not end the session: log it and move on,
@@ -219,25 +235,31 @@ export default class MpvPlayer extends Player {
     if (position > 0) {
       options.push(`start=${position}`);
     }
+    let ok;
+    this.#loading += 1;
     try {
-      await this.#mpv.command('loadfile', url, 'replace', -1, options.join(','));
-    }
-    catch (e) {
-      if (!/invalid parameter/i.test(e.message)) {
-        this.logger.error(`[MpvPlayer] loadfile failed: ${e.message}`);
-        return false;
-      }
-      this.logger.debug('[MpvPlayer] loadfile 5-arg form rejected; trying the older 4-arg form');
       try {
-        await this.#mpv.command('loadfile', url, 'replace', options.join(','));
+        await this.#mpv.command('loadfile', url, 'replace', -1, options.join(','));
       }
-      catch (e2) {
-        this.logger.error(`[MpvPlayer] loadfile failed: ${e2.message}`);
-        return false;
+      catch (e) {
+        if (!/invalid parameter/i.test(e.message)) {
+          this.logger.error(`[MpvPlayer] loadfile failed: ${e.message}`);
+          return false;
+        }
+        this.logger.debug('[MpvPlayer] loadfile 5-arg form rejected; trying the older 4-arg form');
+        try {
+          await this.#mpv.command('loadfile', url, 'replace', options.join(','));
+        }
+        catch (e2) {
+          this.logger.error(`[MpvPlayer] loadfile failed: ${e2.message}`);
+          return false;
+        }
       }
+      ok = await started;
     }
-
-    const ok = await started;
+    finally {
+      this.#loading -= 1;
+    }
     this.logger.info(
       `[MpvPlayer] ${video.id} ${ok ? 'loaded' : 'failed'} after ${since(startedAt)}s `
       + `(resolve ${((resolvedAt - startedAt) / 1000).toFixed(1)}s, mpv ${since(resolvedAt)}s)`);
@@ -253,17 +275,37 @@ export default class MpvPlayer extends Player {
       // The `#retriedFor` guard is load-bearing: without it, a fresh resolve is
       // also a "direct" URL, so a URL that consistently fails to play would
       // recurse forever.
-      this.logger.warn(`[MpvPlayer] ${file ? 'cached file' : 'direct URL'} for ${video.id} did not play — retrying once`);
       this.#retriedFor = video.id;
       if (file) {
+        this.logger.warn(`[MpvPlayer] cached file for ${video.id} did not play — retrying once, streamed`);
         await this.#cache.remove(video.id);
       }
+      else if (await this.#cache?.ready(video.id, CACHE_RESCUE_MS)) {
+        // The stream would not open (googlevideo's intermittent 503), but the copy fetched
+        // in ranges alongside it made it: play that rather than resolve the song again.
+        this.logger.warn(`[MpvPlayer] stream for ${video.id} did not play — retrying once, from the cached copy`);
+      }
       else {
+        this.logger.warn(`[MpvPlayer] direct URL for ${video.id} did not play — retrying once`);
         this.#resolver?.invalidate(video.id);
       }
       return this.doPlay(video, position);
     }
     this.#retriedFor = null;
+    if (!ok && !this.#local) {
+      // Out of retries on a cast queue: move on, as the end-file handler would for a track
+      // that broke while playing. (A local queue skips forward in #playLocalCurrentOrThrow.)
+      // Deferred, because this runs inside the base class's own play().
+      setImmediate(() => void (async () => {
+        try {
+          await this.pause();
+          await this.next();
+        }
+        catch (e) {
+          this.logger.error(`[MpvPlayer] failed to advance queue: ${e.message}`);
+        }
+      })());
+    }
     if (ok) {
       this.#prefetchUpcoming();
     }

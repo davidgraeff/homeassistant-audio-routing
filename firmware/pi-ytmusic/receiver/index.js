@@ -116,6 +116,12 @@ function buildMpvArgs() {
     // push the player into swap. 32 MiB is ~30 min of Opus, so it never binds in
     // practice.
     '--demuxer-max-bytes=32MiB',
+    // Retry a 5xx instead of failing the file. googlevideo answers the open-ended GET mpv
+    // streams with intermittently with 503 — 3 of 8 opens of URLs that had just passed
+    // resolver.js's two-byte check, measured on the add-on — and ffmpeg's HTTP client
+    // gives up on the first one unless told otherwise. With these, 9 of 10 opened; the
+    // rest is player.js's retry, which falls back to the audio cache's copy.
+    '--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_http_error=5xx,reconnect_delay_max=2',
   ];
   if (process.env.YTCR_YTDL_PATH) {
     args.push(`--script-opts=ytdl_hook-ytdl_path=${process.env.YTCR_YTDL_PATH}`);

@@ -10,6 +10,8 @@ export const quietLogger = { debug() {}, info() {}, warn() {}, error() {} };
 /** Just enough of MpvClient: loadfile → file-loaded + playback-restart, stop → end-file. */
 export class FakeMpv extends EventEmitter {
   loaded = [];
+  /** How many of the next opens fail, as googlevideo's intermittent 503 makes them. */
+  failOpens = 0;
   props = { volume: 100, mute: false, 'time-pos': 12.5, duration: 200 };
 
   async command(name, ...args) {
@@ -19,6 +21,13 @@ export class FakeMpv extends EventEmitter {
         this.emit('end-file', { reason: 'stop' });
       }
       this.loaded.push(args[0]);
+      if (this.failOpens > 0) {
+        // A file mpv cannot open: an error end-file, and no file-loaded.
+        this.failOpens -= 1;
+        this.playing = false;
+        setImmediate(() => this.emit('end-file', { reason: 'error', file_error: 'loading failed' }));
+        return null;
+      }
       this.playing = true;
       setImmediate(() => {
         this.emit('file-loaded', {});

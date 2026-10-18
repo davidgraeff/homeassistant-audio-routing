@@ -33,6 +33,13 @@ const CHUNK_BYTES = 10 * 1024 * 1024;
 const CHUNK_TIMEOUT_MS = 30000;
 /** Downloads waiting their turn; past this, new ones are dropped rather than queued. */
 const MAX_PENDING = 8;
+/**
+ * Extra tries per range after a 5xx or a dropped connection, and the pause before each.
+ * googlevideo answers 503 intermittently — ~1 request in 3 at times — and the next try
+ * usually succeeds.
+ */
+const RANGE_RETRIES = 2;
+const RANGE_RETRY_DELAY_MS = 400;
 const VIDEO_ID = /^[\w-]{11}$/;
 
 export default class AudioCache {
@@ -42,8 +49,11 @@ export default class AudioCache {
   /** videoId -> { file, size, used } for complete files. */
   #entries = new Map();
   #total = 0;
-  /** videoIds downloading or waiting to, so one song is never fetched twice at once. */
-  #pending = new Set();
+  /**
+   * videoId -> promise of its file (or null), for downloads running or waiting their turn:
+   * one song is never fetched twice at once, and a caller can wait for it (`ready`).
+   */
+  #pending = new Map();
   #chain = Promise.resolve();
 
   constructor({ dir, maxBytes, logger = console }) {
@@ -122,11 +132,41 @@ export default class AudioCache {
       this.#logger.debug(`[audiocache] ${MAX_PENDING} downloads waiting — not caching ${videoId}`);
       return;
     }
-    this.#pending.add(videoId);
-    this.#chain = this.#chain
+    const done = this.#chain
       .then(() => this.#download(videoId, url, headers))
-      .catch((e) => this.#logger.warn(`[audiocache] could not cache ${videoId}: ${e.message}`))
+      .then(() => this.#entries.get(videoId)?.file ?? null)
+      .catch((e) => {
+        this.#logger.warn(`[audiocache] could not cache ${videoId}: ${e.message}`);
+        return null;
+      })
       .finally(() => this.#pending.delete(videoId));
+    this.#pending.set(videoId, done);
+    this.#chain = done;
+  }
+
+  /**
+   * The file for `videoId` once its download — running, or waiting its turn — is done, or
+   * null if there is none, it fails, or `timeoutMs` passes first. For `player.js`: a stream
+   * mpv could not open is usually on disk a moment later, fetched in ranges alongside it.
+   */
+  async ready(videoId, timeoutMs) {
+    if (this.#entries.has(videoId)) {
+      return this.#entries.get(videoId).file;
+    }
+    const pending = this.#pending.get(videoId);
+    if (!pending) {
+      return null;
+    }
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+    });
+    try {
+      return await Promise.race([ pending, timeout ]);
+    }
+    finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Resolves once every download queued so far has finished; for tests and shutdown. */
@@ -148,7 +188,7 @@ export default class AudioCache {
     try {
       for (;;) {
         const end = length ? Math.min(length, written + CHUNK_BYTES) - 1 : written + CHUNK_BYTES - 1;
-        const res = await getRange(url, { ...headers, Range: `bytes=${written}-${end}` });
+        const res = await getRangeRetrying(url, { ...headers, Range: `bytes=${written}-${end}` });
         if (res.status === 416 && !length && written > 0) {
           break; // asked past the end of a file of unknown length
         }
@@ -211,6 +251,27 @@ function extensionFor(mime) {
     return 'm4a';
   }
   return 'media';
+}
+
+/** `getRange`, tried again after a 5xx or a dropped connection (RANGE_RETRIES). */
+async function getRangeRetrying(url, headers) {
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    try {
+      res = await getRange(url, headers);
+    }
+    catch (e) {
+      if (attempt >= RANGE_RETRIES) {
+        throw e;
+      }
+      await new Promise((r) => setTimeout(r, RANGE_RETRY_DELAY_MS));
+      continue;
+    }
+    if (res.status < 500 || attempt >= RANGE_RETRIES) {
+      return res;
+    }
+    await new Promise((r) => setTimeout(r, RANGE_RETRY_DELAY_MS));
+  }
 }
 
 /** One range request, read whole: `{ status, contentRange, body }`, bounded in time. */

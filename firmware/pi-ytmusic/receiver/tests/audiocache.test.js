@@ -95,3 +95,28 @@ test('a song larger than the whole cache is not fetched at all', async () => {
   await cache.idle();
   assert.equal(requests.length, 0);
 });
+
+test('a range answered 503 is tried again, and a waiting caller gets the file', async () => {
+  let refusals = 1;
+  const flaky = createServer((req, res) => {
+    if (refusals-- > 0) {
+      res.writeHead(503).end();
+      return;
+    }
+    const [ , from, to ] = /bytes=(\d+)-(\d+)/.exec(req.headers.range);
+    const end = Math.min(Number(to), SONG.length - 1);
+    res.writeHead(206, { 'Content-Range': `bytes ${from}-${end}/${SONG.length}` });
+    res.end(SONG.subarray(Number(from), end + 1));
+  });
+  await new Promise((r) => flaky.listen(0, '127.0.0.1', r));
+  try {
+    const cache = new AudioCache({ dir, maxBytes: 100 << 20, logger: quietLogger });
+    await cache.init();
+    assert.equal(await cache.ready('vid00000001', 10), null, 'nothing on its way yet');
+    cache.fetch('vid00000001', `http://127.0.0.1:${flaky.address().port}/a?mime=audio%2Fwebm&clen=${SONG.length}`);
+    assert.equal(await cache.ready('vid00000001', 10000), path.join(dir, 'vid00000001.webm'));
+  }
+  finally {
+    flaky.close();
+  }
+});

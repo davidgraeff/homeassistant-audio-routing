@@ -563,6 +563,25 @@ works without the cache. A cached file that does not play is deleted and the ret
 streams. The log says which it was: `play <id> from 0s (cached)` and
 `[audiocache] cached <id> (4.4 MiB in 0.1s)`.
 
+**A stream that will not open, and the copy that rescues it.** googlevideo answers the
+open-ended GET mpv streams with intermittently with **503** — 3 of 8 opens, of URLs that
+had just passed the two-byte check, measured on 2026-10-18 — and ffmpeg gives up on the
+first one. Three layers, cheapest first:
+
+1. mpv runs with `--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_http_error=5xx,reconnect_delay_max=2`,
+   so ffmpeg retries a 5xx itself: 9 of 10 opened.
+2. A cache download retries a range answered 5xx (twice, 400 ms apart).
+3. When mpv still cannot open the stream, `doPlay`'s one retry first waits up to 3 s for
+   the song's ranged download — running alongside, normally done in under half a second —
+   and plays that file. Only without one does the retry resolve the song again.
+
+That failure also exposed a race older than the cache: a file that fails to *open* emits
+`end-file reason=error` like one that breaks mid-song, so the end-file handler skipped to
+the next track **while** `doPlay` retried the same one — observed, a requested song
+replaced by its successor. The handler now leaves open failures to `doPlay` (`#loading`),
+and `doPlay`, out of retries on a cast queue, advances the queue itself; a local queue
+already skips forward on its own.
+
 #### Compared: VISIONOS, youtubei.js and yt-dlp (2026-10-17)
 
 Measured on the add-on host with the deployed cookie jar: 11 videos (two of them YouTube
