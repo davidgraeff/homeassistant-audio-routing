@@ -37,6 +37,6 @@ cp "$src"/*.js "$src"/*.py "$src"/*.html "$src"/package.json "$dst/"
 #     judge an upload, so cookies cannot be provisioned at all.
 #   admin.js / admin.html              the admin page itself, which is what ingress
 #     proxies to — its absence is a blank panel.
-for required in ytdlp_daemon.py jsc_resident.py jsc_worker.js visionos.js castqueue.js audiocache.js ytm_catalogue.py cookie_jar.py admin.js admin.html control.js; do
+for required in ytdlp_daemon.py jsc_resident.py jsc_worker.js visionos.js castqueue.js audiocache.js playlimit.js ytm_catalogue.py cookie_jar.py admin.js admin.html control.js; do
   [ -f "$dst/$required" ] || { echo "ERROR: $src/$required missing" >&2; exit 1; }
 done

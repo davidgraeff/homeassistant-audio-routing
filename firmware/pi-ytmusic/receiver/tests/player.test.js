@@ -225,3 +225,44 @@ test('a stream mpv cannot open is retried from the cached copy, and the queue do
   assert.equal(d.status, 'playing');
   assert.equal(d.queue.index, 0, 'the failed open did not also skip to the next song');
 });
+
+test('past the maximum continuous play the queue stops at the end of the song, and play continues the list', async () => {
+  const reached = { reached: false, overrun: false, maxMinutes: 180, resets: 0,
+    sample() {}, reset() { this.resets += 1; this.reached = false; },
+    describe() { return { played_minutes: 181 }; } };
+  player = new MpvPlayer(mpv, null, null, { catalogue, limit: reached });
+  player.setLogger(quietLogger);
+  player.queue.setLogger(quietLogger);
+  player.queue.setRequestHandler({ async getPreviousNextVideosAbortable() { return { previous: null, next: null }; },
+    reset() {}, setLogger() {} });
+  await player.playLocal({ playlistId: 'PLroad' });
+  await settle();
+  assert.equal(reached.resets, 1, 'a play request starts the count');
+  reached.reached = true; // three hours later
+  mpv.finishTrack();
+  await settle();
+  assert.equal(mpv.loaded.length, 1, 'the next song was not started');
+  assert.equal((await player.describe()).status, 'stopped');
+  assert.equal(reached.resets, 2, 'the auto-stop is a break');
+  await player.resume();
+  await settle();
+  assert.match(mpv.loaded.at(-1), /vid00000002/, 'resuming continues with the next song');
+});
+
+test('a phone choosing something starts the auto-stop count again; a bare queue update does not', async () => {
+  const limit = { resets: 0, reached: false, overrun: false, maxMinutes: 180, sample() {},
+    reset() { this.resets += 1; }, describe() { return { played_minutes: 0 }; } };
+  player = new MpvPlayer(mpv, null, null, { catalogue, limit });
+  player.setLogger(quietLogger);
+  player.queue.setLogger(quietLogger);
+  player.queue.setRequestHandler({ async getPreviousNextVideosAbortable() { return { previous: null, next: null }; },
+    reset() {}, setLogger() {} });
+  const payload = (eventType) => ({ listId: 'PLmine', videoIds: 'vid00000001,vid00000002', videoId: 'vid00000001',
+    currentIndex: '0', ...(eventType ? { eventDetails: JSON.stringify({ eventType }) } : {}) });
+  await player.queue.updateByMessage({ name: 'updatePlaylist', payload: payload(null) }, null);
+  assert.equal(limit.resets, 0, 'a phone syncing its queue on its own');
+  await player.queue.updateByMessage({ name: 'updatePlaylist', payload: payload('VIDEO_SELECTED') }, null);
+  assert.equal(limit.resets, 1, 'somebody picked a song');
+  await player.queue.updateByMessage({ name: 'setPlaylist', payload: payload(null) }, null);
+  assert.equal(limit.resets, 2, 'somebody cast a list');
+});

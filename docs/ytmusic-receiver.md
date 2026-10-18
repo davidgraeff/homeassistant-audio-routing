@@ -240,6 +240,27 @@ loaded (run.sh only warns about that once, at boot), whether a phone is connecte
 is doing (asked over its IPC socket, so there is no second copy of the state to go stale),
 the yt-dlp version, and whether the long-lived resolver is running.
 
+And it holds the receiver's one setting of its own, the **auto-stop**
+([`playlimit.js`](../firmware/pi-ytmusic/receiver/playlimit.js)): the most it plays without a
+break — default **3 hours**, `0` never stops — after which it stops by itself, because a
+radio never ends and a long playlist runs for hours, so music started and forgotten plays to
+an empty room. Saved through `POST /api/settings` (`{"max_continuous_play_minutes": N}`)
+into `settings.json` in the state directory, next to the play history, and in effect at once.
+
+- **What counts** is time spent *playing*, sampled every 30 s. A pause or stop of 10 minutes
+  or more is a break and starts the count again; so does somebody starting something on
+  purpose — a play request from Home Assistant, or a phone casting a list, picking a song or
+  queuing one. Songs following each other on their own do not, and neither does a bare
+  `updatePlaylist`: phones send those unprompted, and counting them would reset the count on
+  every song.
+- **Where it stops:** the song playing when the limit is reached plays to its end, and the
+  queue then stops instead of advancing — through the base class, so a connected phone shows
+  it stopped. A single song still going 15 minutes past the limit (an hour-long mix) is
+  stopped where it is. A local queue is moved past the finished song first, so pressing play
+  continues the list rather than repeating it; and the stop is itself a break.
+- The log says so: `[MpvPlayer] 3 h 0 min of continuous play — stopping at the end of the song
+  (maximum 180 min, set on the admin page)`.
+
 **On the Pi it is off unless asked for** (`setup_pi_ytmusic.py --admin-port`). That is a
 security decision, not a default: in the add-on the page sits behind ingress, which
 authenticates the visitor, whereas on the Pi it would be an unauthenticated LAN endpoint that

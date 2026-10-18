@@ -453,8 +453,10 @@ async function playback(mpv) {
  * @param {number} o.rtpPort             The UDP port this receiver transmits to.
  * @param {object} o.jar                 `{file, python, ytdlp, jsRuntime}` for the cookie jar.
  * @param {object} o.probes              `{mpv, resolverDaemon, sender}` live state accessors.
+ * @param {object} [o.playLimit]         The auto-stop (playlimit.js); its limit is set here.
  */
-export default function startAdmin({ port, bind, device, router, rtpPort, jar, probes, logger = console }) {
+export default function startAdmin({ port, bind, device, router, rtpPort, jar, probes, playLimit = null,
+  logger = console }) {
   if (!port) {
     return null;
   }
@@ -486,7 +488,29 @@ export default function startAdmin({ port, bind, device, router, rtpPort, jar, p
         rtp: { host: router.host, port: rtpPort, required: REQUIRED_RTP },
         router: routerStatus,
         cookies: cookieStatus,
+        playback_limit: playLimit?.describe() ?? null,
       } ];
+    },
+
+    // The receiver's own settings. One so far: the auto-stop's maximum continuous play.
+    'POST /api/settings': async (req) => {
+      if (!playLimit) {
+        return [ 404, { ok: false, error: 'this receiver has no auto-stop' } ];
+      }
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      }
+      catch {
+        return [ 400, { ok: false, error: 'expected a JSON body' } ];
+      }
+      try {
+        playLimit.setMaxMinutes(body.max_continuous_play_minutes);
+      }
+      catch (e) {
+        return [ 400, { ok: false, error: e.message } ];
+      }
+      return [ 200, { ok: true, playback_limit: playLimit.describe() } ];
     },
 
     'POST /api/rtp-source': async () => {

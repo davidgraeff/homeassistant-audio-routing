@@ -37,6 +37,9 @@ page:
    authenticate *before* storing it, and *Test playback* proves it resolves a real video with
    this box's own yt-dlp. The page also spells out how to export one with yt-dlp, including
    the part that actually matters: use a browser profile you then abandon.
+3. **Playback** — the auto-stop: the most the receiver plays without a break before it stops
+   by itself, default **3 hours** (`0` never stops). The song playing then still finishes; a
+   pause of 10 minutes, or starting something yourself, starts the count again.
 
 With no jar the receiver resolves anonymously — no Premium, no ad-free playback, and YouTube
 stops answering before long. The jar is a live, rotating credential rather than a config

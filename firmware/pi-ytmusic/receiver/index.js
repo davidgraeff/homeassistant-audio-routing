@@ -30,6 +30,7 @@ import MetadataReporter from './metadata.js';
 import MpvClient from './mpv.js';
 import MpvPlayer from './player.js';
 import AudioCache from './audiocache.js';
+import PlayLimit from './playlimit.js';
 import CastQueueHandler from './castqueue.js';
 import Resolver from './resolver.js';
 import VisionOsResolver from './visionos.js';
@@ -348,7 +349,14 @@ async function main() {
     }
   }
 
-  const player = new MpvPlayer(mpv, metadata, resolver, { catalogue, history, cache });
+  // The auto-stop (playlimit.js): its limit is set on the admin page and kept next to
+  // the play history, so it survives restarts.
+  const playLimit = new PlayLimit({
+    file: path.join(process.env.YTCR_STATE_DIR || process.cwd(), 'settings.json'),
+    logger: console,
+  }).load();
+
+  const player = new MpvPlayer(mpv, metadata, resolver, { catalogue, history, cache, limit: playLimit });
 
   const receiver = new YouTubeCastReceiver(player, {
     dial: {
@@ -367,6 +375,7 @@ async function main() {
   ytdlpDaemon?.setLogger(receiver.logger);
   catalogue.setLogger(receiver.logger);
   cache?.setLogger(receiver.logger);
+  playLimit.setLogger(receiver.logger);
   history.setLogger(receiver.logger);
   metadata?.attach(mpv);
 
@@ -456,6 +465,7 @@ async function main() {
       resolverDaemon: () => !!ytdlpDaemon,
       sender: () => connectedSender,
     },
+    playLimit,
     logger: receiver.logger,
   });
 

@@ -37,6 +37,13 @@ const { PLAYER_STATUSES, CLIENTS } = Constants;
 /** The cast queue's events, i.e. "a phone changed what is queued". */
 const CAST_QUEUE_EVENTS = [ 'playlistSet', 'playlistAdded', 'playlistUpdated', 'playlistCleared',
   'videoSelected', 'videoAdded', 'videoRemoved' ];
+/**
+ * The cast-queue events that are somebody choosing something, which start the auto-stop's
+ * count again. Not `playlistUpdated`: a phone sends a bare `updatePlaylist` on its own —
+ * one arrived mid-playback with nobody touching it — and counting those would reset the
+ * count on every song, so a cast would never stop.
+ */
+const CHOICE_EVENTS = new Set([ 'playlistSet', 'playlistAdded', 'videoSelected', 'videoAdded' ]);
 /** Skip at most this many unplayable tracks in a row before giving up on a local queue. */
 const MAX_LOCAL_SKIPS = 3;
 /** How many upcoming cast-queue ids to name for the control API's queue. */
@@ -58,6 +65,8 @@ const PLAY_START_TIMEOUT_MS = 150000;
  * normally on disk within half a second; a yt-dlp resolve costs several.
  */
 const CACHE_RESCUE_MS = 3000;
+/** How often the auto-stop counts playing time (playlimit.js). Its limit is in hours. */
+const LIMIT_SAMPLE_MS = 30 * 1000;
 
 export default class MpvPlayer extends Player {
   #mpv;
@@ -90,8 +99,11 @@ export default class MpvPlayer extends Player {
    * song replaced by its successor while its own retry was starting.
    */
   #loading = 0;
+  /** Auto-stop after a maximum of continuous play (playlimit.js); absent means never. */
+  #limit = null;
 
-  constructor(mpv, metadata = null, resolver = null, { catalogue = null, history = null, cache = null } = {}) {
+  constructor(mpv, metadata = null, resolver = null,
+    { catalogue = null, history = null, cache = null, limit = null } = {}) {
     super();
     this.#mpv = mpv;
     this.#metadata = metadata;
@@ -99,6 +111,11 @@ export default class MpvPlayer extends Player {
     this.#catalogue = catalogue;
     this.#history = history;
     this.#cache = cache;
+    this.#limit = limit;
+    if (limit) {
+      // unref: a sampling timer must never be what keeps the process alive.
+      setInterval(() => void this.#sampleLimit(), LIMIT_SAMPLE_MS).unref?.();
+    }
 
     const onCastQueue = (event) => this.#onCastQueue(event);
     for (const type of CAST_QUEUE_EVENTS) {
@@ -133,6 +150,10 @@ export default class MpvPlayer extends Player {
       }
       void (async () => {
         try {
+          if (this.#limitReached()) {
+            await this.#autoStop('at the end of the song');
+            return;
+          }
           await this.pause();
           await this.next();
         }
@@ -141,6 +162,39 @@ export default class MpvPlayer extends Player {
         }
       })();
     });
+  }
+
+  // --- auto-stop (playlimit.js) ---------------------------------------------------------
+
+  /** Whether the next track change should be a stop instead. Counts the song just ended. */
+  #limitReached() {
+    this.#limit?.sample(true);
+    return !!this.#limit?.reached;
+  }
+
+  async #sampleLimit() {
+    this.#limit.sample(this.status === PLAYER_STATUSES.PLAYING);
+    if (this.#limit.overrun && this.status === PLAYER_STATUSES.PLAYING) {
+      // One song running far past the limit — an hour-long mix — is not waited for.
+      await this.#autoStop('in the middle of an overlong song').catch((e) =>
+        this.logger.error(`[MpvPlayer] auto-stop failed: ${e.message}`));
+    }
+  }
+
+  /**
+   * Stop because the limit was reached, through the base class so a phone sees it. A local
+   * queue moves past the song that just ended first, so pressing play afterwards continues
+   * the list instead of repeating it. The stop is a break: the count starts again.
+   */
+  async #autoStop(where) {
+    const { played_minutes: played } = this.#limit.describe();
+    this.logger.info(`[MpvPlayer] ${Math.floor(played / 60)} h ${played % 60} min of continuous play — `
+      + `stopping ${where} (maximum ${this.#limit.maxMinutes} min, set on the admin page)`);
+    if (where === 'at the end of the song') {
+      this.#local?.advance();
+    }
+    this.#limit.reset();
+    await this.stop();
   }
 
   async doPlay(video, position) {
@@ -388,6 +442,7 @@ export default class MpvPlayer extends Player {
     if (!this.#catalogue) {
       throw new Error('this receiver has no catalogue to build a queue from');
     }
+    this.#limit?.reset();
     if (videoId) {
       return this.#playLocalEarly({ playlistId, videoId });
     }
@@ -558,6 +613,10 @@ export default class MpvPlayer extends Player {
   #onCastQueue(event) {
     if (this.#selfQueueUpdate) {
       return;
+    }
+    // A phone choosing something is somebody there: the auto-stop counts from here.
+    if (CHOICE_EVENTS.has(event?.type)) {
+      this.#limit?.reset();
     }
     if (this.#local) {
       this.logger.info(`[MpvPlayer] a phone changed the queue (${event?.type}) — leaving the receiver's own queue`);

@@ -94,6 +94,11 @@
   .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
 
   input[type=file] { font: inherit; font-size: 0.9rem; max-width: 100%; }
+  input[type=number] {
+    font: inherit; font-size: 0.9rem; width: 6rem; padding: 7px 10px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--text);
+  }
+  label { font-size: 0.9rem; }
   pre {
     background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
     padding: 10px 12px; overflow-x: auto; font-size: 0.82rem; margin: 8px 0;
@@ -200,7 +205,38 @@
     </details>
   </section>
 
-  <!-- 3. the receiver itself --------------------------------------------- -->
+  <!-- 3. auto-stop ------------------------------------------------------- -->
+  <section id="limit-section" hidden>
+    <h2>Playback <span id="limit-pill" class="pill unknown">checking…</span></h2>
+    <p class="small muted">
+      A radio never ends and a long playlist runs for hours, so music started and
+      forgotten plays to an empty room. The receiver stops by itself after this much
+      continuous play: the song playing then still plays to its end.
+    </p>
+    <dl id="limit-facts"></dl>
+    <div class="row">
+      <label for="limit-hours">Maximum continuous play</label>
+      <input type="number" id="limit-hours" min="0" max="24" step="0.5" inputmode="decimal">
+      <span class="small muted">hours — 0 never stops</span>
+      <button id="limit-save">Save</button>
+    </div>
+    <div id="limit-msg" class="msg" hidden></div>
+    <details>
+      <summary>What counts as continuous</summary>
+      <ul class="small">
+        <li>Only time spent playing. A pause or stop of <span id="limit-break">10</span> minutes
+          or more is a break, and the count starts again.</li>
+        <li>Starting something yourself — from Home Assistant, or by casting or picking a
+          song on the phone — also starts the count again. Songs following each other on
+          their own do not.</li>
+        <li>A single song still playing <span id="limit-grace">15</span> minutes past the
+          limit (an hour-long mix) is stopped where it is.</li>
+        <li>After an auto-stop, play continues where it stopped.</li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- 4. the receiver itself --------------------------------------------- -->
   <section>
     <h2>Receiver <span id="recv-pill" class="pill unknown">checking…</span></h2>
     <p class="small muted">
@@ -405,7 +441,59 @@ function renderReceiver(s) {
   $('footer').textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
 
+const hm = (minutes) => {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h ? `${h} h${m ? ` ${m} min` : ''}` : `${m} min`;
+};
+
+function renderLimit(s) {
+  const l = s.playback_limit;
+  $('limit-section').hidden = !l;
+  if (!l) return;
+  if (!l.max_minutes) {
+    pill($('limit-pill'), 'unknown', 'never stops');
+  }
+  else {
+    pill($('limit-pill'), l.reached ? 'warn' : 'ok', l.reached ? 'stopping after this song' : `stops after ${hm(l.max_minutes)}`);
+  }
+  facts($('limit-facts'), [
+    [ 'Playing without a break', hm(l.played_minutes) ],
+    [ 'Stops after', l.max_minutes ? hm(l.max_minutes) : 'never' ],
+  ]);
+  $('limit-break').textContent = l.break_minutes;
+  $('limit-grace').textContent = l.grace_minutes;
+  // Never overwrite what is being typed: the page refreshes every few seconds.
+  const input = $('limit-hours');
+  if (document.activeElement !== input && !input.dataset.dirty) {
+    input.value = String(l.max_minutes / 60);
+  }
+}
+
 // --- actions ---------------------------------------------------------------
+
+$('limit-hours').addEventListener('input', () => { $('limit-hours').dataset.dirty = '1'; });
+
+$('limit-save').addEventListener('click', () => act($('limit-save'), async () => {
+  const hours = Number($('limit-hours').value);
+  if (!Number.isFinite(hours) || hours < 0 || hours > 24) {
+    message($('limit-msg'), false, 'Enter a number of hours from 0 to 24.');
+    return;
+  }
+  const { body } = await api('api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ max_continuous_play_minutes: Math.round(hours * 60) }),
+  });
+  if (body.ok) {
+    delete $('limit-hours').dataset.dirty;
+    const max = body.playback_limit.max_minutes;
+    message($('limit-msg'), true, max ? `Saved. Playback stops after ${hm(max)} without a break.` : 'Saved. Playback never stops by itself.');
+  }
+  else {
+    message($('limit-msg'), false, body.error ?? 'Could not save.');
+  }
+}));
 
 $('route-fix').addEventListener('click', () => act($('route-fix'), async () => {
   const { body } = await api('api/rtp-source', { method: 'POST' });
@@ -473,6 +561,7 @@ async function refresh() {
     const { body } = await api('api/status');
     renderRoute(body);
     renderJar(body);
+    renderLimit(body);
     renderReceiver(body);
   }
   catch (e) {
