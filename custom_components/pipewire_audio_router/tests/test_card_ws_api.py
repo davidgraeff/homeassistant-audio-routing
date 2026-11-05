@@ -1,7 +1,7 @@
 """Tests for the dashboard card's WebSocket API (ws_api.py).
 
 This is the card's only channel: it never talks to the daemon directly, so the
-snapshot shape, the push-on-change behaviour and the four routing commands are
+snapshot shape, the push-on-change behaviour and the routing and level commands are
 the contract. The daemon client is mocked — what's under test is the proxy, not
 the REST calls it forwards to.
 """
@@ -17,6 +17,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.pipewire_audio_router.api import (
     DaemonStatus,
     AppSettings,
+    LevelCaps,
     MusicGroup,
     PipewireRouterApiError,
     RoutingMatrix,
@@ -36,8 +37,12 @@ DEFAULT_PRESETS = PresetsInfo(active="default", presets=[Preset(id="default", na
 DAEMON_STATUS = DaemonStatus(version="0.3.0", host_model="Raspberry Pi 4 Model B", host_arch="aarch64")
 RTP_DISABLED = RtpSourceState(enabled=False, port=46000, latency_msec=200, loaded=False)
 
-KITCHEN = RoutingNode(node_id=None, node_name="ap2-dev-kitchen", display_name="Kitchen")
-BATH = RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath")
+BOTH_KNOBS = LevelCaps(volume=True, mute=True)
+KITCHEN = RoutingNode(
+    node_id=None, node_name="ap2-dev-kitchen", display_name="Kitchen", volume=0.42, muted=False, level_caps=BOTH_KNOBS
+)
+# a sendspin speaker never heard from: a knob, but no level yet
+BATH = RoutingNode(node_id=None, node_name="sendspin-dev-bath", display_name="Bath", level_caps=BOTH_KNOBS)
 LOFT = RoutingNode(node_id=None, node_name="ap2-dev-loft", display_name="Loft", present=False)
 AIRPLAY = RoutingNode(node_id=10, node_name="shairport-sync", display_name="AirPlay")
 BLUETOOTH = RoutingNode(node_id=11, node_name="bt-bridge", display_name="Bluetooth")
@@ -113,12 +118,33 @@ async def test_snapshot_shape(hass, hass_ws_client):
         {"node_name": "shairport-sync", "display_name": "AirPlay", "present": True},
         {"node_name": "bt-bridge", "display_name": "Bluetooth", "present": True},
     ]
-    # `present: False` for the configured-but-absent one; no volumes, meters or
-    # node ids anywhere — the card shows none of them.
+    # `present: False` for the configured-but-absent one; each output's level
+    # (`None` where unknown — never a fabricated one), and no meters or node ids.
     assert snapshot["outputs"] == [
-        {"node_name": "ap2-dev-kitchen", "display_name": "Kitchen", "present": True},
-        {"node_name": "sendspin-dev-bath", "display_name": "Bath", "present": True},
-        {"node_name": "ap2-dev-loft", "display_name": "Loft", "present": False},
+        {
+            "node_name": "ap2-dev-kitchen",
+            "display_name": "Kitchen",
+            "present": True,
+            "volume": 0.42,
+            "muted": False,
+            "level_caps": {"volume": True, "mute": True},
+        },
+        {
+            "node_name": "sendspin-dev-bath",
+            "display_name": "Bath",
+            "present": True,
+            "volume": None,
+            "muted": None,
+            "level_caps": {"volume": True, "mute": True},
+        },
+        {
+            "node_name": "ap2-dev-loft",
+            "display_name": "Loft",
+            "present": False,
+            "volume": None,
+            "muted": None,
+            "level_caps": None,
+        },
     ]
     assert snapshot["links"] == [{"source": "shairport-sync", "output": "ap2-dev-kitchen"}]
     assert snapshot["groups"] == [
@@ -136,6 +162,29 @@ async def test_push_on_matrix_change(hass, hass_ws_client):
     event = await client.receive_json()
     assert event["type"] == "event"
     assert event["event"]["links"] == [{"source": "bt-bridge", "output": "sendspin-dev-bath"}]
+
+
+async def test_push_on_volume_change(hass, hass_ws_client):
+    """A level changed anywhere — the add-on UI, `volume_set`, the receiver's own
+    knob — comes back on the daemon's matrix, and must reach a subscriber like a
+    route does; a mute alone is a change too."""
+    _entry, coordinator = await _setup(hass, _matrix())
+    client = await hass_ws_client(hass)
+    assert (await _subscribe(client))["outputs"][0]["volume"] == 0.42
+
+    louder = RoutingNode(
+        node_id=None, node_name="ap2-dev-kitchen", display_name="Kitchen", volume=0.6, muted=False, level_caps=BOTH_KNOBS
+    )
+    coordinator._apply_routing(_matrix(outputs=(louder, BATH, LOFT)))
+    event = await client.receive_json()
+    assert event["type"] == "event"
+    assert (event["event"]["outputs"][0]["volume"], event["event"]["outputs"][0]["muted"]) == (0.6, False)
+
+    muted = RoutingNode(
+        node_id=None, node_name="ap2-dev-kitchen", display_name="Kitchen", volume=0.6, muted=True, level_caps=BOTH_KNOBS
+    )
+    coordinator._apply_routing(_matrix(outputs=(muted, BATH, LOFT)))
+    assert (await client.receive_json())["event"]["outputs"][0]["muted"] is True
 
 
 async def test_unchanged_state_sends_nothing(hass, hass_ws_client):
@@ -189,6 +238,59 @@ async def test_group_route_is_exclusive_call(hass, hass_ws_client):
     await client.send_json({"id": 8, "type": f"{DOMAIN}/unroute_group", "group_id": "g1"})
     assert (await client.receive_json())["success"]
     coordinator.client.async_unroute_music_group.assert_awaited_once_with("g1")
+
+
+async def test_set_volume_and_mute(hass, hass_ws_client):
+    """One output's level and mute, by node name, on the 0–1 scale the snapshot
+    reports — the same client calls a `media_player` makes."""
+    _entry, coordinator = await _setup(hass, _matrix(), groups=[GROUND_FLOOR])
+    client = await hass_ws_client(hass)
+    coordinator.client.async_set_output_volume = AsyncMock()
+    coordinator.client.async_set_output_mute = AsyncMock()
+
+    # a member of a music group: only that speaker, not the group
+    await client.send_json({"id": 13, "type": f"{DOMAIN}/set_volume", "output": "ap2-dev-kitchen", "volume": 0.3})
+    assert (await client.receive_json())["success"]
+    coordinator.client.async_set_output_volume.assert_awaited_once_with("ap2-dev-kitchen", 0.3)
+
+    # an integer is a level too (JSON has no float type of its own)
+    await client.send_json({"id": 14, "type": f"{DOMAIN}/set_volume", "output": "sendspin-dev-bath", "volume": 1})
+    assert (await client.receive_json())["success"]
+    coordinator.client.async_set_output_volume.assert_awaited_with("sendspin-dev-bath", 1.0)
+
+    await client.send_json({"id": 15, "type": f"{DOMAIN}/set_mute", "output": "ap2-dev-kitchen", "muted": True})
+    assert (await client.receive_json())["success"]
+    coordinator.client.async_set_output_mute.assert_awaited_once_with("ap2-dev-kitchen", True)
+
+
+async def test_set_volume_out_of_range_is_refused(hass, hass_ws_client):
+    """Above full scale is refused, not clamped — a stray 60 meant as percent must not
+    become full power on an AirPlay receiver."""
+    _entry, coordinator = await _setup(hass, _matrix())
+    client = await hass_ws_client(hass)
+    coordinator.client.async_set_output_volume = AsyncMock()
+
+    await client.send_json({"id": 16, "type": f"{DOMAIN}/set_volume", "output": "ap2-dev-kitchen", "volume": 60})
+    msg = await client.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_format"
+    coordinator.client.async_set_output_volume.assert_not_awaited()
+
+
+async def test_set_volume_failure_is_reported(hass, hass_ws_client):
+    """A host with no agent answers 503: the client gets it as an error rather than a
+    slider that silently snaps back on the next push."""
+    _entry, coordinator = await _setup(hass, _matrix())
+    client = await hass_ws_client(hass)
+    coordinator.client.async_set_output_mute = AsyncMock(
+        side_effect=PipewireRouterApiError("could not set mute on 'pwsink-dev-desk': 503")
+    )
+
+    await client.send_json({"id": 17, "type": f"{DOMAIN}/set_mute", "output": "pwsink-dev-desk", "muted": False})
+    msg = await client.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "daemon_error"
+    assert "503" in msg["error"]["message"]
 
 
 async def test_daemon_failure_is_reported(hass, hass_ws_client):

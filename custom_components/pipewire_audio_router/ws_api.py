@@ -11,11 +11,16 @@ The push side costs nothing: the coordinator already holds the matrix pushed
 live from the daemon (`_apply_routing`), so a subscription here is a listener on
 it, not a second socket to the Pi.
 
-The payload is deliberately a *reduced* shape (no volumes, meters, now-playing,
-`node_id`, or per-output metadata): the card shows inputs, targets and links, so
-anything else would be a contract we'd have to keep and never read. That is also
-why these types are declared in the card's own `card/types.ts` instead of being
-shared with the admin UI's `lib/types.ts`.
+The payload is deliberately a *reduced* shape (no meters, now-playing, `node_id`,
+or per-output metadata): the card shows inputs, targets and links, so anything else
+would be a contract we'd have to keep and never read. That is also why these types
+are declared in the card's own `card/types.ts` instead of being shared with the
+admin UI's `lib/types.ts`.
+
+The one addition is each output's level — `volume`, `muted` and `level_caps` —
+for clients with a volume control of their own (a wall display's speaker menu),
+with `set_volume` / `set_mute` to move it. They are on the matrix the daemon pushes
+anyway, so a level changed anywhere reaches every subscriber with no extra poll.
 """
 
 from __future__ import annotations
@@ -38,6 +43,8 @@ WS_UNLINK = f"{DOMAIN}/unlink"
 WS_ROUTE_GROUP = f"{DOMAIN}/route_group"
 WS_UNROUTE_GROUP = f"{DOMAIN}/unroute_group"
 WS_SET_PRESET = f"{DOMAIN}/set_preset"
+WS_SET_VOLUME = f"{DOMAIN}/set_volume"
+WS_SET_MUTE = f"{DOMAIN}/set_mute"
 
 ERR_NO_ENTRY = "no_entry"
 ERR_AMBIGUOUS = "ambiguous_entry"
@@ -56,6 +63,8 @@ def async_register(hass: HomeAssistant) -> None:
         ws_route_group,
         ws_unroute_group,
         ws_set_preset,
+        ws_set_volume,
+        ws_set_mute,
     ):
         websocket_api.async_register_command(hass, handler)
 
@@ -68,6 +77,22 @@ def _node(node: Any) -> dict[str, Any]:
         "node_name": node.node_name,
         "display_name": node.display_name,
         "present": node.present,
+    }
+
+
+def _output(node: Any) -> dict[str, Any]:
+    """One output: its endpoint, plus its level as the daemon last knew it.
+
+    `volume` is 0.0–1.0 on the scale `set_volume` takes (HA's `volume_level`; the
+    daemon maps it per transport), and `None` — like `muted` — means *unknown*, not
+    silent: a client must not draw a fabricated level. `level_caps` says whether a
+    write can land at all ({volume, mute}; `None` when the daemon does not say)."""
+    caps = node.level_caps
+    return {
+        **_node(node),
+        "volume": node.volume,
+        "muted": node.muted,
+        "level_caps": {"volume": caps.volume, "mute": caps.mute} if caps is not None else None,
     }
 
 
@@ -87,7 +112,7 @@ def _snapshot(coordinator: Any) -> dict[str, Any]:
     presets_on = getattr(coordinator, "presets_enabled", False)
     return {
         "sources": [_node(n) for n in matrix.sources],
-        "outputs": [_node(n) for n in matrix.outputs],
+        "outputs": [_output(n) for n in matrix.outputs],
         "links": [{"source": source, "output": output} for source, output in matrix.links],
         "groups": [
             {"id": group.id, "name": group.name, "members": list(group.members)}
@@ -289,3 +314,45 @@ async def ws_set_preset(
         connection.send_error(msg["id"], ERR_DAEMON, str(err))
         return
     connection.send_result(msg["id"])
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_SET_VOLUME,
+        vol.Required("output"): str,
+        vol.Required("volume"): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=1.0)),
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_volume(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Set one output's level, 0.0–1.0 — the scale of `volume_level` and of the
+    snapshot's `volume`; the daemon converts per transport.
+
+    One output only, also for a member of a music group: a group's master volume is
+    its `media_player`. The new level arrives on the subscription, like a route."""
+    coordinator = _resolve(hass, connection, msg)
+    if coordinator is None:
+        return
+    await _call(connection, msg, coordinator.client.async_set_output_volume(msg["output"], msg["volume"]))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_SET_MUTE,
+        vol.Required("output"): str,
+        vol.Required("muted"): bool,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_mute(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Mute or unmute one output; unmuting restores the level it had."""
+    coordinator = _resolve(hass, connection, msg)
+    if coordinator is None:
+        return
+    await _call(connection, msg, coordinator.client.async_set_output_mute(msg["output"], msg["muted"]))

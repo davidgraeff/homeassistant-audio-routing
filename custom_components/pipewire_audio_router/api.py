@@ -204,6 +204,26 @@ class RoutingNode:
     present: bool = True
     configured: bool = True
     node_id: int | None = None
+    # Outputs only: the level as the daemon last knew it (0.0–1.0, the same scale as
+    # `volume_level` and `PUT /api/outputs/{node_name}/volume`) and its mute. `None` is
+    # *unknown* — never heard or set, or a pw-sink host with no agent — not "silent".
+    # They ride the pushed matrix, so a level changed anywhere (the add-on UI, a
+    # `volume_set`, a receiver reporting its own knob) arrives with the next frame.
+    volume: float | None = None
+    muted: bool | None = None
+    # Outputs only: which of the two knobs a write can reach right now (the daemon's
+    # `level_caps`); `None` for sources and for a daemon too old to say.
+    level_caps: LevelCaps | None = None
+
+
+@dataclass(frozen=True)
+class LevelCaps:
+    """Whether a volume / a mute write to one output can be expected to land
+    (routing.rs `LevelCaps`). Per output, not per kind: a pw-sink host can set its
+    level only while its agent reports one, and may have a level but no mute."""
+
+    volume: bool
+    mute: bool
 
 
 @dataclass
@@ -302,12 +322,22 @@ def _parse_routing_matrix(data: dict) -> RoutingMatrix:
     REST fetch and the WebSocket push so both stay in lock-step."""
 
     def _node(item: dict) -> RoutingNode:
+        volume = item.get("volume")
+        muted = item.get("muted")
+        caps = item.get("level_caps")
         return RoutingNode(
             node_name=item.get("node_name") or item["display_name"],
             display_name=item["display_name"],
             present=item.get("present", True),
             configured=item.get("configured", True),
             node_id=item.get("node_id"),
+            volume=float(volume) if isinstance(volume, (int, float)) and not isinstance(volume, bool) else None,
+            muted=muted if isinstance(muted, bool) else None,
+            level_caps=(
+                LevelCaps(volume=bool(caps.get("volume")), mute=bool(caps.get("mute")))
+                if isinstance(caps, dict)
+                else None
+            ),
         )
 
     return RoutingMatrix(

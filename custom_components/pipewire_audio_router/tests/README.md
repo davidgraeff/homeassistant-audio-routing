@@ -35,10 +35,13 @@ installs the version this HA pins, and is the easier way to run all of this.
   which outputs are ducked (both scopes), the satellite's own output included,
   entity-area override, two rooms at once, release on idle/unavailable/switch-off
   and on entry unload, and the AP2-by-IP path with per-output entities off.
-- `test_card_ws_api.py` — the dashboard card's WebSocket API: the snapshot shape,
-  pushes on change (and *no* push when a poll changed nothing), the four routing
-  commands, daemon errors surfaced to the card, and the one-vs-several-routers
-  `entry_id` rules.
+- `test_card_ws_api.py` — the dashboard card's WebSocket API: the snapshot shape
+  (each output's level, unknown kept `null`), pushes on change — a route or a level —
+  (and *no* push when a poll changed nothing), the four routing commands, the preset,
+  `set_volume` (range-checked) and `set_mute` commands, daemon errors surfaced to the
+  card, and the one-vs-several-routers `entry_id` rules.
+- `test_routing_ws.py` — the events socket's frame handling: the matrix (with each
+  output's level) parsed, every other topic skipped, close and non-dict frames.
 - `test_source_control.py` — a controllable source (the YouTube Music receiver) as a
   `media_player`: created from the daemon's `control` announcement, its track/queue
   attributes and features from the receiver's state, the transport services and

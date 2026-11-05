@@ -90,6 +90,38 @@ async def test_matrix_frame_is_parsed():
     assert matrix.links == [("airplay-in", "ap2-dev-dusche")]
 
 
+async def test_output_levels_are_parsed_and_unknown_stays_unknown():
+    """An output's level rides the matrix (routing.rs `volume`/`muted`/`level_caps`).
+    The daemon omits a level it does not know, and that must stay `None` — not 0, not
+    full scale — so a slider is never drawn at a fabricated position."""
+    frame = {
+        "type": "matrix",
+        "sources": [{"node_name": "airplay-in", "display_name": "AirPlay", "present": True}],
+        "outputs": [
+            {
+                "node_name": "ap2-dev-dusche",
+                "display_name": "Shower",
+                "volume": 0.35,
+                "muted": False,
+                "level_caps": {"volume": True, "mute": True},
+            },
+            # a pw-sink host with no agent: the daemon sends no level, and no knob
+            {"node_name": "pwsink-dev-desk", "display_name": "Desk", "level_caps": {"volume": False, "mute": False}},
+        ],
+        "links": [],
+    }
+    [matrix] = await _collect([_text(frame)])
+    shower, desk = matrix.outputs
+    assert (shower.volume, shower.muted) == (0.35, False)
+    assert (shower.level_caps.volume, shower.level_caps.mute) == (True, True)
+    assert (desk.volume, desk.muted) == (None, None)
+    assert (desk.level_caps.volume, desk.level_caps.mute) == (False, False)
+    # sources carry no level, and a frame without levels parses as unknown
+    assert matrix.sources[0].volume is None and matrix.sources[0].level_caps is None
+    [plain] = await _collect([_text(MATRIX_FRAME)])
+    assert (plain.outputs[0].volume, plain.outputs[0].muted, plain.outputs[0].level_caps) == (None, None, None)
+
+
 async def test_listing_frames_are_skipped_not_parsed():
     """The regression: a listing frame must neither raise nor be yielded.
 

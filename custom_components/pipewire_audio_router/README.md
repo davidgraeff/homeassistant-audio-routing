@@ -308,6 +308,44 @@ ingress API is not reachable from the browser. It is built from
 result is **committed** to `www/pipewire-router-card.js`, because HACS copies this
 directory verbatim and runs no build step. CI fails if the two disagree.
 
+### The WebSocket API
+
+The card's channel is open to any client on Home Assistant's websocket (a wall
+display, a script): every command takes an optional `entry_id`, needed only with
+more than one router (`ambiguous_entry` otherwise; `no_entry` without one).
+
+| Command | Fields | Does |
+| --- | --- | --- |
+| `pipewire_audio_router/subscribe` | — | A result, then the snapshot as an event at once and on every change. |
+| `pipewire_audio_router/link` / `unlink` | `source`, `output` | Adds / removes one route (a lone output may mix several sources). |
+| `pipewire_audio_router/route_group` | `group_id`, `source` | The whole music group onto that source alone. |
+| `pipewire_audio_router/unroute_group` | `group_id` | The whole group silent. |
+| `pipewire_audio_router/set_preset` | `preset` (id or name) | Puts a music-group preset in force. |
+| `pipewire_audio_router/set_volume` | `output`, `volume` (0.0–1.0) | One output's level — also for a group member, which leaves the rest of its group alone. |
+| `pipewire_audio_router/set_mute` | `output`, `muted` | One output's mute; unmuting restores its level. |
+
+The snapshot:
+
+```json
+{"sources": [{"node_name": "shairport-sync", "display_name": "AirPlay", "present": true}],
+ "outputs": [{"node_name": "ap2-dev-kitchen", "display_name": "Kitchen", "present": true,
+              "volume": 0.42, "muted": false, "level_caps": {"volume": true, "mute": true}}],
+ "links": [{"source": "shairport-sync", "output": "ap2-dev-kitchen"}],
+ "groups": [{"id": "g1", "name": "Ground floor", "members": ["ap2-dev-kitchen"]}],
+ "presets": [], "active_preset": null}
+```
+
+An output's `volume` is on the scale of `media_player.volume_set` (0.0–1.0), which
+the add-on maps per transport: a PipeWire host's cubic volume (what `wpctl` and
+pavucontrol show), sendspin's 0–100 (the device applies its own curve), an AirPlay 2
+receiver's `20·log10(volume)` dB. A slider drawn linearly on it matches every other
+volume control of the same speaker. `volume` and `muted` are `null` when *unknown* —
+never heard or set, or a host with no agent — and `level_caps` says whether a write
+can land at all (`null` when the add-on does not say). Levels ride the add-on's
+pushed matrix, so one changed anywhere arrives as a new snapshot. A command answers
+once the add-on took it (`daemon_error` if it refused); the new state arrives on the
+subscription.
+
 ## Routing from automations
 
 The idiomatic path is `media_player.select_source`:
@@ -386,7 +424,7 @@ __init__.py       setup/teardown, coordinator (5s poll: players + RTP source; ro
 config_flow.py     single-step host/port form, validates by calling the add-on
 media_player.py    the MediaPlayerEntity subclasses described above (incl. select_source + link/unlink services)
 source_control.py  client for a controllable source's own control API (state, transport, play_media, browse)
-ws_api.py          WebSocket API behind the dashboard card: routing subscription + link/unlink/route_group
+ws_api.py          WebSocket API behind the dashboard card: routing subscription + link/unlink/route_group, set_volume/set_mute
 frontend.py        serves www/pipewire-router-card.js and loads it into the frontend
 www/               the built dashboard card (committed; built from ../../pipewire_audio_router/frontend)
 switch.py          RTP-source enable/disable + voice-ducking on/off switches
